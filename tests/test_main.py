@@ -9,6 +9,18 @@ from aruba_session_tracker.paths import AppPaths
 from aruba_session_tracker.storage import StorageError
 
 
+def test_report_smoke_writes_standalone_html_to_korean_path(tmp_path: Path) -> None:
+    destination = tmp_path / "한국어 결과" / "세션 보고서.html"
+
+    assert main(["--report-smoke-test", str(destination)]) == 0
+
+    text = destination.read_text(encoding="utf-8")
+    assert "<!doctype html>" in text.casefold()
+    assert "한국어-MD" in text
+    assert "https://" not in text.casefold()
+    assert "http://" not in text.casefold()
+
+
 def test_startup_storage_failure_is_visible_and_returns_nonzero(
     qtbot: object,
     tmp_path: Path,

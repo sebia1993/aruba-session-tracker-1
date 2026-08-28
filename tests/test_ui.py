@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QFileDialog, QMessageBox
 
 from aruba_session_tracker.config import ConfigRepository
 from aruba_session_tracker.models import (
@@ -86,6 +86,55 @@ def test_counter_delta_is_only_shown_for_monotonic_samples() -> None:
     assert _counter_delta(10, 10) == "+0"
     assert _counter_delta(2, 10) == "-"
     assert _counter_delta(None, 10) == "-"
+
+
+def test_html_report_export_is_independent_from_csv(
+    qtbot: object,
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    store = SessionStore(tmp_path / "tracker.db", tmp_path / "raw", tmp_path / "exports")
+    store.initialize()
+    run_id = store.start_run(QueryRequest("192.0.2.10", "203.0.113.20", 53000, 443))
+    store.record_query(
+        run_id,
+        (
+            SessionObservation(
+                controller_name="MD-01",
+                controller_host="198.51.100.21",
+                protocol=6,
+                source_ip="192.0.2.10",
+                destination_ip="203.0.113.20",
+                source_port=53000,
+                destination_port=443,
+                flags="FC",
+            ),
+        ),
+    )
+    store.finish_run(run_id)
+    window = MainWindow(ConfigRepository(tmp_path / "config.json"), store, _Executor())
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    window.history_table.selectRow(0)
+    destination = tmp_path / "사용자 선택" / "result.html"
+    messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        QFileDialog,
+        "getSaveFileName",
+        lambda *_args, **_kwargs: (str(destination), "HTML 문서 (*.html)"),
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        QMessageBox,
+        "information",
+        lambda _parent, title, message: messages.append((title, str(message))),
+    )
+
+    window._export_selected_run_html()
+
+    assert window.export_button.text() == "선택 실행 CSV 내보내기"
+    assert window.html_export_button.text() == "선택 실행 HTML 보고서"
+    assert destination.is_file()
+    assert messages == [("HTML 보고서 완료", str(destination))]
+    window.close()
 
 
 def test_loading_one_md_disables_unused_blank_rows(qtbot: object, tmp_path: Path) -> None:

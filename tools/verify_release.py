@@ -38,6 +38,7 @@ FORBIDDEN_DIRECTORY_NAMES = {"exports", "raw"}
 FORBIDDEN_SUFFIXES = {
     ".csv",
     ".db",
+    ".html",
     ".key",
     ".log",
     ".p12",
@@ -356,9 +357,7 @@ def verify_release(
         elif not allow_dirty:
             raise ReleaseVerificationError("clean release verification requires expected commit")
         if build_info.get("authenticodeSigned") is not False:
-            raise ReleaseVerificationError(
-                "unsigned v0.1 package must report authenticodeSigned=false"
-            )
+            raise ReleaseVerificationError("unsigned package must report authenticodeSigned=false")
         if build_info.get("liveDeviceValidated") is not False:
             raise ReleaseVerificationError("fixture build must report liveDeviceValidated=false")
 
@@ -397,6 +396,31 @@ def smoke_executable(zip_path: Path) -> None:
 
         korean_local_app_data = root / "한국어 경로" / "LocalAppData"
         korean_local_app_data.mkdir(parents=True)
+        report_path = root / "한국어 경로" / "보고서" / "세션 결과.html"
+        try:
+            report_result = subprocess.run(  # noqa: S603
+                [executable, "--report-smoke-test", report_path],
+                check=False,
+                capture_output=True,
+                timeout=30,
+                env=logic_environment,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ReleaseVerificationError("packaged HTML report smoke timed out") from error
+        if report_result.returncode != 0 or not report_path.is_file():
+            raise ReleaseVerificationError(
+                "packaged HTML report smoke failed in a Korean output path "
+                f"with exit code {report_result.returncode}"
+            )
+        report_text = report_path.read_text(encoding="utf-8")
+        if (
+            "<!doctype html>" not in report_text.casefold()
+            or "한국어-MD" not in report_text
+            or "https://" in report_text.casefold()
+            or "http://" in report_text.casefold()
+        ):
+            raise ReleaseVerificationError("packaged HTML report is not standalone and complete")
+
         gui_environment = os.environ.copy()
         gui_environment.pop("QT_QPA_PLATFORM", None)
         gui_environment["LOCALAPPDATA"] = str(korean_local_app_data)

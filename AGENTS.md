@@ -28,6 +28,14 @@ datapath session rows from the relevant 7240XM managed device.
 - Build with `powershell -ExecutionPolicy Bypass -File .\build_windows.ps1`.
 - Keep real device addresses, logs, raw output, SQLite files, exports, and
   known-host files out of Git and release assets.
+- Preserve CSV export as an independent manual path. Result reports are
+  separate single-file HTML5 documents with inline CSS, no external resources,
+  responsive and print layouts, escaped database/device values, and no Raw CLI
+  body. Never invent VLAN, SSID, Role, interface, topology, or device facts that
+  are not stored for the selected run; label missing facts as confirmation
+  required.
+- Treat generated HTML reports as private runtime data. Do not add real reports
+  to Git, tests, documentation fixtures, CI artifacts, or public packages.
 
 ## Release
 
