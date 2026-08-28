@@ -7,7 +7,8 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from aruba_session_tracker import __version__
@@ -21,7 +22,7 @@ from aruba_session_tracker.models import (
 from aruba_session_tracker.paths import AppPaths
 from aruba_session_tracker.runtime import RuntimeExecutor
 from aruba_session_tracker.storage import SessionStore, StorageError
-from aruba_session_tracker.ui import MainWindow
+from aruba_session_tracker.ui import DeveloperInspectorController, MainWindow
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -63,14 +64,64 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 1
 
-    window = MainWindow(repository, store, executor)
-    window.show()
-    if options.gui_smoke_test:
-        QTimer.singleShot(300, application.quit)
-    exit_code = application.exec()
+    developer_inspector = DeveloperInspectorController(
+        application,
+        f"v{__version__}",
+        parent=application,
+    )
+    try:
+        window = MainWindow(
+            repository,
+            store,
+            executor,
+            developer_inspector=developer_inspector,
+        )
+        window.show()
+        if options.gui_smoke_test:
+            QTimer.singleShot(
+                300,
+                lambda: _run_gui_smoke_test(application, window, developer_inspector),
+            )
+        exit_code = application.exec()
+    finally:
+        developer_inspector.close()
     if options.gui_smoke_test and exit_code == 0:
         print(f"ARUBA_SESSION_TRACKER_GUI_SMOKE_OK {__version__}")
     return exit_code
+
+
+def _run_gui_smoke_test(
+    application: QApplication,
+    window: MainWindow,
+    developer_inspector: DeveloperInspectorController,
+) -> None:
+    try:
+        if developer_inspector.enabled:
+            raise RuntimeError("developer inspector started enabled")
+        _send_plain_f12(application, window)
+        if not developer_inspector.enabled:
+            raise RuntimeError("developer inspector did not enable")
+        _send_plain_f12(application, window)
+        if developer_inspector.enabled:
+            raise RuntimeError("developer inspector did not disable")
+    except Exception as exc:
+        print(
+            f"ARUBA_SESSION_TRACKER_GUI_SMOKE_FAILED {type(exc).__name__}",
+            file=sys.stderr,
+        )
+        application.exit(1)
+        return
+    application.quit()
+
+
+def _send_plain_f12(application: QApplication, window: MainWindow) -> None:
+    for event_type in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+        event = QKeyEvent(
+            event_type,
+            Qt.Key.Key_F12,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        application.sendEvent(window, event)
 
 
 def _report_smoke_test(destination: Path) -> int:

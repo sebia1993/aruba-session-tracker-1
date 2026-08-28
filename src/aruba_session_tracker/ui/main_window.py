@@ -45,6 +45,12 @@ from aruba_session_tracker.models import (
 )
 from aruba_session_tracker.parsers import interpret_flags, overall_flag_severity
 from aruba_session_tracker.storage import SessionStore
+from aruba_session_tracker.ui.developer_inspector import (
+    DeveloperInspectorController,
+    UiElementMetadata,
+)
+
+_UI_SOURCE_PATH = "src/aruba_session_tracker/ui/main_window.py"
 
 
 class QueryExecutor(Protocol):
@@ -177,11 +183,13 @@ class MainWindow(QMainWindow):
         config_repository: ConfigRepository,
         store: SessionStore,
         executor: QueryExecutor,
+        developer_inspector: DeveloperInspectorController | None = None,
     ) -> None:
         super().__init__()
         self._config_repository = config_repository
         self._store = store
         self._executor = executor
+        self._developer_inspector = developer_inspector
         self._thread_pool = QThreadPool(self)
         self._approval = ApprovalBridge(self)
         self._cancel_token: CancellationToken | None = None
@@ -200,12 +208,27 @@ class MainWindow(QMainWindow):
         self._refresh_history()
 
     def _build_ui(self) -> None:
-        tabs = QTabWidget()
-        tabs.addTab(self._build_query_tab(), "세션 조회")
-        tabs.addTab(self._build_settings_tab(), "장비 설정")
-        tabs.addTab(self._build_history_tab(), "기록 및 내보내기")
-        self.setCentralWidget(tabs)
+        self.central_root = QWidget()
+        self.central_layout = QVBoxLayout(self.central_root)
+        self.central_layout.setContentsMargins(0, 0, 0, 0)
+        self.central_layout.setSpacing(0)
+        if self._developer_inspector is not None:
+            self._developer_inspector.attach_host_layout(
+                self.central_root,
+                self.central_layout,
+            )
+
+        self.tabs = QTabWidget()
+        self.query_page = self._build_query_tab()
+        self.settings_page = self._build_settings_tab()
+        self.history_page = self._build_history_tab()
+        self.tabs.addTab(self.query_page, "세션 조회")
+        self.tabs.addTab(self.settings_page, "장비 설정")
+        self.tabs.addTab(self.history_page, "기록 및 내보내기")
+        self.central_layout.addWidget(self.tabs, 1)
+        self.setCentralWidget(self.central_root)
         self.statusBar().showMessage("실제 장비 접속 전 SSH 지문을 반드시 확인하십시오.")
+        self._register_developer_inspector_catalog()
 
     def _build_query_tab(self) -> QWidget:
         page = QWidget()
@@ -297,14 +320,14 @@ class MainWindow(QMainWindow):
         result_layout.addWidget(self.context_label)
         result_layout.addWidget(self.result_table)
 
-        details = QTabWidget()
+        self.details = QTabWidget()
         self.raw_view = QPlainTextEdit()
         self.raw_view.setReadOnly(True)
         self.diagnostics_list = QListWidget()
-        details.addTab(self.raw_view, "선택 행 Raw")
-        details.addTab(self.diagnostics_list, "진단 이벤트")
+        self.details.addTab(self.raw_view, "선택 행 Raw")
+        self.details.addTab(self.diagnostics_list, "진단 이벤트")
         splitter.addWidget(result_panel)
-        splitter.addWidget(details)
+        splitter.addWidget(self.details)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 2)
         layout.addWidget(splitter, 1)
@@ -375,9 +398,11 @@ class MainWindow(QMainWindow):
         self.save_config_button.clicked.connect(self._save_config)
         save_row.addWidget(self.save_config_button)
         save_row.addStretch(1)
-        warning = QLabel("장비 주소와 주기만 저장합니다. 사용자 이름과 암호는 저장하지 않습니다.")
-        warning.setWordWrap(True)
-        save_row.addWidget(warning)
+        self.settings_privacy_notice = QLabel(
+            "장비 주소와 주기만 저장합니다. 사용자 이름과 암호는 저장하지 않습니다."
+        )
+        self.settings_privacy_notice.setWordWrap(True)
+        save_row.addWidget(self.settings_privacy_notice)
 
         layout.addWidget(self.mm_group)
         layout.addWidget(self.md_group)
@@ -390,17 +415,17 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         toolbar = QHBoxLayout()
-        refresh_button = QPushButton("새로고침")
+        self.refresh_history_button = QPushButton("새로고침")
         self.export_button = QPushButton("선택 실행 CSV 내보내기")
         self.html_export_button = QPushButton("선택 실행 HTML 보고서")
         self.delete_button = QPushButton("선택 실행 삭제")
         self.delete_all_button = QPushButton("전체 기록 삭제")
-        refresh_button.clicked.connect(self._refresh_history)
+        self.refresh_history_button.clicked.connect(self._refresh_history)
         self.export_button.clicked.connect(self._export_selected_run)
         self.html_export_button.clicked.connect(self._export_selected_run_html)
         self.delete_button.clicked.connect(lambda: self._delete_history(all_runs=False))
         self.delete_all_button.clicked.connect(lambda: self._delete_history(all_runs=True))
-        toolbar.addWidget(refresh_button)
+        toolbar.addWidget(self.refresh_history_button)
         toolbar.addWidget(self.export_button)
         toolbar.addWidget(self.html_export_button)
         toolbar.addWidget(self.delete_button)
@@ -413,14 +438,459 @@ class MainWindow(QMainWindow):
         self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.history_table)
-        note = QLabel(
+        self.history_privacy_notice = QLabel(
             "Raw TXT, SQLite, CSV와 HTML 보고서에는 내부 IP 및 세션 메타데이터가 "
             "평문으로 남을 수 있습니다. "
             "자동 삭제하지 않으므로 보존 정책에 따라 수동으로 삭제하십시오."
         )
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        self.history_privacy_notice.setWordWrap(True)
+        layout.addWidget(self.history_privacy_notice)
         return page
+
+    def _register_developer_inspector_catalog(self) -> None:
+        inspector = self._developer_inspector
+        if inspector is None:
+            return
+
+        common = "앱 > 공통"
+        query = "앱 > 세션 조회"
+        settings = "앱 > 장비 설정"
+        history = "앱 > 기록 및 내보내기"
+        widgets: tuple[tuple[QWidget, UiElementMetadata], ...] = (
+            (self, _ui_metadata("메인 창", "MAIN-WINDOW", common, "애플리케이션 기본 창")),
+            (
+                self.statusBar(),
+                _ui_metadata("상태 표시줄", "MAIN-STATUS-BAR", common, "작업 상태와 안내 표시"),
+            ),
+            (self.tabs, _ui_metadata("주 탭", "MAIN-TABS", common, "운영 화면 전환")),
+            (
+                self.tabs.tabBar(),
+                _ui_metadata("주 탭 표시줄", "MAIN-TAB-BAR", common, "운영 화면 탭 선택"),
+            ),
+            (
+                self.query_page,
+                _ui_metadata("세션 조회 화면", "MAIN-QUERY-VIEW", query, "세션 조회 작업 화면"),
+            ),
+            (
+                self.settings_page,
+                _ui_metadata(
+                    "장비 설정 화면", "MAIN-SETTINGS-VIEW", settings, "장비와 모니터링 설정 화면"
+                ),
+            ),
+            (
+                self.history_page,
+                _ui_metadata(
+                    "기록 및 내보내기 화면",
+                    "MAIN-HISTORY-VIEW",
+                    history,
+                    "저장된 실행 기록 관리 화면",
+                ),
+            ),
+            (
+                self.connection_group,
+                _ui_metadata(
+                    "실행 자격증명 영역",
+                    "MAIN-QUERY-CREDENTIALS-GROUP",
+                    query,
+                    "현재 실행에만 사용하는 자격증명 입력 영역",
+                ),
+            ),
+            (
+                self.username_edit,
+                _ui_metadata(
+                    "사용자 이름 입력",
+                    "MAIN-QUERY-CREDENTIALS-USERNAME",
+                    query,
+                    "SSH 사용자 이름 입력",
+                ),
+            ),
+            (
+                self.password_edit,
+                _ui_metadata(
+                    "암호 입력",
+                    "MAIN-QUERY-CREDENTIALS-PASSWORD",
+                    query,
+                    "세션 전용 SSH 암호 입력",
+                ),
+            ),
+            (
+                self.enable_edit,
+                _ui_metadata(
+                    "Enable 암호 입력",
+                    "MAIN-QUERY-CREDENTIALS-ENABLE-SECRET",
+                    query,
+                    "선택적 Enable 암호 입력",
+                ),
+            ),
+            (
+                self.query_group,
+                _ui_metadata(
+                    "세션 조건 영역",
+                    "MAIN-QUERY-CONDITIONS-GROUP",
+                    query,
+                    "조회할 세션 조건 입력 영역",
+                ),
+            ),
+            (
+                self.source_ip_edit,
+                _ui_metadata(
+                    "Source IP 입력", "MAIN-QUERY-CONDITIONS-SOURCE-IP", query, "출발지 IPv4 입력"
+                ),
+            ),
+            (
+                self.destination_ip_edit,
+                _ui_metadata(
+                    "Destination IP 입력",
+                    "MAIN-QUERY-CONDITIONS-DESTINATION-IP",
+                    query,
+                    "목적지 IPv4 입력",
+                ),
+            ),
+            (
+                self.source_port_edit,
+                _ui_metadata(
+                    "Source 포트 입력",
+                    "MAIN-QUERY-CONDITIONS-SOURCE-PORT",
+                    query,
+                    "선택적 출발지 포트 입력",
+                ),
+            ),
+            (
+                self.destination_port_edit,
+                _ui_metadata(
+                    "Destination 포트 입력",
+                    "MAIN-QUERY-CONDITIONS-DESTINATION-PORT",
+                    query,
+                    "선택적 목적지 포트 입력",
+                ),
+            ),
+            (
+                self.bidirectional_check,
+                _ui_metadata(
+                    "양방향 검색 선택",
+                    "MAIN-QUERY-CONDITIONS-BIDIRECTIONAL",
+                    query,
+                    "IP와 포트를 교환한 반대 방향 포함 여부 선택",
+                ),
+            ),
+            (
+                self.query_button,
+                _ui_metadata("현재 조회", "MAIN-QUERY-RUN", query, "단일 조회 시작"),
+            ),
+            (
+                self.monitor_button,
+                _ui_metadata(
+                    "지속 모니터링 시작", "MAIN-QUERY-MONITOR-START", query, "지속 모니터링 시작"
+                ),
+            ),
+            (
+                self.stop_button,
+                _ui_metadata("중지", "MAIN-QUERY-STOP", query, "실행 중인 작업 중지"),
+            ),
+            (
+                self.state_label,
+                _ui_metadata("조회 상태", "MAIN-QUERY-STATE", query, "현재 조회 상태 표시"),
+            ),
+            (
+                self.context_label,
+                _ui_metadata(
+                    "MM/MD 문맥", "MAIN-QUERY-CONTEXT", query, "조회에 사용된 장비 문맥 표시"
+                ),
+            ),
+            (
+                self.result_table,
+                _ui_metadata("조회 결과 표", "MAIN-QUERY-RESULT-TABLE", query, "세션 조회 결과 표"),
+            ),
+            (
+                self.result_table.horizontalHeader(),
+                _ui_metadata(
+                    "조회 결과 표 헤더",
+                    "MAIN-QUERY-RESULT-TABLE-HEADER",
+                    query,
+                    "결과 열 제목 표시",
+                ),
+            ),
+            (
+                self.result_table.viewport(),
+                _ui_metadata(
+                    "조회 결과 표 본문", "MAIN-QUERY-RESULT-TABLE-BODY", query, "결과 행 표시 영역"
+                ),
+            ),
+            (
+                self.details,
+                _ui_metadata(
+                    "조회 상세 탭", "MAIN-QUERY-DETAIL-TABS", query, "Raw와 진단 상세 전환"
+                ),
+            ),
+            (
+                self.details.tabBar(),
+                _ui_metadata(
+                    "조회 상세 탭 표시줄",
+                    "MAIN-QUERY-DETAIL-TAB-BAR",
+                    query,
+                    "Raw와 진단 상세 탭 선택",
+                ),
+            ),
+            (
+                self.raw_view,
+                _ui_metadata("Raw 보기", "MAIN-QUERY-RAW-VIEW", query, "선택 행 Raw 표시"),
+            ),
+            (
+                self.diagnostics_list,
+                _ui_metadata(
+                    "진단 이벤트 목록",
+                    "MAIN-QUERY-DIAGNOSTICS-LIST",
+                    query,
+                    "조회 진단 이벤트 표시",
+                ),
+            ),
+            (
+                self.mm_group,
+                _ui_metadata(
+                    "Mobility Conductor 영역", "MAIN-SETTINGS-MM-GROUP", settings, "MM 설정 영역"
+                ),
+            ),
+            (
+                self.mm_primary_name,
+                _ui_metadata(
+                    "Primary MM 표시 이름",
+                    "MAIN-SETTINGS-MM-PRIMARY-NAME",
+                    settings,
+                    "Primary MM 표시 이름 입력",
+                ),
+            ),
+            (
+                self.mm_primary_host,
+                _ui_metadata(
+                    "Primary MM 주소",
+                    "MAIN-SETTINGS-MM-PRIMARY-HOST",
+                    settings,
+                    "Primary MM IPv4 입력",
+                ),
+            ),
+            (
+                self.mm_primary_port,
+                _ui_metadata(
+                    "Primary MM SSH 포트",
+                    "MAIN-SETTINGS-MM-PRIMARY-PORT",
+                    settings,
+                    "Primary MM SSH 포트 입력",
+                ),
+            ),
+            (
+                self.mm_primary_enabled,
+                _ui_metadata(
+                    "Primary MM 사용",
+                    "MAIN-SETTINGS-MM-PRIMARY-ENABLED",
+                    settings,
+                    "Primary MM 사용 여부 선택",
+                ),
+            ),
+            (
+                self.mm_standby_name,
+                _ui_metadata(
+                    "Standby MM 표시 이름",
+                    "MAIN-SETTINGS-MM-STANDBY-NAME",
+                    settings,
+                    "Standby MM 표시 이름 입력",
+                ),
+            ),
+            (
+                self.mm_standby_host,
+                _ui_metadata(
+                    "Standby MM 주소",
+                    "MAIN-SETTINGS-MM-STANDBY-HOST",
+                    settings,
+                    "Standby MM IPv4 입력",
+                ),
+            ),
+            (
+                self.mm_standby_port,
+                _ui_metadata(
+                    "Standby MM SSH 포트",
+                    "MAIN-SETTINGS-MM-STANDBY-PORT",
+                    settings,
+                    "Standby MM SSH 포트 입력",
+                ),
+            ),
+            (
+                self.mm_standby_enabled,
+                _ui_metadata(
+                    "Standby MM 사용",
+                    "MAIN-SETTINGS-MM-STANDBY-ENABLED",
+                    settings,
+                    "Standby MM 사용 여부 선택",
+                ),
+            ),
+            (
+                self.md_group,
+                _ui_metadata(
+                    "Managed Devices 영역", "MAIN-SETTINGS-MD-GROUP", settings, "MD 설정 영역"
+                ),
+            ),
+            (
+                self.md_table,
+                _ui_metadata(
+                    "Managed Devices 표", "MAIN-SETTINGS-MD-TABLE", settings, "MD 설정 표"
+                ),
+            ),
+            (
+                self.md_table.horizontalHeader(),
+                _ui_metadata(
+                    "Managed Devices 표 헤더",
+                    "MAIN-SETTINGS-MD-TABLE-HEADER",
+                    settings,
+                    "MD 설정 열 제목 표시",
+                ),
+            ),
+            (
+                self.md_table.viewport(),
+                _ui_metadata(
+                    "Managed Devices 표 본문",
+                    "MAIN-SETTINGS-MD-TABLE-BODY",
+                    settings,
+                    "MD 설정 행 표시 영역",
+                ),
+            ),
+            (
+                self.timing_group,
+                _ui_metadata(
+                    "모니터링 영역", "MAIN-SETTINGS-MONITOR-GROUP", settings, "모니터링 주기 설정"
+                ),
+            ),
+            (
+                self.session_interval,
+                _ui_metadata(
+                    "MD 세션 조회 주기",
+                    "MAIN-SETTINGS-MONITOR-SESSION-INTERVAL",
+                    settings,
+                    "MD 세션 조회 주기 입력",
+                ),
+            ),
+            (
+                self.location_interval,
+                _ui_metadata(
+                    "MM 위치 재확인 주기",
+                    "MAIN-SETTINGS-MONITOR-LOCATION-INTERVAL",
+                    settings,
+                    "MM 위치 재확인 주기 입력",
+                ),
+            ),
+            (
+                self.close_misses,
+                _ui_metadata(
+                    "종료 판정 MISS",
+                    "MAIN-SETTINGS-MONITOR-CLOSE-MISSES",
+                    settings,
+                    "세션 종료 판정 MISS 횟수 입력",
+                ),
+            ),
+            (
+                self.save_config_button,
+                _ui_metadata(
+                    "장비 설정 저장", "MAIN-SETTINGS-SAVE", settings, "장비와 주기 설정 저장"
+                ),
+            ),
+            (
+                self.settings_privacy_notice,
+                _ui_metadata(
+                    "설정 보안 안내",
+                    "MAIN-SETTINGS-PRIVACY-NOTICE",
+                    settings,
+                    "자격증명 비저장 안내",
+                ),
+            ),
+            (
+                self.refresh_history_button,
+                _ui_metadata(
+                    "기록 새로고침", "MAIN-HISTORY-REFRESH", history, "저장된 실행 기록 새로고침"
+                ),
+            ),
+            (
+                self.export_button,
+                _ui_metadata(
+                    "CSV 내보내기", "MAIN-HISTORY-EXPORT-CSV", history, "선택 실행 CSV 내보내기"
+                ),
+            ),
+            (
+                self.html_export_button,
+                _ui_metadata(
+                    "HTML 보고서 내보내기",
+                    "MAIN-HISTORY-EXPORT-HTML",
+                    history,
+                    "선택 실행 HTML 보고서 내보내기",
+                ),
+            ),
+            (
+                self.delete_button,
+                _ui_metadata(
+                    "선택 실행 삭제",
+                    "MAIN-HISTORY-DELETE-SELECTED",
+                    history,
+                    "선택한 실행 기록 삭제",
+                ),
+            ),
+            (
+                self.delete_all_button,
+                _ui_metadata(
+                    "전체 기록 삭제", "MAIN-HISTORY-DELETE-ALL", history, "모든 실행 기록 삭제"
+                ),
+            ),
+            (
+                self.history_table,
+                _ui_metadata(
+                    "실행 기록 표", "MAIN-HISTORY-RUN-TABLE", history, "저장된 실행 기록 표"
+                ),
+            ),
+            (
+                self.history_table.horizontalHeader(),
+                _ui_metadata(
+                    "실행 기록 표 헤더",
+                    "MAIN-HISTORY-RUN-TABLE-HEADER",
+                    history,
+                    "기록 열 제목 표시",
+                ),
+            ),
+            (
+                self.history_table.viewport(),
+                _ui_metadata(
+                    "실행 기록 표 본문", "MAIN-HISTORY-RUN-TABLE-BODY", history, "기록 행 표시 영역"
+                ),
+            ),
+            (
+                self.history_privacy_notice,
+                _ui_metadata(
+                    "기록 개인정보 안내",
+                    "MAIN-HISTORY-PRIVACY-NOTICE",
+                    history,
+                    "로컬 기록과 내보내기 데이터 보안 안내",
+                ),
+            ),
+        )
+        for widget, metadata in widgets:
+            inspector.register_widget(widget, metadata)
+
+        for metadata in (
+            _ui_metadata(
+                "조회 결과 선택 행",
+                "MAIN-QUERY-RESULT-TABLE-SELECTION",
+                query,
+                "조회 결과에서 선택한 행 개념",
+            ),
+            _ui_metadata(
+                "Managed Devices 선택 셀",
+                "MAIN-SETTINGS-MD-TABLE-SELECTION",
+                settings,
+                "MD 설정에서 선택한 셀 개념",
+            ),
+            _ui_metadata(
+                "실행 기록 선택 행",
+                "MAIN-HISTORY-RUN-TABLE-SELECTION",
+                history,
+                "실행 기록에서 선택한 행 개념",
+            ),
+        ):
+            inspector.register_catalog_item(metadata)
 
     @staticmethod
     def _port_spin() -> QSpinBox:
@@ -966,6 +1436,21 @@ def _optional_port(text: str, label: str) -> int | None:
     if not 0 <= value <= 65535:
         raise ValueError(f"{label}는 0~65535 범위여야 합니다.")
     return value
+
+
+def _ui_metadata(
+    name_ko: str,
+    stable_id: str,
+    screen_path: str,
+    purpose: str,
+) -> UiElementMetadata:
+    return UiElementMetadata(
+        name_ko=name_ko,
+        stable_id=stable_id,
+        screen_path=screen_path,
+        source_path=_UI_SOURCE_PATH,
+        purpose=purpose,
+    )
 
 
 def _display_number(value: int | None) -> str:
