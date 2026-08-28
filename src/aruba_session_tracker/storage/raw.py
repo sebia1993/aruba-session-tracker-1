@@ -5,11 +5,21 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import stat
 import tempfile
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
+
+from aruba_session_tracker.paths import (
+    DirectoryIdentity,
+    UnsafeManagedPath,
+    ensure_managed_directory,
+    reject_link_or_reparse,
+    verify_managed_directory,
+)
 
 _SAFE_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
@@ -27,7 +37,30 @@ class RawArtifact:
 
 class RawOutputStore:
     def __init__(self, root: Path | str) -> None:
-        self.root = Path(root)
+        self.root = Path(os.path.abspath(Path(root)))
+        self._identity: DirectoryIdentity | None = None
+        self._identity_lock = threading.Lock()
+
+    def initialize(self) -> DirectoryIdentity:
+        with self._identity_lock:
+            try:
+                if self._identity is None:
+                    self.root, self._identity = ensure_managed_directory(self.root)
+                else:
+                    verify_managed_directory(self.root, self._identity)
+            except UnsafeManagedPath as error:
+                raise UnsafeStoragePath(str(error)) from error
+            return self._identity
+
+    def verify(self) -> None:
+        identity = self._identity
+        if identity is None:
+            self.initialize()
+            return
+        try:
+            verify_managed_directory(self.root, identity)
+        except UnsafeManagedPath as error:
+            raise UnsafeStoragePath(str(error)) from error
 
     def write(
         self,
@@ -46,9 +79,18 @@ class RawOutputStore:
         timestamp = _as_utc(captured_at).strftime("%Y%m%dT%H%M%S.%fZ")
         filename = f"{timestamp}_{kind_segment}_{controller_segment}_{uuid4().hex[:8]}.txt"
 
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.verify()
         run_directory = contained_path(self.root, Path(run_segment))
-        run_directory.mkdir(parents=False, exist_ok=True)
+        if os.path.lexists(run_directory):
+            try:
+                info = reject_link_or_reparse(run_directory)
+            except UnsafeManagedPath as error:
+                raise UnsafeStoragePath(str(error)) from error
+            if not stat.S_ISDIR(info.st_mode):
+                raise UnsafeStoragePath("Raw 실행 경로가 디렉터리가 아닙니다.")
+        else:
+            run_directory.mkdir(parents=False, exist_ok=False)
+        self.verify()
         relative = Path(run_segment) / filename
         path = contained_path(self.root, relative)
         data = content.encode("utf-8")
@@ -73,6 +115,7 @@ class RawOutputStore:
         )
 
     def remove(self, relative_path: str) -> None:
+        self.verify()
         path = contained_path(self.root, Path(relative_path))
         if path.exists():
             if not path.is_file():
@@ -98,6 +141,11 @@ def _filename_segment(value: str, label: str) -> str:
 def contained_path(root: Path, relative: Path) -> Path:
     if relative.is_absolute():
         raise UnsafeStoragePath("절대 경로는 관리 상대 경로로 사용할 수 없습니다.")
+    if os.path.lexists(root):
+        try:
+            reject_link_or_reparse(root)
+        except UnsafeManagedPath as error:
+            raise UnsafeStoragePath(str(error)) from error
     root_resolved = root.resolve(strict=False)
     candidate = (root / relative).resolve(strict=False)
     if candidate == root_resolved or not candidate.is_relative_to(root_resolved):

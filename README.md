@@ -19,7 +19,7 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 - 로컬 SQLite 이력, 실행별 Raw TXT, 독립적인 CSV와 HTML 보고서 내보내기
 - 실행할 때마다 꺼진 상태로 시작하는 `F12` 정적 UI Inspector
 
-다음은 v0.3.0 범위에 포함되지 않습니다.
+다음은 v0.3.1 범위에 포함되지 않습니다.
 
 - 장비 설정 변경, 사용자 삭제 또는 쓰기 API
 - 무필터 `show datapath session table` 실행
@@ -31,13 +31,13 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 
 ### 포터블 ZIP
 
-1. GitHub Releases에서 `ArubaSessionTracker_v0.3.0_windows_x64.zip`과
+1. GitHub Releases에서 `ArubaSessionTracker_v0.3.1_windows_x64.zip`과
    같은 이름의 `.sha256` 파일을 함께 받습니다.
 2. PowerShell에서 해시를 확인합니다.
 
    ```powershell
-   Get-FileHash -Algorithm SHA256 .\ArubaSessionTracker_v0.3.0_windows_x64.zip
-   Get-Content .\ArubaSessionTracker_v0.3.0_windows_x64.zip.sha256
+   Get-FileHash -Algorithm SHA256 .\ArubaSessionTracker_v0.3.1_windows_x64.zip
+   Get-Content .\ArubaSessionTracker_v0.3.1_windows_x64.zip.sha256
    ```
 
 3. ZIP을 쓰기 가능한 일반 폴더에 풀고 `ArubaSessionTracker.exe`를
@@ -45,7 +45,7 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 
 `continuous`는 최신 `main`의 자동 검증 결과를 갱신하는 이동형
 사전릴리스입니다. 같은 이름의 공개 자산을 먼저 지우지 않고 후보 자산을
-올려 검증한 뒤 짧은 draft 전환 동안 tag와 자산을 교체합니다. `v0.3.0`
+올려 검증한 뒤 짧은 draft 전환 동안 tag와 자산을 교체합니다. `v0.3.1`
 같은 버전 태그 릴리스는 자동화가 기존 릴리스 덮어쓰기를 거부하는 1회성
 사전릴리스입니다. 두 릴리스 모두 ZIP, SHA-256 sidecar, CycloneDX SBOM을
 제공합니다.
@@ -59,6 +59,23 @@ py -3.13 -m venv .venv
   --check-build-dependencies -e .
 .\.venv\Scripts\python.exe -m aruba_session_tracker
 ```
+
+## v0.3.1 안정성 설계
+
+v0.3.1은 화면 기능, 명령 allowlist와 보고서 형식을 바꾸지 않는 안정화
+릴리스입니다.
+
+- 한 poll의 Raw, 관측, 진단과 수명주기를 하나의 복구 가능한 batch로
+  기록하고, 실행별 프로세스 간 lease로 동시 기록과 종료 충돌을 막습니다.
+- 시작할 때 중단된 Raw·내보내기·삭제 작업의 manifest를 검증해 복구합니다.
+  manifest의 작업 ID, run ID, 대상 경로와 파일 무결성이 맞지 않으면 관련
+  없는 파일을 건드리지 않고 중단합니다.
+- 설정, `known_hosts`, DB, Raw와 관리 내보내기 루트의 link/reparse point와
+  실행 중 교체를 감지합니다. 설정과 `known_hosts`는 1 MiB까지만 읽습니다.
+- Raw 해시는 청크 단위, CSV 행은 묶음 단위로 처리해 긴 실행의 순간 메모리
+  사용량을 제한합니다.
+- 모니터 poll과 Qt 작업은 owner/generation을 확인하고 취소 시 대기 중인
+  호스트 키 승인과 늦게 도착한 UI 신호를 안전하게 정리합니다.
 
 ## F12 개발자 모드
 
@@ -199,11 +216,14 @@ HTML은 인터넷 연결 없이 Edge/Chrome에서 직접 열 수 있습니다. �
 config.json        비밀이 아닌 장비/주기 설정
 known_hosts        승인한 SSH 호스트 키
 tracker.db         실행, 관측, 수명주기, 전환, 비식별 진단 이벤트
+.operations\       장애 복구 manifest와 프로세스 간 lease
 raw\<run-id>\      실행별 UTF-8 장비 원문
 exports\           사용자가 명시적으로 만든 CSV/HTML 내보내기
 ```
 
-Raw 파일은 SQLite에 상대 경로, 바이트 크기, SHA-256으로 연결됩니다.
+`.operations`에는 작업 ID, 상대 경로, 크기와 SHA-256 등 복구 메타데이터만
+기록하며 자격증명이나 Raw CLI 본문은 넣지 않습니다. Raw 파일은 SQLite에
+상대 경로, 바이트 크기, SHA-256으로 연결됩니다.
 일반 진단 메시지에서는 IPv4와 자격증명 형태를 마스킹합니다. CSV의
 문자열은 Excel 수식 삽입을 막도록 보호하고 HTML의 저장 값은 태그나
 스크립트로 실행되지 않도록 이스케이프합니다.
@@ -239,16 +259,17 @@ GitHub 이슈나 외부 지원 채널에 올리지 말고, 공유가 필요하�
 
 저장소는 네트워크와 분리된 비식별 fixture 및 메모리 내 SSH 프로토콜
 fake를 기본 검증 경계로 사용합니다. 실제 소켓을 여는 Paramiko/Netmiko
-loopback 통합시험은 v0.3.0에 포함되지 않습니다.
+loopback 통합시험은 v0.3.1에 포함되지 않습니다.
 
 ```powershell
 .\tools\validate.ps1 -PythonPath .\.venv\Scripts\python.exe
-.\build_windows.ps1 -PythonPath .\.venv\Scripts\python.exe -Version 0.3.0
+.\build_windows.ps1 -PythonPath .\.venv\Scripts\python.exe -Version 0.3.1
 ```
 
 `validate.ps1`은 Python/아키텍처, 해시 고정 lock 동기화, 의존성, 버전
 동기화, 비밀/런타임 파일, Ruff, 포맷, strict mypy, pytest/branch coverage,
-runtime 및 build/development 의존성 `pip-audit`를 확인합니다.
+전역 line 83%·핵심 모듈 branch 65% 정책과 runtime 및 build/development
+의존성 `pip-audit`를 확인합니다.
 `build_windows.ps1`은 깨끗한 Git 커밋에서 PyInstaller onedir ZIP을 만들고
 문서, commit이 결합된 `BUILD_INFO.json`, 전체 runtime lock 기반 SBOM을
 포함한 뒤 private/runtime 파일 부재, SHA-256, Windows EXE logic/native
@@ -282,7 +303,7 @@ smoke와 패키지 검증은 다음을 증명하지 않습니다.
 - Authenticode 서명 또는 조직 보안 제품의 허용
 - 실장비 네트워크 상태나 세션 존재/종료
 
-v0.3.0은 이 한계를 명시한 unsigned 사전릴리스입니다. 현장 검증은
+v0.3.1은 이 한계를 명시한 unsigned 사전릴리스입니다. 현장 검증은
 읽기 전용 계정과 승인된 변경 절차로 별도 수행해야 합니다.
 
 라이선스는 MIT이며 제3자 구성요소 고지는

@@ -52,6 +52,10 @@ try {
     }
     Invoke-Checked $PythonPath $pytestArguments
 
+    if (-not $SkipCoverage) {
+        Invoke-Checked $PythonPath @("tools/check_coverage_policy.py", $coveragePath)
+    }
+
     if (-not $SkipAudit) {
         Invoke-Checked $PythonPath @(
             "-m", "pip_audit", "-r", "requirements-runtime.lock", "--strict", "--no-deps"

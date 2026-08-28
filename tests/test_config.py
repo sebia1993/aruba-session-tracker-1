@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 from aruba_session_tracker.config import ConfigError, ConfigRepository
 from aruba_session_tracker.models import AppConfig, DeviceTarget
+from aruba_session_tracker.paths import UnsafeManagedPath
 
 
 def _config() -> AppConfig:
@@ -34,6 +36,55 @@ def test_round_trip_uses_utf8_and_leaves_no_temporary_file(tmp_path: Path) -> No
     assert repository.load() == _config()
     assert "주-MM" in path.read_text(encoding="utf-8")
     assert list(path.parent.glob(".config.json.*.tmp")) == []
+
+
+def test_load_uses_one_bounded_file_handle_instead_of_path_stat_and_read_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_config().to_dict()), encoding="utf-8")
+    repository = ConfigRepository(path)
+
+    def fail_path_helper(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("path helper must not be used for the bounded read")
+
+    monkeypatch.setattr(Path, "stat", fail_path_helper)
+    monkeypatch.setattr(Path, "read_text", fail_path_helper)
+
+    assert repository.load() == _config()
+
+
+def test_repository_rejects_parent_identity_replacement(tmp_path: Path) -> None:
+    parent = tmp_path / "settings"
+    parent.mkdir()
+    path = parent / "config.json"
+    path.write_text(json.dumps(_config().to_dict()), encoding="utf-8")
+    repository = ConfigRepository(path)
+    moved = tmp_path / "settings-original"
+    os.replace(parent, moved)
+    parent.mkdir()
+    path.write_text(json.dumps(_config().to_dict()), encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="다른 디렉터리"):
+        repository.load()
+
+
+def test_repository_translates_a_reparse_guard_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_config().to_dict()), encoding="utf-8")
+    repository = ConfigRepository(path)
+
+    def reject_reparse(_path: Path) -> object:
+        raise UnsafeManagedPath("reparse point fixture")
+
+    monkeypatch.setattr("aruba_session_tracker.config.reject_link_or_reparse", reject_reparse)
+
+    with pytest.raises(ConfigError, match="reparse point"):
+        repository.load()
 
 
 @pytest.mark.parametrize(

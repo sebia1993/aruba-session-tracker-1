@@ -29,6 +29,7 @@ known_hosts
 config.json
 raw/
 exports/
+.operations/
 .env
 .env.*
 !.env.example

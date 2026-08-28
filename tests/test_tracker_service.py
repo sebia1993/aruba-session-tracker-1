@@ -3,8 +3,12 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from itertools import count
+from threading import Event, Thread
 from types import TracebackType
 from typing import Self
+
+import pytest
 
 from aruba_session_tracker.collectors import (
     CancellationToken,
@@ -28,6 +32,7 @@ from aruba_session_tracker.services import (
     LifecycleEventType,
     MonitorEngine,
     QueryOutcome,
+    RawSnapshot,
     TrackerService,
 )
 
@@ -209,6 +214,8 @@ def test_destination_md_is_queried_only_after_source_md_has_no_match() -> None:
     assert len(outcome.observations) == 1
     assert outcome.controllers == ("MD-1", "MD-2")
     assert factory.calls == ["MM-Primary", "MD-1", "MD-2"]
+    assert outcome.raw_snapshots[-2].observation_keys == ()
+    assert outcome.raw_snapshots[-1].observation_keys == (outcome.observations[0].session_key,)
     assert all(
         command != "show datapath session table"
         for commands in factory.commands_by_device.values()
@@ -231,6 +238,23 @@ def test_md_authentication_failure_stops_before_other_candidates() -> None:
     assert outcome.authoritative is False
     assert factory.calls == ["MM-Primary", "MD-1"]
     assert ErrorCode.AUTH_FAILED in {event.code for event in outcome.diagnostics}
+
+
+def test_md_host_key_failure_stops_before_other_candidates() -> None:
+    config = _config()
+    outputs = {
+        "MM-Primary": _mm_outputs("192.0.2.101", "192.0.2.102"),
+        "MD-1": {NO_PAGING_COMMAND: ""},
+        "MD-2": {NO_PAGING_COMMAND: ""},
+    }
+    factory = FakeFactory(outputs)
+    factory.errors["MD-1"] = CollectorError(ErrorCode.HOST_KEY_CHANGED, "changed")
+
+    outcome = TrackerService(config, factory).query_once(REQUEST, CREDENTIALS)
+
+    assert outcome.authoritative is False
+    assert factory.calls == ["MM-Primary", "MD-1"]
+    assert ErrorCode.HOST_KEY_CHANGED in {event.code for event in outcome.diagnostics}
 
 
 def test_full_scan_requires_explicit_approval_and_queries_all_enabled_mds() -> None:
@@ -263,6 +287,27 @@ def test_full_scan_requires_explicit_approval_and_queries_all_enabled_mds() -> N
         "MD-4",
     ]
     assert approved.authoritative is True
+
+
+def test_full_scan_approval_cancellation_takes_precedence_over_denial() -> None:
+    config = _config()
+    token = CancellationToken()
+    factory = FakeFactory({"MM-Primary": _mm_outputs(None, None)})
+
+    def cancel_approval(*_args: object) -> bool:
+        token.cancel()
+        return False
+
+    outcome = TrackerService(config, factory).query_once(
+        REQUEST,
+        CREDENTIALS,
+        full_scan_approval=cancel_approval,
+        cancel_token=token,
+    )
+
+    assert outcome.authoritative is False
+    assert factory.calls == ["MM-Primary"]
+    assert [event.code for event in outcome.diagnostics][-1] is ErrorCode.CANCELLED
 
 
 def test_rejected_filtered_command_never_falls_back_to_unfiltered_table() -> None:
@@ -416,8 +461,32 @@ def test_non_authoritative_poll_never_advances_miss_or_closes() -> None:
 def test_second_miss_of_one_flow_refreshes_mm_while_another_flow_remains() -> None:
     first = _observation(packets=1)
     second = replace(_observation(packets=1), source_port=23456)
-    both = QueryOutcome(observations=(first, second), used_mm="MM-Primary", authoritative=True)
-    only_first = QueryOutcome(observations=(first,), used_mm="MM-Primary", authoritative=True)
+    both = QueryOutcome(
+        observations=(first, second),
+        used_mm="MM-Primary",
+        raw_snapshots=(
+            RawSnapshot(
+                "MD",
+                "show datapath session table 198.51.100.10",
+                "refreshed snapshot",
+                observation_keys=(first.session_key, second.session_key),
+            ),
+        ),
+        authoritative=True,
+    )
+    only_first = QueryOutcome(
+        observations=(first,),
+        used_mm="MM-Primary",
+        raw_snapshots=(
+            RawSnapshot(
+                "MD",
+                "show datapath session table 198.51.100.10",
+                "first-pass snapshot",
+                observation_keys=(first.session_key,),
+            ),
+        ),
+        authoritative=True,
+    )
     service = StubService([both, only_first, only_first, both])
     ticks = iter((0.0, 5.0, 10.0))
     monitor = MonitorEngine(
@@ -435,6 +504,15 @@ def test_second_miss_of_one_flow_refreshes_mm_while_another_flow_remains() -> No
     assert refreshed.refreshed_location is True
     assert all(item.miss_count == 0 for item in refreshed.active_sessions)
     assert service.refresh_calls == [True, False, False, True]
+    assert tuple(snapshot.output for snapshot in refreshed.raw_snapshots) == (
+        "first-pass snapshot",
+        "refreshed snapshot",
+    )
+    assert refreshed.raw_snapshots[0].observation_keys == ()
+    assert refreshed.raw_snapshots[1].observation_keys == (
+        first.session_key,
+        second.session_key,
+    )
 
 
 def test_failed_second_miss_refresh_retains_positive_first_pass_evidence() -> None:
@@ -470,3 +548,147 @@ def test_failed_second_miss_refresh_retains_positive_first_pass_evidence() -> No
         event.event_type is LifecycleEventType.OBSERVED and event.observation.packets == 3
         for event in result.events
     )
+
+
+def test_discarded_prepared_poll_does_not_advance_monitor_state() -> None:
+    observed = QueryOutcome(
+        observations=(_observation(),), used_mm="MM-Primary", authoritative=True
+    )
+    service = StubService([observed, observed])
+    monitor = MonitorEngine(service, REQUEST, CREDENTIALS)  # type: ignore[arg-type]
+
+    prepared = monitor._prepare_for_persistence()
+    monitor._discard_prepared(prepared)
+    committed = monitor.poll_once()
+
+    assert committed.events[0].event_type is LifecycleEventType.STARTED
+    assert service.refresh_calls == [True, True]
+
+
+def test_monitor_rejects_overlapping_prepared_polls() -> None:
+    started = Event()
+    release = Event()
+    observed = QueryOutcome(
+        observations=(_observation(),), used_mm="MM-Primary", authoritative=True
+    )
+
+    class BlockingService:
+        config = _config()
+
+        def query_once(self, *args: object, **kwargs: object) -> QueryOutcome:
+            del args, kwargs
+            started.set()
+            assert release.wait(timeout=5)
+            return observed
+
+    monitor = MonitorEngine(
+        BlockingService(),  # type: ignore[arg-type]
+        REQUEST,
+        CREDENTIALS,
+    )
+    prepared_results: list[object] = []
+
+    def prepare() -> None:
+        prepared_results.append(monitor._prepare_for_persistence())
+
+    worker = Thread(target=prepare)
+    worker.start()
+    assert started.wait(timeout=5)
+
+    with pytest.raises(RuntimeError, match="이미 진행"):
+        monitor._prepare_for_persistence()
+
+    release.set()
+    worker.join(timeout=10)
+    assert not worker.is_alive()
+    assert len(prepared_results) == 1
+    monitor._discard_prepared(prepared_results[0])  # type: ignore[arg-type]
+
+
+def test_monitor_callback_observes_committed_result_and_thread_can_restart() -> None:
+    observed = QueryOutcome(
+        observations=(_observation(),), used_mm="MM-Primary", authoritative=True
+    )
+    service = StubService([observed, observed])
+    callback_seen = Event()
+    holder: list[MonitorEngine] = []
+
+    def callback(event: object) -> None:
+        monitor = holder[0]
+        assert monitor.last_result is not None
+        assert event in monitor.last_result.events
+        callback_seen.set()
+
+    monitor = MonitorEngine(
+        service,  # type: ignore[arg-type]
+        REQUEST,
+        CREDENTIALS,
+        callbacks=callback,  # type: ignore[arg-type]
+    )
+    holder.append(monitor)
+
+    for _ in range(2):
+        callback_seen.clear()
+        monitor.start()
+        assert callback_seen.wait(timeout=5)
+        monitor.stop(timeout=5)
+        assert monitor.is_running is False
+
+
+def test_monitor_callback_failure_does_not_reclassify_committed_poll() -> None:
+    observed = QueryOutcome(
+        observations=(_observation(),), used_mm="MM-Primary", authoritative=True
+    )
+    service = StubService([observed])
+    callback_events: list[object] = []
+
+    def failing_callback(event: object) -> None:
+        callback_events.append(event)
+        raise RuntimeError("fixture callback failure")
+
+    monitor = MonitorEngine(
+        service,  # type: ignore[arg-type]
+        REQUEST,
+        CREDENTIALS,
+        callbacks=failing_callback,  # type: ignore[arg-type]
+    )
+
+    result = monitor.poll_once()
+
+    assert callback_events == list(result.events)
+    assert monitor.last_result is result
+    assert monitor._prepared_generation is None
+
+
+def test_monitor_ten_thousand_poll_fixture_soak_keeps_bounded_ownership() -> None:
+    iterations = 10_000
+    observed = QueryOutcome(
+        observations=(_observation(),), used_mm="MM-Primary", authoritative=True
+    )
+    service = StubService([observed] * iterations)
+    monotonic_ticks = count(0.0, 1.0)
+    wall_ticks = count()
+    wall_start = datetime(2026, 8, 28, tzinfo=UTC)
+    monitor = MonitorEngine(
+        service,  # type: ignore[arg-type]
+        REQUEST,
+        CREDENTIALS,
+        monotonic_clock=lambda: next(monotonic_ticks),
+        wall_clock=lambda: wall_start + timedelta(seconds=next(wall_ticks)),
+    )
+
+    first_instance: str | None = None
+    for _ in range(iterations):
+        result = monitor.poll_once()
+        assert len(result.active_sessions) == 1
+        if first_instance is None:
+            first_instance = result.active_sessions[0].instance_id
+        else:
+            assert result.active_sessions[0].instance_id == first_instance
+
+    assert monitor.is_running is False
+    assert monitor.last_result is not None
+    assert monitor.last_result.consecutive_misses == 0
+    assert monitor._thread is None
+    assert monitor._cancel_token is None
+    assert monitor._prepared_generation is None

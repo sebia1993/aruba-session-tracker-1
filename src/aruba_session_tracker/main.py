@@ -12,14 +12,14 @@ from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from aruba_session_tracker import __version__
-from aruba_session_tracker.config import ConfigRepository
+from aruba_session_tracker.config import ConfigError, ConfigRepository
 from aruba_session_tracker.models import (
     DiagnosticEvent,
     ErrorCode,
     QueryRequest,
     SessionObservation,
 )
-from aruba_session_tracker.paths import AppPaths
+from aruba_session_tracker.paths import AppPaths, UnsafeManagedPath
 from aruba_session_tracker.runtime import RuntimeExecutor
 from aruba_session_tracker.storage import SessionStore, StorageError
 from aruba_session_tracker.ui import DeveloperInspectorController, MainWindow
@@ -55,7 +55,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         store = SessionStore(paths.database, paths.raw, paths.exports)
         store.initialize()
         executor = RuntimeExecutor(paths, store)
-    except (OSError, StorageError) as exc:
+    except (ConfigError, OSError, StorageError, UnsafeManagedPath) as exc:
         QMessageBox.critical(
             None,
             "Aruba Session Tracker 시작 실패",

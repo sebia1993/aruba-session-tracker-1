@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import os
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import closing
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -19,6 +23,7 @@ from aruba_session_tracker.models import (
     QueryRequest,
     SessionObservation,
 )
+from aruba_session_tracker.services.tracker import QueryOutcome, RawSnapshot
 from aruba_session_tracker.storage import (
     RunReportSnapshot,
     SessionStore,
@@ -140,7 +145,24 @@ def test_initialize_migrates_v1_lifecycle_instance_id(tmp_path: Path) -> None:
     assert version == 2
 
 
-def test_initialize_interrupts_stale_run_once_per_store_instance(tmp_path: Path) -> None:
+def test_initialize_fails_closed_on_foreign_key_corruption(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    with closing(sqlite3.connect(store.db_path)) as connection, connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute(
+            """
+            INSERT INTO diagnostic_events (
+                run_id, occurred_at, stage, code, message
+            ) VALUES ('missing-run', '2026-08-28T00:00:00.000Z', 'test', NULL, 'broken')
+            """
+        )
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    with pytest.raises(StorageError, match="외래 키"):
+        reopened.initialize()
+
+
+def test_initialize_preserves_a_run_leased_by_another_live_store(tmp_path: Path) -> None:
     store = _store(tmp_path)
     run_id = _run(store)
 
@@ -151,6 +173,54 @@ def test_initialize_interrupts_stale_run_once_per_store_instance(tmp_path: Path)
     reopened.initialize()
     row = reopened.list_runs()[0]
     assert row["id"] == run_id
+    assert row["status"] == "RUNNING"
+    assert row["ended_at"] is None
+
+    store.finish_run(run_id)
+    assert reopened.list_runs()[0]["status"] == "COMPLETED"
+
+
+def test_second_store_cannot_mutate_another_process_owned_run(tmp_path: Path) -> None:
+    owner = _store(tmp_path)
+    run_id = _run(owner)
+    other = SessionStore(owner.db_path, owner.raw_root, owner.exports_root)
+    other.initialize()
+
+    with pytest.raises(StorageError, match="시작한 프로세스"):
+        other.record_query(run_id, [_observation()], raw_text="must not write")
+    with pytest.raises(StorageError, match="시작한 프로세스"):
+        other.finish_run(run_id)
+
+    assert owner.list_runs()[0]["status"] == "RUNNING"
+    assert not tuple(owner.raw_root.rglob("*.txt"))
+    owner.finish_run(run_id)
+
+
+def test_initialize_interrupts_a_run_after_its_process_exits(tmp_path: Path) -> None:
+    db_path = tmp_path / "tracker.db"
+    raw_root = tmp_path / "raw"
+    exports_root = tmp_path / "exports"
+    script = """
+import os
+import sys
+from aruba_session_tracker.models import QueryRequest
+from aruba_session_tracker.storage import SessionStore
+store = SessionStore(sys.argv[1], sys.argv[2], sys.argv[3])
+store.initialize()
+store.start_run(QueryRequest('192.0.2.1', '203.0.113.1'), run_id='crashed-run')
+os._exit(0)
+"""
+    completed = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", script, str(db_path), str(raw_root), str(exports_root)],
+        check=False,
+        timeout=20,
+    )
+    assert completed.returncode == 0
+
+    reopened = SessionStore(db_path, raw_root, exports_root)
+    reopened.initialize()
+    row = reopened.list_runs()[0]
+    assert row["id"] == "crashed-run"
     assert row["status"] == "INTERRUPTED"
     assert row["ended_at"] is not None
 
@@ -183,6 +253,571 @@ def test_record_query_links_relative_raw_path_and_sha256(tmp_path: Path) -> None
     assert digest == hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
     assert size == len(raw_text.encode("utf-8"))
     assert "raw_line" not in stored_raw_line
+
+
+def test_record_poll_batch_is_atomic_when_a_late_insert_fails(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    observation = _observation()
+    outcome = QueryOutcome(
+        observations=(observation,),
+        diagnostics=(
+            DiagnosticEvent(stage="poll", code=ErrorCode.DB_WRITE_FAILED, message="late"),
+        ),
+        raw_snapshots=(
+            RawSnapshot(
+                "MD-01",
+                "show datapath session table 192.0.2.100",
+                "raw batch",
+                observation.observed_at,
+            ),
+        ),
+        authoritative=True,
+    )
+    with closing(sqlite3.connect(store.db_path)) as connection, connection:
+        connection.execute(
+            """
+            CREATE TRIGGER fail_batch_diagnostic
+            BEFORE INSERT ON diagnostic_events
+            BEGIN
+                SELECT RAISE(ABORT, 'forced late batch failure');
+            END
+            """
+        )
+
+    with pytest.raises(StorageError, match="batch"):
+        store.record_poll_batch(run_id, outcome)
+
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM raw_files").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM diagnostic_events").fetchone()[0] == 0
+    assert not tuple(store.raw_root.rglob("*.txt"))
+    assert not tuple((tmp_path / ".operations" / "manifests").glob("*.json"))
+    assert not tuple(store.raw_root.glob(".raw-staging-*"))
+
+
+def test_record_poll_batch_uses_explicit_same_controller_raw_provenance(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    observation = _observation(packets=99)
+    first_output = "first same-controller snapshot"
+    second_output = "second same-controller snapshot packets=99"
+    outcome = QueryOutcome(
+        observations=(observation,),
+        raw_snapshots=(
+            RawSnapshot(
+                "MD-01",
+                "show datapath session table 192.0.2.100",
+                first_output,
+                observation.observed_at - timedelta(seconds=1),
+                observation_keys=(),
+            ),
+            RawSnapshot(
+                "MD-01",
+                "show datapath session table 192.0.2.100",
+                second_output,
+                observation.observed_at,
+                observation_keys=(observation.session_key,),
+            ),
+        ),
+        authoritative=True,
+    )
+
+    store.record_poll_batch(run_id, outcome)
+
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        relative_path = connection.execute(
+            """
+            SELECT rf.relative_path
+            FROM observations AS observation
+            JOIN raw_files AS rf ON rf.id = observation.raw_file_id
+            WHERE observation.run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()[0]
+        raw_file_count = connection.execute(
+            "SELECT count(*) FROM raw_files WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+
+    assert raw_file_count == 2
+    assert (store.raw_root / relative_path).read_text(encoding="utf-8") == second_output
+
+
+def test_startup_completes_committed_raw_batch_manifest(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    observation = _observation()
+    outcome = QueryOutcome(
+        observations=(observation,),
+        raw_snapshots=(
+            RawSnapshot(
+                "MD-01",
+                "show datapath session table 192.0.2.100",
+                "committed raw",
+                observation.observed_at,
+            ),
+        ),
+        authoritative=True,
+    )
+    store.record_poll_batch(run_id, outcome)
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        relative, sha256, byte_size = connection.execute(
+            "SELECT relative_path, sha256, byte_size FROM raw_files"
+        ).fetchone()
+    operation_id = "c" * 32
+    manifest = store._write_manifest(
+        operation_id,
+        {
+            "version": 1,
+            "kind": "raw_batch",
+            "operation_id": operation_id,
+            "run_id": run_id,
+            "stage_root": f".raw-staging-{operation_id}",
+            "files": [
+                {
+                    "relative_path": relative,
+                    "sha256": sha256,
+                    "byte_size": byte_size,
+                }
+            ],
+        },
+    )
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+
+    assert (store.raw_root / relative).read_text(encoding="utf-8") == "committed raw"
+    assert not manifest.exists()
+
+
+def test_raw_batch_manifest_cannot_target_another_run_directory(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.finish_run(run_id)
+    unrelated = store.raw_root / "another-run" / "unrelated.txt"
+    unrelated.parent.mkdir()
+    unrelated_data = b"must not be deleted"
+    unrelated.write_bytes(unrelated_data)
+    operation_id = "7" * 32
+    manifest = store._write_manifest(
+        operation_id,
+        {
+            "version": 1,
+            "kind": "raw_batch",
+            "operation_id": operation_id,
+            "run_id": run_id,
+            "stage_root": f".raw-staging-{operation_id}",
+            "files": [
+                {
+                    "relative_path": unrelated.relative_to(store.raw_root).as_posix(),
+                    "sha256": hashlib.sha256(unrelated_data).hexdigest(),
+                    "byte_size": len(unrelated_data),
+                }
+            ],
+        },
+    )
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    with pytest.raises(StorageError, match="실행 ID"):
+        reopened.initialize()
+
+    assert unrelated.read_bytes() == unrelated_data
+    assert manifest.exists()
+
+
+def test_busy_manifest_temporary_file_is_not_deleted_by_concurrent_initializer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    operation_id = "8" * 32
+    lease = store._acquire_operation_lease(operation_id)
+    assert lease is not None
+    destination = store._manifests_root / f"{operation_id}.json"
+    replace_started = threading.Event()
+    continue_replace = threading.Event()
+    errors: list[BaseException] = []
+    original_replace = session_store_module.os.replace
+
+    def pause_manifest_replace(source: Path | str, target: Path | str) -> None:
+        if Path(target) == destination:
+            replace_started.set()
+            assert continue_replace.wait(timeout=10)
+        original_replace(source, target)
+
+    monkeypatch.setattr(session_store_module.os, "replace", pause_manifest_replace)
+
+    def write_manifest() -> None:
+        try:
+            store._write_manifest(
+                operation_id,
+                {
+                    "version": 1,
+                    "kind": "raw_batch",
+                    "operation_id": operation_id,
+                    "run_id": "fixture-run",
+                    "stage_root": f".raw-staging-{operation_id}",
+                    "files": [],
+                },
+            )
+        except BaseException as error:  # pragma: no cover - asserted below
+            errors.append(error)
+
+    writer = threading.Thread(target=write_manifest, daemon=True)
+    writer.start()
+    try:
+        assert replace_started.wait(timeout=10)
+        temporary = tuple(store._manifests_root.glob(f".{operation_id}.json.*.tmp"))
+        assert len(temporary) == 1
+
+        reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+        reopened.initialize()
+
+        assert temporary[0].exists()
+    finally:
+        continue_replace.set()
+        writer.join(timeout=10)
+        session_store_module._release_run_lease(lease, remove=True)
+
+    assert not writer.is_alive()
+    assert errors == []
+    assert destination.exists()
+
+
+@pytest.mark.parametrize(
+    ("entry_kind", "expected_message"),
+    [
+        ("directory", "하위 디렉터리"),
+        ("temporary", "임시 파일"),
+        ("unknown", "인식할 수 없는 저장 작업"),
+    ],
+)
+def test_startup_rejects_unrecognized_manifest_directory_entries(
+    tmp_path: Path,
+    entry_kind: str,
+    expected_message: str,
+) -> None:
+    store = _store(tmp_path)
+    if entry_kind == "directory":
+        (store._manifests_root / "unexpected").mkdir()
+    elif entry_kind == "temporary":
+        (store._manifests_root / "unexpected.tmp").write_text("keep", encoding="utf-8")
+    else:
+        (store._manifests_root / "unexpected.bin").write_text("keep", encoding="utf-8")
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    with pytest.raises(StorageError, match=expected_message):
+        reopened.initialize()
+
+
+@pytest.mark.parametrize(
+    ("invalid_case", "expected_message"),
+    [
+        ("kind", "지원하지 않는"),
+        ("run_id", "실행 ID"),
+        ("stage", "staging"),
+        ("duplicate", "중복"),
+        ("files", "파일 목록"),
+        ("entry", "파일 항목"),
+        ("sha256", "SHA-256"),
+    ],
+)
+def test_startup_rejects_malformed_raw_batch_manifests(
+    tmp_path: Path,
+    invalid_case: str,
+    expected_message: str,
+) -> None:
+    store = _store(tmp_path)
+    operation_id = "5" * 32
+    relative = "fixture-run/capture.txt"
+    file_item: object = {
+        "relative_path": relative,
+        "sha256": "0" * 64,
+        "byte_size": 0,
+    }
+    files: object = [file_item]
+    payload: dict[str, object] = {
+        "version": 1,
+        "kind": "raw_batch",
+        "operation_id": operation_id,
+        "run_id": "fixture-run",
+        "stage_root": f".raw-staging-{operation_id}",
+        "files": files,
+    }
+    if invalid_case == "kind":
+        payload["kind"] = "unknown"
+    elif invalid_case == "run_id":
+        payload["run_id"] = "../fixture-run"
+    elif invalid_case == "stage":
+        payload["stage_root"] = ".raw-staging-wrong"
+    elif invalid_case == "duplicate":
+        payload["files"] = [file_item, file_item]
+    elif invalid_case == "files":
+        payload["files"] = {}
+    elif invalid_case == "entry":
+        payload["files"] = ["not-a-file-entry"]
+    else:
+        payload["files"] = [
+            {
+                "relative_path": relative,
+                "sha256": "invalid",
+                "byte_size": 0,
+            }
+        ]
+    manifest = store._write_manifest(operation_id, payload)
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    with pytest.raises(StorageError, match=expected_message):
+        reopened.initialize()
+
+    assert manifest.exists()
+
+
+def test_startup_rejects_partially_committed_raw_batch(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()], raw_text="registered raw")
+    store.finish_run(run_id)
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        relative, sha256, byte_size = connection.execute(
+            "SELECT relative_path, sha256, byte_size FROM raw_files WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+    operation_id = "4" * 32
+    manifest = store._write_manifest(
+        operation_id,
+        {
+            "version": 1,
+            "kind": "raw_batch",
+            "operation_id": operation_id,
+            "run_id": run_id,
+            "stage_root": f".raw-staging-{operation_id}",
+            "files": [
+                {
+                    "relative_path": relative,
+                    "sha256": sha256,
+                    "byte_size": byte_size,
+                },
+                {
+                    "relative_path": f"{run_id}/missing.txt",
+                    "sha256": "1" * 64,
+                    "byte_size": 1,
+                },
+            ],
+        },
+    )
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    with pytest.raises(StorageError, match="일부만"):
+        reopened.initialize()
+
+    assert manifest.exists()
+
+
+def test_startup_restores_committed_raw_file_from_batch_staging(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    raw_data = b"committed staged raw"
+    store.record_query(run_id, [_observation()], raw_text=raw_data.decode())
+    store.finish_run(run_id)
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        relative, sha256, byte_size = connection.execute(
+            "SELECT relative_path, sha256, byte_size FROM raw_files WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+    operation_id = "3" * 32
+    destination = store.raw_root / Path(relative)
+    staged = store.raw_root / f".raw-staging-{operation_id}" / Path(relative)
+    staged.parent.mkdir(parents=True)
+    os.replace(destination, staged)
+    manifest = store._write_manifest(
+        operation_id,
+        {
+            "version": 1,
+            "kind": "raw_batch",
+            "operation_id": operation_id,
+            "run_id": run_id,
+            "stage_root": f".raw-staging-{operation_id}",
+            "files": [
+                {
+                    "relative_path": relative,
+                    "sha256": sha256,
+                    "byte_size": byte_size,
+                }
+            ],
+        },
+    )
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+
+    assert destination.read_bytes() == raw_data
+    assert not staged.exists()
+    assert not manifest.exists()
+
+
+@pytest.mark.parametrize(
+    ("sha256", "byte_size"),
+    [
+        (None, 0),
+        ("invalid", 0),
+        ("0" * 64, None),
+        ("0" * 64, True),
+        ("0" * 64, -1),
+    ],
+)
+def test_optional_manifest_fingerprint_rejects_partial_or_invalid_pairs(
+    sha256: object,
+    byte_size: object,
+) -> None:
+    with pytest.raises(StorageError, match="fingerprint_sha/fingerprint_size"):
+        session_store_module._manifest_optional_fingerprint(
+            {
+                "fingerprint_sha": sha256,
+                "fingerprint_size": byte_size,
+            },
+            "fingerprint_sha",
+            "fingerprint_size",
+        )
+
+
+@pytest.mark.parametrize(
+    ("document", "expected_message"),
+    [
+        ("{", "읽을 수 없습니다"),
+        ("[]", "형식"),
+        ('{"version": 99, "operation_id": "22222222222222222222222222222222"}', "버전"),
+        ('{"version": 1, "operation_id": "11111111111111111111111111111111"}', "파일명"),
+    ],
+)
+def test_manifest_reader_rejects_corrupt_or_mismatched_documents(
+    tmp_path: Path,
+    document: str,
+    expected_message: str,
+) -> None:
+    operation_id = "2" * 32
+    manifest = tmp_path / f"{operation_id}.json"
+    manifest.write_text(document, encoding="utf-8")
+
+    with pytest.raises(StorageError, match=expected_message):
+        session_store_module._read_manifest(manifest, operation_id)
+
+
+def test_manifest_scalar_validators_reject_missing_or_invalid_values() -> None:
+    with pytest.raises(StorageError, match="required"):
+        session_store_module._manifest_text({}, "required")
+    with pytest.raises(StorageError, match="byte_size"):
+        session_store_module._manifest_int({"byte_size": True}, "byte_size")
+    with pytest.raises(StorageError, match="sha256"):
+        session_store_module._manifest_fingerprint(
+            {"sha256": "invalid", "byte_size": 0},
+            "sha256",
+            "byte_size",
+        )
+
+
+def test_startup_removes_uncommitted_raw_batch_files(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    _run(store)
+    operation_id = "d" * 32
+    relative = "uncommitted-run/capture.txt"
+    data = b"uncommitted raw"
+    sha256 = hashlib.sha256(data).hexdigest()
+    destination = store.raw_root / Path(relative)
+    staged = store.raw_root / f".raw-staging-{operation_id}" / Path(relative)
+    destination.parent.mkdir()
+    staged.parent.mkdir(parents=True)
+    destination.write_bytes(data)
+    staged.write_bytes(data)
+    manifest = store._write_manifest(
+        operation_id,
+        {
+            "version": 1,
+            "kind": "raw_batch",
+            "operation_id": operation_id,
+            "run_id": "uncommitted-run",
+            "stage_root": f".raw-staging-{operation_id}",
+            "files": [
+                {
+                    "relative_path": relative,
+                    "sha256": sha256,
+                    "byte_size": len(data),
+                }
+            ],
+        },
+    )
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+
+    assert not destination.exists()
+    assert not staged.exists()
+    assert not manifest.exists()
+
+
+def test_report_fails_closed_when_registered_raw_content_changes(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()], raw_text="original raw")
+    store.finish_run(run_id)
+    raw_path = next(store.raw_root.rglob("*.txt"))
+    raw_path.write_text("tampered raw", encoding="utf-8")
+
+    with pytest.raises(StorageError, match="SHA-256"):
+        store.export_run_csv(run_id)
+    with pytest.raises(StorageError, match="SHA-256"):
+        store.export_run_html(run_id)
+
+    assert not tuple(store.exports_root.rglob("*.csv"))
+    assert not tuple(store.exports_root.rglob("*.html"))
+
+
+def test_store_detects_managed_root_identity_swap(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    original_raw_root = store.raw_root.with_name("raw-original")
+    os.replace(store.raw_root, original_raw_root)
+    store.raw_root.mkdir()
+
+    with pytest.raises(StorageError, match="실행 중 다른 디렉터리"):
+        store.list_runs()
+
+    assert original_raw_root.is_dir()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction safety test")
+def test_initialize_rejects_a_windows_junction_managed_root(tmp_path: Path) -> None:
+    target = tmp_path / "outside"
+    target.mkdir()
+    sentinel = target / "sentinel.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    junction = tmp_path / "raw-junction"
+    command = [
+        os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"),
+        "/d",
+        "/c",
+        "mklink",
+        "/J",
+        str(junction),
+        str(target),
+    ]
+    completed = subprocess.run(  # noqa: S603
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+    try:
+        store = SessionStore(tmp_path / "tracker.db", junction, tmp_path / "exports")
+        with pytest.raises(StorageError, match="reparse point"):
+            store.initialize()
+        assert sentinel.read_text(encoding="utf-8") == "keep"
+    finally:
+        junction.rmdir()
 
 
 def test_raw_relative_path_does_not_depend_on_windows_root_alias_spelling(
@@ -298,6 +933,32 @@ def test_csv_is_utf8_bom_and_registered_for_confirmed_delete(tmp_path: Path) -> 
     assert store.list_runs() == ()
 
 
+def test_csv_export_uses_the_bounded_cursor_stream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()])
+    store.finish_run(run_id)
+    seen_batch_sizes: list[int] = []
+    original = session_store_module._iter_cursor_dicts
+
+    def observe_batches(
+        cursor: sqlite3.Cursor,
+        *,
+        batch_size: int,
+    ) -> Iterator[dict[str, object]]:
+        seen_batch_sizes.append(batch_size)
+        return original(cursor, batch_size=batch_size)
+
+    monkeypatch.setattr(session_store_module, "_iter_cursor_dicts", observe_batches)
+    exported = store.export_run_csv(run_id, tmp_path / "stream.csv")
+
+    assert exported.exists()
+    assert seen_batch_sizes == [1000]
+
+
 def test_delete_rejects_stale_preview(tmp_path: Path) -> None:
     store = _store(tmp_path)
     run_id = _run(store)
@@ -311,6 +972,116 @@ def test_delete_rejects_stale_preview(tmp_path: Path) -> None:
         store.delete(preview, confirmation_token=preview.confirmation_token)
 
     assert len(store.list_runs()) == 1
+
+
+def test_delete_rejects_same_size_content_change_after_preview(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()], raw_text="AAAA")
+    store.finish_run(run_id)
+    preview = store.preview_delete(run_id)
+    raw_path = next(store.raw_root.rglob("*.txt"))
+    raw_path.write_text("BBBB", encoding="utf-8")
+
+    with pytest.raises(StorageError, match="변경"):
+        store.delete(preview, confirmation_token=preview.confirmation_token)
+
+    assert raw_path.read_text(encoding="utf-8") == "BBBB"
+    assert store.list_runs()[0]["id"] == run_id
+
+
+def test_startup_recovers_delete_staging_when_database_still_references_file(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()], raw_text="recover me")
+    store.finish_run(run_id)
+    snapshot = store._collect_deletion_snapshot(run_id)
+    operation_id = "a" * 32
+    manifest = store._write_manifest(
+        operation_id,
+        {
+            "version": 1,
+            "kind": "delete",
+            "operation_id": operation_id,
+            "files": [
+                {
+                    "category": "raw",
+                    "relative_path": item.relative_path,
+                    "sha256": item.sha256,
+                    "byte_size": item.byte_size,
+                    "registered": item.registered,
+                }
+                for item in snapshot.raw_files
+            ],
+        },
+    )
+    staged: list[session_store_module._StagedFile] = []
+    session_store_module._stage_files(
+        store.raw_root,
+        snapshot.raw_files,
+        operation_id,
+        "raw",
+        staged,
+    )
+    original = staged[0].source
+    assert not original.exists()
+    assert manifest.exists()
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+
+    assert original.read_text(encoding="utf-8") == "recover me"
+    assert not manifest.exists()
+    assert not tuple(store.raw_root.glob(".delete-staging-*"))
+
+
+def test_startup_purges_delete_staging_after_database_delete_committed(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()], raw_text="delete committed")
+    store.finish_run(run_id)
+    snapshot = store._collect_deletion_snapshot(run_id)
+    operation_id = "b" * 32
+    manifest = store._write_manifest(
+        operation_id,
+        {
+            "version": 1,
+            "kind": "delete",
+            "operation_id": operation_id,
+            "files": [
+                {
+                    "category": "raw",
+                    "relative_path": item.relative_path,
+                    "sha256": item.sha256,
+                    "byte_size": item.byte_size,
+                    "registered": item.registered,
+                }
+                for item in snapshot.raw_files
+            ],
+        },
+    )
+    staged: list[session_store_module._StagedFile] = []
+    session_store_module._stage_files(
+        store.raw_root,
+        snapshot.raw_files,
+        operation_id,
+        "raw",
+        staged,
+    )
+    with closing(sqlite3.connect(store.db_path)) as connection, connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+
+    assert reopened.list_runs() == ()
+    assert not manifest.exists()
+    assert not tuple(store.raw_root.glob(".delete-staging-*"))
 
 
 def test_delete_fails_closed_for_tampered_relative_path(tmp_path: Path) -> None:
@@ -457,6 +1228,246 @@ def test_managed_html_restores_the_previous_file_if_registration_update_fails(
     assert not tuple(store.exports_root.glob("*.staged"))
     with closing(sqlite3.connect(store.db_path)) as connection:
         assert connection.execute("SELECT count(*) FROM exports").fetchone()[0] == 1
+
+
+def test_startup_finishes_a_committed_managed_export_swap(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()])
+    store.finish_run(run_id)
+    destination = store.export_run_csv(run_id)
+    old_data = destination.read_bytes()
+    old_sha = hashlib.sha256(old_data).hexdigest()
+    operation_id = "e" * 32
+    backup = destination.with_name(f".{destination.name}.{operation_id}.backup")
+    staged = destination.with_name(f".{destination.name}.{operation_id}.staged")
+    new_data = b"new managed export"
+    new_sha = hashlib.sha256(new_data).hexdigest()
+    os.replace(destination, backup)
+    destination.write_bytes(new_data)
+    with closing(sqlite3.connect(store.db_path)) as connection, connection:
+        connection.execute(
+            "UPDATE exports SET sha256 = ?, byte_size = ? WHERE relative_path = ?",
+            (new_sha, len(new_data), destination.name),
+        )
+    manifest = store._write_manifest(
+        operation_id,
+        {
+            "version": 1,
+            "kind": "export",
+            "operation_id": operation_id,
+            "run_id": run_id,
+            "relative_path": destination.name,
+            "staged_relative": staged.name,
+            "backup_relative": backup.name,
+            "sha256": new_sha,
+            "byte_size": len(new_data),
+            "previous_file_sha256": old_sha,
+            "previous_file_byte_size": len(old_data),
+            "previous_db_sha256": old_sha,
+            "previous_db_byte_size": len(old_data),
+        },
+    )
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+
+    assert destination.read_bytes() == new_data
+    assert not backup.exists()
+    assert not manifest.exists()
+
+
+def test_startup_rolls_back_an_uncommitted_managed_export_swap(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()])
+    store.finish_run(run_id)
+    destination = store.export_run_csv(run_id)
+    old_data = destination.read_bytes()
+    old_sha = hashlib.sha256(old_data).hexdigest()
+    operation_id = "f" * 32
+    backup = destination.with_name(f".{destination.name}.{operation_id}.backup")
+    staged = destination.with_name(f".{destination.name}.{operation_id}.staged")
+    new_data = b"uncommitted replacement"
+    new_sha = hashlib.sha256(new_data).hexdigest()
+    os.replace(destination, backup)
+    destination.write_bytes(new_data)
+    manifest = store._write_manifest(
+        operation_id,
+        {
+            "version": 1,
+            "kind": "export",
+            "operation_id": operation_id,
+            "run_id": run_id,
+            "relative_path": destination.name,
+            "staged_relative": staged.name,
+            "backup_relative": backup.name,
+            "sha256": new_sha,
+            "byte_size": len(new_data),
+            "previous_file_sha256": old_sha,
+            "previous_file_byte_size": len(old_data),
+            "previous_db_sha256": old_sha,
+            "previous_db_byte_size": len(old_data),
+        },
+    )
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+
+    assert destination.read_bytes() == old_data
+    assert not backup.exists()
+    assert not manifest.exists()
+
+
+def test_startup_does_not_treat_a_busy_manifest_export_as_legacy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()])
+    store.finish_run(run_id)
+    destination = store.export_run_csv(run_id)
+    old_data = destination.read_bytes()
+    old_sha = hashlib.sha256(old_data).hexdigest()
+    operation_id = "9" * 32
+    staged = destination.with_name(f".{destination.name}.{operation_id}.staged")
+    backup = destination.with_name(f".{destination.name}.{operation_id}.backup")
+    new_data = b"active export replacement"
+    staged.write_bytes(new_data)
+    manifest = store._write_manifest(
+        operation_id,
+        {
+            "version": 1,
+            "kind": "export",
+            "operation_id": operation_id,
+            "run_id": run_id,
+            "relative_path": destination.name,
+            "staged_relative": staged.name,
+            "backup_relative": backup.name,
+            "sha256": hashlib.sha256(new_data).hexdigest(),
+            "byte_size": len(new_data),
+            "previous_file_sha256": old_sha,
+            "previous_file_byte_size": len(old_data),
+            "previous_db_sha256": old_sha,
+            "previous_db_byte_size": len(old_data),
+        },
+    )
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    original_acquire = reopened._acquire_operation_lease
+
+    def simulate_busy_operation(nonce: str) -> session_store_module._RunLease | None:
+        if nonce == operation_id:
+            return None
+        return original_acquire(nonce)
+
+    monkeypatch.setattr(reopened, "_acquire_operation_lease", simulate_busy_operation)
+
+    reopened.initialize()
+
+    assert destination.read_bytes() == old_data
+    assert staged.read_bytes() == new_data
+    assert manifest.exists()
+
+
+def test_active_managed_export_stage_survives_a_concurrent_initializer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()])
+    store.finish_run(run_id)
+    destination = store.exports_root / f"run-{run_id}.csv"
+    stage_written = threading.Event()
+    continue_export = threading.Event()
+    errors: list[BaseException] = []
+    results: list[Path] = []
+    original_writer = session_store_module.write_csv_atomic
+
+    def pause_after_stage_write(
+        path: Path | str,
+        *,
+        columns: tuple[str, ...],
+        rows: Iterator[dict[str, object]],
+    ) -> Path:
+        written = original_writer(path, columns=columns, rows=rows)
+        stage_written.set()
+        assert continue_export.wait(timeout=10)
+        return written
+
+    monkeypatch.setattr(session_store_module, "write_csv_atomic", pause_after_stage_write)
+
+    def export() -> None:
+        try:
+            results.append(store.export_run_csv(run_id, destination))
+        except BaseException as error:  # pragma: no cover - asserted below
+            errors.append(error)
+
+    worker = threading.Thread(target=export, daemon=True)
+    worker.start()
+    try:
+        assert stage_written.wait(timeout=10)
+        staged = tuple(store.exports_root.glob(f".{destination.name}.*.staged"))
+        assert len(staged) == 1
+
+        reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+        reopened.initialize()
+
+        assert staged[0].exists()
+    finally:
+        continue_export.set()
+        worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert results == [destination]
+    assert destination.exists()
+    assert not tuple(store.exports_root.glob(f".{destination.name}.*.staged"))
+
+
+@pytest.mark.parametrize("tampered_field", ["staged_relative", "backup_relative"])
+def test_export_manifest_cannot_delete_an_unrelated_managed_file(
+    tmp_path: Path,
+    tampered_field: str,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()])
+    store.finish_run(run_id)
+    destination = store.export_run_csv(run_id)
+    data = destination.read_bytes()
+    operation_id = "6" * 32
+    staged = destination.with_name(f".{destination.name}.{operation_id}.staged")
+    backup = destination.with_name(f".{destination.name}.{operation_id}.backup")
+    unrelated = store.exports_root / "unrelated-user-file.txt"
+    unrelated_data = b"must not be unlinked"
+    unrelated.write_bytes(unrelated_data)
+    payload: dict[str, object] = {
+        "version": 1,
+        "kind": "export",
+        "operation_id": operation_id,
+        "run_id": run_id,
+        "relative_path": destination.name,
+        "staged_relative": staged.name,
+        "backup_relative": backup.name,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "byte_size": len(data),
+        "previous_file_sha256": None,
+        "previous_file_byte_size": None,
+        "previous_db_sha256": None,
+        "previous_db_byte_size": None,
+    }
+    payload[tampered_field] = unrelated.name
+    manifest = store._write_manifest(operation_id, payload)
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    with pytest.raises(StorageError, match="작업 ID"):
+        reopened.initialize()
+
+    assert unrelated.read_bytes() == unrelated_data
+    assert destination.read_bytes() == data
+    assert manifest.exists()
 
 
 def test_delete_write_lock_prevents_a_late_managed_html_orphan(
@@ -635,6 +1646,45 @@ def test_record_writes_and_second_finish_require_running_run(tmp_path: Path) -> 
     assert store.list_runs()[0]["status"] == "COMPLETED"
 
 
+def test_finish_run_retries_lease_cleanup_after_database_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    lease_path = store._run_leases[run_id].path
+    release_calls: list[bool] = []
+    original_release = session_store_module._release_run_lease
+
+    def fail_first_cleanup(
+        lease: session_store_module._RunLease,
+        *,
+        remove: bool,
+    ) -> None:
+        release_calls.append(remove)
+        if len(release_calls) == 1:
+            original_release(lease, remove=False)
+            raise OSError("forced lease cleanup failure")
+        original_release(lease, remove=remove)
+
+    monkeypatch.setattr(session_store_module, "_release_run_lease", fail_first_cleanup)
+
+    with pytest.raises(StorageError, match="잠금 파일"):
+        store.finish_run(run_id)
+
+    assert store.list_runs()[0]["status"] == "COMPLETED"
+    assert run_id in store._run_leases
+    assert lease_path.exists()
+
+    store.finish_run(run_id)
+
+    assert release_calls == [True, True]
+    assert run_id not in store._run_leases
+    assert not lease_path.exists()
+    with pytest.raises(StorageError, match="RUNNING"):
+        store.finish_run(run_id)
+
+
 def test_preview_delete_rejects_running_run_for_single_and_full_scope(
     tmp_path: Path,
 ) -> None:
@@ -711,6 +1761,91 @@ def test_delete_rolls_staged_files_back_when_database_commit_fails(tmp_path: Pat
     assert raw_path.read_text(encoding="utf-8") == "preserve me"
     assert len(store.list_runs()) == 1
     assert not tuple(store.raw_root.glob(".delete-staging-*"))
+
+
+def test_delete_restores_a_file_after_transient_post_move_verification_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()], raw_text="restore after verification failure")
+    store.finish_run(run_id)
+    raw_path = next(store.raw_root.rglob("*.txt"))
+    preview = store.preview_delete(run_id)
+    original_verify = session_store_module._verify_file_fingerprint
+    failed_after_move = False
+
+    def fail_first_staged_verification(path: Path, sha256: str, byte_size: int) -> None:
+        nonlocal failed_after_move
+        if not failed_after_move and any(
+            part.startswith(".delete-staging-") for part in path.parts
+        ):
+            failed_after_move = True
+            raise StorageError("forced post-move fingerprint failure")
+        original_verify(path, sha256, byte_size)
+
+    monkeypatch.setattr(
+        session_store_module,
+        "_verify_file_fingerprint",
+        fail_first_staged_verification,
+    )
+
+    with pytest.raises(StorageError, match="post-move"):
+        store.delete(preview, confirmation_token=preview.confirmation_token)
+
+    assert failed_after_move is True
+    assert raw_path.read_text(encoding="utf-8") == "restore after verification failure"
+    assert len(store.list_runs()) == 1
+    assert not tuple(store.raw_root.glob(".delete-staging-*"))
+    assert not tuple(store._manifests_root.glob("*.json"))
+
+
+def test_delete_keeps_manifest_when_post_move_file_cannot_be_restored(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    raw_text = "recover from retained manifest"
+    store.record_query(run_id, [_observation()], raw_text=raw_text)
+    store.finish_run(run_id)
+    raw_path = next(store.raw_root.rglob("*.txt"))
+    preview = store.preview_delete(run_id)
+    original_verify = session_store_module._verify_file_fingerprint
+
+    def fail_staged_verification(path: Path, sha256: str, byte_size: int) -> None:
+        if any(part.startswith(".delete-staging-") for part in path.parts):
+            raise StorageError("forced persistent staging verification failure")
+        original_verify(path, sha256, byte_size)
+
+    monkeypatch.setattr(
+        session_store_module,
+        "_verify_file_fingerprint",
+        fail_staged_verification,
+    )
+
+    with pytest.raises(StorageError, match="persistent staging"):
+        store.delete(preview, confirmation_token=preview.confirmation_token)
+
+    staged_files = tuple(store.raw_root.glob(".delete-staging-*/*/*.txt"))
+    manifests = tuple(store._manifests_root.glob("*.json"))
+    assert not raw_path.exists()
+    assert len(staged_files) == 1
+    assert len(manifests) == 1
+    assert len(store.list_runs()) == 1
+
+    monkeypatch.setattr(
+        session_store_module,
+        "_verify_file_fingerprint",
+        original_verify,
+    )
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+
+    assert raw_path.read_text(encoding="utf-8") == raw_text
+    assert not tuple(store.raw_root.glob(".delete-staging-*"))
+    assert not manifests[0].exists()
 
 
 def test_delete_fails_closed_for_symlink_in_managed_scope(tmp_path: Path) -> None:

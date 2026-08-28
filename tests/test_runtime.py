@@ -6,6 +6,8 @@ from threading import Event, Thread
 from types import TracebackType
 from typing import Self
 
+import pytest
+
 from aruba_session_tracker.collectors import CancellationToken, CommandConnection
 from aruba_session_tracker.commands import (
     NO_PAGING_COMMAND,
@@ -95,6 +97,7 @@ class _BlockingFactory(_Factory):
         self._started = started
         self._release = release
         self._used_block = False
+        self.cancel_tokens: list[CancellationToken] = []
 
     def connect(
         self,
@@ -104,6 +107,7 @@ class _BlockingFactory(_Factory):
         host_key_approval: object,
         cancel_token: CancellationToken,
     ) -> AbstractContextManager[CommandConnection]:
+        self.cancel_tokens.append(cancel_token)
         connection = super().connect(
             target,
             credentials,
@@ -165,6 +169,81 @@ def test_runtime_query_persists_observations_raw_and_diagnostics(tmp_path: Path)
     assert exported.read_bytes().startswith(b"\xef\xbb\xbf")
 
 
+def test_runtime_one_shot_cancellation_is_persisted_as_cancelled(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    store = SessionStore(paths.database, paths.raw, paths.exports)
+    store.initialize()
+    executor = RuntimeExecutor(paths, store, ssh_factory=_Factory())
+    cancel_token = CancellationToken()
+    cancel_token.cancel()
+
+    outcome = executor.execute(
+        _config(),
+        QueryRequest("192.0.2.10", "203.0.113.20", 54321, 443),
+        Credentials("operator", "session-only"),
+        monitoring=False,
+        cancel_token=cancel_token,
+        host_key_approval=lambda _target, _info: True,
+        full_scan_approval=lambda _request, _devices: False,
+    )
+
+    assert outcome.cancelled is True
+    runs = store.list_runs()
+    assert len(runs) == 1
+    assert runs[0]["status"] == "CANCELLED"
+    assert len(outcome.diagnostics) == 1
+
+
+def test_runtime_retries_one_shot_finalization_before_the_next_query(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    store = SessionStore(paths.database, paths.raw, paths.exports)
+    store.initialize()
+    executor = RuntimeExecutor(paths, store, ssh_factory=_Factory())
+    request = QueryRequest("192.0.2.10", "203.0.113.20", 54321, 443)
+    credentials = Credentials("operator", "session-only")
+    original_finish = store.finish_run
+    finish_attempts = 0
+
+    def fail_first_finish(run_id: str, status: str = "COMPLETED") -> None:
+        nonlocal finish_attempts
+        finish_attempts += 1
+        if finish_attempts == 1:
+            raise OSError("fixture one-shot finalize failure")
+        original_finish(run_id, status=status)
+
+    monkeypatch.setattr(store, "finish_run", fail_first_finish)
+    with pytest.raises(RuntimeError, match="종료 상태"):
+        executor.execute(
+            _config(),
+            request,
+            credentials,
+            monitoring=False,
+            cancel_token=CancellationToken(),
+            host_key_approval=lambda _target, _info: True,
+            full_scan_approval=lambda _request, _devices: False,
+        )
+
+    assert executor.last_shutdown_error == "OSError"
+    assert store.list_runs()[0]["status"] == "RUNNING"
+
+    executor.execute(
+        _config(),
+        request,
+        credentials,
+        monitoring=False,
+        cancel_token=CancellationToken(),
+        host_key_approval=lambda _target, _info: True,
+        full_scan_approval=lambda _request, _devices: False,
+    )
+
+    assert finish_attempts == 3
+    assert executor.last_shutdown_error is None
+    assert [run["status"] for run in store.list_runs()] == ["COMPLETED", "COMPLETED"]
+
+
 def test_runtime_monitor_reuses_one_run_and_finishes_on_stop(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     store = SessionStore(paths.database, paths.raw, paths.exports)
@@ -191,13 +270,47 @@ def test_runtime_monitor_reuses_one_run_and_finishes_on_stop(tmp_path: Path) -> 
     assert runs[0]["observation_count"] == 4
 
 
+def test_runtime_restarts_monitor_when_its_identity_changes(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    store = SessionStore(paths.database, paths.raw, paths.exports)
+    store.initialize()
+    executor = RuntimeExecutor(paths, store, ssh_factory=_Factory())
+    request = QueryRequest("192.0.2.10", "203.0.113.20", 54321, 443)
+
+    executor.execute(
+        _config(),
+        request,
+        Credentials("operator-a", "session-only"),
+        monitoring=True,
+        cancel_token=CancellationToken(),
+        host_key_approval=lambda _target, _info: True,
+        full_scan_approval=lambda _request, _devices: False,
+    )
+    executor.execute(
+        _config(),
+        request,
+        Credentials("operator-b", "session-only"),
+        monitoring=True,
+        cancel_token=CancellationToken(),
+        host_key_approval=lambda _target, _info: True,
+        full_scan_approval=lambda _request, _devices: False,
+    )
+    executor.stop_monitor()
+
+    runs = store.list_runs()
+    assert len(runs) == 2
+    assert sorted(run["status"] for run in runs) == ["RESTARTED", "STOPPED"]
+    assert all(run["observation_count"] == 2 for run in runs)
+
+
 def test_runtime_stop_waits_for_inflight_poll_persistence(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     store = SessionStore(paths.database, paths.raw, paths.exports)
     store.initialize()
     started = Event()
     release = Event()
-    executor = RuntimeExecutor(paths, store, ssh_factory=_BlockingFactory(started, release))
+    factory = _BlockingFactory(started, release)
+    executor = RuntimeExecutor(paths, store, ssh_factory=factory)
     request = QueryRequest("192.0.2.10", "203.0.113.20", 54321, 443)
     failures: list[BaseException] = []
 
@@ -228,4 +341,212 @@ def test_runtime_stop_waits_for_inflight_poll_persistence(tmp_path: Path) -> Non
     assert failures == []
     run = store.list_runs()[0]
     assert run["status"] == "STOPPED"
-    assert run["observation_count"] == 2
+    assert run["observation_count"] == 0
+
+
+def test_runtime_rejects_overlapping_monitor_polls_and_stop_cancels_owner(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    store = SessionStore(paths.database, paths.raw, paths.exports)
+    store.initialize()
+    started = Event()
+    release = Event()
+    factory = _BlockingFactory(started, release)
+    executor = RuntimeExecutor(paths, store, ssh_factory=factory)
+    request = QueryRequest("192.0.2.10", "203.0.113.20", 54321, 443)
+    failures: list[BaseException] = []
+
+    def poll() -> None:
+        try:
+            executor.execute(
+                _config(),
+                request,
+                Credentials("operator", "session-only"),
+                monitoring=True,
+                cancel_token=CancellationToken(),
+                host_key_approval=lambda _target, _info: True,
+                full_scan_approval=lambda _request, _devices: False,
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    worker = Thread(target=poll)
+    worker.start()
+    assert started.wait(timeout=5)
+
+    with pytest.raises(RuntimeError, match="이미 진행"):
+        executor.execute(
+            _config(),
+            request,
+            Credentials("operator", "session-only"),
+            monitoring=True,
+            cancel_token=CancellationToken(),
+            host_key_approval=lambda _target, _info: True,
+            full_scan_approval=lambda _request, _devices: False,
+        )
+
+    executor.stop_monitor()
+    assert any(token.is_cancelled for token in factory.cancel_tokens)
+    release.set()
+    worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert store.list_runs()[0]["status"] == "STOPPED"
+
+
+def test_runtime_retries_failed_monitor_finalization_before_next_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    store = SessionStore(paths.database, paths.raw, paths.exports)
+    store.initialize()
+    executor = RuntimeExecutor(paths, store, ssh_factory=_Factory())
+    request = QueryRequest("192.0.2.10", "203.0.113.20", 54321, 443)
+    credentials = Credentials("operator", "session-only")
+    execute_kwargs = {
+        "monitoring": True,
+        "host_key_approval": lambda _target, _info: True,
+        "full_scan_approval": lambda _request, _devices: False,
+    }
+
+    executor.execute(
+        _config(),
+        request,
+        credentials,
+        cancel_token=CancellationToken(),
+        **execute_kwargs,  # type: ignore[arg-type]
+    )
+    original_finish = store.finish_run
+    finish_attempts = 0
+
+    def flaky_finish(run_id: str, status: str = "COMPLETED") -> None:
+        nonlocal finish_attempts
+        finish_attempts += 1
+        if finish_attempts <= 2:
+            raise OSError("fixture finalize failure")
+        original_finish(run_id, status=status)
+
+    monkeypatch.setattr(store, "finish_run", flaky_finish)
+    with pytest.raises(RuntimeError, match="종료 상태"):
+        executor.stop_monitor()
+
+    assert executor.last_shutdown_error == "OSError"
+    assert store.list_runs()[0]["status"] == "RUNNING"
+
+    executor.execute(
+        _config(),
+        request,
+        credentials,
+        cancel_token=CancellationToken(),
+        **execute_kwargs,  # type: ignore[arg-type]
+    )
+    executor.stop_monitor()
+
+    assert executor.last_shutdown_error is None
+    assert finish_attempts == 4
+    assert [run["status"] for run in store.list_runs()] == ["STOPPED", "STOPPED"]
+
+
+def test_runtime_discards_unpersisted_monitor_state_after_batch_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    store = SessionStore(paths.database, paths.raw, paths.exports)
+    store.initialize()
+    executor = RuntimeExecutor(paths, store, ssh_factory=_Factory())
+    request = QueryRequest("192.0.2.10", "203.0.113.20", 54321, 443)
+    credentials = Credentials("operator", "session-only")
+    original_batch = store.record_poll_batch
+    batch_calls = 0
+
+    def fail_once(*args: object, **kwargs: object) -> None:
+        nonlocal batch_calls
+        batch_calls += 1
+        if batch_calls == 1:
+            raise OSError("fixture batch failure")
+        original_batch(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "record_poll_batch", fail_once)
+    with pytest.raises(OSError, match="batch failure"):
+        executor.execute(
+            _config(),
+            request,
+            credentials,
+            monitoring=True,
+            cancel_token=CancellationToken(),
+            host_key_approval=lambda _target, _info: True,
+            full_scan_approval=lambda _request, _devices: False,
+        )
+
+    result = executor.execute(
+        _config(),
+        request,
+        credentials,
+        monitoring=True,
+        cancel_token=CancellationToken(),
+        host_key_approval=lambda _target, _info: True,
+        full_scan_approval=lambda _request, _devices: False,
+    )
+    executor.stop_monitor()
+
+    assert result.events
+    assert all(event.event_type.value == "STARTED" for event in result.events)
+    runs = store.list_runs()
+    assert [run["status"] for run in runs] == ["STOPPED", "FAILED"]
+    assert runs[0]["lifecycle_count"] == len(result.events)
+    assert runs[1]["lifecycle_count"] == 0
+
+
+def test_runtime_cancelled_monitor_failure_finishes_stopped_and_releases_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    store = SessionStore(paths.database, paths.raw, paths.exports)
+    store.initialize()
+    executor = RuntimeExecutor(paths, store, ssh_factory=_Factory())
+    request = QueryRequest("192.0.2.10", "203.0.113.20", 54321, 443)
+    credentials = Credentials("operator", "session-only")
+    cancel_token = CancellationToken()
+    original_batch = store.record_poll_batch
+    batch_calls = 0
+
+    def cancel_and_fail_once(*args: object, **kwargs: object) -> None:
+        nonlocal batch_calls
+        batch_calls += 1
+        if batch_calls == 1:
+            cancel_token.cancel()
+            raise OSError("fixture cancelled persistence failure")
+        original_batch(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "record_poll_batch", cancel_and_fail_once)
+    with pytest.raises(OSError, match="cancelled persistence failure"):
+        executor.execute(
+            _config(),
+            request,
+            credentials,
+            monitoring=True,
+            cancel_token=cancel_token,
+            host_key_approval=lambda _target, _info: True,
+            full_scan_approval=lambda _request, _devices: False,
+        )
+
+    executor.execute(
+        _config(),
+        request,
+        credentials,
+        monitoring=True,
+        cancel_token=CancellationToken(),
+        host_key_approval=lambda _target, _info: True,
+        full_scan_approval=lambda _request, _devices: False,
+    )
+    executor.stop_monitor()
+
+    runs = store.list_runs()
+    assert [run["status"] for run in runs] == ["STOPPED", "STOPPED"]
+    assert runs[0]["lifecycle_count"] > 0
+    assert runs[1]["lifecycle_count"] == 0

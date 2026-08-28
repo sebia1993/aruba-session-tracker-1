@@ -85,7 +85,7 @@ jobs:
           retention-days: 30
 
   publish:
-    name: Publish immutable versioned prerelease
+    name: Publish workflow-protected versioned prerelease
     needs: build
     runs-on: windows-latest
     timeout-minutes: 10
@@ -126,21 +126,24 @@ jobs:
             throw "Verified build commit does not match the release event."
           }
 
-          $tagRefJson = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG"
-          if ($LASTEXITCODE -ne 0) { throw "Could not resolve release tag." }
-          $tagRef = $tagRefJson | ConvertFrom-Json
-          if ($tagRef.object.type -ne "tag") { throw "Release tag is not annotated." }
-          $tagObjectJson = gh api "repos/$env:GITHUB_REPOSITORY/git/tags/$($tagRef.object.sha)"
-          if ($LASTEXITCODE -ne 0) { throw "Could not resolve annotated tag object." }
-          $tagObject = $tagObjectJson | ConvertFrom-Json
-          if (
-            $tagObject.object.type -ne "commit" -or
-            -not [string]::Equals(
-              $tagObject.object.sha, $env:EXPECTED_COMMIT, [StringComparison]::OrdinalIgnoreCase
-            )
-          ) {
-            throw "Annotated tag moved or does not directly reference the verified commit."
+          function Assert-VersionedTagProvenance {
+            $tagRefJson = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG"
+            if ($LASTEXITCODE -ne 0) { throw "Could not resolve release tag." }
+            $tagRef = $tagRefJson | ConvertFrom-Json
+            if ($tagRef.object.type -ne "tag") { throw "Release tag is not annotated." }
+            $tagObjectJson = gh api "repos/$env:GITHUB_REPOSITORY/git/tags/$($tagRef.object.sha)"
+            if ($LASTEXITCODE -ne 0) { throw "Could not resolve annotated tag object." }
+            $tagObject = $tagObjectJson | ConvertFrom-Json
+            if (
+              $tagObject.object.type -ne "commit" -or
+              -not [string]::Equals(
+                $tagObject.object.sha, $env:EXPECTED_COMMIT, [StringComparison]::OrdinalIgnoreCase
+              )
+            ) {
+              throw "Annotated tag moved or does not directly reference the verified commit."
+            }
           }
+          Assert-VersionedTagProvenance
           $mainJson = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/heads/main"
           if ($LASTEXITCODE -ne 0) { throw "Could not resolve current main." }
           $main = $mainJson | ConvertFrom-Json
@@ -149,9 +152,6 @@ jobs:
           )) {
             throw "Remote main moved after the verified build."
           }
-          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
-          if ($LASTEXITCODE -eq 0) { throw "Versioned releases are immutable and already exist." }
-
           $version = $env:RELEASE_TAG.Substring(1)
           $releaseRoot = Join-Path $PWD "artifacts/release"
           ./tools/verify_publish_assets.ps1 `
@@ -162,11 +162,141 @@ jobs:
           $sha = "$zip.sha256"
           $sbom = Join-Path $releaseRoot "ArubaSessionTracker_v${version}_sbom.cdx.json"
           $notes = Join-Path $releaseRoot "release-notes-v${version}.md"
+          $assetPaths = @($zip, $sha, $sbom)
+          $assetNames = @($assetPaths | ForEach-Object { [IO.Path]::GetFileName($_) })
+          $marker = "<!-- aruba-session-tracker-release:$env:RELEASE_TAG`:$env:EXPECTED_COMMIT -->"
+          $ownedNotes = Join-Path $env:RUNNER_TEMP "owned-release-notes.md"
+          $notesText = (Get-Content -LiteralPath $notes -Raw).TrimEnd()
+          Set-Content -LiteralPath $ownedNotes -Encoding utf8 -Value "$notesText`n`n$marker`n"
 
-          gh release create $env:RELEASE_TAG $zip $sha $sbom `
+          $releaseListJson = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100"
+          if ($LASTEXITCODE -ne 0) { throw "Could not inspect existing releases." }
+          $matchingReleases = @(
+            $releaseListJson | ConvertFrom-Json |
+              Where-Object { $_.tag_name -eq $env:RELEASE_TAG }
+          )
+          if ($matchingReleases.Count -gt 1) {
+            throw "More than one release exists for the versioned tag."
+          }
+          if ($matchingReleases.Count -eq 1) {
+            $release = $matchingReleases[0]
+            if ($release.draft -ne $true) {
+              throw "Versioned release is already published; this workflow will not mutate it."
+            }
+            if (
+              -not ([string]$release.body).Contains($marker)
+            ) {
+              throw "An existing draft is not owned by this exact release workflow run."
+            }
+            $unexpected = @($release.assets | Where-Object { $assetNames -notcontains $_.name })
+            if ($unexpected.Count -ne 0) {
+              throw "The owned draft contains an unexpected asset and will not be modified."
+            }
+          } else {
+            gh release create $env:RELEASE_TAG `
+              --repo $env:GITHUB_REPOSITORY `
+              --verify-tag `
+              --target $env:EXPECTED_COMMIT `
+              --draft `
+              --prerelease `
+              --title "Aruba Session Tracker v${version}" `
+              --notes-file $ownedNotes
+            if ($LASTEXITCODE -ne 0) { throw "Could not create versioned release draft." }
+          }
+
+          # A failed upload leaves only a mutable draft. Re-running the exact
+          # tag/commit replaces and completes that workflow-owned draft.
+          foreach ($assetPath in $assetPaths) {
+            gh release upload $env:RELEASE_TAG $assetPath `
+              --repo $env:GITHUB_REPOSITORY --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Could not upload a versioned draft asset." }
+          }
+
+          $releaseListJson = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100"
+          $release = @(
+            $releaseListJson | ConvertFrom-Json |
+              Where-Object { $_.tag_name -eq $env:RELEASE_TAG }
+          )[0]
+          $releaseJsonPath = Join-Path $env:RUNNER_TEMP "versioned-release-draft.json"
+          $release | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $releaseJsonPath -Encoding utf8
+          $assetArguments = @()
+          foreach ($assetPath in $assetPaths) {
+            $assetArguments += @("--asset", "$([IO.Path]::GetFileName($assetPath))=$assetPath")
+          }
+          & python tools/check_remote_release.py `
+            --release-json $releaseJsonPath `
+            --tag $env:RELEASE_TAG `
+            --expected-commit $env:EXPECTED_COMMIT `
+            --state draft `
+            --skip-target-check `
+            --required-marker $marker `
+            @assetArguments
+          if ($LASTEXITCODE -ne 0) { throw "Versioned draft verification failed." }
+
+          $authenticatedRoot = Join-Path $env:RUNNER_TEMP "versioned-authenticated-download"
+          New-Item -ItemType Directory -Force -Path $authenticatedRoot | Out-Null
+          gh release download $env:RELEASE_TAG `
             --repo $env:GITHUB_REPOSITORY `
-            --verify-tag `
+            --dir $authenticatedRoot `
+            --clobber `
+            --pattern $assetNames[0] `
+            --pattern $assetNames[1] `
+            --pattern $assetNames[2]
+          if ($LASTEXITCODE -ne 0) { throw "Could not download draft assets for verification." }
+          foreach ($assetPath in $assetPaths) {
+            $downloaded = Join-Path $authenticatedRoot ([IO.Path]::GetFileName($assetPath))
+            if (
+              -not (Test-Path -LiteralPath $downloaded -PathType Leaf) -or
+              (Get-FileHash -LiteralPath $downloaded -Algorithm SHA256).Hash -ne
+                (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash
+            ) {
+              throw "An authenticated draft download differs from the verified local asset."
+            }
+          }
+
+          # Re-peel the annotated tag immediately before making the draft public.
+          Assert-VersionedTagProvenance
+          gh release edit $env:RELEASE_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:EXPECTED_COMMIT `
+            --draft=false `
             --prerelease `
             --title "Aruba Session Tracker v${version}" `
-            --notes-file $notes
+            --notes-file $ownedNotes
           if ($LASTEXITCODE -ne 0) { throw "Could not publish versioned prerelease." }
+
+          $publishedJson = gh api "repos/$env:GITHUB_REPOSITORY/releases/$($release.id)"
+          if ($LASTEXITCODE -ne 0) { throw "Could not inspect published versioned release." }
+          Set-Content -LiteralPath $releaseJsonPath -Encoding utf8 -Value $publishedJson
+          & python tools/check_remote_release.py `
+            --release-json $releaseJsonPath `
+            --tag $env:RELEASE_TAG `
+            --expected-commit $env:EXPECTED_COMMIT `
+            --state published `
+            --skip-target-check `
+            --required-marker $marker `
+            @assetArguments
+          if ($LASTEXITCODE -ne 0) { throw "Published versioned release verification failed." }
+
+          # Verify public, unauthenticated bytes after publication. The
+          # workflow's no-mutation policy remains intact even if this final
+          # evidence step fails.
+          $published = $publishedJson | ConvertFrom-Json
+          $publicRoot = Join-Path $env:RUNNER_TEMP "versioned-public-download"
+          New-Item -ItemType Directory -Force -Path $publicRoot | Out-Null
+          foreach ($assetPath in $assetPaths) {
+            $name = [IO.Path]::GetFileName($assetPath)
+            $remote = @($published.assets | Where-Object { $_.name -eq $name })
+            if ($remote.Count -ne 1) { throw "A public release asset is missing." }
+            $downloaded = Join-Path $publicRoot $name
+            Invoke-WebRequest -Uri $remote[0].browser_download_url -OutFile $downloaded
+            if (
+              (Get-FileHash -LiteralPath $downloaded -Algorithm SHA256).Hash -ne
+              (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash
+            ) {
+              throw "A public release download differs from the verified local asset."
+            }
+          }
+          # The public evidence is valid only while the annotated tag still
+          # names the commit that produced the verified bytes.
+          Assert-VersionedTagProvenance

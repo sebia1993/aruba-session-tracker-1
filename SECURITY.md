@@ -16,6 +16,15 @@ CDN을 요청하지 않으며, DB와 장비에서 온 문자열은 HTML 이스�
 실행 가능성을 발견하면 공개 이슈 대신 저장소 소유자에게 비공개로
 알려주십시오.
 
+## 로컬 관리 경로
+
+설정, `known_hosts`, SQLite, Raw와 관리 내보내기 경로는 symbolic link와
+Windows reparse point를 허용하지 않습니다. 프로그램이 실행 중 관리
+디렉터리가 다른 항목으로 교체되거나 파일 크기·SHA-256이 저장된 값과
+달라지면 내보내기와 삭제를 중단합니다. `.operations`의 manifest와 lease는
+중단된 로컬 작업 복구에만 사용하며 자격증명이나 Raw CLI 본문을 저장하지
+않습니다. 이 폴더도 임의로 편집하거나 외부에 공유하지 마십시오.
+
 ## F12 UI Inspector와 클립보드
 
 UI Inspector는 실행할 때마다 OFF로 시작하며 정적 UI 카탈로그만
