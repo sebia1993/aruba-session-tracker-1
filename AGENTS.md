@@ -18,6 +18,17 @@ datapath session rows from the relevant 7240XM managed device.
 - Treat parser, SSH, and collection failures as unknown/partial results, never
   as proof that a controller or client is down.
 - Never fall back to an unfiltered datapath table query.
+- Keep the F12 UI Inspector disabled at every process start. Only an unmodified,
+  non-repeating `F12` may toggle it; `Esc` cancels selection without disabling
+  the Inspector, and selection clicks must never reach operational controls.
+- The Inspector may use and copy only the program version, registered static
+  Korean names, stable IDs, screen paths, repository-relative source paths, purposes, and blank
+  symptom/change fields. It must never read or copy runtime IP addresses,
+  hostnames, accounts, passwords, enable secrets, device data, table cells,
+  Raw CLI, diagnostics, logs, configuration values, or absolute paths.
+- Never add Inspector state to CLI options, environment variables, config,
+  registry, or SQLite, and never send Inspector or clipboard content outside
+  the local process.
 
 ## Development
 
@@ -36,6 +47,10 @@ datapath session rows from the relevant 7240XM managed device.
   required.
 - Treat generated HTML reports as private runtime data. Do not add real reports
   to Git, tests, documentation fixtures, CI artifacts, or public packages.
+- Preserve the exact 60-ID static Inspector catalog: 7 common, 23 Session Query,
+  20 Device Settings, and 10 History and Export entries. Keep catalog IDs stable
+  and cover additions or removals with tests that also enforce the static-data
+  and click-blocking boundaries.
 
 ## Release
 
@@ -44,3 +59,6 @@ datapath session rows from the relevant 7240XM managed device.
   `continuous` prerelease may be updated only by the verified `main` workflow.
 - Every release must contain the ZIP, SHA-256 sidecar, and CycloneDX SBOM.
 - CI/package evidence is not live Aruba or clean field-PC evidence.
+- Automated GUI checks do not replace Windows 11 field checks for a physical
+  F12/Fn Lock key, focus handling, restart-off behavior, clipboard output,
+  100/125/150 percent scaling, high contrast, and multiple monitors.

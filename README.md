@@ -17,8 +17,9 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 - IPv4 Source/Destination, 선택적 Source/Destination 포트
 - 1회 조회와 지속 모니터링
 - 로컬 SQLite 이력, 실행별 Raw TXT, 독립적인 CSV와 HTML 보고서 내보내기
+- 실행할 때마다 꺼진 상태로 시작하는 `F12` 정적 UI Inspector
 
-다음은 v0.2.0 범위에 포함되지 않습니다.
+다음은 v0.3.0 범위에 포함되지 않습니다.
 
 - 장비 설정 변경, 사용자 삭제 또는 쓰기 API
 - 무필터 `show datapath session table` 실행
@@ -30,13 +31,13 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 
 ### 포터블 ZIP
 
-1. GitHub Releases에서 `ArubaSessionTracker_v0.2.0_windows_x64.zip`과
+1. GitHub Releases에서 `ArubaSessionTracker_v0.3.0_windows_x64.zip`과
    같은 이름의 `.sha256` 파일을 함께 받습니다.
 2. PowerShell에서 해시를 확인합니다.
 
    ```powershell
-   Get-FileHash -Algorithm SHA256 .\ArubaSessionTracker_v0.2.0_windows_x64.zip
-   Get-Content .\ArubaSessionTracker_v0.2.0_windows_x64.zip.sha256
+   Get-FileHash -Algorithm SHA256 .\ArubaSessionTracker_v0.3.0_windows_x64.zip
+   Get-Content .\ArubaSessionTracker_v0.3.0_windows_x64.zip.sha256
    ```
 
 3. ZIP을 쓰기 가능한 일반 폴더에 풀고 `ArubaSessionTracker.exe`를
@@ -44,7 +45,7 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 
 `continuous`는 최신 `main`의 자동 검증 결과를 갱신하는 이동형
 사전릴리스입니다. 같은 이름의 공개 자산을 먼저 지우지 않고 후보 자산을
-올려 검증한 뒤 짧은 draft 전환 동안 tag와 자산을 교체합니다. `v0.2.0`
+올려 검증한 뒤 짧은 draft 전환 동안 tag와 자산을 교체합니다. `v0.3.0`
 같은 버전 태그 릴리스는 자동화가 기존 릴리스 덮어쓰기를 거부하는 1회성
 사전릴리스입니다. 두 릴리스 모두 ZIP, SHA-256 sidecar, CycloneDX SBOM을
 제공합니다.
@@ -58,6 +59,45 @@ py -3.13 -m venv .venv
   --check-build-dependencies -e .
 .\.venv\Scripts\python.exe -m aruba_session_tracker
 ```
+
+## F12 개발자 모드
+
+UI Inspector는 화면 요소의 위치와 고정 식별자를 확인해 개선 요청을 작성할
+때 사용하는 로컬 전용 보조 기능입니다. 브라우저 개발자 도구, 명령 콘솔,
+REPL 또는 장비 진단 콘솔이 아닙니다.
+
+- 앱은 다시 실행할 때마다 개발자 모드가 꺼진 상태로 시작합니다.
+- `Ctrl`, `Shift`, `Alt` 같은 수정키를 누르지 않은 일반 `F12`만 개발자
+  모드를 켜거나 끕니다. 자동 반복 키 입력과 수정키 조합은 무시합니다.
+- `요소 선택`을 시작한 뒤 마우스로 요소를 가리키면 주황색 테두리로
+  선택 후보를 표시합니다. 이 상태에서 발생한 클릭, 더블클릭과 컨텍스트
+  메뉴는 실제 조회·저장·내보내기·삭제 동작으로 전달되지 않습니다.
+- `Esc`는 현재 요소 선택만 취소하고 개발자 모드는 계속 유지합니다. 다시
+  `F12`를 누르면 선택 상태와 표시 UI까지 모두 닫힙니다.
+- 선택 결과에서 프로그램 버전, 정적 한국어 이름, 고정 UI ID, 화면 경로,
+  저장소 상대 소스 경로와 용도를 확인할 수 있습니다. `복사`는 이 정보와
+  비어 있는 `현재 현상`, `원하는 변경` 입력란만 클립보드에 넣습니다.
+
+정적 카탈로그는 공통 영역 7개와 세 화면 전체를 합한 정확히 60개 ID로
+구성됩니다.
+
+| 화면 | ID 수 | 포함하는 운영 요소 |
+| --- | ---: | --- |
+| 공통 | 7 | 주 창, 상태 표시줄, 탭 영역·탭 바와 세 화면 진입점 |
+| 세션 조회 | 23 | 자격증명 입력, 조회 조건, 조회·모니터링·중지, 상태·조회 맥락, 결과 표·헤더·본문·선택 항목, 상세 탭, Raw 보기, 진단 목록 |
+| 장비 설정 | 20 | MM Primary·Standby 이름/주소/포트/사용 여부, MD 표·헤더·본문·선택 항목, 모니터링 주기·종료 MISS, 설정 저장, 개인정보 안내 |
+| 기록 및 내보내기 | 10 | 새로 고침, CSV·HTML 내보내기, 선택·전체 삭제, 실행 표·헤더·본문·선택 항목, 개인정보 안내 |
+
+Inspector는 이 카탈로그에 코드로 등록된 정적 메타데이터만 사용합니다.
+카탈로그와 프로그램 버전 외의 런타임 데이터는 읽지 않습니다. 현재 입력된
+IP·호스트명·계정·암호·Enable 암호, 장비 정보, 표의 행이나 셀, Raw CLI,
+진단·로그, 설정 값 또는 로컬 절대 경로를 읽거나 복사하지 않습니다. 어떤
+정보도 외부로 보내지 않으며 활성 상태를 CLI 인자, 환경변수,
+`config.json`, Windows 레지스트리 또는 SQLite에 저장하지 않습니다.
+
+복사한 요청 양식을 붙여 넣은 문서에는 이후 사용자가 작성한 내용이
+남습니다. 외부 이슈나 지원 채널에 보내기 전에는 실제 네트워크 정보,
+계정 또는 다른 민감정보를 직접 추가하지 않았는지 확인하십시오.
 
 ## 처음 설정
 
@@ -199,11 +239,11 @@ GitHub 이슈나 외부 지원 채널에 올리지 말고, 공유가 필요하�
 
 저장소는 네트워크와 분리된 비식별 fixture 및 메모리 내 SSH 프로토콜
 fake를 기본 검증 경계로 사용합니다. 실제 소켓을 여는 Paramiko/Netmiko
-loopback 통합시험은 v0.2.0에 포함되지 않습니다.
+loopback 통합시험은 v0.3.0에 포함되지 않습니다.
 
 ```powershell
 .\tools\validate.ps1 -PythonPath .\.venv\Scripts\python.exe
-.\build_windows.ps1 -PythonPath .\.venv\Scripts\python.exe -Version 0.2.0
+.\build_windows.ps1 -PythonPath .\.venv\Scripts\python.exe -Version 0.3.0
 ```
 
 `validate.ps1`은 Python/아키텍처, 해시 고정 lock 동기화, 의존성, 버전
@@ -214,6 +254,12 @@ runtime 및 build/development 의존성 `pip-audit`를 확인합니다.
 포함한 뒤 private/runtime 파일 부재, SHA-256, Windows EXE logic/native
 Qt GUI smoke를 검증합니다. 로컬 시험용 dirty build만
 `-AllowDirty`를 명시할 수 있으며 릴리스에는 사용할 수 없습니다.
+
+Windows 11 현장 UI 확인에서는 실제 키보드의 `F12`와 Fn Lock 조합, 다른
+입력란에 포커스가 있을 때의 전환, 재시작 후 OFF 상태, 클립보드 복사,
+100%·125%·150% 배율, 고대비 테마와 다중 모니터 배치를 별도로 확인해야
+합니다. 자동화된 offscreen GUI smoke는 이 물리 환경 확인을 대신하지
+않습니다.
 
 PR과 `main`은 GitHub-hosted Windows x64 CI를 통과해야 합니다. `main`
 변경은 현재 main과 빌드 commit을 다시 비교한 뒤 기존 release를 지우지
@@ -236,7 +282,7 @@ smoke와 패키지 검증은 다음을 증명하지 않습니다.
 - Authenticode 서명 또는 조직 보안 제품의 허용
 - 실장비 네트워크 상태나 세션 존재/종료
 
-v0.2.0은 이 한계를 명시한 unsigned 사전릴리스입니다. 현장 검증은
+v0.3.0은 이 한계를 명시한 unsigned 사전릴리스입니다. 현장 검증은
 읽기 전용 계정과 승인된 변경 절차로 별도 수행해야 합니다.
 
 라이선스는 MIT이며 제3자 구성요소 고지는
