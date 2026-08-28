@@ -3,19 +3,27 @@ from __future__ import annotations
 import csv
 import hashlib
 import sqlite3
+import threading
+import time
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+import aruba_session_tracker.storage.session_store as session_store_module
 from aruba_session_tracker.models import (
     DiagnosticEvent,
     ErrorCode,
     QueryRequest,
     SessionObservation,
 )
-from aruba_session_tracker.storage import SessionStore, StorageError, guard_csv_cell
+from aruba_session_tracker.storage import (
+    RunReportSnapshot,
+    SessionStore,
+    StorageError,
+    guard_csv_cell,
+)
 
 
 def _store(tmp_path: Path) -> SessionStore:
@@ -311,6 +319,265 @@ def test_external_csv_export_is_not_managed_or_deleted(tmp_path: Path) -> None:
     assert preview.export_files == 0
     assert result.deleted_export_files == 0
     assert external.exists()
+
+
+def test_running_run_rejects_html_export_without_creating_an_artifact(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+
+    with pytest.raises(StorageError, match=r"RUNNING.*중지"):
+        store.export_run_html(run_id)
+
+    assert not tuple(store.exports_root.rglob("*.html"))
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM exports").fetchone()[0] == 0
+
+
+def test_default_csv_and_html_are_managed_and_deleted_together(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()], raw_text="raw evidence")
+    store.finish_run(run_id)
+
+    csv_export = store.export_run_csv(run_id)
+    html_export = store.export_run_html(run_id)
+    preview = store.preview_delete(run_id)
+
+    assert csv_export.parent == store.exports_root
+    assert html_export.parent == store.exports_root
+    assert preview.raw_files == 1
+    assert preview.export_files == 2
+    assert "내보내기 파일 2개" in preview.summary
+
+    result = store.delete(preview, confirmation_token=preview.confirmation_token)
+
+    assert result.deleted_export_files == 2
+    assert not csv_export.exists()
+    assert not html_export.exists()
+    assert store.list_runs() == ()
+
+
+def test_external_html_export_is_not_managed_or_deleted(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()])
+    store.finish_run(run_id)
+    external = tmp_path / "chosen" / "history.html"
+
+    exported = store.export_run_html(run_id, external)
+    preview = store.preview_delete(run_id)
+    result = store.delete(preview, confirmation_token=preview.confirmation_token)
+
+    assert exported == external
+    assert preview.export_files == 0
+    assert result.deleted_export_files == 0
+    assert external.exists()
+
+
+def test_managed_html_is_rolled_back_if_another_instance_deletes_the_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exporter = _store(tmp_path)
+    deleter = SessionStore(exporter.db_path, exporter.raw_root, exporter.exports_root)
+    deleter.initialize()
+    run_id = _run(exporter)
+    exporter.record_query(run_id, [_observation()])
+    exporter.finish_run(run_id)
+    preview = deleter.preview_delete(run_id)
+    original_writer = session_store_module.write_html_report_atomic
+
+    def write_then_delete(destination: Path, snapshot: RunReportSnapshot) -> Path:
+        written = original_writer(destination, snapshot)
+        deleter.delete(preview, confirmation_token=preview.confirmation_token)
+        return written
+
+    monkeypatch.setattr(session_store_module, "write_html_report_atomic", write_then_delete)
+    destination = exporter.exports_root / f"run-{run_id}.html"
+
+    with pytest.raises(StorageError, match="조회 실행 기록이 없습니다"):
+        exporter.export_run_html(run_id, destination)
+
+    assert not destination.exists()
+    assert exporter.list_runs() == ()
+
+
+def test_managed_html_restores_the_previous_file_if_registration_update_fails(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()])
+    store.finish_run(run_id)
+    destination = store.export_run_html(run_id)
+    previous = destination.read_bytes()
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER fail_export_update
+            BEFORE UPDATE ON exports
+            BEGIN
+                SELECT RAISE(ABORT, 'forced export registration failure');
+            END
+            """
+        )
+
+    with pytest.raises(StorageError, match="HTML 보고서를 내보낼 수 없습니다"):
+        store.export_run_html(run_id)
+
+    assert destination.read_bytes() == previous
+    assert not tuple(store.exports_root.glob("*.backup"))
+    assert not tuple(store.exports_root.glob("*.staged"))
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM exports").fetchone()[0] == 1
+
+
+def test_delete_write_lock_prevents_a_late_managed_html_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deleter = _store(tmp_path)
+    exporter = SessionStore(deleter.db_path, deleter.raw_root, deleter.exports_root)
+    exporter.initialize()
+    run_id = _run(deleter)
+    deleter.finish_run(run_id)
+    preview = deleter.preview_delete(run_id)
+    delete_locked = threading.Event()
+    continue_delete = threading.Event()
+    original_stage_files = session_store_module._stage_files
+    first_stage = True
+
+    def pause_after_locked_snapshot(
+        root: Path,
+        relative_paths: tuple[str, ...],
+        preview_id: str,
+        category: str,
+        staged: list[session_store_module._StagedFile],
+    ) -> None:
+        nonlocal first_stage
+        if first_stage:
+            first_stage = False
+            delete_locked.set()
+            if not continue_delete.wait(timeout=10):
+                raise TimeoutError("delete test synchronization timed out")
+        original_stage_files(root, relative_paths, preview_id, category, staged)
+
+    monkeypatch.setattr(session_store_module, "_stage_files", pause_after_locked_snapshot)
+    deletion_results: list[object] = []
+    deletion_errors: list[Exception] = []
+    export_errors: list[Exception] = []
+
+    def delete_run() -> None:
+        try:
+            deletion_results.append(
+                deleter.delete(preview, confirmation_token=preview.confirmation_token)
+            )
+        except Exception as error:  # pragma: no cover - assertion reports thread failures
+            deletion_errors.append(error)
+
+    def export_run() -> None:
+        try:
+            exporter.export_run_html(run_id)
+        except Exception as error:  # expected after delete commits
+            export_errors.append(error)
+
+    delete_thread = threading.Thread(target=delete_run)
+    export_thread = threading.Thread(target=export_run)
+    delete_thread.start()
+    assert delete_locked.wait(timeout=10)
+    export_thread.start()
+    deadline = time.monotonic() + 10
+    while not tuple(exporter.exports_root.glob("*.staged")) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert tuple(exporter.exports_root.glob("*.staged"))
+    continue_delete.set()
+    delete_thread.join(timeout=10)
+    export_thread.join(timeout=10)
+
+    assert not delete_thread.is_alive()
+    assert not export_thread.is_alive()
+    assert not deletion_errors
+    assert len(deletion_results) == 1
+    assert len(export_errors) == 1
+    assert isinstance(export_errors[0], StorageError)
+    assert "조회 실행 기록이 없습니다" in str(export_errors[0])
+    assert deleter.list_runs() == ()
+    assert not tuple(exporter.exports_root.rglob("*.html"))
+    assert not tuple(exporter.exports_root.glob("*.staged"))
+    assert not tuple(exporter.exports_root.glob("*.backup"))
+
+
+def test_html_export_includes_run_events_diagnostics_and_raw_metadata_only(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    observation = _observation(controller_name="서울-MD-01")
+    raw_body = "PRIVATE-RAW-BODY username=raw-user password=raw-secret"
+    raw_digest = hashlib.sha256(raw_body.encode("utf-8")).hexdigest()
+    store.record_query(
+        run_id,
+        [observation],
+        raw_text=raw_body,
+        controller_name="서울-MD-01",
+        raw_kind="session",
+    )
+    store.record_query(
+        run_id,
+        [],
+        raw_text="MM location evidence",
+        controller_name="서울-MM-01",
+        raw_kind="mm-location",
+    )
+    store.record_lifecycle(
+        run_id,
+        session_key=observation.session_key,
+        instance_id="instance-report-001",
+        event_type="opened",
+        controller_name="서울-MD-01",
+        details={"miss_count": 0, "previous_flags": "F"},
+    )
+    store.record_controller_event(
+        run_id,
+        previous_controller="서울-MD-01",
+        current_controller="서울-MD-02",
+        reason="CURRENT_SWITCH_CHANGED",
+    )
+    store.record_diagnostic(
+        DiagnosticEvent(
+            stage="SSH 198.51.100.99",
+            code=ErrorCode.AUTH_FAILED,
+            message="username=operator password=do-not-export at 198.51.100.99",
+        ),
+        run_id=run_id,
+    )
+    store.finish_run(run_id, status="PARTIAL")
+
+    exported = store.export_run_html(run_id, tmp_path / "chosen" / "result.html")
+    document = exported.read_text(encoding="utf-8")
+    raw_relative = next(store.raw_root.rglob("*.txt")).relative_to(store.raw_root).as_posix()
+
+    assert run_id in document
+    assert "PARTIAL" in document
+    assert "서울-MD-01" in document
+    assert "instance-report-001" in document
+    assert "OPENED" in document
+    assert "MISS 횟수: 0" in document
+    assert "이전 Flags: F" in document
+    assert "서울-MD-02" in document
+    assert "CURRENT_SWITCH_CHANGED" in document
+    assert "AUTH_FAILED" in document
+    assert "username=&lt;REDACTED&gt;" in document
+    assert "password=&lt;REDACTED&gt;" in document
+    assert "198.51.100.99" not in document
+    assert "서울-MM-01" in document
+    assert "mm-location" in document
+    assert "DB ID" in document
+    assert raw_digest in document
+    assert "PRIVATE-RAW-BODY" not in document
+    assert "raw-user" not in document
+    assert "raw-secret" not in document
+    assert raw_relative not in document
 
 
 def test_record_writes_and_second_finish_require_running_run(tmp_path: Path) -> None:

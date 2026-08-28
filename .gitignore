@@ -19,6 +19,7 @@ artifacts/
 *.sqlite*
 *.log
 *.csv
+*.html
 *.pem
 *.key
 *.p12

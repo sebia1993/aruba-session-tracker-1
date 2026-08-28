@@ -20,6 +20,15 @@ from uuid import uuid4
 
 from aruba_session_tracker.models import DiagnosticEvent, QueryRequest, SessionObservation
 from aruba_session_tracker.storage.csv_export import write_csv_atomic
+from aruba_session_tracker.storage.html_report import (
+    HTML_CONTROLLER_LIMIT,
+    HTML_DIAGNOSTIC_LIMIT,
+    HTML_LIFECYCLE_LIMIT,
+    HTML_OBSERVATION_LIMIT,
+    HTML_RAW_FILE_LIMIT,
+    RunReportSnapshot,
+    write_html_report_atomic,
+)
 from aruba_session_tracker.storage.raw import (
     RawArtifact,
     RawOutputStore,
@@ -212,7 +221,7 @@ class _StagedFile:
 
 
 class SessionStore:
-    """Facade for run history, raw capture, CSV export, and confirmed deletion."""
+    """Facade for run history, raw capture, report export, and confirmed deletion."""
 
     def __init__(
         self,
@@ -573,15 +582,239 @@ class SessionStore:
                     """,
                     (run_id,),
                 ).fetchall()
-            written = write_csv_atomic(
-                path,
-                columns=_CSV_COLUMNS,
-                rows=(dict(row) for row in rows),
-            )
-            self._register_managed_export(run_id, written)
-            return written
+            managed_destination = self._managed_export_destination(path)
+            if managed_destination is None:
+                return write_csv_atomic(
+                    path,
+                    columns=_CSV_COLUMNS,
+                    rows=(dict(row) for row in rows),
+                )
+            staged = self._staged_export_path(managed_destination)
+            try:
+                write_csv_atomic(
+                    staged,
+                    columns=_CSV_COLUMNS,
+                    rows=(dict(row) for row in rows),
+                )
+                self._commit_managed_export(run_id, managed_destination, staged)
+            finally:
+                staged.unlink(missing_ok=True)
+            return managed_destination
         except (OSError, sqlite3.Error) as error:
             raise StorageError(f"CSV를 내보낼 수 없습니다: {error}") from error
+
+    def export_run_html(self, run_id: str, destination: Path | str | None = None) -> Path:
+        """Export one completed run as a standalone, offline HTML5 report."""
+
+        self._ensure_initialized()
+        safe_segment(run_id, "run_id")
+        path = (
+            Path(destination)
+            if destination is not None
+            else self.exports_root / f"run-{run_id}.html"
+        )
+        try:
+            with self._lock, self._connection() as connection:
+                connection.execute("BEGIN")
+                run = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+                if run is None:
+                    raise StorageError("요청한 조회 실행 기록이 없습니다.")
+                if run["status"] == "RUNNING":
+                    raise StorageError("RUNNING 상태의 실행은 중지 후 HTML 보고서를 만드십시오.")
+
+                controllers = connection.execute(
+                    """
+                    SELECT controller_name AS name FROM observations
+                    WHERE run_id = ? AND controller_name IS NOT NULL
+                    UNION
+                    SELECT controller_name AS name FROM raw_files
+                    WHERE run_id = ? AND controller_name IS NOT NULL
+                    UNION
+                    SELECT previous_controller AS name FROM controller_events
+                    WHERE run_id = ? AND previous_controller IS NOT NULL
+                    UNION
+                    SELECT current_controller AS name FROM controller_events
+                    WHERE run_id = ? AND current_controller IS NOT NULL
+                    ORDER BY name
+                    """,
+                    (run_id, run_id, run_id, run_id),
+                ).fetchall()
+                mm_controllers = connection.execute(
+                    """
+                    SELECT DISTINCT controller_name AS name
+                    FROM raw_files
+                    WHERE run_id = ? AND kind = 'mm-location'
+                          AND controller_name IS NOT NULL
+                    ORDER BY name
+                    """,
+                    (run_id,),
+                ).fetchall()
+                md_controllers = connection.execute(
+                    """
+                    SELECT controller_name AS name FROM observations
+                    WHERE run_id = ? AND controller_name IS NOT NULL
+                    UNION
+                    SELECT controller_name AS name FROM raw_files
+                    WHERE run_id = ? AND kind = 'session' AND controller_name IS NOT NULL
+                    UNION
+                    SELECT previous_controller AS name FROM controller_events
+                    WHERE run_id = ? AND previous_controller IS NOT NULL
+                    UNION
+                    SELECT current_controller AS name FROM controller_events
+                    WHERE run_id = ? AND current_controller IS NOT NULL
+                    ORDER BY name
+                    """,
+                    (run_id, run_id, run_id, run_id),
+                ).fetchall()
+
+                observation_total = int(
+                    connection.execute(
+                        "SELECT count(*) FROM observations WHERE run_id = ?", (run_id,)
+                    ).fetchone()[0]
+                )
+                unique_session_total = int(
+                    connection.execute(
+                        "SELECT count(DISTINCT session_key) FROM observations WHERE run_id = ?",
+                        (run_id,),
+                    ).fetchone()[0]
+                )
+                observations = connection.execute(
+                    """
+                    WITH ranked AS (
+                        SELECT o.*,
+                               row_number() OVER (
+                                   PARTITION BY o.session_key
+                                   ORDER BY o.observed_at DESC, o.id DESC
+                               ) AS rank_in_session
+                        FROM observations o
+                        WHERE o.run_id = ?
+                    )
+                    SELECT observed_at, controller_name, controller_host, protocol,
+                           source_ip, destination_ip, source_port, destination_port,
+                           counter, priority, tos, age, destination, tunnel_age,
+                           packets, bytes_count, flags, cpu_id, session_key
+                    FROM ranked
+                    WHERE rank_in_session = 1
+                    ORDER BY observed_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (run_id, HTML_OBSERVATION_LIMIT),
+                ).fetchall()
+
+                lifecycle_total = int(
+                    connection.execute(
+                        "SELECT count(*) FROM lifecycle_events WHERE run_id = ?", (run_id,)
+                    ).fetchone()[0]
+                )
+                lifecycle_counts = connection.execute(
+                    """
+                    SELECT event_type, count(*) AS event_count
+                    FROM lifecycle_events
+                    WHERE run_id = ?
+                    GROUP BY event_type
+                    ORDER BY event_type
+                    """,
+                    (run_id,),
+                ).fetchall()
+                lifecycle_events = connection.execute(
+                    """
+                    SELECT occurred_at, session_key, instance_id, event_type,
+                           controller_name, details_json
+                    FROM lifecycle_events
+                    WHERE run_id = ?
+                    ORDER BY occurred_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (run_id, HTML_LIFECYCLE_LIMIT),
+                ).fetchall()
+
+                controller_total = int(
+                    connection.execute(
+                        "SELECT count(*) FROM controller_events WHERE run_id = ?", (run_id,)
+                    ).fetchone()[0]
+                )
+                controller_events = connection.execute(
+                    """
+                    SELECT occurred_at, previous_controller, current_controller, reason
+                    FROM controller_events
+                    WHERE run_id = ?
+                    ORDER BY occurred_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (run_id, HTML_CONTROLLER_LIMIT),
+                ).fetchall()
+
+                diagnostic_total = int(
+                    connection.execute(
+                        "SELECT count(*) FROM diagnostic_events WHERE run_id = ?", (run_id,)
+                    ).fetchone()[0]
+                )
+                diagnostics = connection.execute(
+                    """
+                    SELECT occurred_at, stage, code, message
+                    FROM diagnostic_events
+                    WHERE run_id = ?
+                    ORDER BY occurred_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (run_id, HTML_DIAGNOSTIC_LIMIT),
+                ).fetchall()
+
+                raw_totals = connection.execute(
+                    """
+                    SELECT count(*) AS file_count, coalesce(sum(byte_size), 0) AS byte_count
+                    FROM raw_files
+                    WHERE run_id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+                raw_files = connection.execute(
+                    """
+                    SELECT id, captured_at, kind, controller_name, sha256, byte_size
+                    FROM raw_files
+                    WHERE run_id = ?
+                    ORDER BY captured_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (run_id, HTML_RAW_FILE_LIMIT),
+                ).fetchall()
+
+                snapshot = RunReportSnapshot(
+                    run=dict(run),
+                    controllers=tuple(str(row["name"]) for row in controllers),
+                    mm_controllers=tuple(str(row["name"]) for row in mm_controllers),
+                    md_controllers=tuple(str(row["name"]) for row in md_controllers),
+                    observations=tuple(dict(row) for row in observations),
+                    observation_total=observation_total,
+                    unique_session_total=unique_session_total,
+                    lifecycle_events=tuple(dict(row) for row in lifecycle_events),
+                    lifecycle_total=lifecycle_total,
+                    lifecycle_counts=tuple(
+                        (str(row["event_type"]), int(row["event_count"]))
+                        for row in lifecycle_counts
+                    ),
+                    controller_events=tuple(dict(row) for row in controller_events),
+                    controller_total=controller_total,
+                    diagnostics=tuple(dict(row) for row in diagnostics),
+                    diagnostic_total=diagnostic_total,
+                    raw_files=tuple(dict(row) for row in raw_files),
+                    raw_file_total=int(raw_totals["file_count"]),
+                    raw_byte_total=int(raw_totals["byte_count"]),
+                )
+            managed_destination = self._managed_export_destination(path)
+            if managed_destination is None:
+                return write_html_report_atomic(path, snapshot)
+            staged = self._staged_export_path(managed_destination)
+            try:
+                write_html_report_atomic(staged, snapshot)
+                self._commit_managed_export(run_id, managed_destination, staged)
+            finally:
+                staged.unlink(missing_ok=True)
+            return managed_destination
+        except StorageError:
+            raise
+        except (OSError, sqlite3.Error, ValueError) as error:
+            raise StorageError(f"HTML 보고서를 내보낼 수 없습니다: {error}") from error
 
     def preview_delete(self, run_id: str | None = None) -> DeletePreview:
         """Create a five-minute, one-use deletion preview; this does not delete data."""
@@ -608,7 +841,7 @@ class SessionStore:
                 summary=(
                     f"{scope}: 실행 {len(snapshot.run_ids)}개, DB 행 "
                     f"{snapshot.database_rows}개, Raw {len(snapshot.raw_paths)}개, "
-                    f"CSV {len(snapshot.export_paths)}개를 삭제합니다."
+                    f"내보내기 파일 {len(snapshot.export_paths)}개를 삭제합니다."
                 ),
             )
             self._pending_deletions[preview_id] = _PendingDeletion(
@@ -633,42 +866,38 @@ class SessionStore:
             if not secrets.compare_digest(pending.preview.confirmation_token, confirmation_token):
                 raise StorageError("삭제 확인 토큰이 일치하지 않습니다.")
 
-            try:
-                current = self._collect_deletion_snapshot(pending.target_run_id)
-            except UnsafeStoragePath as error:
-                raise StorageError(f"삭제 대상 경로가 안전하지 않습니다: {error}") from error
-            if current != pending.snapshot:
-                self._pending_deletions.pop(preview.preview_id, None)
-                raise StorageError("미리보기 이후 기록이 변경되었습니다. 다시 확인하십시오.")
-
             staged: list[_StagedFile] = []
-            try:
-                _stage_files(
-                    self.raw_root,
-                    current.raw_paths,
-                    preview.preview_id,
-                    "raw",
-                    staged,
-                )
-                _stage_files(
-                    self.exports_root,
-                    current.export_paths,
-                    preview.preview_id,
-                    "export",
-                    staged,
-                )
-            except (OSError, UnsafeStoragePath) as error:
-                restoration_error = _restore_staged_files(staged)
-                if restoration_error is not None:
-                    raise StorageError(
-                        "삭제 대상을 격리하는 중 실패했고 일부 파일을 원위치로 복원하지 못했습니다."
-                    ) from restoration_error
-                raise StorageError(
-                    f"삭제 대상 파일을 안전하게 격리할 수 없습니다: {error}"
-                ) from error
-
+            phase = "snapshot"
             try:
                 with self._connection() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    current = self._collect_deletion_snapshot(
+                        pending.target_run_id,
+                        connection=connection,
+                    )
+                    if current != pending.snapshot:
+                        self._pending_deletions.pop(preview.preview_id, None)
+                        raise StorageError(
+                            "미리보기 이후 기록이 변경되었습니다. 다시 확인하십시오."
+                        )
+
+                    phase = "staging"
+                    _stage_files(
+                        self.raw_root,
+                        current.raw_paths,
+                        preview.preview_id,
+                        "raw",
+                        staged,
+                    )
+                    _stage_files(
+                        self.exports_root,
+                        current.export_paths,
+                        preview.preview_id,
+                        "export",
+                        staged,
+                    )
+
+                    phase = "database"
                     if current.run_ids:
                         placeholders = ",".join("?" for _ in current.run_ids)
                         cursor = connection.execute(
@@ -677,14 +906,20 @@ class SessionStore:
                         )
                         if cursor.rowcount != len(current.run_ids):
                             raise StorageError("삭제 대상 실행 기록이 미리보기와 다릅니다.")
-            except (sqlite3.Error, StorageError) as error:
+            except (OSError, sqlite3.Error, StorageError, UnsafeStoragePath) as error:
                 restoration_error = _restore_staged_files(staged)
                 if restoration_error is not None:
                     raise StorageError(
-                        "데이터베이스 삭제가 취소되었지만 일부 파일을 원위치로 복원하지 못했습니다."
+                        "삭제가 취소되었지만 일부 파일을 원위치로 복원하지 못했습니다."
                     ) from restoration_error
                 if isinstance(error, StorageError):
                     raise
+                if isinstance(error, UnsafeStoragePath):
+                    raise StorageError(f"삭제 대상 경로가 안전하지 않습니다: {error}") from error
+                if phase == "staging":
+                    raise StorageError(
+                        f"삭제 대상 파일을 안전하게 격리할 수 없습니다: {error}"
+                    ) from error
                 raise StorageError(f"데이터베이스 기록을 삭제할 수 없습니다: {error}") from error
 
             self._pending_deletions.pop(preview.preview_id, None)
@@ -747,16 +982,32 @@ class SessionStore:
             raise StorageError("종료할 조회 실행 기록이 없습니다.")
         raise StorageError("RUNNING 상태의 조회 실행만 종료할 수 있습니다.")
 
-    def _register_managed_export(self, run_id: str, path: Path) -> None:
+    def _managed_export_destination(self, path: Path) -> Path | None:
         exports_root = self.exports_root.resolve(strict=False)
         resolved = path.resolve(strict=False)
         if resolved == exports_root or not resolved.is_relative_to(exports_root):
-            return
-        relative = resolved.relative_to(exports_root).as_posix()
-        data = resolved.read_bytes()
+            return None
+        return resolved
+
+    @staticmethod
+    def _staged_export_path(destination: Path) -> Path:
+        return destination.with_name(f".{destination.name}.{uuid4().hex}.staged")
+
+    def _commit_managed_export(self, run_id: str, destination: Path, staged: Path) -> None:
+        exports_root = self.exports_root.resolve(strict=False)
+        relative = destination.relative_to(exports_root).as_posix()
+        backup: Path | None = None
+        installed = False
         try:
+            data = staged.read_bytes()
             with self._lock, self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
                 self._require_run(connection, run_id)
+                if destination.exists():
+                    backup = destination.with_name(f".{destination.name}.{uuid4().hex}.backup")
+                    os.replace(destination, backup)
+                os.replace(staged, destination)
+                installed = True
                 connection.execute(
                     """
                     INSERT INTO exports (
@@ -776,71 +1027,43 @@ class SessionStore:
                         len(data),
                     ),
                 )
-        except sqlite3.Error:
-            resolved.unlink(missing_ok=True)
+        except (OSError, sqlite3.Error, StorageError):
+            try:
+                if backup is not None and backup.exists():
+                    os.replace(backup, destination)
+                elif installed:
+                    destination.unlink(missing_ok=True)
+            except OSError as restore_error:
+                raise StorageError(
+                    "관리 내보내기 등록 실패 후 이전 파일 상태를 복원할 수 없습니다."
+                ) from restore_error
             raise
+        if backup is not None:
+            try:
+                backup.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                raise StorageError(
+                    "관리 내보내기의 이전 백업 파일을 정리할 수 없습니다."
+                ) from cleanup_error
 
     def _collect_deletion_snapshot(
         self,
         run_id: str | None,
+        *,
+        connection: sqlite3.Connection | None = None,
     ) -> _DeletionSnapshot:
         if run_id is not None:
             safe_segment(run_id, "run_id")
         try:
-            with self._connection() as connection:
-                if run_id is None:
-                    run_rows = connection.execute(
-                        "SELECT id, status FROM runs ORDER BY started_at, id"
-                    ).fetchall()
-                else:
-                    self._require_run(connection, run_id)
-                    run_rows = connection.execute(
-                        "SELECT id, status FROM runs WHERE id = ?", (run_id,)
-                    ).fetchall()
-
-                if any(row["status"] == "RUNNING" for row in run_rows):
-                    raise StorageError("RUNNING 상태의 조회 실행은 중지 후에만 삭제할 수 있습니다.")
-                run_ids = tuple(str(row["id"]) for row in run_rows)
-
-                if run_ids:
-                    placeholders = ",".join("?" for _ in run_ids)
-                    row_counts = tuple(
-                        (
-                            table,
-                            int(
-                                connection.execute(
-                                    f"SELECT count(*) FROM {table} "  # noqa: S608
-                                    f"WHERE {'id' if table == 'runs' else 'run_id'} "
-                                    f"IN ({placeholders})",
-                                    run_ids,
-                                ).fetchone()[0]
-                            ),
-                        )
-                        for table in _DELETION_TABLES
-                    )
-                    raw_rows = connection.execute(
-                        f"SELECT run_id, relative_path FROM raw_files "  # noqa: S608
-                        f"WHERE run_id IN ({placeholders}) ORDER BY relative_path",
-                        run_ids,
-                    ).fetchall()
-                    registered_raw_paths = {
-                        _validated_raw_relative(str(row["run_id"]), str(row["relative_path"]))
-                        for row in raw_rows
-                    }
-                    registered_export_paths = {
-                        str(row[0])
-                        for row in connection.execute(
-                            f"SELECT relative_path FROM exports "  # noqa: S608
-                            f"WHERE run_id IN ({placeholders}) ORDER BY relative_path",
-                            run_ids,
-                        ).fetchall()
-                    }
-                else:
-                    row_counts = tuple((table, 0) for table in _DELETION_TABLES)
-                    registered_raw_paths = set()
-                    registered_export_paths = set()
+            if connection is None:
+                with self._connection() as owned_connection:
+                    database_state = self._deletion_database_state(owned_connection, run_id)
+            else:
+                database_state = self._deletion_database_state(connection, run_id)
         except sqlite3.Error as error:
             raise StorageError(f"삭제 대상을 확인할 수 없습니다: {error}") from error
+
+        run_ids, row_counts, registered_raw_paths, registered_export_paths = database_state
 
         if run_id is None:
             filesystem_raw_paths = set(_scan_regular_files(self.raw_root))
@@ -856,6 +1079,67 @@ class SessionStore:
         total_bytes = sum(_managed_size(self.raw_root, item) for item in raw_paths)
         total_bytes += sum(_managed_size(self.exports_root, item) for item in export_paths)
         return _DeletionSnapshot(run_ids, row_counts, raw_paths, export_paths, total_bytes)
+
+    def _deletion_database_state(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str | None,
+    ) -> tuple[tuple[str, ...], tuple[tuple[str, int], ...], set[str], set[str]]:
+        if run_id is None:
+            run_rows = connection.execute(
+                "SELECT id, status FROM runs ORDER BY started_at, id"
+            ).fetchall()
+        else:
+            self._require_run(connection, run_id)
+            run_rows = connection.execute(
+                "SELECT id, status FROM runs WHERE id = ?", (run_id,)
+            ).fetchall()
+
+        if any(row["status"] == "RUNNING" for row in run_rows):
+            raise StorageError("RUNNING 상태의 조회 실행은 중지 후에만 삭제할 수 있습니다.")
+        run_ids = tuple(str(row["id"]) for row in run_rows)
+
+        if not run_ids:
+            return (
+                run_ids,
+                tuple((table, 0) for table in _DELETION_TABLES),
+                set(),
+                set(),
+            )
+
+        placeholders = ",".join("?" for _ in run_ids)
+        row_counts = tuple(
+            (
+                table,
+                int(
+                    connection.execute(
+                        f"SELECT count(*) FROM {table} "  # noqa: S608
+                        f"WHERE {'id' if table == 'runs' else 'run_id'} "
+                        f"IN ({placeholders})",
+                        run_ids,
+                    ).fetchone()[0]
+                ),
+            )
+            for table in _DELETION_TABLES
+        )
+        raw_rows = connection.execute(
+            f"SELECT run_id, relative_path FROM raw_files "  # noqa: S608
+            f"WHERE run_id IN ({placeholders}) ORDER BY relative_path",
+            run_ids,
+        ).fetchall()
+        registered_raw_paths = {
+            _validated_raw_relative(str(row["run_id"]), str(row["relative_path"]))
+            for row in raw_rows
+        }
+        registered_export_paths = {
+            str(row[0])
+            for row in connection.execute(
+                f"SELECT relative_path FROM exports "  # noqa: S608
+                f"WHERE run_id IN ({placeholders}) ORDER BY relative_path",
+                run_ids,
+            ).fetchall()
+        }
+        return run_ids, row_counts, registered_raw_paths, registered_export_paths
 
 
 _DELETION_TABLES = (

@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from aruba_session_tracker import __version__
 from aruba_session_tracker.collectors.ssh import CancellationToken, HostKeyInfo
 from aruba_session_tracker.config import ConfigRepository
 from aruba_session_tracker.models import (
@@ -190,7 +191,7 @@ class MainWindow(QMainWindow):
         self._monitor_timer = QTimer(self)
         self._monitor_timer.timeout.connect(self._start_query)
 
-        self.setWindowTitle("Aruba Session Tracker 0.1.0")
+        self.setWindowTitle(f"Aruba Session Tracker {__version__}")
         self.resize(1320, 820)
         self.setMinimumSize(1080, 680)
         self._build_ui()
@@ -391,26 +392,30 @@ class MainWindow(QMainWindow):
         toolbar = QHBoxLayout()
         refresh_button = QPushButton("새로고침")
         self.export_button = QPushButton("선택 실행 CSV 내보내기")
+        self.html_export_button = QPushButton("선택 실행 HTML 보고서")
         self.delete_button = QPushButton("선택 실행 삭제")
         self.delete_all_button = QPushButton("전체 기록 삭제")
         refresh_button.clicked.connect(self._refresh_history)
         self.export_button.clicked.connect(self._export_selected_run)
+        self.html_export_button.clicked.connect(self._export_selected_run_html)
         self.delete_button.clicked.connect(lambda: self._delete_history(all_runs=False))
         self.delete_all_button.clicked.connect(lambda: self._delete_history(all_runs=True))
         toolbar.addWidget(refresh_button)
         toolbar.addWidget(self.export_button)
+        toolbar.addWidget(self.html_export_button)
         toolbar.addWidget(self.delete_button)
         toolbar.addWidget(self.delete_all_button)
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
         self.history_table = QTableWidget(0, 5)
-        self.history_table.setHorizontalHeaderLabels(["Run ID", "시작", "종료", "상태", "세션 수"])
+        self.history_table.setHorizontalHeaderLabels(["Run ID", "시작", "종료", "상태", "관측 행"])
         self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.history_table)
         note = QLabel(
-            "Raw TXT와 SQLite에는 내부 IP 및 세션 메타데이터가 평문으로 남습니다. "
+            "Raw TXT, SQLite, CSV와 HTML 보고서에는 내부 IP 및 세션 메타데이터가 "
+            "평문으로 남을 수 있습니다. "
             "자동 삭제하지 않으므로 보존 정책에 따라 수동으로 삭제하십시오."
         )
         note.setWordWrap(True)
@@ -788,6 +793,7 @@ class MainWindow(QMainWindow):
             self.monitor_button.setEnabled(not busy)
         history_mutable = not busy and not self._monitoring
         self.export_button.setEnabled(history_mutable)
+        self.html_export_button.setEnabled(history_mutable)
         self.delete_button.setEnabled(history_mutable)
         self.delete_all_button.setEnabled(history_mutable)
 
@@ -861,6 +867,28 @@ class MainWindow(QMainWindow):
             return
         QMessageBox.information(self, "내보내기 완료", str(exported))
 
+    @Slot()
+    def _export_selected_run_html(self) -> None:
+        run_id = self._selected_run_id()
+        if run_id is None:
+            QMessageBox.information(self, "HTML 보고서", "실행 기록을 선택하십시오.")
+            return
+        default_name = f"aruba-session-{run_id}.html"
+        destination, _ = QFileDialog.getSaveFileName(
+            self,
+            "HTML 보고서 저장",
+            default_name,
+            "HTML 문서 (*.html)",
+        )
+        if not destination:
+            return
+        try:
+            exported = self._store.export_run_html(run_id, Path(destination))
+        except Exception as exc:
+            QMessageBox.warning(self, "HTML 보고서 실패", str(exc))
+            return
+        QMessageBox.information(self, "HTML 보고서 완료", str(exported))
+
     def _delete_history(self, *, all_runs: bool) -> None:
         run_id = None if all_runs else self._selected_run_id()
         if not all_runs and run_id is None:
@@ -878,7 +906,7 @@ class MainWindow(QMainWindow):
             f"실행: {run_count}건\n"
             f"DB 행: {getattr(preview, 'database_rows', 0)}개\n"
             f"Raw TXT: {getattr(preview, 'raw_files', 0)}개\n"
-            f"관리 CSV: {getattr(preview, 'export_files', 0)}개\n"
+            f"관리 내보내기(CSV/HTML): {getattr(preview, 'export_files', 0)}개\n"
             f"파일 크기: {_display_bytes(int(getattr(preview, 'total_file_bytes', 0)))}\n\n"
             "위 대상을 영구 삭제합니다. 계속하시겠습니까?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,

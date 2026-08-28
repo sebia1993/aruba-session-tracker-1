@@ -24,6 +24,7 @@ _SCAN_OVERLAP_BYTES = 256
 _PRIVATE_SUFFIXES = {
     ".csv",
     ".db",
+    ".html",
     ".key",
     ".log",
     ".p12",

@@ -30,10 +30,15 @@ def versions(repository: Path) -> dict[str, str]:
     changelog_match = re.search(r"^##\s+(\d+\.\d+\.\d+)\b", changelog_text, re.M)
     if changelog_match is None:
         raise VersionError("CHANGELOG.md has no version heading")
+    build_text = (repository / "build_windows.ps1").read_text(encoding="utf-8")
+    build_match = re.search(r'\[string\]\$Version\s*=\s*"([^"]+)"', build_text)
+    if build_match is None:
+        raise VersionError("build_windows.ps1 has no default Version")
     return {
         "pyproject": project_version,
         "package": package_match.group(1),
         "changelog": changelog_match.group(1),
+        "build": build_match.group(1),
     }
 
 

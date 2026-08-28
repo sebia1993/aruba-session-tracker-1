@@ -16,9 +16,9 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 - Primary Mobility Conductor, Standby, MD 1대 이상
 - IPv4 Source/Destination, 선택적 Source/Destination 포트
 - 1회 조회와 지속 모니터링
-- 로컬 SQLite 이력, 실행별 Raw TXT, 명시적 CSV 내보내기
+- 로컬 SQLite 이력, 실행별 Raw TXT, 독립적인 CSV와 HTML 보고서 내보내기
 
-다음은 v0.1.0 범위에 포함되지 않습니다.
+다음은 v0.2.0 범위에 포함되지 않습니다.
 
 - 장비 설정 변경, 사용자 삭제 또는 쓰기 API
 - 무필터 `show datapath session table` 실행
@@ -30,13 +30,13 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 
 ### 포터블 ZIP
 
-1. GitHub Releases에서 `ArubaSessionTracker_v0.1.0_windows_x64.zip`과
+1. GitHub Releases에서 `ArubaSessionTracker_v0.2.0_windows_x64.zip`과
    같은 이름의 `.sha256` 파일을 함께 받습니다.
 2. PowerShell에서 해시를 확인합니다.
 
    ```powershell
-   Get-FileHash -Algorithm SHA256 .\ArubaSessionTracker_v0.1.0_windows_x64.zip
-   Get-Content .\ArubaSessionTracker_v0.1.0_windows_x64.zip.sha256
+   Get-FileHash -Algorithm SHA256 .\ArubaSessionTracker_v0.2.0_windows_x64.zip
+   Get-Content .\ArubaSessionTracker_v0.2.0_windows_x64.zip.sha256
    ```
 
 3. ZIP을 쓰기 가능한 일반 폴더에 풀고 `ArubaSessionTracker.exe`를
@@ -44,7 +44,7 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 
 `continuous`는 최신 `main`의 자동 검증 결과를 갱신하는 이동형
 사전릴리스입니다. 같은 이름의 공개 자산을 먼저 지우지 않고 후보 자산을
-올려 검증한 뒤 짧은 draft 전환 동안 tag와 자산을 교체합니다. `v0.1.0`
+올려 검증한 뒤 짧은 draft 전환 동안 tag와 자산을 교체합니다. `v0.2.0`
 같은 버전 태그 릴리스는 자동화가 기존 릴리스 덮어쓰기를 거부하는 1회성
 사전릴리스입니다. 두 릴리스 모두 ZIP, SHA-256 sidecar, CycloneDX SBOM을
 제공합니다.
@@ -122,6 +122,35 @@ SYN, `R`은 redirect입니다. 정의를 확인하지 못한 문자는
 [global-user-table 명령 문서](https://arubanetworking.hpe.com/techdocs/CLI-Bank/Content/aos8/sh-glb-usr-tab.htm)의
 출력 구조를 기준으로 합니다.
 
+## HTML 결과 보고서
+
+`기록 및 내보내기` 화면에서 종료된 실행을 선택하면 기존 CSV와 별도로
+`선택 실행 HTML 보고서`를 사용할 수 있습니다. CSV는 전체 관측 행을
+분석하는 데이터 파일이고, HTML은 사람이 실행 결과와 주의사항을 빠르게
+검토하는 기술문서입니다. 두 경로는 서로 독립적이며 하나를 만들지 않아도
+다른 하나를 계속 사용할 수 있습니다.
+
+HTML 보고서는 다음 조건을 만족합니다.
+
+- 단일 UTF-8 HTML5 파일, 내장 CSS, 외부 CSS/JavaScript/CDN/웹폰트 없음
+- PC·태블릿·모바일 반응형, Sticky 목차, 가로 스크롤 표, 인쇄 스타일
+- 지원 기준 환경, 실행 조건, Executive Summary와 프로그램 조회 흐름
+- 최신 고유 세션, Raw Flags 해석, 수명주기와 Controller 전환
+- 비식별 진단, Troubleshooting, Warning, 수집 파일 크기·SHA-256
+- 허용된 읽기 전용 CLI의 명령어·목적·예상 결과와 Quick Reference
+
+보고서는 선택한 실행의 SQLite 스냅샷만 사용합니다. 실행 당시 저장되지
+않은 VLAN, SSID, Role, ACL, 인터페이스, 물리 토폴로지나 실제 장비에서
+검출한 모델/펌웨어는 만들지 않고 `확인 필요`로 표시합니다. Raw CLI 본문과
+자격증명은 넣지 않으며 모든 저장 문자열은 HTML 이스케이프합니다. 긴
+모니터링 결과는 표시 상한과 전체 건수를 함께 알리고 전체 행은 CSV 또는
+SQLite에서 확인하도록 안내합니다.
+
+HTML은 인터넷 연결 없이 Edge/Chrome에서 직접 열 수 있습니다. 내부 IP,
+장비명과 세션 메타데이터는 결과 자체이므로 평문으로 포함될 수 있습니다.
+외부에 공유하기 전에는 HTML 원문을 열어 민감정보를 직접 제거하고
+검토하십시오.
+
 ## 로컬 데이터와 개인정보
 
 기본 저장 위치는 `%LOCALAPPDATA%\ArubaSessionTracker`입니다.
@@ -131,21 +160,22 @@ config.json        비밀이 아닌 장비/주기 설정
 known_hosts        승인한 SSH 호스트 키
 tracker.db         실행, 관측, 수명주기, 전환, 비식별 진단 이벤트
 raw\<run-id>\      실행별 UTF-8 장비 원문
-exports\           사용자가 명시적으로 만든 UTF-8 BOM CSV
+exports\           사용자가 명시적으로 만든 CSV/HTML 내보내기
 ```
 
 Raw 파일은 SQLite에 상대 경로, 바이트 크기, SHA-256으로 연결됩니다.
 일반 진단 메시지에서는 IPv4와 자격증명 형태를 마스킹합니다. CSV의
-문자열은 Excel 수식 삽입을 막도록 보호합니다.
+문자열은 Excel 수식 삽입을 막도록 보호하고 HTML의 저장 값은 태그나
+스크립트로 실행되지 않도록 이스케이프합니다.
 
-기록은 자동 삭제하지 않습니다. 삭제 화면은 실행 수, DB 행 수, Raw/CSV
-파일 수와 전체 크기를 먼저 보여주고 사용자가 확인한 경우에만 5분짜리
-1회용 미리보기에 포함된 항목을 삭제합니다. 미리보기 뒤 데이터가
+기록은 자동 삭제하지 않습니다. 삭제 화면은 실행 수, DB 행 수, Raw와
+관리 내보내기 파일 수·전체 크기를 먼저 보여주고 사용자가 확인한 경우에만
+5분짜리 1회용 미리보기에 포함된 항목을 삭제합니다. 미리보기 뒤 데이터가
 달라지거나 관리 루트 밖을 가리키는 경로가 있으면 삭제하지 않습니다.
-사용자가 다른 폴더를 직접 선택해 내보낸 CSV는 자동 삭제 대상이
+사용자가 다른 폴더를 직접 선택해 내보낸 CSV와 HTML은 자동 삭제 대상이
 아닙니다.
 
-Raw, DB, 내보낸 CSV에는 실제 네트워크 정보가 포함될 수 있습니다.
+Raw, DB, 내보낸 CSV와 HTML에는 실제 네트워크 정보가 포함될 수 있습니다.
 GitHub 이슈나 외부 지원 채널에 올리지 말고, 공유가 필요하면 IP, 장비명,
 계정, 명령 출력을 제거한 오류 코드와 단계만 제공하십시오.
 
@@ -169,11 +199,11 @@ GitHub 이슈나 외부 지원 채널에 올리지 말고, 공유가 필요하�
 
 저장소는 네트워크와 분리된 비식별 fixture 및 메모리 내 SSH 프로토콜
 fake를 기본 검증 경계로 사용합니다. 실제 소켓을 여는 Paramiko/Netmiko
-loopback 통합시험은 v0.1.0에 포함되지 않습니다.
+loopback 통합시험은 v0.2.0에 포함되지 않습니다.
 
 ```powershell
 .\tools\validate.ps1 -PythonPath .\.venv\Scripts\python.exe
-.\build_windows.ps1 -PythonPath .\.venv\Scripts\python.exe -Version 0.1.0
+.\build_windows.ps1 -PythonPath .\.venv\Scripts\python.exe -Version 0.2.0
 ```
 
 `validate.ps1`은 Python/아키텍처, 해시 고정 lock 동기화, 의존성, 버전
@@ -206,7 +236,7 @@ smoke와 패키지 검증은 다음을 증명하지 않습니다.
 - Authenticode 서명 또는 조직 보안 제품의 허용
 - 실장비 네트워크 상태나 세션 존재/종료
 
-v0.1.0은 이 한계를 명시한 unsigned 사전릴리스입니다. 현장 검증은
+v0.2.0은 이 한계를 명시한 unsigned 사전릴리스입니다. 현장 검증은
 읽기 전용 계정과 승인된 변경 절차로 별도 수행해야 합니다.
 
 라이선스는 MIT이며 제3자 구성요소 고지는
