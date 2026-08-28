@@ -1,0 +1,25 @@
+(md-document-01) # show datapath session table 192.0.2.10
+
+Datapath Session Table Entries
+------------------------------
+Flags: F - fast age, S - src NAT, N - dest NAT
+       D - deny, R - redirect, Y - no syn
+       H - high prio, P - set prio, T - set ToS
+       C - client, M - mirror, V - VOIP
+       Q - Real-Time Quality analysis, u - Upstream Real-Time Quality analysis
+       I - Deep inspect, U - Locally destined
+       E - Media Deep Inspect, G - media signal
+       r - Route Nexthop, h - High Value
+       A - Application Firewall Inspect
+       i - Session classified on first packet
+       J - SDWAN Default Probe stats used as fallback
+       X - SDWAN Exception, x - Translation
+       B - Permanent, O - Openflow
+       L - Log, o - Openflow config revision mismatched
+
+Source IP or MAC  Destination IP  Prot SPort DPort Cntr Prio ToS Age Destination TAge Packets Bytes Flags CPU ID
+----------------  --------------  ---- ----- ----- ---- ---- --- --- ----------- ---- ------- ----- ----- ------
+192.0.2.10        203.0.113.20    6    54321 443   0/0  0    0   12  local       0    10      2048  FCI   1
+203.0.113.20      192.0.2.10      6    443   54321 0/0  0    0   13  0/0/0       f4cb 11      4096  Y     2
+192.0.2.10        198.51.100.53   17   53000 53    1/2  0    40  1   local       19   2       144         6
+Entries: 3

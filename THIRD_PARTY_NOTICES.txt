@@ -1,0 +1,56 @@
+Aruba Session Tracker - Third-Party Notices
+============================================
+
+This distribution contains third-party software. The bundled CycloneDX file
+"sbom.cdx.json" is the exact package/version/wheel-hash inventory for the
+locked Python runtime dependencies. It does not claim to inventory Windows
+system components, the embedded CPython runtime, or the PyInstaller bootloader.
+Copyright notices and license texts supplied inside packaged libraries remain
+applicable. The portable bundle's "licenses" directory contains per-component
+wheel license evidence and metadata. It also contains the full
+LGPL-3.0-only/GPL-3.0 text used for the PySide6/Qt redistribution choice.
+
+Direct runtime components
+-------------------------
+
+PySide6-Essentials / Qt for Python 6.11.0
+  Copyright (C) The Qt Company Ltd. and other contributors.
+  PySide6 and the corresponding Qt libraries are available under the GNU
+  Lesser General Public License version 3 (with applicable Qt exceptions),
+  the GNU General Public License, or commercial terms. This project uses the
+  LGPL option for redistribution. The portable onedir package keeps Qt DLLs as
+  separate files so a recipient can replace/relink compatible LGPL-covered
+  libraries. Qt source and license information is available from:
+  https://www.qt.io/licensing/open-source-lgpl-obligations
+  https://code.qt.io/
+
+Netmiko 4.6.0
+  Copyright (C) Kirk Byers and contributors.
+  License: MIT.
+  https://github.com/ktbyers/netmiko
+
+Paramiko 5.0.0
+  Copyright (C) Jeff Forcier and contributors.
+  License: GNU Lesser General Public License version 2.1.
+  https://github.com/paramiko/paramiko
+
+Build-only component
+--------------------
+
+PyInstaller 6.22.2
+  Copyright (C) PyInstaller Development Team.
+  License: GNU General Public License version 2 with the special exception that
+  permits distribution of executables produced by PyInstaller under the
+  application's license.
+  https://pyinstaller.org/
+
+Transitive dependencies
+-----------------------
+
+Netmiko, Paramiko, PySide6 and the build tools bring additional transitive
+components. Review the exact CycloneDX SBOM included with the release before
+deployment. This notice is informational and does not replace any license text
+distributed by a component.
+
+Aruba, ArubaOS and HPE are trademarks of their respective owners. This project
+is independent and is not endorsed by Hewlett Packard Enterprise.

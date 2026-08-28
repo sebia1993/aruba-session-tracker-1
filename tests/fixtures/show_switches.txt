@@ -1,0 +1,10 @@
+(mm-primary) [mynode] # show switches
+
+All Switches
+------------
+IP Address       Name              Location              Type  Model         Version              Status
+---------------- ----------------- --------------------- ----- ------------- -------------------- ------
+198.51.100.10    mm-documentation  lab.example.floor1    MM    Aruba7240XM   8.10.0.10_89128      up
+198.51.100.11    md-document-01    lab.example.floor1    MD    Aruba7240XM   8.10.0.10_89128      up
+198.51.100.12    md-document-02    lab.example.floor2    MD    Aruba7240XM   8.10.0.10_89128      up
+Total Switches:3

@@ -1,0 +1,5 @@
+Datapath Session Table Entries
+------------------------------
+Source IP or MAC Destination IP Prot SPort DPort Cntr Prio ToS Age Destination TAge Packets Bytes Flags CPU ID
+---------------- ---------------- ---- ----- ----- ---- ---- --- --- ----------- ---- ------- ----- ----- ------
+Entries: 0

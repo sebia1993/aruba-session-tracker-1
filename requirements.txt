@@ -1,0 +1,4 @@
+# Keep direct runtime pins synchronized with pyproject.toml.
+netmiko==4.6.0
+paramiko==5.0.0
+PySide6-Essentials==6.11.0

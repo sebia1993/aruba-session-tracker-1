@@ -1,0 +1,12 @@
+(mm-primary) [mynode] # show switches debug
+
+All Switches
+------------
+IP Address       MAC                Name              Nodepath             Type  Model         Version
+---------------- ------------------ ----------------- -------------------- ----- ------------- --------------------
+198.51.100.11    00:00:5e:00:53:11  md-document-01    /md/document/01      MD    Aruba7240XM   8.10.0.10_89128
+
+Status  Uptime  CrashInfo  Config Sync Time (sec)  License  Release Type
+------  ------  ---------  ----------------------  -------  ------------
+up      3d 1h   no         0                       N/A      LSR
+Total Switches:1

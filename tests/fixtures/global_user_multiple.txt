@@ -1,0 +1,9 @@
+(mm-primary) [mynode] # show global-user-table list ip "192.0.2.44"
+
+Global Users
+------------
+IP Address      MAC                Name           Current switch Role         Auth   AP name
+--------------- ------------------ -------------- -------------- ------------ ------ -------------
+192.0.2.44      00:00:5e:00:53:02  doc-client     198.51.100.11  employee     dot1x  ap-doc-01
+192.0.2.44      00:00:5e:00:53:02  doc-client     198.51.100.12  employee     dot1x  ap-doc-02
+Total entries = 2

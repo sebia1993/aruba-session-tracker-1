@@ -32,8 +32,7 @@ datapath session rows from the relevant 7240XM managed device.
 ## Release
 
 - Public builds are unsigned Windows x64 onedir ZIP files.
-- Versioned tags and releases are immutable. The moving `continuous`
-  prerelease may be replaced only by the verified `main` workflow.
+- Versioned tags and releases are immutable by workflow policy. The moving
+  `continuous` prerelease may be updated only by the verified `main` workflow.
 - Every release must contain the ZIP, SHA-256 sidecar, and CycloneDX SBOM.
 - CI/package evidence is not live Aruba or clean field-PC evidence.
-
