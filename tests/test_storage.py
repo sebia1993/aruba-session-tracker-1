@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import aruba_session_tracker.storage.raw as raw_module
 import aruba_session_tracker.storage.session_store as session_store_module
 from aruba_session_tracker.models import (
     DiagnosticEvent,
@@ -182,6 +183,32 @@ def test_record_query_links_relative_raw_path_and_sha256(tmp_path: Path) -> None
     assert digest == hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
     assert size == len(raw_text.encode("utf-8"))
     assert "raw_line" not in stored_raw_line
+
+
+def test_raw_relative_path_does_not_depend_on_windows_root_alias_spelling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured_root = tmp_path / "configured-long-name" / "raw"
+    equivalent_alias = tmp_path / "ALIAS" / "raw"
+    equivalent_alias.mkdir(parents=True)
+
+    def simulated_windows_alias(_root: Path, relative: Path) -> Path:
+        return equivalent_alias / relative
+
+    monkeypatch.setattr(raw_module, "contained_path", simulated_windows_alias)
+    store = raw_module.RawOutputStore(configured_root)
+    artifact = store.write(
+        "run-alias-test",
+        kind="session",
+        controller_name="MD-01",
+        content="fixture",
+        captured_at=datetime(2026, 8, 28, 9, 0, tzinfo=UTC),
+    )
+
+    assert artifact.relative_path.startswith("run-alias-test/")
+    assert not Path(artifact.relative_path).is_absolute()
+    assert (equivalent_alias / artifact.relative_path).read_text(encoding="utf-8") == "fixture"
 
 
 def test_lifecycle_controller_and_sanitized_diagnostic_are_recorded(tmp_path: Path) -> None:

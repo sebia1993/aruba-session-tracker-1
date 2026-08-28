@@ -49,7 +49,8 @@ class RawOutputStore:
         self.root.mkdir(parents=True, exist_ok=True)
         run_directory = contained_path(self.root, Path(run_segment))
         run_directory.mkdir(parents=False, exist_ok=True)
-        path = contained_path(self.root, Path(run_segment) / filename)
+        relative = Path(run_segment) / filename
+        path = contained_path(self.root, relative)
         data = content.encode("utf-8")
 
         descriptor, temporary_name = tempfile.mkstemp(
@@ -65,9 +66,8 @@ class RawOutputStore:
         finally:
             temporary_path.unlink(missing_ok=True)
 
-        relative = path.relative_to(self.root).as_posix()
         return RawArtifact(
-            relative_path=relative,
+            relative_path=relative.as_posix(),
             sha256=hashlib.sha256(data).hexdigest(),
             byte_size=len(data),
         )
