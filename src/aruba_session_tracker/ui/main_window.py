@@ -5,7 +5,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, Qt, QThread, QThreadPool, QTimer, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -34,17 +34,18 @@ from PySide6.QtWidgets import (
 )
 
 from aruba_session_tracker import __version__
-from aruba_session_tracker.collectors.ssh import CancellationToken, HostKeyInfo
-from aruba_session_tracker.config import ConfigRepository
+from aruba_session_tracker.collectors.ssh import CancellationToken, CollectorError, HostKeyInfo
+from aruba_session_tracker.config import ConfigError, ConfigRepository
 from aruba_session_tracker.models import (
     AppConfig,
     Credentials,
     DeviceTarget,
+    ErrorCode,
     QueryRequest,
     SessionObservation,
 )
 from aruba_session_tracker.parsers import interpret_flags, overall_flag_severity
-from aruba_session_tracker.storage import SessionStore
+from aruba_session_tracker.storage import SessionStore, StorageError
 from aruba_session_tracker.ui.developer_inspector import (
     DeveloperInspectorController,
     UiElementMetadata,
@@ -70,9 +71,9 @@ class QueryExecutor(Protocol):
 
 
 class _TaskSignals(QObject):
-    succeeded = Signal(object)
-    failed = Signal(object)
-    finished = Signal()
+    succeeded = Signal(int, object)
+    failed = Signal(int, object)
+    finished = Signal(int)
 
 
 class _QueryTask(QRunnable):
@@ -86,9 +87,11 @@ class _QueryTask(QRunnable):
         token: CancellationToken,
         host_key_approval: Callable[[DeviceTarget, HostKeyInfo], bool],
         full_scan_approval: Callable[..., bool],
+        generation: int,
     ) -> None:
         super().__init__()
         self.signals = _TaskSignals()
+        self.generation = generation
         self._executor = executor
         self._config = config
         self._request = request
@@ -111,43 +114,65 @@ class _QueryTask(QRunnable):
                 full_scan_approval=self._full_scan_approval,
             )
         except Exception as exc:
-            self.signals.failed.emit(exc)
+            self.signals.failed.emit(self.generation, exc)
         else:
-            self.signals.succeeded.emit(outcome)
+            self.signals.succeeded.emit(self.generation, outcome)
         finally:
-            self.signals.finished.emit()
+            self.signals.finished.emit(self.generation)
 
 
 class _ApprovalRequest:
-    def __init__(self, title: str, message: str) -> None:
+    def __init__(self, title: str, message: str, generation: int | None) -> None:
         self.title = title
         self.message = message
+        self.generation = generation
         self.answer = False
         self.event = threading.Event()
 
 
 class ApprovalBridge(QObject):
     requested = Signal(object)
+    dismiss_requested = Signal(object)
 
-    def __init__(self, parent: QObject | None = None) -> None:
-        super().__init__(parent)
+    def __init__(self, owner: QWidget | None = None) -> None:
+        super().__init__(owner)
+        self._owner = owner
+        self._lock = threading.Lock()
+        self._pending: set[_ApprovalRequest] = set()
+        self._dialogs: dict[_ApprovalRequest, QMessageBox] = {}
+        self._shutting_down = False
         self.requested.connect(self._show_request)
+        self.dismiss_requested.connect(self._dismiss_request)
 
-    def approve_host_key(self, target: DeviceTarget, info: HostKeyInfo) -> bool:
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+    def approve_host_key(
+        self,
+        target: DeviceTarget,
+        info: HostKeyInfo,
+        *,
+        cancel_token: CancellationToken | None = None,
+        generation: int | None = None,
+    ) -> bool:
         request = _ApprovalRequest(
             "SSH 호스트 키 승인",
             f"장비: {target.name}\n주소: {target.host}:{target.port}\n"
             f"알고리즘: {info.algorithm}\n지문: {info.sha256_fingerprint}\n\n"
             "장비의 실제 지문과 일치하는지 확인한 뒤 승인하십시오.",
+            generation,
         )
-        self.requested.emit(request)
-        request.event.wait()
-        return request.answer
+        return self._request_answer(request, cancel_token)
 
     def approve_full_scan(
         self,
         _request: QueryRequest,
         devices: tuple[DeviceTarget, ...],
+        *,
+        cancel_token: CancellationToken | None = None,
+        generation: int | None = None,
     ) -> bool:
         targets = "\n".join(f"- {device.name}: {device.host}:{device.port}" for device in devices)
         request = _ApprovalRequest(
@@ -155,26 +180,125 @@ class ApprovalBridge(QObject):
             "Source와 Destination을 MM에서 찾지 못했습니다.\n"
             "다음 활성 MD를 한 대씩 순차 조회합니다.\n\n"
             f"{targets}\n\n장비 부하와 조회 권한을 확인한 뒤 진행하십시오.",
+            generation,
         )
-        self.requested.emit(request)
-        request.event.wait()
+        return self._request_answer(request, cancel_token)
+
+    def cancel_pending(self, generation: int | None = None) -> None:
+        with self._lock:
+            requests = tuple(
+                request
+                for request in self._pending
+                if generation is None or request.generation == generation
+            )
+        for request in requests:
+            self._complete_request(request, False, dismiss=True)
+
+    def shutdown(self) -> None:
+        with self._lock:
+            self._shutting_down = True
+        self.cancel_pending()
+
+    def _request_answer(
+        self,
+        request: _ApprovalRequest,
+        cancel_token: CancellationToken | None,
+    ) -> bool:
+        if cancel_token is not None and cancel_token.is_cancelled:
+            return False
+        with self._lock:
+            if self._shutting_down:
+                return False
+            self._pending.add(request)
+
+        if cancel_token is not None and cancel_token.is_cancelled:
+            self._complete_request(request, False, dismiss=False)
+            return False
+        if QThread.currentThread() == self.thread():
+            self._show_request_blocking(request)
+        else:
+            self.requested.emit(request)
+
+        while not request.event.wait(0.05):
+            if cancel_token is not None and cancel_token.is_cancelled:
+                self._complete_request(request, False, dismiss=True)
         return request.answer
+
+    def _complete_request(
+        self,
+        request: _ApprovalRequest,
+        answer: bool,
+        *,
+        dismiss: bool,
+    ) -> bool:
+        with self._lock:
+            if request not in self._pending:
+                return False
+            self._pending.remove(request)
+            request.answer = answer
+            request.event.set()
+        if dismiss:
+            self.dismiss_requested.emit(request)
+        return True
+
+    def _show_request_blocking(self, request: _ApprovalRequest) -> None:
+        with self._lock:
+            if request not in self._pending:
+                return
+        answer = QMessageBox.question(
+            self._owner,
+            request.title,
+            request.message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        self._complete_request(
+            request,
+            answer == QMessageBox.StandardButton.Yes,
+            dismiss=False,
+        )
 
     @Slot(object)
     def _show_request(self, request: _ApprovalRequest) -> None:
-        try:
-            request.answer = (
-                QMessageBox.question(
-                    QApplication.activeWindow(),
-                    request.title,
-                    request.message,
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
-                )
-                == QMessageBox.StandardButton.Yes
+        with self._lock:
+            if request not in self._pending:
+                return
+        dialog = QMessageBox(
+            QMessageBox.Icon.Question,
+            request.title,
+            request.message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            self._owner,
+        )
+        dialog.setDefaultButton(QMessageBox.StandardButton.No)
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self._dialogs[request] = dialog
+        dialog.finished.connect(
+            lambda _result, current=request, current_dialog=dialog: self._dialog_finished(
+                current,
+                current_dialog,
             )
-        finally:
-            request.event.set()
+        )
+        with self._lock:
+            still_pending = request in self._pending
+        if not still_pending:
+            self._dismiss_request(request)
+            return
+        dialog.open()
+
+    def _dialog_finished(self, request: _ApprovalRequest, dialog: QMessageBox) -> None:
+        clicked = dialog.clickedButton()
+        yes_button = QMessageBox.StandardButton.Yes
+        answer = clicked is not None and dialog.standardButton(clicked) == yes_button
+        self._dialogs.pop(request, None)
+        self._complete_request(request, answer, dismiss=False)
+        dialog.deleteLater()
+
+    @Slot(object)
+    def _dismiss_request(self, request: _ApprovalRequest) -> None:
+        dialog = self._dialogs.get(request)
+        if dialog is not None:
+            dialog.done(QMessageBox.StandardButton.No.value)
 
 
 class MainWindow(QMainWindow):
@@ -191,10 +315,15 @@ class MainWindow(QMainWindow):
         self._executor = executor
         self._developer_inspector = developer_inspector
         self._thread_pool = QThreadPool(self)
+        self._thread_pool.setMaxThreadCount(1)
         self._approval = ApprovalBridge(self)
         self._cancel_token: CancellationToken | None = None
+        self._current_task: _QueryTask | None = None
+        self._task_generation = 0
+        self._user_cancel_generation: int | None = None
         self._query_running = False
         self._monitoring = False
+        self._closing_requested = False
         self._last_counters: dict[str, tuple[int | None, int | None]] = {}
         self._monitor_timer = QTimer(self)
         self._monitor_timer.timeout.connect(self._start_query)
@@ -942,8 +1071,12 @@ class MainWindow(QMainWindow):
     def _load_config(self) -> None:
         try:
             config = self._config_repository.load()
-        except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, "설정 읽기 실패", str(exc))
+        except (ConfigError, OSError, ValueError):
+            QMessageBox.warning(
+                self,
+                "설정 읽기 실패",
+                "설정 파일을 안전하게 읽지 못했습니다. 파일 형식과 권한을 확인하십시오.",
+            )
             return
         if config is None:
             return
@@ -983,8 +1116,12 @@ class MainWindow(QMainWindow):
         try:
             config = self._read_config_from_ui()
             self._config_repository.save(config)
-        except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, "설정 저장 실패", str(exc))
+        except (ConfigError, OSError, ValueError):
+            QMessageBox.warning(
+                self,
+                "설정 저장 실패",
+                "설정 파일을 안전하게 저장하지 못했습니다. 저장 위치의 권한을 확인하십시오.",
+            )
             return
         self.statusBar().showMessage("장비 설정을 안전하게 저장했습니다.", 5000)
 
@@ -1008,7 +1145,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _start_query(self) -> None:
-        if self._query_running:
+        if self._query_running or self._closing_requested:
             return
         if not self._monitoring:
             self._last_counters.clear()
@@ -1016,30 +1153,56 @@ class MainWindow(QMainWindow):
             config, request, credentials = self._read_query()
         except ValueError as exc:
             QMessageBox.warning(self, "입력 확인", str(exc))
-            self._stop_work()
+            self._cancel_active_work()
+            self.state_label.setText("입력 확인 필요")
             return
         self._query_running = True
-        self._cancel_token = CancellationToken()
+        self._task_generation += 1
+        generation = self._task_generation
+        token = CancellationToken()
+        self._cancel_token = token
         self._set_busy(True)
         self.state_label.setText("조회 중")
+
+        def approve_host_key(target: DeviceTarget, info: HostKeyInfo) -> bool:
+            return self._approval.approve_host_key(
+                target,
+                info,
+                cancel_token=token,
+                generation=generation,
+            )
+
+        def approve_full_scan(
+            current_request: QueryRequest,
+            devices: tuple[DeviceTarget, ...],
+        ) -> bool:
+            return self._approval.approve_full_scan(
+                current_request,
+                devices,
+                cancel_token=token,
+                generation=generation,
+            )
+
         task = _QueryTask(
             self._executor,
             config,
             request,
             credentials,
             self._monitoring,
-            self._cancel_token,
-            self._approval.approve_host_key,
-            self._approval.approve_full_scan,
+            token,
+            approve_host_key,
+            approve_full_scan,
+            generation,
         )
-        task.signals.succeeded.connect(self._display_outcome)
-        task.signals.failed.connect(self._display_failure)
+        self._current_task = task
+        task.signals.succeeded.connect(self._task_succeeded)
+        task.signals.failed.connect(self._task_failed)
         task.signals.finished.connect(self._query_finished)
         self._thread_pool.start(task)
 
     @Slot()
     def _start_monitoring(self) -> None:
-        if self._monitoring:
+        if self._monitoring or self._closing_requested:
             return
         self._last_counters.clear()
         self._monitoring = True
@@ -1051,15 +1214,61 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _stop_work(self) -> None:
+        status = "중지 요청" if self._query_running else "중지됨"
+        self._cancel_active_work(status=status, user_requested=True)
+
+    def _cancel_active_work(
+        self,
+        *,
+        status: str | None = None,
+        user_requested: bool = False,
+    ) -> None:
+        was_active = self._query_running or self._monitoring
         self._monitoring = False
         self._last_counters.clear()
         self._monitor_timer.stop()
         if self._cancel_token is not None:
             self._cancel_token.cancel()
-        self._executor.stop_monitor()
-        self.state_label.setText("중지 요청")
+        current_generation = (
+            self._current_task.generation if self._current_task is not None else None
+        )
+        if user_requested and current_generation is not None:
+            self._user_cancel_generation = current_generation
+        self._approval.cancel_pending(current_generation)
+        try:
+            self._executor.stop_monitor()
+        except Exception:
+            self.diagnostics_list.addItem(
+                "[UNEXPECTED] 모니터링 중지 정리 중 내부 오류가 발생했습니다."
+            )
+        if status is not None and was_active:
+            self.state_label.setText(status)
         self._set_monitor_inputs_enabled(True)
         self._set_busy(self._query_running)
+
+    @Slot(int, object)
+    def _task_succeeded(self, generation: int, outcome: object) -> None:
+        if (
+            not self._owns_task(generation)
+            or self._closing_requested
+            or self._user_cancel_generation == generation
+        ):
+            return
+        self._display_outcome(outcome)
+
+    @Slot(int, object)
+    def _task_failed(self, generation: int, exc: object) -> None:
+        if not self._owns_task(generation) or self._closing_requested:
+            return
+        failure = exc if isinstance(exc, Exception) else RuntimeError("invalid task failure")
+        self._display_failure(failure)
+
+    def _owns_task(self, generation: int) -> bool:
+        return (
+            self._current_task is not None
+            and self._current_task.generation == generation
+            and self._task_generation == generation
+        )
 
     @Slot(object)
     def _display_outcome(self, outcome: object) -> None:
@@ -1170,7 +1379,7 @@ class MainWindow(QMainWindow):
             self.state_label.setText("중지됨")
         elif fatal_code is not None:
             if self._monitoring:
-                self._stop_work()
+                self._cancel_active_work()
             state = {
                 "AUTH_FAILED": "인증 실패",
                 "HOST_KEY_CHANGED": "호스트 키 변경 감지",
@@ -1240,28 +1449,36 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _display_failure(self, exc: Exception) -> None:
-        code = getattr(getattr(exc, "code", None), "value", None)
-        message = str(exc) or "알 수 없는 오류가 발생했습니다."
-        self.diagnostics_list.addItem(f"[{code or 'UNEXPECTED'}] {message}")
-        self.state_label.setText("실패")
-        if code not in {"CANCELLED"}:
-            QMessageBox.warning(self, "조회 실패", f"{code + ': ' if code else ''}{message}")
-        self._stop_work()
+        code, message = _safe_query_failure(exc)
+        self._cancel_active_work()
+        self.diagnostics_list.addItem(f"[{code}] {message}")
+        self.state_label.setText("중지됨" if code == ErrorCode.CANCELLED.value else "실패")
+        if code != ErrorCode.CANCELLED.value:
+            QMessageBox.warning(self, "조회 실패", f"{code}: {message}")
 
-    @Slot()
-    def _query_finished(self) -> None:
+    @Slot(int)
+    def _query_finished(self, generation: int) -> None:
+        if not self._owns_task(generation):
+            return
+        self._approval.cancel_pending(generation)
+        user_cancelled = self._user_cancel_generation == generation
         self._query_running = False
+        self._current_task = None
+        self._user_cancel_generation = None
         self._set_busy(False)
         self._cancel_token = None
-        if self._monitoring:
+        if user_cancelled and not self._closing_requested:
+            self.state_label.setText("중지됨")
+        if self._monitoring and not self._closing_requested:
             self._monitor_timer.start()
 
     def _set_busy(self, busy: bool) -> None:
-        self.query_button.setEnabled(not busy and not self._monitoring)
-        self.stop_button.setEnabled(busy or self._monitoring)
+        interactive = not self._closing_requested
+        self.query_button.setEnabled(interactive and not busy and not self._monitoring)
+        self.stop_button.setEnabled(interactive and (busy or self._monitoring))
         if not self._monitoring:
-            self.monitor_button.setEnabled(not busy)
-        history_mutable = not busy and not self._monitoring
+            self.monitor_button.setEnabled(interactive and not busy)
+        history_mutable = interactive and not busy and not self._monitoring
         self.export_button.setEnabled(history_mutable)
         self.html_export_button.setEnabled(history_mutable)
         self.delete_button.setEnabled(history_mutable)
@@ -1289,8 +1506,10 @@ class MainWindow(QMainWindow):
     def _refresh_history(self) -> None:
         try:
             runs = self._store.list_runs(limit=100)
-        except Exception as exc:
-            self.statusBar().showMessage(f"기록 읽기 실패: {exc}", 5000)
+        except Exception:
+            self.statusBar().showMessage(
+                "기록 읽기 실패: 로컬 기록을 안전하게 읽지 못했습니다.", 5000
+            )
             return
         self.history_table.setRowCount(0)
         for run in runs:
@@ -1332,8 +1551,12 @@ class MainWindow(QMainWindow):
             return
         try:
             exported = self._store.export_run_csv(run_id, Path(destination))
-        except Exception as exc:
-            QMessageBox.warning(self, "내보내기 실패", str(exc))
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "내보내기 실패",
+                "CSV 파일을 안전하게 내보내지 못했습니다.",
+            )
             return
         QMessageBox.information(self, "내보내기 완료", str(exported))
 
@@ -1354,8 +1577,12 @@ class MainWindow(QMainWindow):
             return
         try:
             exported = self._store.export_run_html(run_id, Path(destination))
-        except Exception as exc:
-            QMessageBox.warning(self, "HTML 보고서 실패", str(exc))
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "HTML 보고서 실패",
+                "HTML 보고서를 안전하게 만들지 못했습니다.",
+            )
             return
         QMessageBox.information(self, "HTML 보고서 완료", str(exported))
 
@@ -1366,8 +1593,12 @@ class MainWindow(QMainWindow):
             return
         try:
             preview = self._store.preview_delete(run_id)
-        except Exception as exc:
-            QMessageBox.warning(self, "삭제 준비 실패", str(exc))
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "삭제 준비 실패",
+                "삭제 대상을 안전하게 확인하지 못했습니다.",
+            )
             return
         run_count = len(getattr(preview, "run_ids", ()))
         answer = QMessageBox.warning(
@@ -1386,8 +1617,12 @@ class MainWindow(QMainWindow):
             return
         try:
             self._store.delete(preview, confirmation_token=preview.confirmation_token)
-        except Exception as exc:
-            QMessageBox.warning(self, "삭제 실패", str(exc))
+        except Exception:
+            QMessageBox.warning(
+                self,
+                "삭제 실패",
+                "확인된 기록을 안전하게 삭제하지 못했습니다.",
+            )
             return
         self._refresh_history()
         self.statusBar().showMessage("선택한 기록을 삭제했습니다.", 5000)
@@ -1414,7 +1649,9 @@ class MainWindow(QMainWindow):
             application.setFont(font)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        self._stop_work()
+        self._closing_requested = True
+        self._cancel_active_work(status="중지 요청", user_requested=True)
+        self._approval.shutdown()
         if self._query_running:
             QMessageBox.information(
                 self,
@@ -1436,6 +1673,19 @@ def _optional_port(text: str, label: str) -> int | None:
     if not 0 <= value <= 65535:
         raise ValueError(f"{label}는 0~65535 범위여야 합니다.")
     return value
+
+
+def _safe_query_failure(exc: Exception) -> tuple[str, str]:
+    raw_code = getattr(getattr(exc, "code", None), "value", None)
+    known_codes = {item.value for item in ErrorCode}
+    if isinstance(exc, CollectorError) and isinstance(raw_code, str) and raw_code in known_codes:
+        return raw_code, str(exc) or "안전하게 처리할 수 없는 조회 오류가 발생했습니다."
+    if isinstance(exc, StorageError):
+        return ErrorCode.DB_WRITE_FAILED.value, "로컬 조회 기록을 안전하게 저장하지 못했습니다."
+    return (
+        "UNEXPECTED",
+        f"예상하지 못한 내부 오류가 발생했습니다. 오류 유형: {type(exc).__name__}",
+    )
 
 
 def _ui_metadata(

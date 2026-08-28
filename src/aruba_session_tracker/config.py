@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from aruba_session_tracker.models import AppConfig
+from aruba_session_tracker.paths import (
+    DirectoryIdentity,
+    UnsafeManagedPath,
+    ensure_managed_directory,
+    reject_link_or_reparse,
+    reject_managed_file_link,
+    verify_managed_directory,
+)
 
 _MAX_CONFIG_BYTES = 1024 * 1024
 _TOP_LEVEL_KEYS = frozenset(
@@ -49,25 +58,42 @@ class ConfigRepository:
     """
 
     def __init__(self, path: Path | str) -> None:
-        self.path = Path(path)
+        self.path = Path(os.path.abspath(Path(path)))
+        self._parent_identity: DirectoryIdentity | None = None
+        if os.path.lexists(self.path.parent):
+            self._verify_parent(create=False)
 
     def load(self, default: AppConfig | None = None) -> AppConfig | None:
         """Return stored settings, or ``default`` when the file does not exist."""
 
-        if not self.path.exists():
+        if not os.path.lexists(self.path):
             return default
-        if not self.path.is_file():
-            raise ConfigError("설정 경로가 일반 파일이 아닙니다.")
         try:
-            size = self.path.stat().st_size
-            if size > _MAX_CONFIG_BYTES:
+            self._verify_parent(create=False)
+            before = reject_link_or_reparse(self.path)
+            if not stat.S_ISREG(before.st_mode):
+                raise ConfigError("설정 경로가 일반 파일이 아닙니다.")
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(self.path, flags)
+            with os.fdopen(descriptor, "rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or int(opened.st_dev) != int(before.st_dev)
+                    or int(opened.st_ino) != int(before.st_ino)
+                ):
+                    raise ConfigError("설정 파일이 읽는 동안 변경되었습니다.")
+                data = stream.read(_MAX_CONFIG_BYTES + 1)
+            if len(data) > _MAX_CONFIG_BYTES:
                 raise ConfigError("설정 파일이 허용 크기(1 MiB)를 초과했습니다.")
-            text = self.path.read_text(encoding="utf-8")
+            text = data.decode("utf-8")
             value = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
             _validate_document(value)
             return AppConfig.from_dict(value)
         except ConfigError:
             raise
+        except UnsafeManagedPath as error:
+            raise ConfigError(str(error)) from error
         except (json.JSONDecodeError, KeyError, OSError, TypeError, ValueError) as error:
             raise ConfigError(f"설정 파일을 읽을 수 없습니다: {error}") from error
 
@@ -80,11 +106,9 @@ class ConfigRepository:
         _validate_document(document)
         payload = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
 
-        parent = self.path.parent
         try:
-            parent.mkdir(parents=True, exist_ok=True)
-            if self.path.exists() and not self.path.is_file():
-                raise ConfigError("설정 경로가 일반 파일이 아닙니다.")
+            parent = self._verify_parent(create=True)
+            reject_managed_file_link(self.path)
             descriptor, temporary_name = tempfile.mkstemp(
                 prefix=f".{self.path.name}.", suffix=".tmp", dir=parent
             )
@@ -94,13 +118,49 @@ class ConfigRepository:
                     stream.write(payload)
                     stream.flush()
                     os.fsync(stream.fileno())
+                self._verify_parent(create=False)
+                reject_managed_file_link(self.path)
                 os.replace(temporary_path, self.path)
+                self._verify_parent(create=False)
+                reject_managed_file_link(self.path)
+                _sync_directory(parent)
             finally:
                 temporary_path.unlink(missing_ok=True)
         except ConfigError:
             raise
+        except UnsafeManagedPath as error:
+            raise ConfigError(str(error)) from error
         except OSError as error:
             raise ConfigError(f"설정 파일을 저장할 수 없습니다: {error}") from error
+
+    def _verify_parent(self, *, create: bool) -> Path:
+        parent = self.path.parent
+        try:
+            if self._parent_identity is None:
+                if not os.path.lexists(parent) and not create:
+                    raise ConfigError("설정 파일의 상위 경로가 없습니다.")
+                absolute, identity = ensure_managed_directory(parent)
+                self._parent_identity = identity
+                if absolute != parent:
+                    self.path = absolute / self.path.name
+                    parent = absolute
+            else:
+                verify_managed_directory(parent, self._parent_identity)
+        except UnsafeManagedPath as error:
+            raise ConfigError(str(error)) from error
+        return parent
+
+
+def _sync_directory(path: Path) -> None:
+    """Persist the rename metadata where directory fsync is supported."""
+
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

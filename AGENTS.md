@@ -36,6 +36,9 @@ datapath session rows from the relevant 7240XM managed device.
 - Keep command builders, SSH, parsers, orchestration, storage, and UI separate.
 - Run `powershell -ExecutionPolicy Bypass -File .\tools\validate.ps1` before
   packaging.
+- Keep global line coverage at or above 83 percent and branch coverage for the
+  lifecycle-critical modules listed in `tools/check_coverage_policy.py` at or
+  above 65 percent. Do not lower these floors to make CI pass.
 - Build with `powershell -ExecutionPolicy Bypass -File .\build_windows.ps1`.
 - Keep real device addresses, logs, raw output, SQLite files, exports, and
   known-host files out of Git and release assets.
@@ -58,6 +61,9 @@ datapath session rows from the relevant 7240XM managed device.
 - Versioned tags and releases are immutable by workflow policy. The moving
   `continuous` prerelease may be updated only by the verified `main` workflow.
 - Every release must contain the ZIP, SHA-256 sidecar, and CycloneDX SBOM.
+- Verify release assets while draft, compare GitHub-reported SHA-256 digests,
+  re-download authenticated bytes before publish, and re-download public bytes
+  after publish. A published versioned release must never be repaired in place.
 - CI/package evidence is not live Aruba or clean field-PC evidence.
 - Automated GUI checks do not replace Windows 11 field checks for a physical
   F12/Fn Lock key, focus handling, restart-off behavior, clipboard output,

@@ -11,13 +11,16 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import msvcrt
 import os
 import re
 import socket
+import stat
 import tempfile
 import threading
-from collections.abc import Callable, Iterable
-from contextlib import AbstractContextManager, suppress
+import time
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -26,13 +29,26 @@ from typing import Any, Protocol, Self
 import paramiko
 from netmiko.aruba.aruba_os import ArubaOsSSH
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
-from paramiko.hostkeys import InvalidHostKey
+from paramiko.hostkeys import HostKeyEntry, InvalidHostKey
 
 from aruba_session_tracker.models import Credentials, DeviceTarget, ErrorCode
 from aruba_session_tracker.parsers.common import ParseError, reject_command_errors
+from aruba_session_tracker.paths import (
+    DirectoryIdentity,
+    UnsafeManagedPath,
+    ensure_managed_directory,
+    reject_link_or_reparse,
+    reject_managed_file_link,
+    verify_managed_directory,
+)
 
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_OUTPUT_LINES = 50_000
+KNOWN_HOSTS_LOCK_TIMEOUT_SECONDS = 10.0
+MAX_KNOWN_HOSTS_BYTES = 1024 * 1024
+
+_KNOWN_HOSTS_LOCKS_GUARD = threading.Lock()
+_KNOWN_HOSTS_LOCKS: dict[str, threading.Lock] = {}
 
 _GLOBAL_USER_RE = re.compile(
     r'^show global-user-table list ip "(?:25[0-5]|2[0-4]\d|1?\d?\d)'
@@ -160,7 +176,8 @@ class SSHCollector:
                 host_key_approval=host_key_approval,
                 cancel_token=token,
             )
-            with manager as connection:
+            connection = manager.__enter__()
+            try:
                 for command in requested:
                     token.raise_if_cancelled()
                     output = connection.send_command(command, read_timeout=self._command_timeout)
@@ -179,17 +196,28 @@ class SSHCollector:
                                 "장비가 세션 페이징 해제 명령을 거부했습니다.",
                             ) from exc
                     outputs.append(CommandOutput(command=command, output=output))
-        except CollectorError:
+            except BaseException as exc:
+                with suppress(Exception):
+                    manager.__exit__(type(exc), exc, exc.__traceback__)
+                raise
+            else:
+                manager.__exit__(None, None, None)
+                token.raise_if_cancelled()
+        except CollectorError as exc:
+            if token.is_cancelled and exc.retryable_network:
+                token.raise_if_cancelled()
             raise
         except (NetmikoAuthenticationException, paramiko.AuthenticationException) as exc:
             raise CollectorError(ErrorCode.AUTH_FAILED, "SSH 인증에 실패했습니다.") from exc
         except (NetmikoTimeoutException, TimeoutError) as exc:
+            token.raise_if_cancelled()
             raise CollectorError(
                 ErrorCode.MM_UNREACHABLE,
                 "SSH 연결 또는 명령 시간이 초과되었습니다.",
                 retryable_network=True,
             ) from exc
         except (OSError, paramiko.SSHException) as exc:
+            token.raise_if_cancelled()
             raise CollectorError(
                 ErrorCode.MM_UNREACHABLE,
                 "SSH 네트워크 연결에 실패했습니다.",
@@ -200,7 +228,8 @@ class SSHCollector:
 
 class _NetmikoConnectionManager(AbstractContextManager[CommandConnection]):
     def __init__(self, connection: Any) -> None:
-        self._connection = connection
+        self._connection: Any | None = connection
+        self._lock = threading.Lock()
 
     def __enter__(self) -> Self:
         return self
@@ -211,10 +240,18 @@ class _NetmikoConnectionManager(AbstractContextManager[CommandConnection]):
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            if exc_type is None:
+                raise
 
     def send_command(self, command: str, *, read_timeout: float) -> str:
-        result = self._connection.send_command(
+        with self._lock:
+            connection = self._connection
+        if connection is None:
+            raise CollectorError(ErrorCode.MM_UNREACHABLE, "SSH 연결이 이미 종료되었습니다.")
+        result = connection.send_command(
             command,
             read_timeout=read_timeout,
             strip_prompt=False,
@@ -223,7 +260,26 @@ class _NetmikoConnectionManager(AbstractContextManager[CommandConnection]):
         return str(result)
 
     def close(self) -> None:
-        self._connection.disconnect()
+        with self._lock:
+            connection = self._connection
+            self._connection = None
+        if connection is None:
+            return
+        try:
+            connection.disconnect()
+        except CollectorError:
+            raise
+        except (NetmikoTimeoutException, TimeoutError, OSError, paramiko.SSHException) as exc:
+            raise CollectorError(
+                ErrorCode.MM_UNREACHABLE,
+                "SSH 연결 정리에 실패했습니다.",
+                retryable_network=True,
+            ) from exc
+        except Exception as exc:
+            raise CollectorError(
+                ErrorCode.PROMPT_PARSE_FAILED,
+                "SSH 연결을 안전하게 정리하지 못했습니다.",
+            ) from exc
 
 
 KeyProbe = Callable[[DeviceTarget, float], paramiko.PKey]
@@ -262,11 +318,22 @@ class StrictNetmikoFactory:
         key_probe: KeyProbe | None = None,
         connector: NetmikoConnector | None = None,
     ) -> None:
-        self._known_hosts_path = Path(known_hosts_path)
+        self._known_hosts_path = Path(os.path.abspath(known_hosts_path))
         self._connect_timeout = connect_timeout
         self._key_probe = key_probe or _probe_server_key
         self._connector = connector or _connect_read_only_aruba
-        self._host_keys_lock = threading.Lock()
+        self._host_keys_lock = _known_hosts_thread_lock(self._known_hosts_path)
+        try:
+            parent, self._known_hosts_parent_identity = ensure_managed_directory(
+                self._known_hosts_path.parent
+            )
+            self._known_hosts_path = parent / self._known_hosts_path.name
+            reject_managed_file_link(self._known_hosts_path)
+        except UnsafeManagedPath as exc:
+            raise CollectorError(
+                ErrorCode.HOST_KEY_UNKNOWN,
+                "known_hosts 관리 경로를 안전하게 사용할 수 없습니다.",
+            ) from exc
 
     def connect(
         self,
@@ -279,16 +346,20 @@ class StrictNetmikoFactory:
         cancel_token.raise_if_cancelled()
         try:
             offered_key = self._key_probe(target, self._connect_timeout)
-        except CollectorError:
+        except CollectorError as exc:
+            if exc.retryable_network:
+                cancel_token.raise_if_cancelled()
             raise
         except (TimeoutError, OSError, paramiko.SSHException) as exc:
+            cancel_token.raise_if_cancelled()
             raise CollectorError(
                 ErrorCode.MM_UNREACHABLE,
                 "SSH 호스트 키 확인 연결에 실패했습니다.",
                 retryable_network=True,
             ) from exc
         cancel_token.raise_if_cancelled()
-        self._verify_or_approve(target, offered_key, host_key_approval)
+        self._verify_or_approve(target, offered_key, host_key_approval, cancel_token)
+        cancel_token.raise_if_cancelled()
 
         try:
             connection = self._connector(
@@ -315,6 +386,7 @@ class StrictNetmikoFactory:
                 "SSH 호스트 키가 변경되었습니다.",
             ) from exc
         except (NetmikoTimeoutException, TimeoutError, OSError) as exc:
+            cancel_token.raise_if_cancelled()
             raise CollectorError(
                 ErrorCode.MM_UNREACHABLE,
                 "SSH 연결 시간이 초과되었거나 장비에 연결할 수 없습니다.",
@@ -332,88 +404,260 @@ class StrictNetmikoFactory:
                     ErrorCode.HOST_KEY_CHANGED,
                     "SSH 호스트 키 검증에 실패했습니다.",
                 ) from exc
+            cancel_token.raise_if_cancelled()
             raise CollectorError(
                 ErrorCode.MM_UNREACHABLE,
                 "SSH 세션 수립에 실패했습니다.",
                 retryable_network=True,
             ) from exc
 
+        manager = _NetmikoConnectionManager(connection)
+        if cancel_token.is_cancelled:
+            with suppress(Exception):
+                manager.close()
+            cancel_token.raise_if_cancelled()
+
         if credentials.enable_secret:
             try:
+                cancel_token.raise_if_cancelled()
                 connection.enable()
             except (NetmikoAuthenticationException, ValueError) as exc:
                 with suppress(Exception):
-                    connection.disconnect()
+                    manager.close()
                 raise CollectorError(
                     ErrorCode.AUTH_FAILED,
                     "SSH Enable 인증에 실패했습니다.",
                 ) from exc
-            except (NetmikoTimeoutException, TimeoutError, OSError) as exc:
+            except (NetmikoTimeoutException, TimeoutError, OSError, paramiko.SSHException) as exc:
+                if cancel_token.is_cancelled:
+                    with suppress(Exception):
+                        manager.close()
+                    cancel_token.raise_if_cancelled()
                 with suppress(Exception):
-                    connection.disconnect()
+                    manager.close()
                 raise CollectorError(
                     ErrorCode.MM_UNREACHABLE,
                     "SSH Enable 전환 중 연결이 중단되었습니다.",
                     retryable_network=True,
                 ) from exc
-        return _NetmikoConnectionManager(connection)
+            if cancel_token.is_cancelled:
+                with suppress(Exception):
+                    manager.close()
+                cancel_token.raise_if_cancelled()
+        return manager
 
     def _verify_or_approve(
         self,
         target: DeviceTarget,
         offered_key: paramiko.PKey,
         approval: HostKeyApproval | None,
+        cancel_token: CancellationToken,
     ) -> None:
         host_token = _known_hosts_token(target)
-        with self._host_keys_lock:
-            host_keys = paramiko.HostKeys()
-            if self._known_hosts_path.exists():
-                try:
-                    host_keys.load(str(self._known_hosts_path))
-                except (OSError, paramiko.SSHException, InvalidHostKey, binascii.Error) as exc:
-                    raise CollectorError(
-                        ErrorCode.HOST_KEY_CHANGED,
-                        "known_hosts 파일을 안전하게 읽을 수 없습니다.",
-                    ) from exc
+        cancel_token.raise_if_cancelled()
+        with self._locked_host_keys(cancel_token) as host_keys:
+            if _known_key_matches(host_keys, host_token, offered_key):
+                return
 
-            known = host_keys.lookup(host_token)
-            if known is not None:
-                expected = known.get(offered_key.get_name())
-                if expected is not None and expected == offered_key:
-                    return
-                raise CollectorError(ErrorCode.HOST_KEY_CHANGED, "SSH 호스트 키가 변경되었습니다.")
-
-            info = HostKeyInfo(
-                algorithm=offered_key.get_name(),
-                sha256_fingerprint=_sha256_fingerprint(offered_key),
+        info = HostKeyInfo(
+            algorithm=offered_key.get_name(),
+            sha256_fingerprint=_sha256_fingerprint(offered_key),
+        )
+        approved = approval is not None and approval(target, info)
+        cancel_token.raise_if_cancelled()
+        if not approved:
+            raise CollectorError(
+                ErrorCode.HOST_KEY_UNKNOWN,
+                "승인되지 않은 SSH 호스트 키입니다.",
             )
-            if approval is None or not approval(target, info):
-                raise CollectorError(
-                    ErrorCode.HOST_KEY_UNKNOWN,
-                    "승인되지 않은 SSH 호스트 키입니다.",
-                )
+
+        # Approval must not hold either the process-local or cross-process lock.
+        # Reload after approval so another process cannot be overwritten.
+        with self._locked_host_keys(cancel_token) as host_keys:
+            if _known_key_matches(host_keys, host_token, offered_key):
+                return
+            cancel_token.raise_if_cancelled()
             host_keys.add(host_token, offered_key.get_name(), offered_key)
             try:
                 self._save_host_keys(host_keys)
             except OSError as exc:
-                # A local trust-store failure is not a network error and must
-                # never make MM standby failover eligible.
                 raise CollectorError(
                     ErrorCode.HOST_KEY_UNKNOWN,
                     "승인한 SSH 호스트 키를 known_hosts에 저장할 수 없습니다.",
                 ) from exc
+        cancel_token.raise_if_cancelled()
+
+    @contextmanager
+    def _locked_host_keys(
+        self,
+        cancel_token: CancellationToken,
+    ) -> Iterator[paramiko.HostKeys]:
+        try:
+            with (
+                self._host_keys_lock,
+                _known_hosts_file_lock(
+                    self._known_hosts_path,
+                    cancel_token,
+                    parent_identity=self._known_hosts_parent_identity,
+                ),
+            ):
+                self._assert_known_hosts_path()
+                try:
+                    host_keys = self._load_host_keys()
+                except (
+                    OSError,
+                    UnicodeError,
+                    paramiko.SSHException,
+                    InvalidHostKey,
+                    binascii.Error,
+                ) as exc:
+                    raise CollectorError(
+                        ErrorCode.HOST_KEY_CHANGED,
+                        "known_hosts 파일을 안전하게 읽을 수 없습니다.",
+                    ) from exc
+                yield host_keys
+        except CollectorError:
+            raise
+        except (OSError, UnsafeManagedPath) as exc:
+            raise CollectorError(
+                ErrorCode.HOST_KEY_UNKNOWN,
+                "known_hosts 잠금을 안전하게 사용할 수 없습니다.",
+            ) from exc
 
     def _save_host_keys(self, host_keys: paramiko.HostKeys) -> None:
         parent = self._known_hosts_path.parent
-        parent.mkdir(parents=True, exist_ok=True)
+        self._assert_known_hosts_path()
         file_descriptor, temporary_name = tempfile.mkstemp(prefix="known_hosts.", dir=parent)
         os.close(file_descriptor)
         temporary_path = Path(temporary_name)
         try:
             host_keys.save(str(temporary_path))
+            with temporary_path.open("r+b") as stream:
+                os.fsync(stream.fileno())
+            self._assert_known_hosts_path()
             os.replace(temporary_path, self._known_hosts_path)
+            self._assert_known_hosts_path()
         finally:
             temporary_path.unlink(missing_ok=True)
+
+    def _load_host_keys(self) -> paramiko.HostKeys:
+        host_keys = paramiko.HostKeys()
+        if not os.path.lexists(self._known_hosts_path):
+            return host_keys
+        before = reject_link_or_reparse(self._known_hosts_path)
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError("known_hosts is not a regular file")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(self._known_hosts_path, flags)
+        with os.fdopen(descriptor, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or int(opened.st_dev) != int(before.st_dev)
+                or int(opened.st_ino) != int(before.st_ino)
+            ):
+                raise OSError("known_hosts changed while opening")
+            data = stream.read(MAX_KNOWN_HOSTS_BYTES + 1)
+        if len(data) > MAX_KNOWN_HOSTS_BYTES:
+            raise OSError("known_hosts exceeds the size limit")
+        for line_number, raw_line in enumerate(data.decode("utf-8").splitlines(), 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            entry = HostKeyEntry.from_line(line, line_number)
+            if entry is None:
+                continue
+            for hostname in entry.hostnames:
+                host_keys.add(hostname, entry.key.get_name(), entry.key)
+        return host_keys
+
+    def _assert_known_hosts_path(self) -> None:
+        try:
+            verify_managed_directory(
+                self._known_hosts_path.parent,
+                self._known_hosts_parent_identity,
+            )
+            reject_managed_file_link(self._known_hosts_path)
+        except UnsafeManagedPath as exc:
+            raise CollectorError(
+                ErrorCode.HOST_KEY_UNKNOWN,
+                "known_hosts 관리 경로가 실행 중 변경되었습니다.",
+            ) from exc
+
+
+def _known_hosts_thread_lock(path: Path) -> threading.Lock:
+    key = os.path.normcase(os.path.abspath(path))
+    with _KNOWN_HOSTS_LOCKS_GUARD:
+        return _KNOWN_HOSTS_LOCKS.setdefault(key, threading.Lock())
+
+
+@contextmanager
+def _known_hosts_file_lock(
+    known_hosts_path: Path,
+    cancel_token: CancellationToken,
+    *,
+    timeout: float = KNOWN_HOSTS_LOCK_TIMEOUT_SECONDS,
+    parent_identity: DirectoryIdentity | None = None,
+) -> Iterator[None]:
+    parent = known_hosts_path.parent
+    if parent_identity is None:
+        parent, parent_identity = ensure_managed_directory(parent)
+        known_hosts_path = parent / known_hosts_path.name
+    else:
+        verify_managed_directory(parent, parent_identity)
+    lock_path = known_hosts_path.with_name(f"{known_hosts_path.name}.lock")
+    reject_managed_file_link(lock_path)
+    deadline = time.monotonic() + timeout
+    with lock_path.open("a+b") as stream:
+        verify_managed_directory(parent, parent_identity)
+        lock_info = reject_link_or_reparse(lock_path)
+        opened = os.fstat(stream.fileno())
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or int(opened.st_dev) != int(lock_info.st_dev)
+            or int(opened.st_ino) != int(lock_info.st_ino)
+        ):
+            raise UnsafeManagedPath("known_hosts 잠금 파일이 여는 동안 변경되었습니다.")
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+        acquired = False
+        try:
+            while not acquired:
+                cancel_token.raise_if_cancelled()
+                stream.seek(0)
+                try:
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                except OSError as exc:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise CollectorError(
+                            ErrorCode.HOST_KEY_UNKNOWN,
+                            "known_hosts 잠금 시간이 초과되었습니다.",
+                        ) from exc
+                    cancel_token.wait(min(0.05, remaining))
+            yield
+        finally:
+            if acquired:
+                stream.seek(0)
+                with suppress(OSError):
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def _known_key_matches(
+    host_keys: paramiko.HostKeys,
+    host_token: str,
+    offered_key: paramiko.PKey,
+) -> bool:
+    known = host_keys.lookup(host_token)
+    if known is None:
+        return False
+    expected = known.get(offered_key.get_name())
+    if expected is not None and expected == offered_key:
+        return True
+    raise CollectorError(ErrorCode.HOST_KEY_CHANGED, "SSH 호스트 키가 변경되었습니다.")
 
 
 def _known_hosts_token(target: DeviceTarget) -> str:
@@ -427,12 +671,16 @@ def _sha256_fingerprint(key: paramiko.PKey) -> str:
 
 def _probe_server_key(target: DeviceTarget, timeout: float) -> paramiko.PKey:
     sock = socket.create_connection((target.host, target.port), timeout=timeout)
-    transport = paramiko.Transport(sock)
+    transport: paramiko.Transport | None = None
     try:
+        transport = paramiko.Transport(sock)
         transport.start_client(timeout=timeout)
         return transport.get_remote_server_key()
     finally:
-        transport.close()
+        if transport is not None:
+            transport.close()
+        else:
+            sock.close()
 
 
 def _validate_command(command: str) -> None:

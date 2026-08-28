@@ -143,38 +143,345 @@ jobs:
           $sha = "$zip.sha256"
           $sbom = Join-Path $releaseRoot "ArubaSessionTracker_v${env:RELEASE_VERSION}_sbom.cdx.json"
           $notes = Join-Path $releaseRoot "release-notes-v${env:RELEASE_VERSION}.md"
+          $assetPaths = @($zip, $sha, $sbom)
+          $markerPrefix = "<!-- aruba-session-tracker-continuous:"
+          $marker = "$markerPrefix$env:EXPECTED_COMMIT -->"
+          $canonicalAssetPattern = '^ArubaSessionTracker_v\d+\.\d+\.\d+_(windows_x64\.zip(\.sha256)?|sbom\.cdx\.json)$'
+          $temporaryAssetPattern = '^(previous-\d+|candidate-[0-9a-fA-F]{12})--ArubaSessionTracker_v\d+\.\d+\.\d+_(windows_x64\.zip(\.sha256)?|sbom\.cdx\.json)$'
+          $ownedNotes = Join-Path $env:RUNNER_TEMP "continuous-release-notes.md"
+          $notesText = (Get-Content -LiteralPath $notes -Raw).TrimEnd()
+          Set-Content -LiteralPath $ownedNotes -Encoding utf8 -Value "$notesText`n`n$marker`n"
 
-          $releaseListJson = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100"
-          if ($LASTEXITCODE -ne 0) { throw "Could not inspect existing releases." }
-          $matchingReleases = @(
-            $releaseListJson | ConvertFrom-Json | Where-Object { $_.tag_name -eq "continuous" }
-          )
-          if ($matchingReleases.Count -gt 1) {
-            throw "More than one continuous release was returned."
+          function Get-ContinuousReleaseOrNull {
+            $errorPath = Join-Path $env:RUNNER_TEMP "continuous-release-lookup-error.txt"
+            $json = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/continuous" 2> $errorPath
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -eq 0) { return ($json | ConvertFrom-Json) }
+            $errorText = if (Test-Path -LiteralPath $errorPath) {
+              Get-Content -LiteralPath $errorPath -Raw
+            } else { "" }
+            if ($errorText -match '(?i)HTTP 404') { return $null }
+            throw "Could not inspect the exact continuous release tag endpoint."
           }
 
-          if ($matchingReleases.Count -eq 0) {
-            gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/continuous" *> $null
-            if ($LASTEXITCODE -eq 0) {
-              gh api -X PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/continuous" `
-                -f "sha=$env:EXPECTED_COMMIT" -F force=true *> $null
-            } else {
-              gh api -X POST "repos/$env:GITHUB_REPOSITORY/git/refs" `
-                -f "ref=refs/tags/continuous" -f "sha=$env:EXPECTED_COMMIT" *> $null
+          function Get-ContinuousTagOrNull {
+            $errorPath = Join-Path $env:RUNNER_TEMP "continuous-tag-lookup-error.txt"
+            $json = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/continuous" 2> $errorPath
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -eq 0) { return ($json | ConvertFrom-Json) }
+            $errorText = if (Test-Path -LiteralPath $errorPath) {
+              Get-Content -LiteralPath $errorPath -Raw
+            } else { "" }
+            if ($errorText -match '(?i)HTTP 404') { return $null }
+            throw "Could not inspect the exact continuous tag reference."
+          }
+
+          function Assert-MainStillExpected {
+            $json = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/heads/main"
+            if ($LASTEXITCODE -ne 0) { throw "Could not recheck current main." }
+            $mainRef = $json | ConvertFrom-Json
+            if (
+              $mainRef.object.type -ne "commit" -or
+              -not [string]::Equals(
+                [string]$mainRef.object.sha,
+                $env:EXPECTED_COMMIT,
+                [StringComparison]::OrdinalIgnoreCase
+              )
+            ) {
+              throw "A newer main commit exists; this continuous build will not publish."
             }
-            if ($LASTEXITCODE -ne 0) { throw "Could not prepare the continuous tag." }
-            gh release create continuous $zip $sha $sbom `
-              --repo $env:GITHUB_REPOSITORY `
-              --verify-tag `
-              --prerelease `
-              --title "Aruba Session Tracker continuous" `
-              --notes-file $notes
-            if ($LASTEXITCODE -ne 0) { throw "Could not publish continuous prerelease." }
+          }
+
+          function Assert-ContinuousTagAt([string]$Expected) {
+            $tagRef = Get-ContinuousTagOrNull
+            if (
+              $null -eq $tagRef -or $tagRef.object.type -ne "commit" -or
+              -not [string]::Equals(
+                [string]$tagRef.object.sha, $Expected, [StringComparison]::OrdinalIgnoreCase
+              )
+            ) {
+              throw "The continuous tag does not resolve directly to the expected commit."
+            }
+          }
+
+          $assetArguments = @()
+          foreach ($assetPath in $assetPaths) {
+            $assetArguments += @(
+              "--asset", "$([IO.Path]::GetFileName($assetPath))=$assetPath"
+            )
+          }
+
+          $release = Get-ContinuousReleaseOrNull
+          $tagBefore = Get-ContinuousTagOrNull
+          if ($null -eq $release -and $null -ne $tagBefore) {
+            throw "The continuous tag exists without an associated release; refusing to take ownership."
+          }
+
+          if ($null -eq $release -or $release.draft -eq $true) {
+            # A pre-existing draft is mutable only when its body proves workflow
+            # ownership. Reserved-looking asset names never substitute for the marker.
+            if (
+              $null -ne $release -and
+              -not ([string]$release.body).Contains($markerPrefix)
+            ) {
+              throw "The existing continuous draft is not owned by this workflow."
+            }
+            if ($null -ne $release) {
+              $unexpectedDraftAssets = @(
+                $release.assets | Where-Object {
+                  $_.name -notmatch $canonicalAssetPattern -and
+                  $_.name -notmatch $temporaryAssetPattern
+                }
+              )
+              if ($unexpectedDraftAssets.Count -ne 0) {
+                throw "The workflow-owned continuous draft contains an unexpected asset."
+              }
+            }
+
+            $initialPublishVerified = $false
+            try {
+              if ($null -eq $release) {
+                # The create-release API binds tag_name and target_commitish in
+                # one server operation and returns the draft id for cleanup.
+                $createPayloadPath = Join-Path $env:RUNNER_TEMP "continuous-create.json"
+                @{
+                  tag_name = "continuous"
+                  target_commitish = $env:EXPECTED_COMMIT
+                  name = "Aruba Session Tracker continuous"
+                  body = Get-Content -LiteralPath $ownedNotes -Raw
+                  draft = $true
+                  prerelease = $true
+                  make_latest = "false"
+                } | ConvertTo-Json -Depth 5 |
+                  Set-Content -LiteralPath $createPayloadPath -Encoding utf8
+                $createdJson = gh api -X POST `
+                  "repos/$env:GITHUB_REPOSITORY/releases" `
+                  --input $createPayloadPath
+                if ($LASTEXITCODE -ne 0) { throw "Could not create continuous release draft." }
+                $release = $createdJson | ConvertFrom-Json
+                if (
+                  $release.tag_name -ne "continuous" -or $release.draft -ne $true -or
+                  -not ([string]$release.body).Contains($marker)
+                ) {
+                  throw "The create-release response did not prove the owned draft."
+                }
+              } else {
+                gh release edit continuous `
+                  --repo $env:GITHUB_REPOSITORY `
+                  --target $env:EXPECTED_COMMIT `
+                  --draft `
+                  --prerelease `
+                  --title "Aruba Session Tracker continuous" `
+                  --notes-file $ownedNotes
+                if ($LASTEXITCODE -ne 0) { throw "Could not refresh the owned continuous draft." }
+              }
+
+              $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/$($release.id)" |
+                ConvertFrom-Json
+              if ($LASTEXITCODE -ne 0) { throw "Could not refresh the owned draft." }
+              foreach ($ownedAsset in @(
+                $release.assets | Where-Object {
+                  $_.name -match $canonicalAssetPattern -or
+                  $_.name -match $temporaryAssetPattern
+                }
+              )) {
+                gh api -X DELETE `
+                  "repos/$env:GITHUB_REPOSITORY/releases/assets/$($ownedAsset.id)" *> $null
+                if ($LASTEXITCODE -ne 0) { throw "Could not clean an owned draft asset." }
+              }
+              foreach ($assetPath in $assetPaths) {
+                gh release upload continuous $assetPath --repo $env:GITHUB_REPOSITORY
+                if ($LASTEXITCODE -ne 0) { throw "Could not upload a continuous draft asset." }
+              }
+
+              $releaseJsonPath = Join-Path $env:RUNNER_TEMP "continuous-draft.json"
+              $draftJson = gh api "repos/$env:GITHUB_REPOSITORY/releases/$($release.id)"
+              if ($LASTEXITCODE -ne 0) { throw "Could not inspect the prepared continuous draft." }
+              Set-Content -LiteralPath $releaseJsonPath -Encoding utf8 -Value $draftJson
+              & python tools/check_remote_release.py `
+                --release-json $releaseJsonPath `
+                --tag continuous `
+                --expected-commit $env:EXPECTED_COMMIT `
+                --state draft `
+                --required-marker $marker `
+                @assetArguments
+              if ($LASTEXITCODE -ne 0) { throw "Continuous draft verification failed." }
+
+              $downloadRoot = Join-Path $env:RUNNER_TEMP "continuous-initial-download"
+              New-Item -ItemType Directory -Force -Path $downloadRoot | Out-Null
+              foreach ($assetPath in $assetPaths) {
+                $name = [IO.Path]::GetFileName($assetPath)
+                gh release download continuous `
+                  --repo $env:GITHUB_REPOSITORY `
+                  --dir $downloadRoot `
+                  --clobber `
+                  --pattern $name
+                if ($LASTEXITCODE -ne 0) { throw "Could not download a continuous draft asset." }
+                if (
+                  (Get-FileHash -LiteralPath (Join-Path $downloadRoot $name) -Algorithm SHA256).Hash -ne
+                  (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash
+                ) {
+                  throw "A continuous draft download differs from its verified input."
+                }
+              }
+
+              Assert-MainStillExpected
+              # Delay tag creation/movement until every hidden draft asset has
+              # passed the exact contract and authenticated download check.
+              $currentTag = Get-ContinuousTagOrNull
+              if ($null -eq $currentTag) {
+                gh api -X POST "repos/$env:GITHUB_REPOSITORY/git/refs" `
+                  -f "ref=refs/tags/continuous" -f "sha=$env:EXPECTED_COMMIT" *> $null
+              } elseif (
+                $currentTag.object.type -ne "commit" -or
+                -not [string]::Equals(
+                  [string]$currentTag.object.sha,
+                  $env:EXPECTED_COMMIT,
+                  [StringComparison]::OrdinalIgnoreCase
+                )
+              ) {
+                gh api -X PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/continuous" `
+                  -f "sha=$env:EXPECTED_COMMIT" -F force=true *> $null
+              }
+              if ($LASTEXITCODE -ne 0) { throw "Could not align the draft tag provenance." }
+              Assert-ContinuousTagAt $env:EXPECTED_COMMIT
+              gh release edit continuous `
+                --repo $env:GITHUB_REPOSITORY `
+                --target $env:EXPECTED_COMMIT `
+                --draft=false `
+                --prerelease `
+                --title "Aruba Session Tracker continuous" `
+                --notes-file $ownedNotes
+              if ($LASTEXITCODE -ne 0) { throw "Could not publish continuous prerelease." }
+              Assert-ContinuousTagAt $env:EXPECTED_COMMIT
+
+              $published = Get-ContinuousReleaseOrNull
+              if ($null -eq $published -or [int64]$published.id -ne [int64]$release.id) {
+                throw "The tag endpoint did not return the published continuous release."
+              }
+              $published | ConvertTo-Json -Depth 20 |
+                Set-Content -LiteralPath $releaseJsonPath -Encoding utf8
+              & python tools/check_remote_release.py `
+                --release-json $releaseJsonPath `
+                --tag continuous `
+                --expected-commit $env:EXPECTED_COMMIT `
+                --state published `
+                --required-marker $marker `
+                @assetArguments
+              if ($LASTEXITCODE -ne 0) { throw "Published continuous release verification failed." }
+              foreach ($assetPath in $assetPaths) {
+                $name = [IO.Path]::GetFileName($assetPath)
+                $remote = @($published.assets | Where-Object { $_.name -eq $name })
+                $publicPath = Join-Path $env:RUNNER_TEMP "public-$name"
+                Invoke-WebRequest -Uri $remote[0].browser_download_url -OutFile $publicPath
+                if (
+                  (Get-FileHash -LiteralPath $publicPath -Algorithm SHA256).Hash -ne
+                  (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash
+                ) {
+                  throw "A public continuous download differs from its verified input."
+                }
+              }
+              $initialPublishVerified = $true
+            }
+            catch {
+              $primaryError = $_
+              if (-not $initialPublishVerified) {
+                try {
+                  $ownedDraftRetained = $false
+                  $currentRelease = $null
+                  if ($null -ne $release -and [int64]$release.id -gt 0) {
+                    $currentJson = gh api `
+                      "repos/$env:GITHUB_REPOSITORY/releases/$($release.id)" 2> $null
+                    if ($LASTEXITCODE -eq 0) {
+                      $currentRelease = $currentJson | ConvertFrom-Json
+                    }
+                  }
+                  if ($null -eq $currentRelease) {
+                    $currentRelease = Get-ContinuousReleaseOrNull
+                  }
+                  if ($null -ne $currentRelease) {
+                    gh release edit continuous --repo $env:GITHUB_REPOSITORY --draft
+                    if ($LASTEXITCODE -ne 0) { throw "Could not hide the failed initial release." }
+                    $ownedDraftRetained = $true
+                    $currentRelease = gh api `
+                      "repos/$env:GITHUB_REPOSITORY/releases/$($currentRelease.id)" |
+                      ConvertFrom-Json
+                    foreach ($ownedAsset in @(
+                      $currentRelease.assets | Where-Object {
+                        $_.name -match $canonicalAssetPattern -or
+                        $_.name -match $temporaryAssetPattern
+                      }
+                    )) {
+                      gh api -X DELETE `
+                        "repos/$env:GITHUB_REPOSITORY/releases/assets/$($ownedAsset.id)" *> $null
+                      if ($LASTEXITCODE -ne 0) { throw "Could not clean a failed draft asset." }
+                    }
+                  }
+                  if ($null -ne $tagBefore) {
+                    gh api -X PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/continuous" `
+                      -f "sha=$($tagBefore.object.sha)" -F force=true *> $null
+                    if ($LASTEXITCODE -ne 0) { throw "Could not restore the prior draft tag." }
+                  } elseif ($ownedDraftRetained) {
+                    $failedTag = Get-ContinuousTagOrNull
+                    if ($null -eq $failedTag) {
+                      gh api -X POST "repos/$env:GITHUB_REPOSITORY/git/refs" `
+                        -f "ref=refs/tags/continuous" `
+                        -f "sha=$env:EXPECTED_COMMIT" *> $null
+                      if ($LASTEXITCODE -ne 0) { throw "Could not retain the owned draft tag." }
+                    } elseif (
+                      $failedTag.object.type -ne "commit" -or
+                      -not [string]::Equals(
+                        [string]$failedTag.object.sha,
+                        $env:EXPECTED_COMMIT,
+                        [StringComparison]::OrdinalIgnoreCase
+                      )
+                    ) {
+                      gh api -X PATCH `
+                        "repos/$env:GITHUB_REPOSITORY/git/refs/tags/continuous" `
+                        -f "sha=$env:EXPECTED_COMMIT" -F force=true *> $null
+                      if ($LASTEXITCODE -ne 0) { throw "Could not realign the owned draft tag." }
+                    }
+                  } else {
+                    $failedTag = Get-ContinuousTagOrNull
+                    if (
+                      $null -ne $failedTag -and $failedTag.object.type -eq "commit" -and
+                      [string]::Equals(
+                        [string]$failedTag.object.sha,
+                        $env:EXPECTED_COMMIT,
+                        [StringComparison]::OrdinalIgnoreCase
+                      )
+                    ) {
+                      gh api -X DELETE `
+                        "repos/$env:GITHUB_REPOSITORY/git/refs/tags/continuous" *> $null
+                      if ($LASTEXITCODE -ne 0) { throw "Could not clean the failed draft tag." }
+                    }
+                  }
+                }
+                catch {
+                  throw "Initial continuous publish failed and cleanup also failed: $($primaryError.Exception.Message); $($_.Exception.Message)"
+                }
+              }
+              throw $primaryError
+            }
           } else {
-            $release = $matchingReleases[0]
+            if ($release.draft -ne $false -or $release.prerelease -ne $true) {
+              throw "The existing continuous release is not a published prerelease."
+            }
+            if (-not ([string]$release.body).Contains($markerPrefix)) {
+              throw "The published continuous release is not owned by this workflow."
+            }
+            if ($null -eq $tagBefore -or $tagBefore.object.type -ne "commit") {
+              throw "The continuous tag is not a direct commit reference."
+            }
+            $oldCommit = [string]$tagBefore.object.sha
+            $oldTitle = [string]$release.name
+            $oldNotes = Join-Path $env:RUNNER_TEMP "prior-continuous-notes.md"
+            Set-Content -LiteralPath $oldNotes -Encoding utf8 -Value ([string]$release.body)
             $shortCommit = $env:EXPECTED_COMMIT.Substring(0, 12).ToLowerInvariant()
             $candidateRoot = Join-Path $releaseRoot "continuous-staging"
+            $rollbackRoot = Join-Path $env:RUNNER_TEMP "continuous-rollback"
             New-Item -ItemType Directory -Force -Path $candidateRoot | Out-Null
+            New-Item -ItemType Directory -Force -Path $rollbackRoot | Out-Null
             $assetMap = @(
               [pscustomobject]@{
                 Canonical = [IO.Path]::GetFileName($zip)
@@ -182,6 +489,11 @@ jobs:
                 Candidate = "candidate-${shortCommit}--$([IO.Path]::GetFileName($zip))"
                 CandidatePath = $null
                 CandidateId = 0
+                OldId = 0
+                OldName = $null
+                OldBackup = $null
+                PreviousName = $null
+                Pattern = '^ArubaSessionTracker_v\d+\.\d+\.\d+_windows_x64\.zip$'
               },
               [pscustomobject]@{
                 Canonical = [IO.Path]::GetFileName($sha)
@@ -189,6 +501,11 @@ jobs:
                 Candidate = "candidate-${shortCommit}--$([IO.Path]::GetFileName($sha))"
                 CandidatePath = $null
                 CandidateId = 0
+                OldId = 0
+                OldName = $null
+                OldBackup = $null
+                PreviousName = $null
+                Pattern = '^ArubaSessionTracker_v\d+\.\d+\.\d+_windows_x64\.zip\.sha256$'
               },
               [pscustomobject]@{
                 Canonical = [IO.Path]::GetFileName($sbom)
@@ -196,92 +513,288 @@ jobs:
                 Candidate = "candidate-${shortCommit}--$([IO.Path]::GetFileName($sbom))"
                 CandidatePath = $null
                 CandidateId = 0
+                OldId = 0
+                OldName = $null
+                OldBackup = $null
+                PreviousName = $null
+                Pattern = '^ArubaSessionTracker_v\d+\.\d+\.\d+_sbom\.cdx\.json$'
               }
             )
             foreach ($item in $assetMap) {
+              $old = @($release.assets | Where-Object { $_.name -match $item.Pattern })
+              if ($old.Count -ne 1) {
+                throw "The prior continuous release does not have one canonical asset per type."
+              }
+              $item.OldId = [int64]$old[0].id
+              $item.OldName = [string]$old[0].name
+              $item.OldBackup = Join-Path $rollbackRoot $item.OldName
+              $item.PreviousName = "previous-$($old[0].id)--$($old[0].name)"
               $item.CandidatePath = Join-Path $candidateRoot $item.Candidate
               Copy-Item -LiteralPath $item.Source -Destination $item.CandidatePath -Force
             }
-
-            # Candidate uploads never replace the public canonical assets.
-            foreach ($stale in @($release.assets)) {
-              if ($assetMap.Candidate -contains $stale.name) {
-                gh api -X DELETE `
-                  "repos/$env:GITHUB_REPOSITORY/releases/assets/$($stale.id)" *> $null
-                if ($LASTEXITCODE -ne 0) { throw "Could not remove a stale candidate asset." }
+            $recognizedOldIds = @($assetMap.OldId)
+            $unexpectedPublicAssets = @(
+              $release.assets | Where-Object {
+                $recognizedOldIds -notcontains $_.id -and
+                $_.name -notmatch $temporaryAssetPattern
               }
+            )
+            if ($unexpectedPublicAssets.Count -ne 0) {
+              throw "The prior continuous release contains an unexpected public asset."
             }
-            $candidatePaths = @($assetMap.CandidatePath)
-            & gh release upload continuous @candidatePaths --repo $env:GITHUB_REPOSITORY
-            if ($LASTEXITCODE -ne 0) { throw "Could not upload continuous candidate assets." }
 
-            $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/$($release.id)" |
-              ConvertFrom-Json
-            if ($LASTEXITCODE -ne 0) { throw "Could not verify continuous candidate assets." }
+            # Download rollback bytes before any mutation. They are re-uploaded
+            # if any hidden candidate/swap/publish verification step fails.
             foreach ($item in $assetMap) {
-              $candidate = @($release.assets | Where-Object { $_.name -eq $item.Candidate })
+              gh release download continuous `
+                --repo $env:GITHUB_REPOSITORY `
+                --dir $rollbackRoot `
+                --clobber `
+                --pattern $item.OldName
+              if ($LASTEXITCODE -ne 0) { throw "Could not retain a prior continuous asset." }
+              $remote = @($release.assets | Where-Object { $_.id -eq $item.OldId })[0]
               if (
-                $candidate.Count -ne 1 -or
-                [int64]$candidate[0].size -ne [int64](Get-Item -LiteralPath $item.Source).Length
+                [int64]$remote.size -ne [int64](Get-Item -LiteralPath $item.OldBackup).Length -or
+                -not [string]::Equals(
+                  [string]$remote.digest,
+                  "sha256:$((Get-FileHash -LiteralPath $item.OldBackup -Algorithm SHA256).Hash.ToLowerInvariant())",
+                  [StringComparison]::OrdinalIgnoreCase
+                )
               ) {
-                throw "A continuous candidate asset failed its size/uniqueness check."
+                throw "A retained prior continuous asset failed its size/digest check."
               }
-              $item.CandidateId = [int64]$candidate[0].id
             }
 
-            # Hide the release only for the pointer swap. Every prior asset is
-            # renamed, not deleted, until the new public release is verified.
-            gh release edit continuous --repo $env:GITHUB_REPOSITORY --draft
-            if ($LASTEXITCODE -ne 0) { throw "Could not stage the continuous release update." }
-            foreach ($item in $assetMap) {
-              foreach ($old in @($release.assets | Where-Object { $_.name -eq $item.Canonical })) {
-                $previousName = "previous-$($old.id)--$($item.Canonical)"
+            $draftTransitioned = $false
+            $newReleaseVerified = $false
+            try {
+              # Hide the published release before deleting stale temporaries or
+              # uploading any candidate. No workflow-reserved asset is public.
+              gh release edit continuous --repo $env:GITHUB_REPOSITORY --draft
+              if ($LASTEXITCODE -ne 0) { throw "Could not stage the continuous release update." }
+              $draftTransitioned = $true
+
+              $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/$($release.id)" |
+                ConvertFrom-Json
+              if ($LASTEXITCODE -ne 0 -or $release.draft -ne $true) {
+                throw "Could not verify the continuous draft transition."
+              }
+              foreach ($temporary in @(
+                $release.assets | Where-Object { $_.name -match $temporaryAssetPattern }
+              )) {
+                gh api -X DELETE `
+                  "repos/$env:GITHUB_REPOSITORY/releases/assets/$($temporary.id)" *> $null
+                if ($LASTEXITCODE -ne 0) {
+                  throw "Could not recover a temporary continuous asset from a prior run."
+                }
+              }
+
+              $candidatePaths = @($assetMap.CandidatePath)
+              & gh release upload continuous @candidatePaths --repo $env:GITHUB_REPOSITORY
+              if ($LASTEXITCODE -ne 0) { throw "Could not upload continuous candidate assets." }
+              $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/$($release.id)" |
+                ConvertFrom-Json
+              if ($LASTEXITCODE -ne 0) { throw "Could not verify continuous candidate assets." }
+              foreach ($item in $assetMap) {
+                $candidate = @($release.assets | Where-Object { $_.name -eq $item.Candidate })
+                if (
+                  $candidate.Count -ne 1 -or
+                  [int64]$candidate[0].size -ne [int64](Get-Item -LiteralPath $item.Source).Length -or
+                  -not [string]::Equals(
+                    [string]$candidate[0].digest,
+                    "sha256:$((Get-FileHash -LiteralPath $item.Source -Algorithm SHA256).Hash.ToLowerInvariant())",
+                    [StringComparison]::OrdinalIgnoreCase
+                  )
+                ) {
+                  throw "A continuous candidate asset failed its size/digest check."
+                }
+                $item.CandidateId = [int64]$candidate[0].id
+              }
+
+              $candidateDownloadRoot = Join-Path $env:RUNNER_TEMP "continuous-candidate-download"
+              New-Item -ItemType Directory -Force -Path $candidateDownloadRoot | Out-Null
+              foreach ($item in $assetMap) {
+                gh release download continuous `
+                  --repo $env:GITHUB_REPOSITORY `
+                  --dir $candidateDownloadRoot `
+                  --clobber `
+                  --pattern $item.Candidate
+                if ($LASTEXITCODE -ne 0) { throw "Could not download a continuous candidate." }
+                $downloaded = Join-Path $candidateDownloadRoot $item.Candidate
+                if (
+                  (Get-FileHash -LiteralPath $downloaded -Algorithm SHA256).Hash -ne
+                  (Get-FileHash -LiteralPath $item.Source -Algorithm SHA256).Hash
+                ) {
+                  throw "An authenticated continuous candidate download differs."
+                }
+              }
+
+              foreach ($item in $assetMap) {
                 gh api -X PATCH `
-                  "repos/$env:GITHUB_REPOSITORY/releases/assets/$($old.id)" `
-                  -f "name=$previousName" *> $null
+                  "repos/$env:GITHUB_REPOSITORY/releases/assets/$($item.OldId)" `
+                  -f "name=$($item.PreviousName)" *> $null
                 if ($LASTEXITCODE -ne 0) { throw "Could not preserve a prior continuous asset." }
+                gh api -X PATCH `
+                  "repos/$env:GITHUB_REPOSITORY/releases/assets/$($item.CandidateId)" `
+                  -f "name=$($item.Canonical)" *> $null
+                if ($LASTEXITCODE -ne 0) { throw "Could not promote a continuous candidate asset." }
               }
-              gh api -X PATCH `
-                "repos/$env:GITHUB_REPOSITORY/releases/assets/$($item.CandidateId)" `
-                -f "name=$($item.Canonical)" *> $null
-              if ($LASTEXITCODE -ne 0) { throw "Could not promote a continuous candidate asset." }
-            }
 
-            gh api -X PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/continuous" `
-              -f "sha=$env:EXPECTED_COMMIT" -F force=true *> $null
-            if ($LASTEXITCODE -ne 0) { throw "Could not advance the continuous tag." }
-            gh release edit continuous `
-              --repo $env:GITHUB_REPOSITORY `
-              --target $env:EXPECTED_COMMIT `
-              --draft=false `
-              --prerelease `
-              --title "Aruba Session Tracker continuous" `
-              --notes-file $notes
-            if ($LASTEXITCODE -ne 0) { throw "Could not publish updated continuous metadata." }
-
-            $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/$($release.id)" |
-              ConvertFrom-Json
-            if (
-              $LASTEXITCODE -ne 0 -or $release.draft -ne $false -or
-              $release.prerelease -ne $true
-            ) {
-              throw "Updated continuous release state could not be verified."
-            }
-            foreach ($item in $assetMap) {
-              $published = @($release.assets | Where-Object { $_.name -eq $item.Canonical })
-              if (
-                $published.Count -ne 1 -or
-                [int64]$published[0].size -ne [int64](Get-Item -LiteralPath $item.Source).Length
-              ) {
-                throw "A published continuous asset failed its size/uniqueness check."
-              }
-            }
-            $keepNames = @($assetMap.Canonical)
-            foreach ($asset in @($release.assets)) {
-              if ($keepNames -notcontains $asset.name) {
+              # Previous bytes were retained locally and are removed while the
+              # release is still a draft, before any new bytes become public.
+              foreach ($item in $assetMap) {
                 gh api -X DELETE `
-                  "repos/$env:GITHUB_REPOSITORY/releases/assets/$($asset.id)" *> $null
-                if ($LASTEXITCODE -ne 0) { throw "Could not remove a stale continuous asset." }
+                  "repos/$env:GITHUB_REPOSITORY/releases/assets/$($item.OldId)" *> $null
+                if ($LASTEXITCODE -ne 0) { throw "Could not remove a prior continuous asset." }
               }
+
+              gh release edit continuous `
+                --repo $env:GITHUB_REPOSITORY `
+                --target $env:EXPECTED_COMMIT `
+                --draft `
+                --prerelease `
+                --title "Aruba Session Tracker continuous" `
+                --notes-file $ownedNotes
+              if ($LASTEXITCODE -ne 0) { throw "Could not update continuous draft metadata." }
+
+              $releaseJsonPath = Join-Path $env:RUNNER_TEMP "continuous-release.json"
+              $draftJson = gh api "repos/$env:GITHUB_REPOSITORY/releases/$($release.id)"
+              if ($LASTEXITCODE -ne 0) { throw "Could not inspect the final continuous draft." }
+              Set-Content -LiteralPath $releaseJsonPath -Encoding utf8 -Value $draftJson
+              & python tools/check_remote_release.py `
+                --release-json $releaseJsonPath `
+                --tag continuous `
+                --expected-commit $env:EXPECTED_COMMIT `
+                --state draft `
+                --required-marker $marker `
+                @assetArguments
+              if ($LASTEXITCODE -ne 0) { throw "Final continuous draft contract failed." }
+
+              Assert-MainStillExpected
+              gh api -X PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/continuous" `
+                -f "sha=$env:EXPECTED_COMMIT" -F force=true *> $null
+              if ($LASTEXITCODE -ne 0) { throw "Could not advance the continuous tag." }
+              # Re-resolve immediately before publish so release metadata, tag,
+              # and verified assets cannot silently diverge.
+              Assert-ContinuousTagAt $env:EXPECTED_COMMIT
+              gh release edit continuous `
+                --repo $env:GITHUB_REPOSITORY `
+                --target $env:EXPECTED_COMMIT `
+                --draft=false `
+                --prerelease `
+                --title "Aruba Session Tracker continuous" `
+                --notes-file $ownedNotes
+              if ($LASTEXITCODE -ne 0) { throw "Could not publish updated continuous metadata." }
+              Assert-ContinuousTagAt $env:EXPECTED_COMMIT
+
+              $published = Get-ContinuousReleaseOrNull
+              if ($null -eq $published -or [int64]$published.id -ne [int64]$release.id) {
+                throw "The exact tag endpoint returned a different continuous release."
+              }
+              $published | ConvertTo-Json -Depth 20 |
+                Set-Content -LiteralPath $releaseJsonPath -Encoding utf8
+              & python tools/check_remote_release.py `
+                --release-json $releaseJsonPath `
+                --tag continuous `
+                --expected-commit $env:EXPECTED_COMMIT `
+                --state published `
+                --required-marker $marker `
+                @assetArguments
+              if ($LASTEXITCODE -ne 0) { throw "Final continuous release contract failed." }
+              foreach ($item in $assetMap) {
+                $remote = @($published.assets | Where-Object { $_.name -eq $item.Canonical })
+                $publicPath = Join-Path $env:RUNNER_TEMP "public-$($item.Canonical)"
+                Invoke-WebRequest -Uri $remote[0].browser_download_url -OutFile $publicPath
+                if (
+                  (Get-FileHash -LiteralPath $publicPath -Algorithm SHA256).Hash -ne
+                  (Get-FileHash -LiteralPath $item.Source -Algorithm SHA256).Hash
+                ) {
+                  throw "A public continuous download differs from the verified asset."
+                }
+              }
+              # This flag is intentionally last: prior assets are gone and the
+              # final exact release contract plus public bytes have succeeded.
+              $newReleaseVerified = $true
+            }
+            catch {
+              $primaryError = $_
+              if ($draftTransitioned -and -not $newReleaseVerified) {
+                try {
+                  gh release edit continuous --repo $env:GITHUB_REPOSITORY --draft
+                  if ($LASTEXITCODE -ne 0) { throw "Could not hide continuous for rollback." }
+                  $current = gh api "repos/$env:GITHUB_REPOSITORY/releases/$($release.id)" |
+                    ConvertFrom-Json
+                  if ($LASTEXITCODE -ne 0) { throw "Could not inspect continuous for rollback." }
+                  $unexpectedRollbackAssets = @(
+                    $current.assets | Where-Object {
+                      $_.name -notmatch $canonicalAssetPattern -and
+                      $_.name -notmatch $temporaryAssetPattern
+                    }
+                  )
+                  if ($unexpectedRollbackAssets.Count -ne 0) {
+                    throw "Rollback found an unexpected continuous asset."
+                  }
+                  foreach ($ownedAsset in @($current.assets)) {
+                    gh api -X DELETE `
+                      "repos/$env:GITHUB_REPOSITORY/releases/assets/$($ownedAsset.id)" *> $null
+                    if ($LASTEXITCODE -ne 0) { throw "Could not clear a failed continuous asset." }
+                  }
+                  $oldBackupPaths = @($assetMap.OldBackup)
+                  & gh release upload continuous @oldBackupPaths --repo $env:GITHUB_REPOSITORY
+                  if ($LASTEXITCODE -ne 0) { throw "Could not restore prior continuous assets." }
+                  gh api -X PATCH "repos/$env:GITHUB_REPOSITORY/git/refs/tags/continuous" `
+                    -f "sha=$oldCommit" -F force=true *> $null
+                  if ($LASTEXITCODE -ne 0) { throw "Could not restore the prior continuous tag." }
+                  Assert-ContinuousTagAt $oldCommit
+                  gh release edit continuous `
+                    --repo $env:GITHUB_REPOSITORY `
+                    --target $oldCommit `
+                    --draft=false `
+                    --prerelease `
+                    --title $oldTitle `
+                    --notes-file $oldNotes
+                  if ($LASTEXITCODE -ne 0) { throw "Could not republish the prior continuous release." }
+                  Assert-ContinuousTagAt $oldCommit
+                  $restored = Get-ContinuousReleaseOrNull
+                  if ($null -eq $restored -or [int64]$restored.id -ne [int64]$release.id) {
+                    throw "Could not resolve the restored continuous release."
+                  }
+                  $restoredNames = @($restored.assets.name | Sort-Object)
+                  $expectedOldNames = @($assetMap.OldName | Sort-Object)
+                  if (Compare-Object $restoredNames $expectedOldNames) {
+                    throw "The restored continuous release does not have the exact prior asset set."
+                  }
+                  foreach ($item in $assetMap) {
+                    $remote = @($restored.assets | Where-Object { $_.name -eq $item.OldName })
+                    if (
+                      $remote.Count -ne 1 -or
+                      [int64]$remote[0].size -ne [int64](Get-Item -LiteralPath $item.OldBackup).Length -or
+                      -not [string]::Equals(
+                        [string]$remote[0].digest,
+                        "sha256:$((Get-FileHash -LiteralPath $item.OldBackup -Algorithm SHA256).Hash.ToLowerInvariant())",
+                        [StringComparison]::OrdinalIgnoreCase
+                      )
+                    ) {
+                      throw "A restored prior continuous asset failed its exact contract."
+                    }
+                    $restoredPublicPath = Join-Path `
+                      $env:RUNNER_TEMP "restored-$($item.OldName)"
+                    Invoke-WebRequest `
+                      -Uri $remote[0].browser_download_url `
+                      -OutFile $restoredPublicPath
+                    if (
+                      (Get-FileHash -LiteralPath $restoredPublicPath -Algorithm SHA256).Hash -ne
+                      (Get-FileHash -LiteralPath $item.OldBackup -Algorithm SHA256).Hash
+                    ) {
+                      throw "A restored public continuous download differs from its prior bytes."
+                    }
+                  }
+                }
+                catch {
+                  gh release edit continuous --repo $env:GITHUB_REPOSITORY --draft *> $null
+                  throw "Continuous update failed and rollback also failed: $($primaryError.Exception.Message); $($_.Exception.Message)"
+                }
+              }
+              throw $primaryError
             }
           }

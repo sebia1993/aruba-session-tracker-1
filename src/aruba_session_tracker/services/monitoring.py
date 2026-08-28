@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 
@@ -25,6 +26,8 @@ from .tracker import (
     RawSnapshot,
     TrackerService,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class LifecycleEventType(StrEnum):
@@ -119,6 +122,17 @@ class _ActiveSession:
         )
 
 
+@dataclass(slots=True)
+class _PreparedMonitorPoll:
+    owner_id: int
+    generation: int
+    result: MonitorPollResult
+    location_snapshot: LocationSnapshot | None
+    last_location_refresh: float | None
+    consecutive_misses: int
+    active: dict[str, _ActiveSession]
+
+
 class MonitorEngine:
     """Poll at MD cadence, refresh MM at location cadence, and emit lifecycle events."""
 
@@ -148,10 +162,13 @@ class MonitorEngine:
         self._cancel_token: CancellationToken | None = None
         self._lock = threading.RLock()
         self._last_result: MonitorPollResult | None = None
+        self._prepare_generation = 0
+        self._prepared_generation: int | None = None
 
     @property
     def is_running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
 
     @property
     def last_result(self) -> MonitorPollResult | None:
@@ -159,82 +176,187 @@ class MonitorEngine:
             return self._last_result
 
     def poll_once(self, *, cancel_token: CancellationToken | None = None) -> MonitorPollResult:
+        prepared = self._prepare_for_persistence(cancel_token=cancel_token)
+        try:
+            return self._commit_prepared(prepared)
+        except BaseException:
+            self._discard_prepared(prepared)
+            raise
+
+    def _prepare_for_persistence(
+        self,
+        *,
+        cancel_token: CancellationToken | None = None,
+    ) -> _PreparedMonitorPoll:
+        """Query and calculate a poll without changing committed monitor state."""
         token = cancel_token or CancellationToken()
+        with self._lock:
+            if self._prepared_generation is not None:
+                raise RuntimeError("모니터링 조회가 이미 진행 중입니다.")
+            self._prepare_generation += 1
+            generation = self._prepare_generation
+            self._prepared_generation = generation
+            location_snapshot = self._location_snapshot
+            last_location_refresh = self._last_location_refresh
+            consecutive_misses = self._consecutive_misses
+            active = _clone_active(self._active)
+
+        try:
+            return self._calculate_prepared_poll(
+                token,
+                generation=generation,
+                location_snapshot=location_snapshot,
+                last_location_refresh=last_location_refresh,
+                consecutive_misses=consecutive_misses,
+                active=active,
+            )
+        except BaseException:
+            with self._lock:
+                if self._prepared_generation == generation:
+                    self._prepared_generation = None
+            raise
+
+    def _calculate_prepared_poll(
+        self,
+        token: CancellationToken,
+        *,
+        generation: int,
+        location_snapshot: LocationSnapshot | None,
+        last_location_refresh: float | None,
+        consecutive_misses: int,
+        active: dict[str, _ActiveSession],
+    ) -> _PreparedMonitorPoll:
         now_monotonic = self._monotonic_clock()
         refresh = (
-            self._location_snapshot is None
-            or self._last_location_refresh is None
-            or now_monotonic - self._last_location_refresh
+            location_snapshot is None
+            or last_location_refresh is None
+            or now_monotonic - last_location_refresh
             >= self._service.config.location_interval_seconds
         )
-        outcome = self._query(token, refresh=refresh)
+        outcome = self._query(token, refresh=refresh, location_snapshot=location_snapshot)
         if refresh and outcome.used_mm is not None:
-            self._remember_locations(outcome, now_monotonic)
+            location_snapshot = outcome.location_snapshot
+            last_location_refresh = now_monotonic
 
         if outcome.authoritative:
             observed_flows = {_flow_key(item) for item in outcome.observations}
             second_miss_pending = any(
-                flow_key not in observed_flows and active.miss_count + 1 == 2
-                for flow_key, active in self._active.items()
+                flow_key not in observed_flows and item.miss_count + 1 == 2
+                for flow_key, item in active.items()
             )
             # Refresh MM on the second authoritative MISS of any active flow.
             # This also covers a moved flow while another matched flow remains.
             if second_miss_pending and not refresh:
-                refreshed = self._query(token, refresh=True)
+                refreshed = self._query(
+                    token,
+                    refresh=True,
+                    location_snapshot=location_snapshot,
+                )
                 outcome = _merge_outcomes(outcome, refreshed)
                 refresh = True
                 if refreshed.used_mm is not None:
-                    self._remember_locations(refreshed, now_monotonic)
+                    location_snapshot = refreshed.location_snapshot
+                    last_location_refresh = now_monotonic
 
         events: list[LifecycleEvent] = []
         if outcome.observations:
-            self._consecutive_misses = 0
+            consecutive_misses = 0
         elif outcome.authoritative:
-            self._consecutive_misses += 1
+            consecutive_misses += 1
         # Positive observations are useful even from a partial multi-device
         # poll; only an authoritative absence may advance MISS/CLOSED state.
         events.extend(
             self._apply_observations(
+                active,
                 outcome.observations,
                 absence_is_authoritative=outcome.authoritative,
             )
         )
-
-        for event in events:
-            if self._callback is not None:
-                self._callback(event)
-
         result = MonitorPollResult(
             outcome=outcome,
             events=tuple(events),
-            active_sessions=tuple(item.snapshot() for item in self._active.values()),
-            consecutive_misses=self._consecutive_misses,
+            active_sessions=tuple(item.snapshot() for item in active.values()),
+            consecutive_misses=consecutive_misses,
             refreshed_location=refresh,
         )
+        return _PreparedMonitorPoll(
+            owner_id=id(self),
+            generation=generation,
+            result=result,
+            location_snapshot=location_snapshot,
+            last_location_refresh=last_location_refresh,
+            consecutive_misses=consecutive_misses,
+            active=active,
+        )
+
+    def _commit_prepared(self, prepared: _PreparedMonitorPoll) -> MonitorPollResult:
+        """Commit exactly the poll prepared by this engine and emit its callbacks."""
         with self._lock:
-            self._last_result = result
-        return result
+            self._validate_prepared_locked(prepared)
+            self._location_snapshot = prepared.location_snapshot
+            self._last_location_refresh = prepared.last_location_refresh
+            self._consecutive_misses = prepared.consecutive_misses
+            self._active = prepared.active
+            self._last_result = prepared.result
+        try:
+            for event in prepared.result.events:
+                if self._callback is not None:
+                    try:
+                        self._callback(event)
+                    except Exception as exc:
+                        # Persistence and monitor state are already committed.  A
+                        # notification consumer must not turn that successful
+                        # poll into an apparent failure or make it replayable.
+                        _LOGGER.warning(
+                            "Lifecycle callback failed after commit (%s).",
+                            type(exc).__name__,
+                        )
+            return prepared.result
+        finally:
+            with self._lock:
+                if self._prepared_generation == prepared.generation:
+                    self._prepared_generation = None
+
+    def _discard_prepared(self, prepared: _PreparedMonitorPoll) -> None:
+        """Release an uncommitted poll after persistence or caller failure."""
+        with self._lock:
+            if prepared.owner_id != id(self):
+                raise RuntimeError("다른 모니터링 실행의 조회 결과입니다.")
+            if self._prepared_generation == prepared.generation:
+                self._prepared_generation = None
+
+    def _validate_prepared_locked(self, prepared: _PreparedMonitorPoll) -> None:
+        if prepared.owner_id != id(self) or self._prepared_generation != prepared.generation:
+            raise RuntimeError("현재 모니터링 조회와 일치하지 않는 결과입니다.")
 
     def run(self, cancel_token: CancellationToken | None = None) -> None:
         token = cancel_token or CancellationToken()
-        while not token.is_cancelled:
-            self.poll_once(cancel_token=token)
-            if token.wait(self._service.config.session_interval_seconds):
-                break
+        current_thread = threading.current_thread()
+        try:
+            while not token.is_cancelled:
+                self.poll_once(cancel_token=token)
+                if token.wait(self._service.config.session_interval_seconds):
+                    break
+        finally:
+            with self._lock:
+                if self._thread is current_thread and self._cancel_token is token:
+                    self._thread = None
+                    self._cancel_token = None
 
     def start(self) -> None:
         with self._lock:
-            if self.is_running:
+            if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError("모니터링이 이미 실행 중입니다.")
             token = CancellationToken()
-            self._cancel_token = token
-            self._thread = threading.Thread(
+            thread = threading.Thread(
                 target=self.run,
                 args=(token,),
                 name="aruba-session-monitor",
                 daemon=True,
             )
-            self._thread.start()
+            self._cancel_token = token
+            self._thread = thread
+            thread.start()
 
     def stop(self, *, wait: bool = True, timeout: float = 10.0) -> None:
         with self._lock:
@@ -244,23 +366,31 @@ class MonitorEngine:
             token.cancel()
         if wait and thread is not None and thread is not threading.current_thread():
             thread.join(timeout)
+        with self._lock:
+            if thread is not None and self._thread is thread and not thread.is_alive():
+                self._thread = None
+                if self._cancel_token is token:
+                    self._cancel_token = None
 
-    def _query(self, token: CancellationToken, *, refresh: bool) -> QueryOutcome:
+    def _query(
+        self,
+        token: CancellationToken,
+        *,
+        refresh: bool,
+        location_snapshot: LocationSnapshot | None,
+    ) -> QueryOutcome:
         return self._service.query_once(
             self._request,
             self._credentials,
             full_scan_approval=self._full_scan_approval,
             cancel_token=token,
-            location_snapshot=self._location_snapshot,
+            location_snapshot=location_snapshot,
             refresh_locations=refresh,
         )
 
-    def _remember_locations(self, outcome: QueryOutcome, refreshed_at: float) -> None:
-        self._location_snapshot = outcome.location_snapshot
-        self._last_location_refresh = refreshed_at
-
     def _apply_observations(
         self,
+        active_sessions: dict[str, _ActiveSession],
         observations: tuple[SessionObservation, ...],
         *,
         absence_is_authoritative: bool,
@@ -270,7 +400,7 @@ class MonitorEngine:
         events: list[LifecycleEvent] = []
 
         for flow_key, observation in observed_by_flow.items():
-            active = self._active.get(flow_key)
+            active = active_sessions.get(flow_key)
             if active is None:
                 active = _ActiveSession(
                     instance_id=str(uuid.uuid4()),
@@ -280,7 +410,7 @@ class MonitorEngine:
                     miss_count=0,
                     observation=observation,
                 )
-                self._active[flow_key] = active
+                active_sessions[flow_key] = active
                 events.append(
                     LifecycleEvent(
                         LifecycleEventType.STARTED,
@@ -339,7 +469,7 @@ class MonitorEngine:
                     )
                 )
 
-        for flow_key, active in tuple(self._active.items()):
+        for flow_key, active in tuple(active_sessions.items()):
             if flow_key in observed_by_flow:
                 continue
             if not absence_is_authoritative:
@@ -360,8 +490,22 @@ class MonitorEngine:
                 )
             )
             if event_type == LifecycleEventType.CLOSED:
-                del self._active[flow_key]
+                del active_sessions[flow_key]
         return events
+
+
+def _clone_active(active: dict[str, _ActiveSession]) -> dict[str, _ActiveSession]:
+    return {
+        flow_key: _ActiveSession(
+            instance_id=item.instance_id,
+            flow_key=item.flow_key,
+            first_seen=item.first_seen,
+            last_seen=item.last_seen,
+            miss_count=item.miss_count,
+            observation=item.observation,
+        )
+        for flow_key, item in active.items()
+    }
 
 
 def _flow_key(observation: SessionObservation) -> str:
@@ -380,13 +524,37 @@ def _flow_key(observation: SessionObservation) -> str:
 def _merge_outcomes(first: QueryOutcome, second: QueryOutcome) -> QueryOutcome:
     """Retain first-pass evidence while the refreshed pass determines authority/data."""
     observations = {_flow_key(item): item for item in first.observations}
-    observations.update({_flow_key(item): item for item in second.observations})
+    second_observations = {_flow_key(item): item for item in second.observations}
+    superseded_keys = {
+        item.session_key
+        for flow_key, item in observations.items()
+        if flow_key in second_observations
+    }
+    observations.update(second_observations)
+    first_remaining = {item.session_key: item for item in first.observations}
+    first_raw_snapshots: list[RawSnapshot] = []
+    for snapshot in first.raw_snapshots:
+        keys = snapshot.observation_keys
+        if keys is None:
+            keys = tuple(
+                key
+                for key, item in first_remaining.items()
+                if item.controller_name == snapshot.device_name
+            )
+        for key in keys:
+            first_remaining.pop(key, None)
+        first_raw_snapshots.append(
+            replace(
+                snapshot,
+                observation_keys=tuple(key for key in keys if key not in superseded_keys),
+            )
+        )
     return QueryOutcome(
         observations=tuple(observations.values()),
         diagnostics=first.diagnostics + second.diagnostics,
         used_mm=second.used_mm or first.used_mm,
         controllers=tuple(dict.fromkeys(first.controllers + second.controllers)),
-        raw_snapshots=first.raw_snapshots + second.raw_snapshots,
+        raw_snapshots=tuple(first_raw_snapshots) + second.raw_snapshots,
         source_location=second.source_location,
         destination_location=second.destination_location,
         full_scan_eligible=second.full_scan_eligible,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 
 from aruba_session_tracker.collectors import (
@@ -52,6 +52,11 @@ class RawSnapshot:
     command: str
     output: str = field(repr=False)
     observed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    observation_keys: tuple[str, ...] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,7 +173,29 @@ class TrackerService:
         full_scan = locations.full_scan_eligible
         if full_scan:
             approval = full_scan_approval or self._callbacks.full_scan_approval
-            if approval is None or not approval(request, enabled_devices):
+            approved = (
+                not token.is_cancelled
+                and approval is not None
+                and approval(request, enabled_devices)
+            )
+            if token.is_cancelled:
+                diagnostics.append(
+                    DiagnosticEvent(
+                        stage="MD_SCAN",
+                        code=ErrorCode.CANCELLED,
+                        message="작업이 취소되었습니다.",
+                    )
+                )
+                return QueryOutcome(
+                    diagnostics=tuple(diagnostics),
+                    used_mm=locations.used_mm,
+                    raw_snapshots=tuple(raw_snapshots),
+                    source_location=source_location,
+                    destination_location=destination_location,
+                    full_scan_eligible=locations.full_scan_eligible,
+                    authoritative=False,
+                )
+            if not approved:
                 diagnostics.append(
                     DiagnosticEvent(
                         stage="MD_SCAN",
@@ -233,14 +260,20 @@ class TrackerService:
                     )
                 )
                 authoritative = False
-                if exc.code in {ErrorCode.AUTH_FAILED, ErrorCode.CANCELLED}:
+                if exc.code in {
+                    ErrorCode.AUTH_FAILED,
+                    ErrorCode.CANCELLED,
+                    ErrorCode.HOST_KEY_CHANGED,
+                    ErrorCode.HOST_KEY_UNKNOWN,
+                }:
                     break
                 continue
 
             controllers.append(device.name)
             command = build_datapath_session_command(filter_ip)
             output = batch.output_for(command)
-            raw_snapshots.append(RawSnapshot(device.name, command, output))
+            snapshot_index = len(raw_snapshots)
+            raw_snapshots.append(RawSnapshot(device.name, command, output, observation_keys=()))
             try:
                 parsed = parse_datapath_sessions(
                     output,
@@ -257,9 +290,17 @@ class TrackerService:
                 )
                 authoritative = False
                 continue
+            matched_keys: list[str] = []
             for observation in parsed:
                 if request.matches(observation):
-                    observations.setdefault(observation.session_key, observation)
+                    key = observation.session_key
+                    if key not in observations:
+                        observations[key] = observation
+                        matched_keys.append(key)
+            raw_snapshots[snapshot_index] = replace(
+                raw_snapshots[snapshot_index],
+                observation_keys=tuple(dict.fromkeys(matched_keys)),
+            )
 
         if not observations and authoritative:
             diagnostics.append(
@@ -343,7 +384,9 @@ class TrackerService:
         for client_ip in (request.source_ip, request.destination_ip):
             command = build_global_user_command(client_ip)
             output = batch.output_for(command)
-            raw_snapshots.append(RawSnapshot(selected_mm.name, command, output))
+            raw_snapshots.append(
+                RawSnapshot(selected_mm.name, command, output, observation_keys=())
+            )
             try:
                 lookup = parse_global_user_table(output, client_ip=client_ip)
             except ParseError as exc:
