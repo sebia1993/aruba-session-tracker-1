@@ -1,0 +1,5 @@
+Datapath Session Table Entries
+------------------------------
+Source IP or MAC Destination IP Prot SPort DPort Cntr Prio ToS Age Destination TAge Packets Bytes Flags CPU ID
+---------------- ---------------- ---- ----- ----- ---- ---- --- --- ----------- ---- ------- ----- ----- ------
+192.0.2.10 203.0.113.20 6 54321 443 0/0 0 0 12 local 0 10

@@ -1,0 +1,46 @@
+# Generated for CPython 3.13 x64 on Windows.
+# Direct requirements: requirements.txt
+# Every transitive dependency is pinned to the exact downloaded wheel hash.
+--only-binary=:all:
+--require-hashes
+
+bcrypt==5.0.0 \
+    --hash=sha256:64ee8434b0da054d830fa8e89e1c8bf30061d539044a39524ff7dec90481e5c2
+cffi==2.1.1 \
+    --hash=sha256:1aa5645c30469b09530c4ebca77ebf8f17618293c58f8549cb1a543a50236e7d
+cryptography==50.0.1 \
+    --hash=sha256:aed8db4f6d71c51efb89530e12d9464e7bf2923d46c3205dc794a2a93f8c0648
+invoke==3.0.3 \
+    --hash=sha256:f11327165e5cbb89b2ad1d88d3292b5113332c43b8553b494da435d6ec6f5053
+markdown-it-py==4.2.0 \
+    --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a
+mdurl==0.1.2 \
+    --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8
+netmiko==4.6.0 \
+    --hash=sha256:0c9b7309005d2c8a010b275f3494628cadb1658a8841632131c848074b7cdadb
+ntc-templates==9.2.0 \
+    --hash=sha256:b94ea1221e6814e65bd5233ad6b4060e5e6ef1f6c7efec54dbae68592c0c86bd
+paramiko==5.0.0 \
+    --hash=sha256:b7044611c30140d9a75261653210e2002977b71a0497ff3ba0d98d7edbf62f7c
+pycparser==3.0 \
+    --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
+Pygments==2.21.0 \
+    --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9
+PyNaCl==1.6.2 \
+    --hash=sha256:62985f233210dee6548c223301b6c25440852e13d59a8b81490203c3227c5ba0
+pyserial==3.5 \
+    --hash=sha256:c4451db6ba391ca6ca299fb3ec7bae67a5c55dde170964c7a14ceefec02f2cf0
+PySide6-Essentials==6.11.0 \
+    --hash=sha256:3b3362882ad9389357a80504e600180006a957731fec05786fced7b038461fdf
+PyYAML==6.0.3 \
+    --hash=sha256:79005a0d97d5ddabfeeea4cf676af11e647e41d81c9a7722a193022accdb6b7c
+rich==15.0.0 \
+    --hash=sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb
+ruamel.yaml==0.19.1 \
+    --hash=sha256:27592957fedf6e0b62f281e96effd28043345e0e66001f97683aa9a40c667c93
+scp==0.16.1 \
+    --hash=sha256:52d48423ffb0d22afcec738d66c2c8d5865ab9b45e040a7508789f58b39533fe
+shiboken6==6.11.0 \
+    --hash=sha256:483ff78a73c7b3189ca924abc694318084f078bcfeaffa68e32024ff2d025ee1
+textfsm==2.1.0 \
+    --hash=sha256:55886490474890fa09ade0e8c9555a913fd325724842293364dc44ea705b3616

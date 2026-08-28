@@ -1,0 +1,21 @@
+{
+  "mm_primary": {
+    "name": "MM-Conductor",
+    "host": "192.0.2.10",
+    "port": 22
+  },
+  "mm_standby": {
+    "name": "MM-Standby",
+    "host": "192.0.2.11",
+    "port": 22
+  },
+  "managed_devices": [
+    {"name": "MD-01", "host": "198.51.100.21", "port": 22, "enabled": true},
+    {"name": "MD-02", "host": "198.51.100.22", "port": 22, "enabled": true},
+    {"name": "MD-03", "host": "198.51.100.23", "port": 22, "enabled": true},
+    {"name": "MD-04", "host": "198.51.100.24", "port": 22, "enabled": true}
+  ],
+  "session_interval_seconds": 5,
+  "location_interval_seconds": 30,
+  "close_after_misses": 3
+}

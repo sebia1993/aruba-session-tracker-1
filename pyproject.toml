@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools==84.0.0", "wheel==0.46.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aruba-session-tracker"
+version = "0.1.0"
+description = "Read-only Aruba AOS 8 datapath session tracker for Windows 11."
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+license = { file = "LICENSE" }
+authors = [{ name = "sebia1993" }]
+dependencies = [
+  "netmiko==4.6.0",
+  "paramiko==5.0.0",
+  "PySide6-Essentials==6.11.0",
+]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows :: Windows 11",
+  "Programming Language :: Python :: 3.13",
+]
+
+[project.scripts]
+aruba-session-tracker = "aruba_session_tracker.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+  "gui: Qt GUI test",
+  "integration: local fake integration test",
+  "windows: Windows-only test",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["aruba_session_tracker"]
+
+[tool.coverage.report]
+fail_under = 75
+show_missing = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "SIM", "RUF"]
+ignore = ["S101"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+packages = ["aruba_session_tracker"]
+
+[[tool.mypy.overrides]]
+module = ["netmiko", "netmiko.*", "paramiko", "paramiko.*"]
+ignore_missing_imports = true
