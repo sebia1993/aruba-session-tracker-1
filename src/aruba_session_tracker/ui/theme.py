@@ -598,8 +598,8 @@ def _configure_guidance(window: MainWindow) -> None:
     window.username_edit.setPlaceholderText("SSH 사용자 이름")
     window.source_ip_edit.setPlaceholderText("예: 192.0.2.10")
     window.destination_ip_edit.setPlaceholderText("예: 203.0.113.20")
-    window.source_port_edit.setPlaceholderText("0–65535")
-    window.destination_port_edit.setPlaceholderText("0–65535")
+    window.source_port_edit.setPlaceholderText("0-65535")
+    window.destination_port_edit.setPlaceholderText("0-65535")
     window.mm_primary_host.setPlaceholderText("Primary MM IPv4")
     window.mm_standby_host.setPlaceholderText("Standby MM IPv4")
 
