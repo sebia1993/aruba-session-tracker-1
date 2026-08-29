@@ -113,6 +113,18 @@ def test_report_smoke_writes_standalone_html_to_korean_path(tmp_path: Path) -> N
     text = destination.read_text(encoding="utf-8")
     assert "<!doctype html>" in text.casefold()
     assert "한국어-MD" in text
+    assert "최신 세션 결과" in text
+    assert "세션별 수치 변화" in text
+    assert "전체 추적 이력" in text
+    assert "KST" in text
+    assert "PACKAGE-RAW-CANARY" not in text
+    assert "PACKAGE-DIAGNOSTIC-CANARY" not in text
+    assert "PARSE_PARTIAL" not in text
+    assert "report-smoke" not in text
+    assert text.index("최신 세션 결과") < text.index("세션별 수치 변화")
+    assert text.index("세션별 수치 변화") < text.index("전체 추적 이력")
+    assert "<details>" in text
+    assert "<details open" not in text
     assert "https://" not in text.casefold()
     assert "http://" not in text.casefold()
 

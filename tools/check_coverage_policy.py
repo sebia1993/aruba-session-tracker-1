@@ -24,6 +24,7 @@ CRITICAL_BRANCH_FLOORS = {
     "src/aruba_session_tracker/collectors/ssh.py": 0.65,
     "src/aruba_session_tracker/services/monitoring.py": 0.65,
     "src/aruba_session_tracker/services/tracker.py": 0.65,
+    "src/aruba_session_tracker/storage/html_report.py": 0.65,
     "src/aruba_session_tracker/storage/session_store.py": 0.65,
     "src/aruba_session_tracker/ui/main_window.py": 0.65,
 }

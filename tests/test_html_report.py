@@ -13,73 +13,96 @@ from aruba_session_tracker.storage import (
 )
 
 
+def _observation(
+    *,
+    observed_at: str = "2026-08-28T08:01:00.000Z",
+    controller_name: str = "서울-MD-01",
+    controller_host: str = "198.51.100.21",
+    protocol: int = 6,
+    source_ip: str = "192.0.2.100",
+    destination_ip: str = "203.0.113.80",
+    source_port: int = 53000,
+    destination_port: int = 443,
+    packets: int | None = 12,
+    bytes_count: int | None = 2048,
+) -> dict[str, object]:
+    return {
+        "observed_at": observed_at,
+        "controller_name": controller_name,
+        "controller_host": controller_host,
+        "protocol": protocol,
+        "source_ip": source_ip,
+        "destination_ip": destination_ip,
+        "source_port": source_port,
+        "destination_port": destination_port,
+        "packets": packets,
+        "bytes_count": bytes_count,
+        "age": 2,
+        "flags": "DY",
+        "cpu_id": 1,
+        "session_key": (
+            f"{controller_host}|{protocol}|{source_ip}|{destination_ip}|"
+            f"{source_port}|{destination_port}"
+        ),
+    }
+
+
 def _snapshot(
     *,
     run: dict[str, object] | None = None,
     observations: tuple[dict[str, object], ...] | None = None,
     observation_history: tuple[dict[str, object], ...] | None = None,
+    lifecycle_events: tuple[dict[str, object], ...] | None = None,
     diagnostics: tuple[dict[str, object], ...] | None = None,
     observation_total: int | None = None,
-    unique_session_total: int | None = None,
-    lifecycle_total: int | None = None,
-    controller_total: int | None = None,
-    diagnostic_total: int | None = None,
-    raw_file_total: int | None = None,
 ) -> RunReportSnapshot:
-    run_row = run or {
-        "id": "run-report-001",
-        "started_at": "2026-08-28T08:00:00.000Z",
-        "ended_at": "2026-08-28T08:05:00.000Z",
-        "source_ip": "192.0.2.100",
-        "destination_ip": "203.0.113.80",
-        "source_port": 53000,
-        "destination_port": 443,
-        "bidirectional": 1,
-        "status": "COMPLETED",
-    }
-    observation_rows = observations or (
-        {
-            "observed_at": "2026-08-28T08:01:00.000Z",
-            "controller_name": "서울-MD-01",
-            "controller_host": "198.51.100.21",
-            "protocol": 6,
+    run_row = (
+        run
+        if run is not None
+        else {
+            "id": "run-report-001",
+            "started_at": "2026-08-28T08:00:00.000Z",
+            "ended_at": "2026-08-28T08:05:00.000Z",
             "source_ip": "192.0.2.100",
             "destination_ip": "203.0.113.80",
             "source_port": 53000,
             "destination_port": 443,
-            "packets": 12,
-            "bytes_count": 2048,
-            "age": 2,
-            "flags": "DY",
-            "cpu_id": 1,
-            "session_key": "stable-session-key",
-        },
+            "bidirectional": 1,
+            "status": "COMPLETED",
+        }
     )
+    observation_rows = observations if observations is not None else (_observation(),)
+    history_rows = observation_rows if observation_history is None else observation_history
+    default_session_key = str(observation_rows[0]["session_key"]) if observation_rows else ""
     lifecycle_rows = (
-        {
-            "occurred_at": "2026-08-28T08:01:00.000Z",
-            "session_key": "stable-session-key",
-            "instance_id": "instance-001",
-            "event_type": "OPENED",
-            "controller_name": "서울-MD-01",
-            "details_json": '{"miss_count": 0, "previous_flags": "F"}',
-        },
+        lifecycle_events
+        if lifecycle_events is not None
+        else (
+            (
+                {
+                    "occurred_at": "2026-08-28T08:01:00.000Z",
+                    "session_key": default_session_key,
+                    "instance_id": "instance-001",
+                    "event_type": "STARTED",
+                    "controller_name": "서울-MD-01",
+                    "details_json": '{"miss_count": 0}',
+                },
+            )
+            if observation_rows
+            else ()
+        )
     )
-    controller_rows = (
-        {
-            "occurred_at": "2026-08-28T08:02:00.000Z",
-            "previous_controller": "서울-MD-01",
-            "current_controller": "서울-MD-02",
-            "reason": "CURRENT_SWITCH_CHANGED",
-        },
-    )
-    diagnostic_rows = diagnostics or (
-        {
-            "occurred_at": "2026-08-28T08:03:00.000Z",
-            "stage": "md-query",
-            "code": "SESSION_NOT_FOUND",
-            "message": "다음 조회에서 다시 확인하십시오.",
-        },
+    diagnostic_rows = (
+        diagnostics
+        if diagnostics is not None
+        else (
+            {
+                "occurred_at": "2026-08-28T08:03:00.000Z",
+                "stage": "MD_QUERY",
+                "code": "SESSION_NOT_FOUND",
+                "message": "보고서에 표시하면 안 되는 진단 메시지",
+            },
+        )
     )
     raw_rows = (
         {
@@ -92,44 +115,53 @@ def _snapshot(
             "relative_path": "must-not-be-rendered.txt",
             "raw_text": "RAW-BODY-MUST-NOT-BE-RENDERED",
         },
-        {
-            "id": 42,
-            "captured_at": "2026-08-28T08:01:00.000Z",
-            "kind": "session",
-            "controller_name": "서울-MD-01",
-            "sha256": "b" * 64,
-            "byte_size": 2048,
-        },
     )
     return RunReportSnapshot(
         run=run_row,
-        controllers=("MM-주장비", "서울-MD-01", "서울-MD-02"),
+        controllers=("MM-주장비", "서울-MD-01"),
         mm_controllers=("MM-주장비",),
-        md_controllers=("서울-MD-01", "서울-MD-02"),
+        md_controllers=("서울-MD-01",),
         observations=observation_rows,
-        observation_total=(
-            len(observation_rows) if observation_total is None else observation_total
-        ),
-        unique_session_total=(
-            len(observation_rows) if unique_session_total is None else unique_session_total
-        ),
+        observation_total=(len(history_rows) if observation_total is None else observation_total),
+        unique_session_total=len(observation_rows),
         lifecycle_events=lifecycle_rows,
-        lifecycle_total=(len(lifecycle_rows) if lifecycle_total is None else lifecycle_total),
-        lifecycle_counts=(("OPENED", 1),),
-        controller_events=controller_rows,
-        controller_total=(len(controller_rows) if controller_total is None else controller_total),
-        diagnostics=diagnostic_rows,
-        diagnostic_total=(len(diagnostic_rows) if diagnostic_total is None else diagnostic_total),
-        raw_files=raw_rows,
-        raw_file_total=(len(raw_rows) if raw_file_total is None else raw_file_total),
-        raw_byte_total=3072,
-        observation_history=(
-            observation_rows if observation_history is None else observation_history
+        lifecycle_total=len(lifecycle_rows),
+        lifecycle_counts=(("STARTED", 1),) if lifecycle_rows else (),
+        controller_events=(
+            {
+                "occurred_at": "2026-08-28T08:02:00.000Z",
+                "previous_controller": "서울-MD-01",
+                "current_controller": "서울-MD-02",
+                "reason": "CURRENT_SWITCH_CHANGED",
+            },
         ),
+        controller_total=1,
+        diagnostics=diagnostic_rows,
+        diagnostic_total=len(diagnostic_rows),
+        raw_files=raw_rows,
+        raw_file_total=len(raw_rows),
+        raw_byte_total=1024,
+        observation_history=history_rows,
     )
 
 
-def test_report_is_standalone_offline_html5_with_korean_sections_and_csp() -> None:
+def _section(document: str, section_id: str) -> str:
+    match = re.search(
+        rf'<section id="{re.escape(section_id)}"[^>]*>(?P<body>.*?)</section>',
+        document,
+        flags=re.DOTALL,
+    )
+    assert match is not None
+    return match.group("body")
+
+
+def _table_body(section: str) -> str:
+    match = re.search(r"<tbody>(?P<body>.*?)</tbody>", section, flags=re.DOTALL)
+    assert match is not None
+    return match.group("body")
+
+
+def test_report_is_concise_standalone_result_only_html5() -> None:
     document = render_html_report(_snapshot())
     lowered = document.casefold()
 
@@ -148,60 +180,493 @@ def test_report_is_standalone_offline_html5_with_korean_sections_and_csp() -> No
     assert "http://" not in lowered
     assert "https://" not in lowered
     assert not re.search(r"\b(?:src|href)=[\"'](?:https?:)?//", lowered)
+    assert "<nav" not in lowered
 
-    for heading in (
+    headings = ("최신 세션 결과", "세션별 수치 변화", "전체 추적 이력")
+    positions = [document.index(f"<h2>{heading}</h2>") for heading in headings]
+    assert positions == sorted(positions)
+    assert document.count("<h2>") == 3
+    assert re.findall(r'<th scope="col">([^<]+)</th>', _section(document, "latest-sessions")) == [
+        "마지막 확인 시각",
+        "장비명",
+        "프로토콜",
+        "출발지 IP:포트",
+        "목적지 IP:포트",
+        "추적 상태",
+    ]
+    assert re.findall(
+        r'<th scope="col">([^<]+)</th>', _section(document, "observation-history")
+    ) == [
+        "확인 시각",
+        "장비명",
+        "프로토콜",
+        "출발지 IP:포트",
+        "목적지 IP:포트",
+        "추적 상태",
+    ]
+    assert re.findall(r'<th scope="col">([^<]+)</th>', _section(document, "session-changes")) == [
+        "세션",
+        "처음 확인",
+        "마지막 확인",
+        "패킷",
+        "바이트",
+        "장비 변화",
+    ]
+    assert "<summary>전체 추적 이력 1건 보기</summary>" in document
+    assert "<details open" not in document
+    assert 'role="region" aria-label="최신 세션 결과 표" tabindex="0"' in document
+    assert 'role="region" aria-label="세션별 수치 변화 표" tabindex="0"' in document
+    assert 'role="region" aria-label="전체 추적 이력 표" tabindex="0"' in document
+    assert document.count('<th scope="col">') == 18
+
+    for removed_text in (
         "Executive Summary",
-        "환경정보와 조회 조건",
         "프로그램 조회 흐름",
-        "세션 결과와 Flags",
-        "전체 관측 이력",
         "수명주기와 Controller 전환",
-        "확인 및 검증 결과",
-        "수집 증거",
         "Troubleshooting",
         "CLI와 Quick Reference",
         "Warning / 주의사항",
+        "SESSION_NOT_FOUND",
+        "보고서에 표시하면 안 되는 진단 메시지",
+        "RAW-BODY-MUST-NOT-BE-RENDERED",
+        "must-not-be-rendered.txt",
+        "MM-주장비",
+        "DB ID",
+        "show datapath session table",
     ):
-        assert heading in document
-    assert "서울-MD-01" in document
-    assert '<div class="label">Controller</div><div class="metric">3</div>' in document
-    assert "차단" in document
-    assert "SYN 없음" in document
-    assert '<caption class="sr-only">최신 고유 세션</caption>' in document
-    assert '<caption class="sr-only">전체 관측 이력</caption>' in document
-    assert '<th scope="col">마지막 관측</th>' in document
-    assert 'role="region" aria-label="최신 고유 세션 표" tabindex="0"' in document
-    assert "DB ID" in document
-    assert ">41<" in document
+        assert removed_text not in document
 
 
-def test_report_warns_when_the_stored_run_time_range_is_reversed() -> None:
+def test_report_renders_kst_with_utc_date_rollover_and_missing_values_as_dash() -> None:
     document = render_html_report(
         _snapshot(
             run={
-                "id": "run-reversed-time",
-                "started_at": "2026-08-28T09:05:00.000Z",
-                "ended_at": "2026-08-28T09:00:00.000Z",
+                "id": "not-rendered",
+                "started_at": "2026-08-28T16:00:00.000Z",
+                "ended_at": "2026-08-28T16:05:00+00:00",
+                "source_ip": None,
+                "destination_ip": "",
+                "source_port": None,
+                "destination_port": "",
+                "bidirectional": 0,
+                "status": "PARTIAL",
+            },
+            observations=(),
+            observation_history=(),
+            lifecycle_events=(),
+            observation_total=0,
+        )
+    )
+
+    assert "2026-08-29 01:00:00 KST" in document
+    assert "2026-08-29 01:05:00 KST" in document
+    assert "2026-08-28T16:00:00.000Z" not in document
+    assert "2026-08-28T16:05:00+00:00" not in document
+    assert '<div class="label">수집 상태</div><span class="value">일부 수집</span>' in document
+    assert '<div class="label">출발지 IP</div><span class="value">-</span>' in document
+    assert '<div class="label">목적지 포트</div><span class="value">-</span>' in document
+    assert "PARTIAL" not in document
+
+
+def test_lifecycle_statuses_are_korean_and_diagnostics_do_not_change_status() -> None:
+    rows = tuple(
+        _observation(
+            destination_port=port,
+            source_port=52000 + index,
+            controller_host=f"198.51.100.{21 + index}",
+        )
+        for index, port in enumerate((443, 8443, 9443, 10443))
+    )
+    lifecycle = (
+        {
+            "occurred_at": "2026-08-28T08:04:00.000Z",
+            "session_key": rows[0]["session_key"],
+            "event_type": "CLOSED",
+        },
+        {
+            "occurred_at": "2026-08-28T08:03:00.000Z",
+            "session_key": rows[1]["session_key"],
+            "event_type": "MISSED",
+        },
+        {
+            "occurred_at": "2026-08-28T08:02:00.000Z",
+            "session_key": rows[2]["session_key"],
+            "event_type": "STARTED",
+        },
+    )
+    document = render_html_report(
+        _snapshot(
+            observations=rows,
+            observation_history=rows,
+            lifecycle_events=lifecycle,
+            diagnostics=(
+                {
+                    "occurred_at": "2026-08-28T08:05:00.000Z",
+                    "stage": "MD_QUERY",
+                    "code": "MD_UNREACHABLE",
+                    "message": "transient communication failure",
+                },
+            ),
+        )
+    )
+    latest = _section(document, "latest-sessions")
+
+    assert latest.count(">종료 확인<") == 1
+    assert latest.count(">잠시 미확인<") == 1
+    assert latest.count(">확인됨<") == 1
+    assert latest.count(">관측됨<") == 1
+    history = _section(document, "observation-history")
+    assert history.count(">관측됨<") == 4
+    assert ">종료 확인<" not in history
+    assert ">잠시 미확인<" not in history
+    assert "MD_UNREACHABLE" not in document
+    assert "transient communication failure" not in document
+
+
+def test_latest_lifecycle_event_wins_and_equal_times_keep_database_order() -> None:
+    observation = _observation()
+    reopened = render_html_report(
+        _snapshot(
+            lifecycle_events=(
+                {
+                    "occurred_at": "2026-08-28T08:03:00.000Z",
+                    "session_key": observation["session_key"],
+                    "event_type": "STARTED",
+                },
+                {
+                    "occurred_at": "2026-08-28T08:02:00.000Z",
+                    "session_key": observation["session_key"],
+                    "event_type": "CLOSED",
+                },
+            )
+        )
+    )
+    tied = render_html_report(
+        _snapshot(
+            lifecycle_events=(
+                {
+                    "occurred_at": "2026-08-28T08:03:00.000Z",
+                    "session_key": observation["session_key"],
+                    "event_type": "MISSED",
+                },
+                {
+                    "occurred_at": "2026-08-28T08:03:00.000Z",
+                    "session_key": observation["session_key"],
+                    "event_type": "COUNTERS_CHANGED",
+                },
+            )
+        )
+    )
+
+    reopened_latest = _section(reopened, "latest-sessions")
+    tied_latest = _section(tied, "latest-sessions")
+    assert ">확인됨<" in reopened_latest
+    assert ">종료 확인<" not in reopened_latest
+    assert ">잠시 미확인<" in tied_latest
+    assert ">확인됨<" not in tied_latest
+
+
+def test_unknown_lifecycle_event_is_not_presented_as_an_observation() -> None:
+    observation = _observation()
+    document = render_html_report(
+        _snapshot(
+            lifecycle_events=(
+                {
+                    "occurred_at": "2026-08-28T08:03:00.000Z",
+                    "session_key": observation["session_key"],
+                    "event_type": "FUTURE_EVENT",
+                },
+            )
+        )
+    )
+
+    latest = _section(document, "latest-sessions")
+    assert ">상태 확인 필요<" in latest
+    assert ">관측됨<" not in latest
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    (
+        "STARTED",
+        "OPENED",
+        "OBSERVED",
+        "CONTROLLER_CHANGED",
+        "FLAGS_CHANGED",
+        "COUNTERS_CHANGED",
+    ),
+)
+def test_positive_lifecycle_events_are_presented_as_confirmed(event_type: str) -> None:
+    observation = _observation()
+    document = render_html_report(
+        _snapshot(
+            lifecycle_events=(
+                {
+                    "occurred_at": "2026-08-28T08:03:00.000Z",
+                    "session_key": observation["session_key"],
+                    "event_type": event_type,
+                },
+            )
+        )
+    )
+
+    latest = _section(document, "latest-sessions")
+    assert ">확인됨<" in latest
+
+
+def test_controller_move_is_one_logical_flow_with_first_to_last_values() -> None:
+    first = _observation(
+        observed_at="2026-08-28T08:01:00.000Z",
+        controller_name="MD-A",
+        controller_host="198.51.100.21",
+        packets=1_000,
+        bytes_count=2_048,
+    )
+    last = _observation(
+        observed_at="2026-08-28T08:03:00.000Z",
+        controller_name="MD-B",
+        controller_host="198.51.100.22",
+        packets=1_250,
+        bytes_count=4_096,
+    )
+    lifecycle = (
+        {
+            "occurred_at": "2026-08-28T08:03:00.000Z",
+            "session_key": last["session_key"],
+            "event_type": "CONTROLLER_CHANGED",
+        },
+        {
+            "occurred_at": "2026-08-28T08:01:00.000Z",
+            "session_key": first["session_key"],
+            "event_type": "STARTED",
+        },
+    )
+    document = render_html_report(
+        _snapshot(
+            observations=(last, first),
+            observation_history=(first, last),
+            lifecycle_events=lifecycle,
+            observation_total=2,
+        )
+    )
+
+    latest_rows = _table_body(_section(document, "latest-sessions"))
+    change_rows = _table_body(_section(document, "session-changes"))
+    history_rows = _table_body(_section(document, "observation-history"))
+    assert latest_rows.count("<tr>") == 1
+    assert change_rows.count("<tr>") == 1
+    assert history_rows.count("<tr>") == 2
+    assert '<div class="label">고유 세션</div><span class="value">1개</span>' in document
+    assert "MD-A → MD-B" in change_rows
+    assert "1,000 → 1,250" in change_rows
+    assert "변화 +250" in change_rows
+    assert "2,048 B (2.0 KiB) → 4,096 B (4.0 KiB)" in change_rows
+    assert "변화 +2,048 B (+2.0 KiB)" in change_rows
+
+
+def test_changes_show_zero_and_negative_deltas_without_guessing_a_cause() -> None:
+    unchanged_first = _observation(destination_port=443, packets=100, bytes_count=2048)
+    unchanged_last = _observation(
+        observed_at="2026-08-28T08:02:00.000Z",
+        destination_port=443,
+        packets=100,
+        bytes_count=2048,
+    )
+    decreased_first = _observation(
+        destination_port=8443,
+        source_port=54000,
+        packets=900,
+        bytes_count=8192,
+    )
+    decreased_last = _observation(
+        observed_at="2026-08-28T08:03:00.000Z",
+        destination_port=8443,
+        source_port=54000,
+        packets=700,
+        bytes_count=4096,
+    )
+    document = render_html_report(
+        _snapshot(
+            observations=(decreased_last, unchanged_last),
+            observation_history=(
+                unchanged_first,
+                decreased_first,
+                unchanged_last,
+                decreased_last,
+            ),
+            lifecycle_events=(),
+        )
+    )
+    changes = _section(document, "session-changes")
+
+    assert "100 → 100" in changes
+    assert "변화 0" in changes
+    assert "900 → 700" in changes
+    assert "변화 -200" in changes
+    assert "8,192 B (8.0 KiB) → 4,096 B (4.0 KiB)" in changes
+    assert "변화 -4,096 B (-4.0 KiB)" in changes
+    assert "초기화" not in changes
+    assert "오류" not in changes
+
+
+def test_partial_counter_values_are_preserved_and_only_delta_is_unavailable() -> None:
+    first = _observation(packets=None, bytes_count=2048)
+    last = _observation(
+        observed_at="2026-08-28T08:02:00.000Z",
+        packets=50,
+        bytes_count=None,
+    )
+    document = render_html_report(
+        _snapshot(
+            observations=(last,),
+            observation_history=(first, last),
+            lifecycle_events=(),
+        )
+    )
+    changes = _section(document, "session-changes")
+
+    assert ">- → 50</span>" in changes
+    assert ">2,048 B (2.0 KiB) → -</span>" in changes
+    assert changes.count("변화 계산 불가") == 2
+
+
+def test_zero_ports_keep_lifecycle_status_and_controller_move_in_one_flow() -> None:
+    first = _observation(
+        controller_name="MD-A",
+        controller_host="198.51.100.21",
+        protocol=1,
+        source_port=0,
+        destination_port=0,
+    )
+    last = _observation(
+        observed_at="2026-08-28T08:02:00.000Z",
+        controller_name="MD-B",
+        controller_host="198.51.100.22",
+        protocol=1,
+        source_port=0,
+        destination_port=0,
+    )
+    document = render_html_report(
+        _snapshot(
+            observations=(last, first),
+            observation_history=(first, last),
+            lifecycle_events=(
+                {
+                    "occurred_at": "2026-08-28T08:03:00.000Z",
+                    "session_key": last["session_key"],
+                    "event_type": "CLOSED",
+                },
+            ),
+        )
+    )
+
+    latest = _section(document, "latest-sessions")
+    assert _table_body(latest).count("<tr>") == 1
+    assert ">종료 확인<" in latest
+    assert "MD-A → MD-B" in _section(document, "session-changes")
+
+
+@pytest.mark.parametrize(
+    ("stored_status", "displayed_status"),
+    (("CANCELLED", "사용자 취소"), ("RESTARTED", "조건 변경 종료")),
+)
+def test_run_status_uses_precise_korean_label(
+    stored_status: str,
+    displayed_status: str,
+) -> None:
+    snapshot = _snapshot()
+    run = dict(snapshot.run)
+    run["status"] = stored_status
+    document = render_html_report(
+        _snapshot(run=run, observations=(), observation_history=(), lifecycle_events=())
+    )
+
+    assert displayed_status in document
+    assert stored_status not in document
+
+
+def test_naive_or_invalid_times_are_not_assumed_to_be_utc() -> None:
+    document = render_html_report(
+        _snapshot(
+            run={
+                "started_at": "2026-08-28T08:00:00",
+                "ended_at": "not-a-time",
                 "source_ip": "192.0.2.100",
                 "destination_ip": "203.0.113.80",
                 "source_port": 53000,
                 "destination_port": 443,
                 "bidirectional": 1,
                 "status": "COMPLETED",
-            }
+            },
+            observations=(),
+            observation_history=(),
+            lifecycle_events=(),
         )
     )
 
-    assert "시간 범위 확인 필요" in document
-    assert "종료 시각이 시작 시각보다 빠릅니다." in document
+    assert document.count('<span class="value">-</span>') >= 2
+    assert "2026-08-28 17:00:00 KST" not in document
 
 
-def test_report_escapes_stored_values_and_remasks_diagnostics() -> None:
+def test_only_latest_table_is_limited_to_fifty_logical_flows() -> None:
+    rows = tuple(
+        _observation(
+            observed_at=f"2026-08-28T08:{index:02d}:00.000Z",
+            source_port=53000 + index,
+            destination_port=10000 + index,
+        )
+        for index in range(55)
+    )
+    document = render_html_report(
+        _snapshot(
+            observations=tuple(reversed(rows)),
+            observation_history=rows,
+            lifecycle_events=(),
+            observation_total=55,
+        )
+    )
+
+    latest = _section(document, "latest-sessions")
+    changes = _section(document, "session-changes")
+    history = _section(document, "observation-history")
+    assert _table_body(latest).count("<tr>") == 50
+    assert _table_body(changes).count("<tr>") == 55
+    assert _table_body(history).count("<tr>") == 55
+    assert "고유 세션 55개 중 마지막 확인 시각을 기준으로 최근 50개" in latest
+    assert "192.0.2.100:53000" not in _table_body(latest)
+    assert "192.0.2.100:53000" in _table_body(history)
+
+
+def test_full_history_preserves_all_2005_rows_beyond_ui_limit() -> None:
+    history = tuple(
+        _observation(
+            observed_at=f"2026-08-28T08:01:{index % 60:02d}.000Z",
+            packets=index,
+            bytes_count=index * 128,
+        )
+        for index in range(2_005)
+    )
+    document = render_html_report(
+        _snapshot(
+            observations=(history[-1],),
+            observation_history=history,
+            lifecycle_events=(),
+            observation_total=2_005,
+        )
+    )
+    history_section = _section(document, "observation-history")
+
+    assert _table_body(history_section).count("<tr>") == 2_005
+    assert "전체 추적 이력 2,005건 보기" in history_section
+
+
+def test_report_escapes_result_values_and_excludes_all_internal_evidence() -> None:
     script_payload = '<script data-x="stored">alert(1)</script>'
     attribute_payload = '" autofocus onfocus="alert(2)'
+    observation = _observation(controller_name=script_payload)
     snapshot = _snapshot(
         run={
-            "id": script_payload,
+            "id": "SECRET-RUN-ID",
             "started_at": "2026-08-28T08:00:00.000Z",
             "ended_at": "2026-08-28T08:05:00.000Z",
             "source_ip": attribute_payload,
@@ -211,22 +676,15 @@ def test_report_escapes_stored_values_and_remasks_diagnostics() -> None:
             "bidirectional": 1,
             "status": "COMPLETED",
         },
-        observations=(
+        observations=(observation,),
+        observation_history=(observation,),
+        lifecycle_events=(
             {
-                "observed_at": "2026-08-28T08:01:00.000Z",
-                "controller_name": script_payload,
-                "controller_host": "198.51.100.21",
-                "protocol": 6,
-                "source_ip": "192.0.2.100",
-                "destination_ip": "203.0.113.80",
-                "source_port": 53000,
-                "destination_port": 443,
-                "packets": 12,
-                "bytes_count": 2048,
-                "age": 2,
-                "flags": "DY",
-                "cpu_id": 1,
-                "session_key": "stable-session-key",
+                "occurred_at": "2026-08-28T08:01:00.000Z",
+                "session_key": observation["session_key"],
+                "event_type": "STARTED",
+                "instance_id": "SECRET-INSTANCE",
+                "details_json": '{"password":"SECRET-LIFECYCLE"}',
             },
         ),
         diagnostics=(
@@ -234,55 +692,56 @@ def test_report_escapes_stored_values_and_remasks_diagnostics() -> None:
                 "occurred_at": "2026-08-28T08:03:00.000Z",
                 "stage": "ssh 198.18.0.99",
                 "code": "AUTH_FAILED",
-                "message": "username=operator password=not-for-report at 198.18.0.99 "
-                + script_payload,
+                "message": "username=operator password=SECRET-DIAGNOSTIC",
             },
         ),
     )
-
     document = render_html_report(snapshot)
 
     assert script_payload not in document
     assert attribute_payload not in document
     assert "&lt;script data-x=&quot;stored&quot;&gt;alert(1)&lt;/script&gt;" in document
     assert "&quot; autofocus onfocus=&quot;alert(2)" in document
-    assert "198.18.0.99" not in document
-    assert "not-for-report" not in document
-    assert "operator" not in document
-    assert "username=&lt;REDACTED&gt;" in document
-    assert "password=&lt;REDACTED&gt;" in document
+    for secret in (
+        "SECRET-RUN-ID",
+        "SECRET-INSTANCE",
+        "SECRET-LIFECYCLE",
+        "AUTH_FAILED",
+        "SECRET-DIAGNOSTIC",
+        "operator",
+        "198.18.0.99",
+        "RAW-BODY-MUST-NOT-BE-RENDERED",
+        "must-not-be-rendered.txt",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "CURRENT_SWITCH_CHANGED",
+    ):
+        assert secret not in document
 
 
-def test_report_excludes_raw_body_and_paths_and_marks_truncated_sections() -> None:
+def test_empty_result_has_clear_rows_and_no_false_session_state() -> None:
     document = render_html_report(
         _snapshot(
-            observation_total=9,
-            unique_session_total=5,
-            lifecycle_total=7,
-            controller_total=4,
-            diagnostic_total=6,
-            raw_file_total=8,
+            observations=(),
+            observation_history=(),
+            lifecycle_events=(),
+            diagnostics=(),
+            observation_total=0,
         )
     )
 
-    assert "RAW-BODY-MUST-NOT-BE-RENDERED" not in document
-    assert "must-not-be-rendered.txt" not in document
-    assert "Raw CLI 본문과 파일 경로는 보고서에 포함하지 않습니다." in document
-    assert "최신 고유 세션 전체 5건 중 최근 1건 표시" in document
-    assert "전체 관측 이력 전체 9건 중 최근 1건 표시" in document
-    assert "수명주기 이벤트 전체 7건 중 최근 1건 표시" in document
-    assert "Controller 전환 전체 4건 중 최근 1건 표시" in document
-    assert "진단 이벤트 전체 6건 중 최근 1건 표시" in document
-    assert "Raw 파일 전체 8건 중 최근 2건 표시" in document
-    assert "전체 데이터는 CSV 또는 SQLite를 확인하십시오." in document
+    assert "관측된 세션이 없습니다." in document
+    assert "비교할 세션이 없습니다." in document
+    assert "저장된 관측 이력이 없습니다." in document
+    assert "종료 확인" not in document
+    assert "고유 세션 0개를 모두 표시합니다." in document
 
 
 def test_render_and_atomic_writes_are_deterministic(tmp_path: Path) -> None:
     snapshot = _snapshot()
     first_render = render_html_report(snapshot)
     second_render = render_html_report(snapshot)
-    first_path = tmp_path / "first.html"
-    second_path = tmp_path / "second.html"
+    first_path = tmp_path / "첫 번째 결과.html"
+    second_path = tmp_path / "두 번째 결과.html"
 
     assert first_render == second_render
     assert write_html_report_atomic(first_path, snapshot) == first_path

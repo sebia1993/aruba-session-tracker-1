@@ -19,7 +19,7 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 - 로컬 SQLite 이력, 실행별 Raw TXT, 독립적인 CSV와 HTML 보고서 내보내기
 - 실행할 때마다 꺼진 상태로 시작하는 `F12` 화면 개선 도우미
 
-다음은 v0.4.0 범위에 포함되지 않습니다.
+다음은 v0.4.1 범위에 포함되지 않습니다.
 
 - 장비 설정 변경, 사용자 삭제 또는 쓰기 API
 - 무필터 `show datapath session table` 실행
@@ -31,13 +31,13 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 
 ### 포터블 ZIP
 
-1. GitHub Releases에서 `ArubaSessionTracker_v0.4.0_windows_x64.zip`을
+1. GitHub Releases에서 `ArubaSessionTracker_v0.4.1_windows_x64.zip`을
    받습니다. GitHub의 자동 생성 Source code ZIP/TAR는 실행 프로그램이
    아닙니다.
 2. 릴리스 본문의 SHA-256과 PowerShell 계산 결과를 비교합니다.
 
    ```powershell
-   Get-FileHash -Algorithm SHA256 .\ArubaSessionTracker_v0.4.0_windows_x64.zip
+   Get-FileHash -Algorithm SHA256 .\ArubaSessionTracker_v0.4.1_windows_x64.zip
    ```
 
 3. ZIP을 쓰기 가능한 일반 폴더에 풀고 `ArubaSessionTracker.exe`를
@@ -48,7 +48,7 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 검증한 뒤 같은 ID를 다시 공개합니다. 중단되면 이전 커밋으로 되돌려
 재공개하지 않고 숨겨진 단계 기록에서 다음 실행이 이어집니다. 이 방식은
 GitHub 기본 토큰에 없는 과거 워크플로 수정 권한을 요구하지 않으며, 태그로
-초안을 추측해 중복 릴리스를 만드는 문제도 피합니다. `v0.4.0` 같은 버전
+초안을 추측해 중복 릴리스를 만드는 문제도 피합니다. `v0.4.1` 같은 버전
 태그 릴리스는 자동화가 기존 릴리스 덮어쓰기를 거부하는 1회성
 사전릴리스입니다. 공개 자산은 Windows x64 ZIP 하나이며 SHA-256은 릴리스
 본문에, CycloneDX SBOM은 ZIP 내부 `ArubaSessionTracker/sbom.cdx.json`에
@@ -64,10 +64,11 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m aruba_session_tracker
 ```
 
-## v0.4.0 단순 UI와 안정성 설계
+## v0.4.1 단순 UI, 안정성과 결과 보고서
 
-v0.4.0은 기존 기능과 저장 형식을 유지하면서 자주 쓰는 입력과 결과만 먼저
-보여주고 장시간 실행의 일시 장애·저장 용량·복구 경계를 강화합니다.
+v0.4.1은 기존 기능과 저장 형식을 유지하면서 자주 쓰는 입력과 결과만 먼저
+보여줍니다. 장시간 실행의 일시 장애·저장 용량·복구 경계를 유지하고 HTML은
+실제로 추적한 결과값만 읽기 좋게 정리합니다.
 
 - 기본 화면에는 사용자 이름, 암호, Source와 Destination만 표시합니다.
   Enable 암호, 포트와 양방향 조건은 `고급 조건 보기`에서 열고
@@ -205,26 +206,33 @@ SYN, `R`은 redirect입니다. 정의를 확인하지 못한 문자는
 ## HTML 결과 보고서
 
 `기록 및 내보내기` 화면에서 종료된 실행을 선택하면 기존 CSV와 별도로
-`선택 실행 HTML 보고서`를 사용할 수 있습니다. CSV는 전체 관측 행을
-분석하는 데이터 파일이고, HTML은 사람이 실행 결과와 주의사항을 빠르게
-검토하는 기술문서입니다. 두 경로는 서로 독립적이며 하나를 만들지 않아도
-다른 하나를 계속 사용할 수 있습니다.
+`선택 실행 HTML 보고서`를 만들 수 있습니다. CSV는 전체 관측 행을 분석할
+때 쓰는 데이터 파일이고, HTML은 프로그램이 추적한 세션 결과를 사람이
+읽기 좋게 정리한 문서입니다. 두 내보내기는 서로 독립적입니다.
 
 HTML 보고서는 다음 조건을 만족합니다.
 
 - 단일 UTF-8 HTML5 파일, 내장 CSS, 외부 CSS/JavaScript/CDN/웹폰트 없음
-- PC·태블릿·모바일 반응형, Sticky 목차, 가로 스크롤 표, 인쇄 스타일
-- 지원 기준 환경, 실행 조건, Executive Summary와 프로그램 조회 흐름
-- 최신 고유 세션, Raw Flags 해석, 수명주기와 Controller 전환
-- 비식별 진단, Troubleshooting, Warning, 수집 파일 크기·SHA-256
-- 허용된 읽기 전용 CLI의 명령어·목적·예상 결과와 Quick Reference
+- PC·태블릿·모바일 반응형, 가로 스크롤 표와 인쇄 스타일
+- KST 기준 추적 시작·종료 시각, 조회 조건, 전체 관측 수와 고유 세션 수
+- 마지막 확인 시각, 장비명, 프로토콜, 출발지와 목적지를 담은 최신 세션
+  결과 50건
+- 처음·마지막 확인 시각, 패킷·바이트 시작값과 마지막 값·증감, 장비 변경을
+  담은 세션별 수치 변화
+- 기본으로 접어 두지만 저장된 모든 관측 행을 포함하는 전체 추적 이력
 
-보고서는 선택한 실행의 SQLite 스냅샷만 사용합니다. 실행 당시 저장되지
-않은 VLAN, SSID, Role, ACL, 인터페이스, 물리 토폴로지나 실제 장비에서
-검출한 모델/펌웨어는 만들지 않고 `확인 필요`로 표시합니다. Raw CLI 본문과
-자격증명은 넣지 않으며 모든 저장 문자열은 HTML 이스케이프합니다. 화면의
-실시간 표만 최대 2,000행으로 제한되며 HTML 보고서, CSV와 SQLite에는
-선택한 실행의 저장된 관측 행 전체가 포함됩니다.
+보고서는 선택한 실행의 SQLite 스냅샷만 사용합니다. 저장된 수명주기 이벤트를
+바탕으로 세션 상태를 `확인됨`, `잠시 미확인`, `종료 확인` 또는 `관측됨`으로
+표시합니다. 일시적인 통신 실패처럼 세션 종료를 확인할 수 없는 상황은
+`종료 확인`으로 바꾸지 않습니다. 패킷이나 바이트 값이 감소해도 원인을
+추측하지 않고 저장된 값과 단순 차이만 보여줍니다.
+
+진단 이벤트, 오류 코드, Raw 본문·경로·해시, CLI, 프로그램 처리 흐름,
+Troubleshooting, Warning과 개발자 정보는 HTML에 넣지 않습니다. 자격증명과
+로그도 제외하며 모든 저장 문자열은 HTML 이스케이프합니다. 화면의 실시간
+표만 최대 2,000행으로 제한됩니다. HTML 보고서, CSV와 SQLite에는 선택한
+실행의 저장된 관측 행 전체가 포함됩니다. 기존 SQLite 스키마, CSV와 Raw
+형식은 바뀌지 않습니다.
 
 HTML은 인터넷 연결 없이 Edge/Chrome에서 직접 열 수 있습니다. 내부 IP,
 장비명과 세션 메타데이터는 결과 자체이므로 평문으로 포함될 수 있습니다.
@@ -286,7 +294,7 @@ GitHub 이슈나 외부 지원 채널에 올리지 말고, 공유가 필요하�
 저장소는 네트워크와 분리된 비식별 fixture 및 메모리 내 SSH 프로토콜
 fake를 기본 검증 경계로 사용합니다. 127.0.0.1에만 바인딩하는 최소
 Paramiko 서버를 통한 실제 Paramiko/Netmiko loopback 통합시험도 포함합니다.
-실제 Aruba 장비 접속과 회사 네트워크 현장 검증은 v0.4.0 검증 범위에
+실제 Aruba 장비 접속과 회사 네트워크 현장 검증은 v0.4.1 검증 범위에
 포함되지 않습니다.
 
 내보내기 복구 시험은 각 단계에서 별도 프로세스를 `os._exit()`로 종료한 뒤
@@ -295,7 +303,7 @@ Paramiko 서버를 통한 실제 Paramiko/Netmiko loopback 통합시험도 포�
 
 ```powershell
 .\tools\validate.ps1 -PythonPath .\.venv\Scripts\python.exe
-.\build_windows.ps1 -PythonPath .\.venv\Scripts\python.exe -Version 0.4.0
+.\build_windows.ps1 -PythonPath .\.venv\Scripts\python.exe -Version 0.4.1
 ```
 
 `validate.ps1`은 Python/아키텍처, 해시 고정 lock 동기화, 의존성, 버전
@@ -336,7 +344,7 @@ smoke와 패키지 검증은 다음을 증명하지 않습니다.
 - Authenticode 서명 또는 조직 보안 제품의 허용
 - 실장비 네트워크 상태나 세션 존재/종료
 
-v0.4.0은 이 한계를 명시한 unsigned 사전릴리스입니다. 사용자가 실제 장비에서
+v0.4.1은 이 한계를 명시한 unsigned 사전릴리스입니다. 사용자가 실제 장비에서
 확인한 결과는 자동 테스트 증거와 구분합니다.
 
 라이선스는 MIT이며 제3자 구성요소 고지는

@@ -413,9 +413,33 @@ def smoke_executable(zip_path: Path) -> None:
                 f"with exit code {report_result.returncode}"
             )
         report_text = report_path.read_text(encoding="utf-8")
+        required_report_markers = (
+            "세션 추적 결과",
+            "최신 세션 결과",
+            "세션별 수치 변화",
+            "전체 추적 이력",
+            "KST",
+            "한국어-MD",
+        )
+        forbidden_report_markers = (
+            "PACKAGE-RAW-CANARY",
+            "PACKAGE-DIAGNOSTIC-CANARY",
+            "PARSE_PARTIAL",
+            "report-smoke",
+            "Troubleshooting",
+            "CLI와 Quick Reference",
+        )
+        section_positions = tuple(
+            report_text.find(marker)
+            for marker in ("최신 세션 결과", "세션별 수치 변화", "전체 추적 이력")
+        )
         if (
             "<!doctype html>" not in report_text.casefold()
-            or "한국어-MD" not in report_text
+            or any(marker not in report_text for marker in required_report_markers)
+            or any(marker in report_text for marker in forbidden_report_markers)
+            or section_positions != tuple(sorted(section_positions))
+            or "<details>" not in report_text
+            or "<details open" in report_text
             or "https://" in report_text.casefold()
             or "http://" in report_text.casefold()
         ):

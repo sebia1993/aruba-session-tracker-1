@@ -42,10 +42,17 @@ def _store(tmp_path: Path) -> SessionStore:
     return store
 
 
-def _observation(*, controller_name: str = "MD-01", packets: int = 12) -> SessionObservation:
+def _observation(
+    *,
+    controller_name: str = "MD-01",
+    controller_host: str = "198.51.100.21",
+    packets: int = 12,
+    bytes_count: int = 2048,
+    observed_at: datetime | None = None,
+) -> SessionObservation:
     return SessionObservation(
         controller_name=controller_name,
-        controller_host="198.51.100.21",
+        controller_host=controller_host,
         protocol=6,
         source_ip="192.0.2.100",
         destination_ip="203.0.113.80",
@@ -58,11 +65,11 @@ def _observation(*, controller_name: str = "MD-01", packets: int = 12) -> Sessio
         destination="local",
         tunnel_age=0,
         packets=packets,
-        bytes_count=2048,
+        bytes_count=bytes_count,
         flags="FC",
         cpu_id=1,
         raw_line="sensitive raw line",
-        observed_at=datetime(2026, 8, 28, 8, 0, tzinfo=UTC),
+        observed_at=observed_at or datetime(2026, 8, 28, 8, 0, tzinfo=UTC),
     )
 
 
@@ -1609,7 +1616,7 @@ def test_delete_write_lock_prevents_a_late_managed_html_orphan(
     assert not tuple(exporter.exports_root.glob("*.backup"))
 
 
-def test_html_export_includes_run_events_diagnostics_and_raw_metadata_only(
+def test_html_export_contains_results_and_excludes_technical_metadata(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path)
@@ -1659,27 +1666,97 @@ def test_html_export_includes_run_events_diagnostics_and_raw_metadata_only(
     document = exported.read_text(encoding="utf-8")
     raw_relative = next(store.raw_root.rglob("*.txt")).relative_to(store.raw_root).as_posix()
 
-    assert run_id in document
-    assert "PARTIAL" in document
+    assert "세션 추적 결과" in document
+    assert "일부 수집" in document
     assert "서울-MD-01" in document
-    assert "instance-report-001" in document
-    assert "OPENED" in document
-    assert "MISS 횟수: 0" in document
-    assert "이전 Flags: F" in document
-    assert "서울-MD-02" in document
-    assert "CURRENT_SWITCH_CHANGED" in document
-    assert "AUTH_FAILED" in document
-    assert "username=&lt;REDACTED&gt;" in document
-    assert "password=&lt;REDACTED&gt;" in document
+    assert "192.0.2.100:53000" in document
+    assert "203.0.113.80:443" in document
+    assert "확인됨" in document
+    assert run_id not in document
+    assert "PARTIAL" not in document
+    assert "instance-report-001" not in document
+    assert "OPENED" not in document
+    assert "MISS 횟수: 0" not in document
+    assert "이전 Flags: F" not in document
+    assert "서울-MD-02" not in document
+    assert "CURRENT_SWITCH_CHANGED" not in document
+    assert "AUTH_FAILED" not in document
+    assert "username" not in document.casefold()
+    assert "password" not in document.casefold()
     assert "198.51.100.99" not in document
-    assert "서울-MM-01" in document
-    assert "mm-location" in document
-    assert "DB ID" in document
-    assert raw_digest in document
+    assert "198.51.100.21" not in document
+    assert "서울-MM-01" not in document
+    assert "mm-location" not in document
+    assert "DB ID" not in document
+    assert raw_digest not in document
     assert "PRIVATE-RAW-BODY" not in document
     assert "raw-user" not in document
     assert "raw-secret" not in document
     assert raw_relative not in document
+
+
+def test_html_export_uses_database_id_order_for_equal_observation_and_lifecycle_times(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    same_time = datetime(2026, 8, 28, 8, 5, tzinfo=UTC)
+    first = _observation(
+        controller_name="MD-A",
+        controller_host="198.51.100.21",
+        packets=10,
+        bytes_count=1024,
+        observed_at=same_time,
+    )
+    last = _observation(
+        controller_name="MD-B",
+        controller_host="198.51.100.22",
+        packets=20,
+        bytes_count=2048,
+        observed_at=same_time,
+    )
+    store.record_query(run_id, (first,))
+    store.record_query(run_id, (last,))
+    store.record_lifecycle(
+        run_id,
+        session_key=first.session_key,
+        instance_id="same-time-instance",
+        event_type="MISSED",
+        controller_name=first.controller_name,
+        occurred_at=same_time,
+    )
+    store.record_lifecycle(
+        run_id,
+        session_key=last.session_key,
+        instance_id="same-time-instance",
+        event_type="COUNTERS_CHANGED",
+        controller_name=last.controller_name,
+        occurred_at=same_time,
+    )
+    store.finish_run(run_id, ended_at=same_time)
+
+    document = store.export_run_html(run_id).read_text(encoding="utf-8")
+    latest = re.search(
+        r'<section id="latest-sessions">(?P<body>.*?)</section>', document, re.DOTALL
+    )
+    changes = re.search(
+        r'<section id="session-changes".*?>(?P<body>.*?)</section>', document, re.DOTALL
+    )
+    history = re.search(
+        r'<section id="observation-history">(?P<body>.*?)</section>', document, re.DOTALL
+    )
+
+    assert latest is not None and changes is not None and history is not None
+    latest_body = latest.group("body")
+    changes_body = changes.group("body")
+    history_body = history.group("body")
+    assert latest_body.count("<tbody><tr>") == 1
+    assert "MD-B" in latest_body
+    assert ">확인됨<" in latest_body
+    assert "MD-A → MD-B" in changes_body
+    assert "10 → 20" in changes_body
+    assert "1,024 B (1.0 KiB) → 2,048 B (2.0 KiB)" in changes_body
+    assert history_body.index("MD-A") < history_body.index("MD-B")
 
 
 def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
@@ -1822,17 +1899,15 @@ def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
 
     assert history_table_body.group("body").count("<tr>") == 2_005
     assert "OLDEST-OBSERVATION-CONTROLLER" in history_body
-    assert "OLDEST-LIFECYCLE-INSTANCE" in document
-    assert "OLDEST-CONTROLLER-REASON" in document
-    assert "OLDEST-DIAGNOSTIC-MESSAGE" in document
-    assert "oldest-raw-kind" in document
+    assert "OLDEST-LIFECYCLE-INSTANCE" not in document
+    assert "OLDEST-CONTROLLER-REASON" not in document
+    assert "OLDEST-DIAGNOSTIC-MESSAGE" not in document
+    assert "oldest-raw-kind" not in document
     assert "capture-0000.txt" not in document
     assert "private-raw-body-0" not in document
-    assert 'class="truncate-note">전체 관측 이력' not in document
-    assert 'class="truncate-note">수명주기 이벤트' not in document
-    assert 'class="truncate-note">Controller 전환' not in document
-    assert 'class="truncate-note">진단 이벤트' not in document
-    assert 'class="truncate-note">Raw 파일' not in document
+    assert "<summary>전체 추적 이력 2,005건 보기</summary>" in document
+    assert "0 → 2,004" in document
+    assert "0 B → 256,512 B (250.5 KiB)" in document
 
 
 def test_record_writes_and_second_finish_require_running_run(tmp_path: Path) -> None:

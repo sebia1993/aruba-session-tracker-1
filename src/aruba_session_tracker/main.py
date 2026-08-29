@@ -153,7 +153,7 @@ def _report_smoke_test(destination: Path) -> int:
         store.record_query(
             run_id,
             (observation,),
-            raw_text="synthetic fixture only",
+            raw_text="PACKAGE-RAW-CANARY",
             controller_name=observation.controller_name,
             captured_at=observed_at,
         )
@@ -161,7 +161,7 @@ def _report_smoke_test(destination: Path) -> int:
             DiagnosticEvent(
                 stage="report-smoke",
                 code=ErrorCode.PARSE_PARTIAL,
-                message="합성 데이터 보고서 생성 검증",
+                message="PACKAGE-DIAGNOSTIC-CANARY",
                 occurred_at=observed_at,
             ),
             run_id=run_id,
@@ -169,9 +169,32 @@ def _report_smoke_test(destination: Path) -> int:
         store.finish_run(run_id, ended_at=observed_at)
         written = store.export_run_html(run_id, destination)
     text = written.read_text(encoding="utf-8")
+    required = (
+        "세션 추적 결과",
+        "최신 세션 결과",
+        "세션별 수치 변화",
+        "전체 추적 이력",
+        "KST",
+        "한국어-MD",
+    )
+    forbidden = (
+        "PACKAGE-RAW-CANARY",
+        "PACKAGE-DIAGNOSTIC-CANARY",
+        "PARSE_PARTIAL",
+        "report-smoke",
+        "Troubleshooting",
+        "CLI와 Quick Reference",
+    )
+    section_positions = tuple(
+        text.find(marker) for marker in ("최신 세션 결과", "세션별 수치 변화", "전체 추적 이력")
+    )
     if (
         "<!doctype html>" not in text.casefold()
-        or "한국어-MD" not in text
+        or any(marker not in text for marker in required)
+        or any(marker in text for marker in forbidden)
+        or section_positions != tuple(sorted(section_positions))
+        or "<details>" not in text
+        or "<details open" in text
         or "https://" in text.casefold()
         or "http://" in text.casefold()
     ):
