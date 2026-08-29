@@ -69,9 +69,54 @@ function Invoke-GhJson {
 }
 
 function Get-ContinuousRelease {
-    return Invoke-GhJson @(
-        "api", "repos/$Repository/releases/tags/$tag"
-    ) -AllowNotFound
+    # The tag endpoint intentionally does not return drafts. Discover by release
+    # id so an interrupted draft remains addressable and cannot cause duplicate
+    # drafts or tag-ambiguous uploads on the next run.
+    $all = @()
+    foreach ($page in 1..100) {
+        $batch = @(
+            Invoke-GhJson @(
+                "api", "repos/$Repository/releases?per_page=100&page=$page"
+            )
+        )
+        $all += $batch
+        if ($batch.Count -lt 100) {
+            break
+        }
+        if ($page -eq 100) {
+            throw "Release discovery reached its safe pagination bound."
+        }
+    }
+    $matches = @($all | Where-Object { [string]$_.tag_name -ceq $tag })
+    if ($matches.Count -eq 0) {
+        return $null
+    }
+    $candidatesPath = Join-Path $TemporaryRoot "continuous-candidates.json"
+    $matches | ConvertTo-Json -Depth 20 -AsArray |
+        Set-Content -LiteralPath $candidatesPath -Encoding utf8
+    $selectionOutput = @(
+        & $PythonPath tools/continuous_release_state.py select-release `
+            --releases-json $candidatesPath
+    )
+    if ($LASTEXITCODE -ne 0 -or $selectionOutput.Count -ne 1) {
+        throw "Could not safely select the canonical continuous release."
+    }
+    $selection = ([string]$selectionOutput[0]) | ConvertFrom-Json
+    $keeper = @($matches | Where-Object { $_.id -eq $selection.keeper_id })
+    if ($keeper.Count -ne 1) {
+        throw "The selected continuous release id is unavailable."
+    }
+    foreach ($assetId in @($selection.cleanup_asset_ids)) {
+        Invoke-GhChecked @(
+            "api", "-X", "DELETE", "repos/$Repository/releases/assets/$assetId"
+        )
+    }
+    foreach ($duplicateId in @($selection.cleanup_ids)) {
+        Invoke-GhChecked @(
+            "api", "-X", "DELETE", "repos/$Repository/releases/$duplicateId"
+        )
+    }
+    return Invoke-GhJson @("api", "repos/$Repository/releases/$($keeper[0].id)")
 }
 
 function Get-ContinuousTag {
@@ -89,6 +134,78 @@ function Get-DirectTagCommit {
         throw "The continuous tag is not a direct commit reference."
     }
     return [string]$TagReference.object.sha
+}
+
+function Set-ReleaseDraftState {
+    param(
+        [Parameter(Mandatory = $true)][int64]$ReleaseId,
+        [Parameter(Mandatory = $true)][bool]$Draft
+    )
+    $payloadPath = Join-Path $TemporaryRoot "continuous-draft-$ReleaseId.json"
+    @{ draft = $Draft } | ConvertTo-Json -Compress |
+        Set-Content -LiteralPath $payloadPath -Encoding utf8
+    return Invoke-GhJson @(
+        "api", "-X", "PATCH", "repos/$Repository/releases/$ReleaseId",
+        "--input", $payloadPath
+    )
+}
+
+function Set-ReleaseMetadata {
+    param(
+        [Parameter(Mandatory = $true)][int64]$ReleaseId,
+        [Parameter(Mandatory = $true)][string]$Target,
+        [Parameter(Mandatory = $true)][bool]$Draft,
+        [Parameter(Mandatory = $true)][bool]$Prerelease,
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string]$BodyPath
+    )
+    $payloadPath = Join-Path $TemporaryRoot "continuous-edit-$ReleaseId.json"
+    @{
+        tag_name = $tag
+        target_commitish = $Target
+        name = $Title
+        body = Get-Content -LiteralPath $BodyPath -Raw
+        draft = $Draft
+        prerelease = $Prerelease
+        make_latest = "false"
+    } | ConvertTo-Json -Depth 5 |
+        Set-Content -LiteralPath $payloadPath -Encoding utf8
+    return Invoke-GhJson @(
+        "api", "-X", "PATCH", "repos/$Repository/releases/$ReleaseId",
+        "--input", $payloadPath
+    )
+}
+
+function Add-ReleaseAsset {
+    param(
+        [Parameter(Mandatory = $true)][int64]$ReleaseId,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    $name = [Uri]::EscapeDataString([IO.Path]::GetFileName($Path))
+    return Invoke-GhJson @(
+        "api", "-X", "POST",
+        "-H", "Content-Type: application/octet-stream",
+        "--input", $Path,
+        "https://uploads.github.com/repos/$Repository/releases/$ReleaseId/assets?name=$name"
+    )
+}
+
+function Save-ReleaseAsset {
+    param(
+        [Parameter(Mandatory = $true)]$Asset,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+        throw "GH_TOKEN is required to download a draft release asset."
+    }
+    Invoke-WebRequest `
+        -Uri ([string]$Asset.url) `
+        -Headers @{
+            Accept = "application/octet-stream"
+            Authorization = "Bearer $($env:GH_TOKEN)"
+            "X-GitHub-Api-Version" = "2022-11-28"
+        } `
+        -OutFile $Destination
 }
 
 function Assert-MainStillExpected {
@@ -207,179 +324,31 @@ function Assert-RemoteContract {
 
 function Assert-DownloadedZip {
     param(
+        [Parameter(Mandatory = $true)]$Release,
         [Parameter(Mandatory = $true)][string]$Destination,
-        [Parameter(Mandatory = $true)][string]$FailureMessage
+        [Parameter(Mandatory = $true)][string]$FailureMessage,
+        [switch]$Public
     )
     New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-    Invoke-GhChecked @(
-        "release", "download", $tag,
-        "--repo", $Repository,
-        "--dir", $Destination,
-        "--clobber",
-        "--pattern", $zipName
-    )
     $downloaded = Join-Path $Destination $zipName
+    $remote = @($Release.assets | Where-Object { $_.name -ceq $zipName })
+    if ($remote.Count -ne 1) {
+        throw "The continuous release does not contain exactly one expected ZIP."
+    }
+    if ($Public) {
+        Invoke-WebRequest `
+            -Uri ([string]$remote[0].browser_download_url) `
+            -OutFile $downloaded
+    }
+    else {
+        Save-ReleaseAsset $remote[0] $downloaded
+    }
     if (
         -not (Test-Path -LiteralPath $downloaded -PathType Leaf) -or
         (Get-FileHash -LiteralPath $downloaded -Algorithm SHA256).Hash -ne
             (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
     ) {
         throw $FailureMessage
-    }
-}
-
-function Save-RollbackState {
-    param(
-        [Parameter(Mandatory = $true)]$Release,
-        [Parameter(Mandatory = $true)]$TagReference
-    )
-    if ($Release.draft -ne $false -or $Release.prerelease -ne $true) {
-        throw "Only a published continuous prerelease can be retained for rollback."
-    }
-    if (
-        [string]$Release.tag_name -cne $tag -or
-        $null -eq $Release.name -or
-        [string]::IsNullOrWhiteSpace([string]$Release.name) -or
-        $null -eq $Release.body -or
-        [string]::IsNullOrWhiteSpace([string]$Release.target_commitish)
-    ) {
-        throw "The prior continuous metadata cannot be restored exactly."
-    }
-    $oldCommit = Get-DirectTagCommit $TagReference
-    if ($null -eq $oldCommit) {
-        throw "The prior continuous commit is unavailable."
-    }
-    Assert-OwnedAssetNames @($Release.assets)
-    $root = Join-Path $TemporaryRoot "continuous-rollback"
-    New-Item -ItemType Directory -Force -Path $root | Out-Null
-    $bodyPath = Join-Path $root "prior-body.md"
-    [IO.File]::WriteAllText(
-        $bodyPath,
-        [string]$Release.body,
-        [Text.UTF8Encoding]::new($false)
-    )
-    $assets = @()
-    foreach ($asset in @($Release.assets)) {
-        Invoke-GhChecked @(
-            "release", "download", $tag,
-            "--repo", $Repository,
-            "--dir", $root,
-            "--clobber",
-            "--pattern", ([string]$asset.name)
-        )
-        $path = Join-Path $root ([string]$asset.name)
-        $digest = "sha256:$((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant())"
-        if (
-            [int64]$asset.size -ne [int64](Get-Item -LiteralPath $path).Length -or
-            -not [string]::Equals(
-                [string]$asset.digest,
-                $digest,
-                [StringComparison]::OrdinalIgnoreCase
-            )
-        ) {
-            throw "A prior continuous asset could not be retained exactly."
-        }
-        $assets += [pscustomobject]@{
-            Name = [string]$asset.name
-            Path = $path
-            Size = [int64]$asset.size
-            Digest = $digest
-        }
-    }
-    return [pscustomobject]@{
-        ReleaseId = [int64]$Release.id
-        TagName = [string]$Release.tag_name
-        Commit = $oldCommit
-        Title = [string]$Release.name
-        Body = [string]$Release.body
-        BodyPath = $bodyPath
-        Target = [string]$Release.target_commitish
-        Draft = [bool]$Release.draft
-        Prerelease = [bool]$Release.prerelease
-        Assets = @($assets)
-    }
-}
-
-function Restore-RollbackState {
-    param([Parameter(Mandatory = $true)]$Rollback)
-    Invoke-GhChecked @("release", "edit", $tag, "--repo", $Repository, "--draft")
-    $current = Invoke-GhJson @(
-        "api", "repos/$Repository/releases/$($Rollback.ReleaseId)"
-    )
-    Assert-OwnedAssetNames @($current.assets)
-    foreach ($asset in @($current.assets)) {
-        Invoke-GhChecked @(
-            "api", "-X", "DELETE",
-            "repos/$Repository/releases/assets/$($asset.id)"
-        )
-    }
-    $paths = @($Rollback.Assets | ForEach-Object { $_.Path })
-    $arguments = @("release", "upload", $tag) + $paths + @("--repo", $Repository)
-    Invoke-GhChecked $arguments
-
-    $tagReference = Get-ContinuousTag
-    if ($null -eq $tagReference) {
-        Invoke-GhChecked @(
-            "api", "-X", "POST", "repos/$Repository/git/refs",
-            "-f", "ref=refs/tags/$tag", "-f", "sha=$($Rollback.Commit)"
-        )
-    }
-    else {
-        Invoke-GhChecked @(
-            "api", "-X", "PATCH", "repos/$Repository/git/refs/tags/$tag",
-            "-f", "sha=$($Rollback.Commit)", "-F", "force=true"
-        )
-    }
-    Assert-ContinuousTagAt $Rollback.Commit
-    Invoke-GhChecked @(
-        "release", "edit", $tag,
-        "--repo", $Repository,
-        "--target", $Rollback.Target,
-        "--draft=false",
-        "--prerelease",
-        "--title", $Rollback.Title,
-        "--notes-file", $Rollback.BodyPath
-    )
-    Assert-ContinuousTagAt $Rollback.Commit
-    $restored = Get-ContinuousRelease
-    if (
-        $null -eq $restored -or
-        [int64]$restored.id -ne [int64]$Rollback.ReleaseId -or
-        $restored.draft -ne $Rollback.Draft -or
-        $restored.prerelease -ne $Rollback.Prerelease -or
-        [string]$restored.tag_name -cne [string]$Rollback.TagName -or
-        [string]$restored.name -cne [string]$Rollback.Title -or
-        [string]$restored.body -cne [string]$Rollback.Body -or
-        [string]$restored.target_commitish -cne [string]$Rollback.Target
-    ) {
-        throw "The restored release metadata differs from the exact prior state."
-    }
-    $restoredNames = @($restored.assets.name | Sort-Object)
-    $expectedNames = @($Rollback.Assets.Name | Sort-Object)
-    if (Compare-Object $restoredNames $expectedNames) {
-        throw "The restored release asset names differ from the exact prior state."
-    }
-    foreach ($expected in @($Rollback.Assets)) {
-        $remote = @($restored.assets | Where-Object { $_.name -eq $expected.Name })
-        if (
-            $remote.Count -ne 1 -or
-            [int64]$remote[0].size -ne [int64]$expected.Size -or
-            -not [string]::Equals(
-                [string]$remote[0].digest,
-                [string]$expected.Digest,
-                [StringComparison]::OrdinalIgnoreCase
-            )
-        ) {
-            throw "A restored release asset differs from its exact prior metadata."
-        }
-        $publicPath = Join-Path $TemporaryRoot "restored-$($expected.Name)"
-        Invoke-WebRequest -Uri $remote[0].browser_download_url -OutFile $publicPath
-        if (
-            (Get-FileHash -LiteralPath $publicPath -Algorithm SHA256).Hash -ne
-            (Get-FileHash -LiteralPath $expected.Path -Algorithm SHA256).Hash
-        ) {
-            throw "A restored public asset differs from its exact prior bytes."
-        }
     }
 }
 
@@ -399,10 +368,9 @@ $authenticated = $false
 $publicVerified = $false
 $transactionStarted = $false
 $completed = $false
-$rollback = $null
-$release = Get-ContinuousRelease
 $tagReference = Get-ContinuousTag
 Assert-MainStillExpected
+$release = Get-ContinuousRelease
 
 try {
     foreach ($attempt in 1..40) {
@@ -450,13 +418,9 @@ try {
                     }
                 )[0]
                 foreach ($asset in @($legacyZip, $legacySha, $legacySbom)) {
-                    Invoke-GhChecked @(
-                        "release", "download", $tag,
-                        "--repo", $Repository,
-                        "--dir", $legacyRoot,
-                        "--clobber",
-                        "--pattern", ([string]$asset.name)
-                    )
+                    Save-ReleaseAsset `
+                        $asset `
+                        (Join-Path $legacyRoot ([string]$asset.name))
                 }
                 & $PythonPath tools/continuous_release_state.py validate-legacy `
                     --zip (Join-Path $legacyRoot $legacyZip.name) `
@@ -469,36 +433,27 @@ try {
             }
             "hide_and_mark_staging" {
                 Assert-MainStillExpected
-                if ($null -eq $rollback) {
-                    $rollback = Save-RollbackState $release $tagReference
-                }
                 $transactionStarted = $true
-                Invoke-GhChecked @(
-                    "release", "edit", $tag,
-                    "--repo", $Repository,
-                    "--target", $ExpectedCommit,
-                    "--draft",
-                    "--prerelease",
-                    "--title", "Aruba Session Tracker continuous",
-                    "--notes-file", $stageBodies.staging
-                )
+                $release = Set-ReleaseMetadata `
+                    ([int64]$release.id) `
+                    $ExpectedCommit `
+                    $true `
+                    $true `
+                    "Aruba Session Tracker continuous" `
+                    $stageBodies.staging
                 $authenticated = $false
-                $release = Get-ContinuousRelease
                 $tagReference = Get-ContinuousTag
             }
             "mark_staging" {
                 $transactionStarted = $true
-                Invoke-GhChecked @(
-                    "release", "edit", $tag,
-                    "--repo", $Repository,
-                    "--target", $ExpectedCommit,
-                    "--draft",
-                    "--prerelease",
-                    "--title", "Aruba Session Tracker continuous",
-                    "--notes-file", $stageBodies.staging
-                )
+                $release = Set-ReleaseMetadata `
+                    ([int64]$release.id) `
+                    $ExpectedCommit `
+                    $true `
+                    $true `
+                    "Aruba Session Tracker continuous" `
+                    $stageBodies.staging
                 $authenticated = $false
-                $release = Get-ContinuousRelease
                 $tagReference = Get-ContinuousTag
             }
             "replace_assets" {
@@ -513,31 +468,29 @@ try {
                         "repos/$Repository/releases/assets/$($asset.id)"
                     )
                 }
-                Invoke-GhChecked @(
-                    "release", "upload", $tag, $zip, "--repo", $Repository
-                )
+                $null = Add-ReleaseAsset ([int64]$release.id) $zip
                 $authenticated = $false
-                $release = Get-ContinuousRelease
+                $release = Invoke-GhJson @(
+                    "api", "repos/$Repository/releases/$($release.id)"
+                )
                 $tagReference = Get-ContinuousTag
             }
             "verify_draft_download" {
                 Assert-RemoteContract $release "draft"
                 Assert-DownloadedZip `
+                    $release `
                     (Join-Path $TemporaryRoot "continuous-draft-download") `
                     "The authenticated continuous ZIP differs from the verified input."
                 $authenticated = $true
             }
             "mark_assets_verified" {
-                Invoke-GhChecked @(
-                    "release", "edit", $tag,
-                    "--repo", $Repository,
-                    "--target", $ExpectedCommit,
-                    "--draft",
-                    "--prerelease",
-                    "--title", "Aruba Session Tracker continuous",
-                    "--notes-file", $stageBodies.assets_verified
-                )
-                $release = Get-ContinuousRelease
+                $release = Set-ReleaseMetadata `
+                    ([int64]$release.id) `
+                    $ExpectedCommit `
+                    $true `
+                    $true `
+                    "Aruba Session Tracker continuous" `
+                    $stageBodies.assets_verified
                 $tagReference = Get-ContinuousTag
             }
             "align_tag" {
@@ -560,16 +513,13 @@ try {
             }
             "mark_ready" {
                 Assert-RemoteContract $release "draft"
-                Invoke-GhChecked @(
-                    "release", "edit", $tag,
-                    "--repo", $Repository,
-                    "--target", $ExpectedCommit,
-                    "--draft",
-                    "--prerelease",
-                    "--title", "Aruba Session Tracker continuous",
-                    "--notes-file", $stageBodies.ready
-                )
-                $release = Get-ContinuousRelease
+                $release = Set-ReleaseMetadata `
+                    ([int64]$release.id) `
+                    $ExpectedCommit `
+                    $true `
+                    $true `
+                    "Aruba Session Tracker continuous" `
+                    $stageBodies.ready
                 $tagReference = Get-ContinuousTag
             }
             "publish" {
@@ -577,25 +527,31 @@ try {
                 Assert-ContinuousTagAt $ExpectedCommit
                 Assert-MainStillExpected
                 $transactionStarted = $true
-                Invoke-GhChecked @(
-                    "release", "edit", $tag,
-                    "--repo", $Repository,
-                    "--target", $ExpectedCommit,
-                    "--draft=false",
-                    "--prerelease",
-                    "--title", "Aruba Session Tracker continuous",
-                    "--notes-file", $stageBodies.ready
-                )
+                $release = Set-ReleaseMetadata `
+                    ([int64]$release.id) `
+                    $ExpectedCommit `
+                    $false `
+                    $true `
+                    "Aruba Session Tracker continuous" `
+                    $stageBodies.ready
                 Assert-ContinuousTagAt $ExpectedCommit
-                $release = Get-ContinuousRelease
                 $tagReference = Get-ContinuousTag
             }
             "verify_public" {
                 Assert-ContinuousTagAt $ExpectedCommit
+                $publishedByTag = Invoke-GhJson @(
+                    "api", "repos/$Repository/releases/tags/$tag"
+                )
+                if ([int64]$publishedByTag.id -ne [int64]$release.id) {
+                    throw "The public tag endpoint returned a different release id."
+                }
+                $release = $publishedByTag
                 Assert-RemoteContract $release "published"
                 Assert-DownloadedZip `
+                    $release `
                     (Join-Path $TemporaryRoot "continuous-public-download") `
-                    "The public continuous ZIP differs from the verified input."
+                    "The public continuous ZIP differs from the verified input." `
+                    -Public
                 Assert-ContinuousTagAt $ExpectedCommit
                 $publicVerified = $true
             }
@@ -617,23 +573,18 @@ try {
 }
 catch {
     $primaryError = $_
-    if ($transactionStarted -and $null -ne $rollback) {
-        try {
-            Restore-RollbackState $rollback
+    if ($transactionStarted) {
+        # GitHub's built-in token cannot republish an older target when workflow
+        # files differ from current main. Retain the owned release as a hidden,
+        # durable forward state so the next run can resume by release id.
+        if ($null -ne $release -and [int64]$release.id -gt 0) {
+            try {
+                $null = Set-ReleaseDraftState ([int64]$release.id) $true 2>$null
+            }
+            catch {
+                Write-Warning "Could not confirm the interrupted release is hidden."
+            }
         }
-        catch {
-            $rollbackError = $_
-            $null = & gh release edit $tag --repo $Repository --draft 2>$null
-            throw (
-                "Continuous update failed and exact rollback also failed: " +
-                "$($primaryError.Exception.Message); $($rollbackError.Exception.Message)"
-            )
-        }
-    }
-    elseif ($transactionStarted) {
-        # The durable body marker remains the source of truth for the next run.
-        # Hiding is best effort because the publish response may be ambiguous.
-        $null = & gh release edit $tag --repo $Repository --draft 2>$null
     }
     throw $primaryError
 }

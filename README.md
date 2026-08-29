@@ -44,9 +44,12 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
    실행합니다. Python과 관리자 권한은 필요하지 않습니다.
 
 `continuous`는 최신 `main`의 자동 검증 결과를 갱신하는 이동형
-사전릴리스입니다. 같은 이름의 공개 자산을 먼저 지우지 않고 후보 자산을
-올려 검증한 뒤 짧은 draft 전환 동안 tag와 자산을 교체합니다. `v0.4.0`
-같은 버전 태그 릴리스는 자동화가 기존 릴리스 덮어쓰기를 거부하는 1회성
+사전릴리스입니다. 갱신 중에는 기존 릴리스 ID를 draft로 전환하고 ZIP을
+검증한 뒤 같은 ID를 다시 공개합니다. 중단되면 이전 커밋으로 되돌려
+재공개하지 않고 숨겨진 단계 기록에서 다음 실행이 이어집니다. 이 방식은
+GitHub 기본 토큰에 없는 과거 워크플로 수정 권한을 요구하지 않으며, 태그로
+초안을 추측해 중복 릴리스를 만드는 문제도 피합니다. `v0.4.0` 같은 버전
+태그 릴리스는 자동화가 기존 릴리스 덮어쓰기를 거부하는 1회성
 사전릴리스입니다. 공개 자산은 Windows x64 ZIP 하나이며 SHA-256은 릴리스
 본문에, CycloneDX SBOM은 ZIP 내부 `ArubaSessionTracker/sbom.cdx.json`에
 포함됩니다.
@@ -313,7 +316,8 @@ Qt GUI smoke를 검증합니다. 로컬 시험용 dirty build만
 
 PR과 `main`은 GitHub-hosted Windows x64 CI를 통과해야 합니다. `main`
 변경은 현재 main과 빌드 commit을 다시 비교한 뒤 기존 release를 지우지
-않고 `continuous` tag, 메타데이터와 자산을 갱신합니다.
+않고 고정된 릴리스 ID에서 `continuous` tag, 메타데이터와 자산을
+전진식으로 갱신합니다.
 `vMAJOR.MINOR.PATCH`는 반드시 annotated tag여야 하며 원격 tag, checkout
 HEAD, GitHub event SHA, 최신 원격 `main`이 같은 commit일 때만 변경 불가
 정책의 사전릴리스를 처음 한 번 게시합니다. 이 불변성은 release workflow

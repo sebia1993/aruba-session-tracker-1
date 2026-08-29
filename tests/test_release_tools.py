@@ -17,12 +17,14 @@ from tools.continuous_release_state import (
     ContinuousReleaseStateError,
     DesiredRelease,
     DurableState,
+    ReleaseSelection,
     ReleaseSnapshot,
     Stage,
     classify_asset_names,
     next_action,
     parse_state,
     render_body,
+    select_release_candidates,
     snapshot_from_document,
     validate_legacy_files,
     verify_rollback,
@@ -277,6 +279,155 @@ def _desired_asset(desired: DesiredRelease) -> tuple[AssetEvidence, ...]:
     )
 
 
+def _continuous_candidate(
+    release_id: int,
+    *,
+    published_at: str | None = None,
+    assets: list[dict[str, object]] | None = None,
+    body: str | None = None,
+) -> dict[str, object]:
+    return {
+        "id": release_id,
+        "draft": True,
+        "prerelease": True,
+        "name": "Aruba Session Tracker continuous",
+        "body": body or _durable_body(Stage.STAGING),
+        "target_commitish": "a" * 40,
+        "tag_name": "continuous",
+        "published_at": published_at,
+        "assets": assets or [],
+    }
+
+
+def _legacy_candidate_assets() -> list[dict[str, object]]:
+    archive = "ArubaSessionTracker_v0.3.1_windows_x64.zip"
+    return [
+        {"name": archive, "size": 10, "digest": f"sha256:{'c' * 64}"},
+        {"name": f"{archive}.sha256", "size": 109, "digest": f"sha256:{'d' * 64}"},
+        {
+            "name": "ArubaSessionTracker_v0.3.1_sbom.cdx.json",
+            "size": 200,
+            "digest": f"sha256:{'e' * 64}",
+        },
+    ]
+
+
+def test_continuous_release_selection_recovers_real_duplicate_draft_shape() -> None:
+    candidates = [
+        _continuous_candidate(
+            378408554,
+            published_at="2026-08-29T00:00:00Z",
+            assets=_legacy_candidate_assets(),
+        ),
+        _continuous_candidate(378942556),
+        _continuous_candidate(378942581),
+    ]
+
+    selection = select_release_candidates(candidates)
+
+    assert selection == ReleaseSelection(
+        keeper_id=378408554,
+        cleanup_ids=(378942556, 378942581),
+    )
+
+
+def test_continuous_release_selection_fails_closed_on_nonempty_duplicate() -> None:
+    candidates = [
+        _continuous_candidate(
+            10,
+            published_at="2026-08-29T00:00:00Z",
+            assets=_legacy_candidate_assets(),
+        ),
+        _continuous_candidate(
+            11,
+            assets=[
+                {
+                    "name": "ArubaSessionTracker_v0.4.0_windows_x64.zip",
+                    "size": 1234,
+                    "digest": f"sha256:{'b' * 64}",
+                }
+            ],
+        ),
+    ]
+
+    with pytest.raises(ContinuousReleaseStateError, match="empty unpublished draft"):
+        select_release_candidates(candidates)
+
+
+def test_continuous_release_selection_fails_closed_on_foreign_duplicate() -> None:
+    candidates = [
+        _continuous_candidate(
+            10,
+            published_at="2026-08-29T00:00:00Z",
+            assets=_legacy_candidate_assets(),
+        ),
+        _continuous_candidate(11, body="not owned"),
+    ]
+
+    with pytest.raises(ContinuousReleaseStateError, match="not workflow-owned"):
+        select_release_candidates(candidates)
+
+
+def test_continuous_release_selection_cleans_owned_starter_upload() -> None:
+    candidate = _continuous_candidate(
+        10,
+        published_at="2026-08-29T00:00:00Z",
+        assets=[
+            {
+                "id": 901,
+                "name": "ArubaSessionTracker_v0.4.0_windows_x64.zip",
+                "state": "starter",
+                "size": 0,
+                "digest": None,
+            }
+        ],
+    )
+
+    selection = select_release_candidates([candidate])
+
+    assert selection == ReleaseSelection(
+        keeper_id=10,
+        cleanup_ids=(),
+        cleanup_asset_ids=(901,),
+    )
+
+
+def test_continuous_release_selection_rejects_starter_with_foreign_name() -> None:
+    candidate = _continuous_candidate(
+        10,
+        assets=[
+            {
+                "id": 901,
+                "name": "unowned.bin",
+                "state": "starter",
+                "size": 0,
+                "digest": None,
+            }
+        ],
+    )
+
+    with pytest.raises(ContinuousReleaseStateError, match="not a disposable owned"):
+        select_release_candidates([candidate])
+
+
+def test_continuous_release_selection_requires_durable_marker_for_duplicate() -> None:
+    old_commit = "c" * 40
+    candidates = [
+        _continuous_candidate(
+            10,
+            published_at="2026-08-29T00:00:00Z",
+            assets=_legacy_candidate_assets(),
+        ),
+        _continuous_candidate(
+            11,
+            body=(f"# legacy draft\n\n<!-- aruba-session-tracker-continuous:{old_commit} -->\n"),
+        ),
+    ]
+
+    with pytest.raises(ContinuousReleaseStateError, match="no durable state marker"):
+        select_release_candidates(candidates)
+
+
 def test_continuous_durable_marker_round_trips_exact_desired_state() -> None:
     desired = _desired_release()
 
@@ -372,7 +523,7 @@ def _apply_reconcile_action(
             title="Aruba Session Tracker continuous",
             body=_durable_body(Stage.STAGING, desired),
             target_commitish=desired.commit,
-            tag_commit=desired.commit,
+            tag_commit=None,
             assets=(),
         )
     assert snapshot is not None
@@ -477,6 +628,7 @@ def test_continuous_reconciliation_converges_after_every_interruption_boundary(
     assert final.assets == _desired_asset(desired)
     assert parse_state(final.body) == DurableState(Stage.READY, desired)
     assert actions[-2:] == (Action.VERIFY_PUBLIC, Action.DONE)
+    assert Action.ALIGN_TAG in actions
     if source_contract == "legacy_trio":
         assert Action.VALIDATE_LEGACY in actions
 
@@ -567,7 +719,7 @@ def test_continuous_workflow_delegates_to_durable_reconciler() -> None:
     assert "gh release" not in workflow
 
 
-def test_continuous_reconciler_persists_stages_and_keeps_exact_rollback() -> None:
+def test_continuous_reconciler_persists_stages_and_uses_release_ids() -> None:
     script = Path("tools/publish_continuous.ps1").read_text(encoding="utf-8")
 
     assert 'Write-StageBody "staging"' in script
@@ -576,19 +728,22 @@ def test_continuous_reconciler_persists_stages_and_keeps_exact_rollback() -> Non
     assert "tools/continuous_release_state.py action" not in script
     assert '"tools/continuous_release_state.py", "action"' in script
     assert "tools/continuous_release_state.py validate-legacy" in script
-    assert "[IO.File]::WriteAllText(" in script
-    assert "[string]$restored.body -cne [string]$Rollback.Body" in script
-    assert "[string]$restored.tag_name -cne [string]$Rollback.TagName" in script
-    assert "[string]$restored.name -cne [string]$Rollback.Title" in script
-    assert "$restored.draft -ne $Rollback.Draft" in script
-    assert "$restored.prerelease -ne $Rollback.Prerelease" in script
-    assert "Assert-ContinuousTagAt $Rollback.Commit" in script
-    assert "A restored public asset differs from its exact prior bytes." in script
-    assert "Continuous update failed and exact rollback also failed" in script
-    assert "tag exists without an associated release" not in script
-    save_index = script.index("$rollback = Save-RollbackState")
-    hide_index = script.index('"release", "edit", $tag', save_index)
-    assert save_index < hide_index
+    assert "tools/continuous_release_state.py select-release" in script
+    assert '"repos/$Repository/releases?per_page=100&page=$page"' in script
+    assert '"repos/$Repository/releases/$ReleaseId"' in script
+    assert '"https://uploads.github.com/repos/' in script
+    assert '"--hostname", "uploads.github.com"' not in script
+    assert "Save-ReleaseAsset" in script
+    assert "cleanup_asset_ids" in script
+    assert '"release", "upload"' not in script
+    assert '"release", "download"' not in script
+    assert '"release", "edit"' not in script
+    assert "Restore-RollbackState" not in script
+    assert "durable forward state" in script
+    assert "releases/$duplicateId" in script
+    catch_case = script[script.index("catch {") : script.rindex("throw $primaryError")]
+    assert "Set-ReleaseDraftState" in catch_case
+    assert "Write-Warning" in catch_case
 
 
 def test_continuous_reconciler_rechecks_main_tag_and_exact_single_zip() -> None:
@@ -601,11 +756,13 @@ def test_continuous_reconciler_rechecks_main_tag_and_exact_single_zip() -> None:
     contract_index = publish_case.index('Assert-RemoteContract $release "draft"')
     tag_index = publish_case.index("Assert-ContinuousTagAt $ExpectedCommit", contract_index)
     main_index = publish_case.index("Assert-MainStillExpected", tag_index)
-    mutation_index = publish_case.index("Invoke-GhChecked", main_index)
+    mutation_index = publish_case.index("Set-ReleaseMetadata", main_index)
     assert contract_index < tag_index < main_index < mutation_index
     public_case = script[script.index('"verify_public" {') : script.index('"done" {')]
     assert public_case.count("Assert-ContinuousTagAt $ExpectedCommit") == 2
+    assert "publishedByTag.id -ne [int64]$release.id" in public_case
     assert 'Assert-RemoteContract $release "published"' in public_case
+    assert "-Public" in public_case
     assert "The public continuous ZIP differs from the verified input." in public_case
 
 

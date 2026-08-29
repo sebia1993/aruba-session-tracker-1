@@ -71,6 +71,9 @@ datapath session rows from the relevant 7240XM managed device.
 - Public builds are unsigned Windows x64 onedir ZIP files.
 - Versioned tags and releases are immutable by workflow policy. The moving
   `continuous` prerelease may be updated only by the verified `main` workflow.
+- Reconcile `continuous` drafts by their release ID, never by a tag-only draft
+  lookup or upload. Recovery is forward-only: preserve an interrupted owned
+  draft and resume it instead of republishing an older workflow target.
 - Every public release must contain exactly one uploaded Windows x64 ZIP. Keep
   the verified SHA-256 in the release body and the CycloneDX SBOM inside the ZIP.
   Local build inputs still include the sidecar and external SBOM for verification.
