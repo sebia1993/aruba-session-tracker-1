@@ -377,7 +377,7 @@ def smoke_executable(zip_path: Path) -> None:
         with zipfile.ZipFile(zip_path) as archive:
             archive.extractall(root)
         executable = root / PRODUCT / f"{PRODUCT}.exe"
-        logic_environment = os.environ.copy()
+        logic_environment = _packaged_environment()
         logic_environment["QT_QPA_PLATFORM"] = "offscreen"
         try:
             result = subprocess.run(  # noqa: S603
@@ -421,7 +421,7 @@ def smoke_executable(zip_path: Path) -> None:
         ):
             raise ReleaseVerificationError("packaged HTML report is not standalone and complete")
 
-        gui_environment = os.environ.copy()
+        gui_environment = _packaged_environment()
         gui_environment.pop("QT_QPA_PLATFORM", None)
         gui_environment["LOCALAPPDATA"] = str(korean_local_app_data)
         try:
@@ -439,6 +439,17 @@ def smoke_executable(zip_path: Path) -> None:
                 "packaged native Qt GUI smoke failed in a Korean LocalAppData path "
                 f"with exit code {gui_result.returncode}"
             )
+
+
+def _packaged_environment() -> dict[str, str]:
+    """Return a Windows smoke environment with no development Python on PATH."""
+
+    environment = os.environ.copy()
+    for name in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "CONDA_PREFIX"):
+        environment.pop(name, None)
+    system_root = environment.get("SystemRoot", r"C:\Windows")
+    environment["PATH"] = os.pathsep.join((str(Path(system_root) / "System32"), system_root))
+    return environment
 
 
 def main() -> int:

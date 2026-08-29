@@ -58,8 +58,9 @@ class _Factory:
         *,
         host_key_approval: object,
         cancel_token: CancellationToken,
+        deadline: object,
     ) -> AbstractContextManager[CommandConnection]:
-        del credentials, host_key_approval
+        del credentials, host_key_approval, deadline
         cancel_token.raise_if_cancelled()
         if target.host == "192.0.2.1":
             responses = {
@@ -106,6 +107,7 @@ class _BlockingFactory(_Factory):
         *,
         host_key_approval: object,
         cancel_token: CancellationToken,
+        deadline: object,
     ) -> AbstractContextManager[CommandConnection]:
         self.cancel_tokens.append(cancel_token)
         connection = super().connect(
@@ -113,6 +115,7 @@ class _BlockingFactory(_Factory):
             credentials,
             host_key_approval=host_key_approval,
             cancel_token=cancel_token,
+            deadline=deadline,
         )
         if self._used_block:
             return connection

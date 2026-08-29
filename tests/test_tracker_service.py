@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from contextlib import AbstractContextManager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -14,6 +15,7 @@ from aruba_session_tracker.collectors import (
     CancellationToken,
     CollectorError,
     CommandConnection,
+    PollDeadline,
 )
 from aruba_session_tracker.commands import (
     NO_PAGING_COMMAND,
@@ -24,6 +26,7 @@ from aruba_session_tracker.models import (
     AppConfig,
     Credentials,
     DeviceTarget,
+    DiagnosticEvent,
     ErrorCode,
     QueryRequest,
     SessionObservation,
@@ -31,6 +34,7 @@ from aruba_session_tracker.models import (
 from aruba_session_tracker.services import (
     LifecycleEventType,
     MonitorEngine,
+    PollBudget,
     QueryOutcome,
     RawSnapshot,
     TrackerService,
@@ -122,7 +126,9 @@ class FakeFactory:
         *,
         host_key_approval: object,
         cancel_token: CancellationToken,
+        deadline: object,
     ) -> FakeConnection:
+        del credentials, host_key_approval, cancel_token, deadline
         self.calls.append(target.name)
         if target.name in self.errors:
             raise self.errors[target.name]
@@ -187,6 +193,10 @@ def test_primary_network_failure_uses_standby_but_auth_failure_does_not() -> Non
     assert outcome.used_mm == "MM-Standby"
     assert len(outcome.observations) == 1
     assert factory.calls[:2] == ["MM-Primary", "MM-Standby"]
+    primary_failure = outcome.diagnostics[0]
+    assert primary_failure.transient is True
+    assert primary_failure.recovered is True
+    assert outcome.authoritative is True
 
     auth_factory = FakeFactory(outputs)
     auth_factory.errors["MM-Primary"] = CollectorError(ErrorCode.AUTH_FAILED, "auth")
@@ -194,6 +204,25 @@ def test_primary_network_failure_uses_standby_but_auth_failure_does_not() -> Non
     assert outcome.observations == ()
     assert [event.code for event in outcome.diagnostics] == [ErrorCode.AUTH_FAILED]
     assert auth_factory.calls == ["MM-Primary"]
+
+
+def test_expired_poll_deadline_does_not_attempt_mm_failover() -> None:
+    outputs = {
+        "MM-Primary": _mm_outputs("192.0.2.101", None),
+        "MM-Standby": _mm_outputs("192.0.2.101", None),
+    }
+    factory = FakeFactory(outputs)
+
+    outcome = TrackerService(_config(), factory).query_once(
+        REQUEST,
+        CREDENTIALS,
+        deadline=PollDeadline(1.0, lambda: 1.0),
+    )
+
+    assert outcome.authoritative is False
+    assert factory.calls == []
+    assert [item.code for item in outcome.diagnostics] == [ErrorCode.POLL_DEADLINE_EXCEEDED]
+    assert outcome.diagnostics[0].transient is True
 
 
 def test_destination_md_is_queried_only_after_source_md_has_no_match() -> None:
@@ -310,6 +339,92 @@ def test_full_scan_approval_cancellation_takes_precedence_over_denial() -> None:
     assert [event.code for event in outcome.diagnostics][-1] is ErrorCode.CANCELLED
 
 
+def test_monitor_full_scan_reuses_only_the_md_that_matched_until_mm_refresh() -> None:
+    config = _config()
+    outputs: dict[str, dict[str, str]] = {"MM-Primary": _mm_outputs(None, None)}
+    for device in config.managed_devices:
+        outputs[device.name] = {
+            NO_PAGING_COMMAND: "",
+            build_datapath_session_command(REQUEST.source_ip): (
+                _datapath_output() if device.name == "MD-2" else DATAPATH_EMPTY
+            ),
+        }
+    factory = FakeFactory(outputs)
+    approvals = 0
+
+    def approve(*_args: object) -> bool:
+        nonlocal approvals
+        approvals += 1
+        return True
+
+    ticks = count(0.0, 5.0)
+    monitor = MonitorEngine(
+        TrackerService(config, factory),
+        REQUEST,
+        CREDENTIALS,
+        full_scan_approval=approve,
+        monotonic_clock=lambda: next(ticks),
+    )
+
+    first = monitor.poll_once()
+    calls_after_first = tuple(factory.calls)
+    second = monitor.poll_once()
+
+    assert len(first.observations) == 1
+    assert len(second.observations) == 1
+    assert approvals == 1
+    assert calls_after_first == ("MM-Primary", "MD-1", "MD-2", "MD-3", "MD-4")
+    assert factory.calls[len(calls_after_first) :] == ["MD-2"]
+
+
+def test_monitor_empty_full_scan_is_not_repeated_before_the_next_mm_refresh() -> None:
+    config = _config()
+    outputs: dict[str, dict[str, str]] = {"MM-Primary": _mm_outputs(None, None)}
+    for device in config.managed_devices:
+        outputs[device.name] = {
+            NO_PAGING_COMMAND: "",
+            build_datapath_session_command(REQUEST.source_ip): DATAPATH_EMPTY,
+        }
+    factory = FakeFactory(outputs)
+    approvals = 0
+
+    def approve(*_args: object) -> bool:
+        nonlocal approvals
+        approvals += 1
+        return True
+
+    ticks = count(0.0, 5.0)
+    monitor = MonitorEngine(
+        TrackerService(config, factory),
+        REQUEST,
+        CREDENTIALS,
+        full_scan_approval=approve,
+        monotonic_clock=lambda: next(ticks),
+    )
+
+    monitor.poll_once()
+    calls_after_first = tuple(factory.calls)
+    deferred = monitor.poll_once()
+
+    assert approvals == 1
+    assert tuple(factory.calls) == calls_after_first
+    assert deferred.authoritative is False
+    assert ErrorCode.CLIENT_NOT_FOUND_ON_MM in {event.code for event in deferred.diagnostics}
+
+
+def test_query_raw_budget_exhaustion_is_non_authoritative() -> None:
+    factory = FakeFactory({"MM-Primary": _mm_outputs("192.0.2.101", None)})
+
+    outcome = TrackerService(_config(), factory).query_once(
+        REQUEST,
+        CREDENTIALS,
+        poll_budget=PollBudget(max_raw_bytes=1),
+    )
+
+    assert outcome.authoritative is False
+    assert ErrorCode.OUTPUT_LIMIT_EXCEEDED in {event.code for event in outcome.diagnostics}
+
+
 def test_rejected_filtered_command_never_falls_back_to_unfiltered_table() -> None:
     config = _config()
     filtered = build_datapath_session_command(REQUEST.source_ip)
@@ -402,7 +517,7 @@ def test_monitor_refreshes_mm_on_second_miss_and_closes_on_third() -> None:
     )
     miss = QueryOutcome(used_mm="MM-Primary", authoritative=True)
     service = StubService([observed, miss, miss, miss, miss])
-    ticks = iter((0.0, 5.0, 10.0, 15.0, 20.0))
+    ticks = count(0.0, 5.0)
     wall = datetime(2026, 8, 28, tzinfo=UTC)
     wall_ticks = iter(wall + timedelta(seconds=i) for i in range(10))
     monitor = MonitorEngine(
@@ -444,7 +559,7 @@ def test_non_authoritative_poll_never_advances_miss_or_closes() -> None:
     )
     uncertain = QueryOutcome(used_mm="MM-Primary", authoritative=False)
     service = StubService([observed, uncertain])
-    ticks = iter((0.0, 5.0))
+    ticks = count(0.0, 5.0)
     monitor = MonitorEngine(
         service,  # type: ignore[arg-type]
         REQUEST,
@@ -456,6 +571,157 @@ def test_non_authoritative_poll_never_advances_miss_or_closes() -> None:
     assert result.consecutive_misses == 0
     assert result.events == ()
     assert len(result.active_sessions) == 1
+
+
+def test_both_mm_transient_outage_recovers_without_false_miss_or_close() -> None:
+    config = replace(_config(), location_interval_seconds=10)
+    outputs = {
+        "MM-Primary": _mm_outputs("192.0.2.101", None),
+        "MM-Standby": _mm_outputs("192.0.2.101", None),
+        "MD-1": {
+            NO_PAGING_COMMAND: "",
+            build_datapath_session_command(REQUEST.source_ip): _datapath_output(),
+        },
+    }
+    factory = FakeFactory(outputs)
+    now = [0.0]
+    monitor = MonitorEngine(
+        TrackerService(config, factory),
+        REQUEST,
+        CREDENTIALS,
+        monotonic_clock=lambda: now[0],
+    )
+
+    started = monitor.poll_once()
+    assert started.events[0].event_type is LifecycleEventType.STARTED
+
+    factory.errors["MM-Primary"] = CollectorError(
+        ErrorCode.MM_UNREACHABLE, "fixture primary timeout", retryable_network=True
+    )
+    factory.errors["MM-Standby"] = CollectorError(
+        ErrorCode.MM_UNREACHABLE, "fixture standby timeout", retryable_network=True
+    )
+    now[0] = 11.0
+    unavailable = monitor.poll_once()
+
+    assert unavailable.authoritative is False
+    assert unavailable.retry_after_seconds == 5
+    assert unavailable.consecutive_misses == 0
+    assert len(unavailable.active_sessions) == 1
+    assert not {
+        LifecycleEventType.MISSED,
+        LifecycleEventType.CLOSED,
+    }.intersection(event.event_type for event in unavailable.events)
+
+    factory.errors.clear()
+    now[0] = 22.0
+    recovered = monitor.poll_once()
+
+    assert recovered.authoritative is True
+    assert recovered.retry_after_seconds == 0
+    assert recovered.consecutive_transient_failures == 0
+    assert recovered.consecutive_misses == 0
+    assert len(recovered.active_sessions) == 1
+    assert not {
+        LifecycleEventType.MISSED,
+        LifecycleEventType.CLOSED,
+    }.intersection(event.event_type for event in recovered.events)
+
+
+def test_transient_md_outage_recovers_without_false_miss_or_close() -> None:
+    outputs = {
+        "MM-Primary": _mm_outputs("192.0.2.101", None),
+        "MM-Standby": _mm_outputs("192.0.2.101", None),
+        "MD-1": {
+            NO_PAGING_COMMAND: "",
+            build_datapath_session_command(REQUEST.source_ip): _datapath_output(),
+        },
+    }
+    factory = FakeFactory(outputs)
+    now = [0.0]
+    monitor = MonitorEngine(
+        TrackerService(_config(), factory),
+        REQUEST,
+        CREDENTIALS,
+        monotonic_clock=lambda: now[0],
+    )
+
+    monitor.poll_once()
+    factory.errors["MD-1"] = CollectorError(
+        ErrorCode.MD_UNREACHABLE, "fixture MD timeout", retryable_network=True
+    )
+    now[0] = 1.0
+    unavailable = monitor.poll_once()
+
+    assert unavailable.authoritative is False
+    assert unavailable.retry_after_seconds == 5
+    assert unavailable.consecutive_misses == 0
+    assert len(unavailable.active_sessions) == 1
+    assert not {
+        LifecycleEventType.MISSED,
+        LifecycleEventType.CLOSED,
+    }.intersection(event.event_type for event in unavailable.events)
+
+    factory.errors.clear()
+    now[0] = 2.0
+    recovered = monitor.poll_once()
+
+    assert recovered.authoritative is True
+    assert recovered.retry_after_seconds == 0
+    assert recovered.consecutive_transient_failures == 0
+    assert recovered.consecutive_misses == 0
+    assert len(recovered.active_sessions) == 1
+    assert not {
+        LifecycleEventType.MISSED,
+        LifecycleEventType.CLOSED,
+    }.intersection(event.event_type for event in recovered.events)
+
+
+def test_monitor_transient_failure_backoff_is_deterministic_and_resets() -> None:
+    transient = QueryOutcome(
+        diagnostics=(
+            DiagnosticEvent(
+                stage="MM_QUERY",
+                code=ErrorCode.MM_UNREACHABLE,
+                message="fixture transient",
+                transient=True,
+            ),
+        ),
+        authoritative=False,
+    )
+    recovered = QueryOutcome(used_mm="MM-Primary", authoritative=True)
+    service = StubService([transient] * 7 + [recovered])
+    ticks = count(0.0, 1.0)
+    monitor = MonitorEngine(
+        service,  # type: ignore[arg-type]
+        REQUEST,
+        CREDENTIALS,
+        monotonic_clock=lambda: next(ticks),
+    )
+
+    delays = [monitor.poll_once().retry_after_seconds for _ in range(7)]
+    final = monitor.poll_once()
+
+    assert delays == [5, 10, 20, 40, 80, 160, 300]
+    assert final.retry_after_seconds == 0
+    assert final.consecutive_transient_failures == 0
+
+
+def test_successful_location_refresh_timestamp_is_taken_after_query_completion() -> None:
+    observed = QueryOutcome(used_mm="MM-Primary", authoritative=True)
+    service = StubService([observed, observed])
+    ticks = iter((0.0, 45.0, 50.0))
+    monitor = MonitorEngine(
+        service,  # type: ignore[arg-type]
+        REQUEST,
+        CREDENTIALS,
+        monotonic_clock=lambda: next(ticks),
+    )
+
+    monitor.poll_once()
+    monitor.poll_once()
+
+    assert service.refresh_calls == [True, False]
 
 
 def test_second_miss_of_one_flow_refreshes_mm_while_another_flow_remains() -> None:
@@ -488,7 +754,7 @@ def test_second_miss_of_one_flow_refreshes_mm_while_another_flow_remains() -> No
         authoritative=True,
     )
     service = StubService([both, only_first, only_first, both])
-    ticks = iter((0.0, 5.0, 10.0))
+    ticks = count(0.0, 5.0)
     monitor = MonitorEngine(
         service,  # type: ignore[arg-type]
         REQUEST,
@@ -529,7 +795,7 @@ def test_failed_second_miss_refresh_retains_positive_first_pass_evidence() -> No
     )
     refresh_failed = QueryOutcome(authoritative=False)
     service = StubService([both, only_first, first_before_failed_refresh, refresh_failed])
-    ticks = iter((0.0, 5.0, 10.0))
+    ticks = count(0.0, 5.0)
     monitor = MonitorEngine(
         service,  # type: ignore[arg-type]
         REQUEST,
@@ -660,12 +926,37 @@ def test_monitor_callback_failure_does_not_reclassify_committed_poll() -> None:
     assert monitor._prepared_generation is None
 
 
-def test_monitor_ten_thousand_poll_fixture_soak_keeps_bounded_ownership() -> None:
-    iterations = 10_000
-    observed = QueryOutcome(
-        observations=(_observation(),), used_mm="MM-Primary", authoritative=True
-    )
-    service = StubService([observed] * iterations)
+@pytest.mark.soak
+def test_monitor_accelerated_soak_keeps_bounded_ownership() -> None:
+    iterations_text = os.environ.get("ARUBA_SOAK_POLLS", "2000")
+    assert iterations_text.isascii() and iterations_text.isdecimal()
+    iterations = int(iterations_text)
+    assert 1 <= iterations <= 20_000
+
+    class FreshSoakService:
+        def __init__(self) -> None:
+            self.config = _config()
+            self.polls = 0
+
+        def query_once(self, *args: object, **kwargs: object) -> QueryOutcome:
+            del args, kwargs
+            self.polls += 1
+            observation = _observation(packets=self.polls)
+            return QueryOutcome(
+                observations=(observation,),
+                used_mm="MM-Primary",
+                raw_snapshots=(
+                    RawSnapshot(
+                        "MD",
+                        build_datapath_session_command(REQUEST.source_ip),
+                        f"poll={self.polls}",
+                        observation_keys=(observation.session_key,),
+                    ),
+                ),
+                authoritative=True,
+            )
+
+    service = FreshSoakService()
     monotonic_ticks = count(0.0, 1.0)
     wall_ticks = count()
     wall_start = datetime(2026, 8, 28, tzinfo=UTC)
@@ -678,17 +969,24 @@ def test_monitor_ten_thousand_poll_fixture_soak_keeps_bounded_ownership() -> Non
     )
 
     first_instance: str | None = None
-    for _ in range(iterations):
+    previous_outcome: QueryOutcome | None = None
+    for poll_number in range(1, iterations + 1):
         result = monitor.poll_once()
         assert len(result.active_sessions) == 1
+        assert result.outcome is not previous_outcome
+        assert result.raw_snapshots[0].output == f"poll={poll_number}"
+        assert result.retry_after_seconds == 0
         if first_instance is None:
             first_instance = result.active_sessions[0].instance_id
         else:
             assert result.active_sessions[0].instance_id == first_instance
+        previous_outcome = result.outcome
 
+    assert service.polls == iterations
     assert monitor.is_running is False
     assert monitor.last_result is not None
     assert monitor.last_result.consecutive_misses == 0
     assert monitor._thread is None
     assert monitor._cancel_token is None
     assert monitor._prepared_generation is None
+    assert len(monitor._active) == 1

@@ -10,6 +10,7 @@ from aruba_session_tracker.collectors import (
     CancellationToken,
     CollectorError,
     HostKeyApproval,
+    PollDeadline,
     SSHCollector,
     SSHConnectionFactory,
 )
@@ -37,6 +38,35 @@ from aruba_session_tracker.parsers import (
 
 FullScanApproval = Callable[[QueryRequest, tuple[DeviceTarget, ...]], bool]
 ProgressCallback = Callable[[str, str], None]
+MAX_POLL_RAW_BYTES = 32 * 1024 * 1024
+MAX_POLL_OBSERVATIONS = 20_000
+
+
+@dataclass(slots=True)
+class PollBudget:
+    """Aggregate in-memory limits shared by every query pass in one poll."""
+
+    max_raw_bytes: int = MAX_POLL_RAW_BYTES
+    max_observations: int = MAX_POLL_OBSERVATIONS
+    raw_bytes: int = 0
+    observations: int = 0
+
+    @property
+    def remaining_observations(self) -> int:
+        return max(0, self.max_observations - self.observations)
+
+    def consume_raw(self, output: str) -> bool:
+        byte_size = len(output.encode("utf-8", errors="replace"))
+        if self.raw_bytes + byte_size > self.max_raw_bytes:
+            return False
+        self.raw_bytes += byte_size
+        return True
+
+    def consume_observations(self, count: int) -> bool:
+        if count < 0 or self.observations + count > self.max_observations:
+            return False
+        self.observations += count
+        return True
 
 
 @dataclass(slots=True)
@@ -118,8 +148,14 @@ class TrackerService:
         cancel_token: CancellationToken | None = None,
         location_snapshot: LocationSnapshot | None = None,
         refresh_locations: bool = True,
+        allow_full_scan: bool = True,
+        fallback_devices: tuple[DeviceTarget, ...] = (),
+        poll_budget: PollBudget | None = None,
+        deadline: PollDeadline | None = None,
     ) -> QueryOutcome:
         token = cancel_token or CancellationToken()
+        budget = poll_budget or PollBudget()
+        poll_deadline = deadline or PollDeadline.after()
         diagnostics: list[DiagnosticEvent] = []
         raw_snapshots: list[RawSnapshot] = []
         controllers: list[str] = []
@@ -132,6 +168,8 @@ class TrackerService:
                 token,
                 diagnostics,
                 raw_snapshots,
+                budget,
+                poll_deadline,
             )
             if locations is None:
                 return QueryOutcome(
@@ -171,7 +209,27 @@ class TrackerService:
         # ambiguous, malformed or unmapped location must never be upgraded to
         # permission to scan every MD.
         full_scan = locations.full_scan_eligible
-        if full_scan:
+        if full_scan and fallback_devices:
+            fallback = tuple(device for device in fallback_devices if device in enabled_devices)
+            if len(fallback) != len(fallback_devices):
+                diagnostics.append(
+                    DiagnosticEvent(
+                        stage="MD_ROUTE",
+                        code=ErrorCode.CURRENT_SWITCH_UNMAPPED,
+                        message="이전 전수조회 대상이 현재 활성 MD 설정과 일치하지 않습니다.",
+                    )
+                )
+                return QueryOutcome(
+                    diagnostics=tuple(diagnostics),
+                    used_mm=locations.used_mm,
+                    raw_snapshots=tuple(raw_snapshots),
+                    source_location=source_location,
+                    destination_location=destination_location,
+                    full_scan_eligible=True,
+                    authoritative=False,
+                )
+            device_candidates = [(device, request.source_ip) for device in fallback]
+        elif full_scan and allow_full_scan:
             approval = full_scan_approval or self._callbacks.full_scan_approval
             approved = (
                 not token.is_cancelled
@@ -215,6 +273,23 @@ class TrackerService:
                     authoritative=False,
                 )
             device_candidates = [(device, request.source_ip) for device in enabled_devices]
+        elif full_scan:
+            diagnostics.append(
+                DiagnosticEvent(
+                    stage="MD_SCAN",
+                    code=ErrorCode.CLIENT_NOT_FOUND_ON_MM,
+                    message="다음 MM 위치 갱신 전까지 MD 전수조회를 반복하지 않습니다.",
+                )
+            )
+            return QueryOutcome(
+                diagnostics=tuple(diagnostics),
+                used_mm=locations.used_mm,
+                raw_snapshots=tuple(raw_snapshots),
+                source_location=source_location,
+                destination_location=destination_location,
+                full_scan_eligible=True,
+                authoritative=False,
+            )
 
         if not device_candidates:
             diagnostics.append(
@@ -241,6 +316,7 @@ class TrackerService:
                 break
             self._progress("MD_QUERY", device.name)
             try:
+                poll_deadline.raise_if_expired()
                 batch = self._collector.collect(
                     device,
                     credentials,
@@ -250,6 +326,7 @@ class TrackerService:
                     ),
                     host_key_approval=self._callbacks.host_key_approval,
                     cancel_token=token,
+                    deadline=poll_deadline,
                 )
             except CollectorError as exc:
                 diagnostics.append(
@@ -257,6 +334,7 @@ class TrackerService:
                         stage="MD_QUERY",
                         code=_md_error_code(exc),
                         message=f"선택한 MD에서 세션 출력을 수집하지 못했습니다: {exc}",
+                        transient=exc.retryable_network,
                     )
                 )
                 authoritative = False
@@ -265,6 +343,7 @@ class TrackerService:
                     ErrorCode.CANCELLED,
                     ErrorCode.HOST_KEY_CHANGED,
                     ErrorCode.HOST_KEY_UNKNOWN,
+                    ErrorCode.POLL_DEADLINE_EXCEEDED,
                 }:
                     break
                 continue
@@ -272,6 +351,16 @@ class TrackerService:
             controllers.append(device.name)
             command = build_datapath_session_command(filter_ip)
             output = batch.output_for(command)
+            if not budget.consume_raw(output):
+                diagnostics.append(
+                    DiagnosticEvent(
+                        stage="MD_COLLECT",
+                        code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+                        message="한 번의 조회에서 저장할 수 있는 Raw 출력 총량을 초과했습니다.",
+                    )
+                )
+                authoritative = False
+                break
             snapshot_index = len(raw_snapshots)
             raw_snapshots.append(RawSnapshot(device.name, command, output, observation_keys=()))
             try:
@@ -279,17 +368,31 @@ class TrackerService:
                     output,
                     controller_name=device.name,
                     controller_host=device.host,
+                    max_observations=budget.remaining_observations,
                 )
             except ParseError as exc:
+                parse_code = _parse_error_code(exc)
                 diagnostics.append(
                     DiagnosticEvent(
                         stage="MD_PARSE",
-                        code=_parse_error_code(exc),
+                        code=parse_code,
                         message=f"MD 세션 출력을 안전하게 해석하지 못했습니다: {exc}",
                     )
                 )
                 authoritative = False
+                if parse_code is ErrorCode.OUTPUT_LIMIT_EXCEEDED:
+                    break
                 continue
+            if not budget.consume_observations(len(parsed)):
+                diagnostics.append(
+                    DiagnosticEvent(
+                        stage="MD_PARSE",
+                        code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+                        message="한 번의 조회에서 처리할 수 있는 관측 수를 초과했습니다.",
+                    )
+                )
+                authoritative = False
+                break
             matched_keys: list[str] = []
             for observation in parsed:
                 if request.matches(observation):
@@ -330,6 +433,8 @@ class TrackerService:
         token: CancellationToken,
         diagnostics: list[DiagnosticEvent],
         raw_snapshots: list[RawSnapshot],
+        budget: PollBudget,
+        deadline: PollDeadline,
     ) -> LocationSnapshot | None:
         commands: tuple[str, ...] = (
             NO_PAGING_COMMAND,
@@ -340,6 +445,7 @@ class TrackerService:
         commands = tuple(dict.fromkeys(commands))
         batch = None
         selected_mm: DeviceTarget | None = None
+        selected_index: int | None = None
         for index, target in enumerate((self.config.mm_primary, self.config.mm_standby)):
             if not target.enabled:
                 continue
@@ -348,14 +454,17 @@ class TrackerService:
             else:
                 self._progress("MM_QUERY", target.name)
             try:
+                deadline.raise_if_expired()
                 batch = self._collector.collect(
                     target,
                     credentials,
                     commands,
                     host_key_approval=self._callbacks.host_key_approval,
                     cancel_token=token,
+                    deadline=deadline,
                 )
                 selected_mm = target
+                selected_index = index
                 break
             except CollectorError as exc:
                 diagnostics.append(
@@ -363,8 +472,11 @@ class TrackerService:
                         stage="MM_QUERY",
                         code=exc.code,
                         message=f"MM 조회 실패: {exc}",
+                        transient=exc.retryable_network,
                     )
                 )
+                if exc.code is ErrorCode.POLL_DEADLINE_EXCEEDED:
+                    return None
                 # Authentication, cancellation and host-key failures must never be bypassed.
                 if not exc.retryable_network or index > 0:
                     return None
@@ -379,11 +491,28 @@ class TrackerService:
                 )
             return None
 
+        if selected_index is not None and selected_index > 0:
+            diagnostics[:] = [
+                replace(event, recovered=True)
+                if event.stage == "MM_QUERY" and event.transient
+                else event
+                for event in diagnostics
+            ]
+
         resolved: list[ControllerLocation | None] = []
         not_found: list[bool] = []
         for client_ip in (request.source_ip, request.destination_ip):
             command = build_global_user_command(client_ip)
             output = batch.output_for(command)
+            if not budget.consume_raw(output):
+                diagnostics.append(
+                    DiagnosticEvent(
+                        stage="MM_COLLECT",
+                        code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+                        message="한 번의 조회에서 저장할 수 있는 Raw 출력 총량을 초과했습니다.",
+                    )
+                )
+                return None
             raw_snapshots.append(
                 RawSnapshot(selected_mm.name, command, output, observation_keys=())
             )

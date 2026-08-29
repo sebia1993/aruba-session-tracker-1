@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -12,6 +14,7 @@ from collections.abc import Iterator
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,6 +31,7 @@ from aruba_session_tracker.storage import (
     RunReportSnapshot,
     SessionStore,
     StorageError,
+    StorageHealth,
     guard_csv_cell,
 )
 
@@ -64,6 +68,66 @@ def _observation(*, controller_name: str = "MD-01", packets: int = 12) -> Sessio
 
 def _run(store: SessionStore) -> str:
     return store.start_run(QueryRequest("192.0.2.100", "203.0.113.80", 53000, 443))
+
+
+def _run_export_crash(
+    store: SessionStore,
+    run_id: str,
+    destination: Path,
+    target_phase: str,
+    export_format: str = "csv",
+) -> subprocess.CompletedProcess[str]:
+    repository = Path(__file__).resolve().parents[1]
+    worker = Path(__file__).with_name("export_phase_crash_worker.py")
+    environment = os.environ.copy()
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = str(repository / "src") + (
+        os.pathsep + existing_pythonpath if existing_pythonpath else ""
+    )
+    return subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            str(worker),
+            str(store.db_path),
+            str(store.raw_root),
+            str(store.exports_root),
+            run_id,
+            str(destination),
+            target_phase,
+            export_format,
+        ],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+
+def test_storage_path_helpers_cover_fail_closed_boundary_branches(tmp_path: Path) -> None:
+    managed_root = tmp_path / "managed"
+    managed_root.mkdir()
+    assert session_store_module._managed_size(managed_root, "missing.bin") == 0
+    managed_file = managed_root / "present.bin"
+    managed_file.write_bytes(b"abc")
+    assert session_store_module._managed_size(managed_root, "present.bin") == 3
+
+    operation_id = "a" * 32
+    with pytest.raises(ValueError, match="지원하지 않는"):
+        session_store_module._export_operation_relative("report.csv", operation_id, "other")
+    with pytest.raises(ValueError, match="지원하지 않는"):
+        session_store_module._external_export_operation_path(
+            tmp_path / "report.csv", operation_id, "other"
+        )
+    with pytest.raises(ValueError, match="여유 공간"):
+        session_store_module._minimum_free_bytes(())
+    with pytest.raises(session_store_module.UnsafeStoragePath, match="상대 경로"):
+        session_store_module._safe_relative_parts(tmp_path.resolve())
+
+    assert session_store_module._regular_file_size(tmp_path / "absent.bin") == 0
+    with pytest.raises(session_store_module.UnsafeStoragePath, match="일반 파일"):
+        session_store_module._regular_file_size(managed_root)
 
 
 def test_initialize_creates_required_schema(tmp_path: Path) -> None:
@@ -1618,6 +1682,159 @@ def test_html_export_includes_run_events_diagnostics_and_raw_metadata_only(
     assert raw_relative not in document
 
 
+def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    raw_directory = store.raw_root / run_id / "legacy-bulk"
+    raw_directory.mkdir(parents=True)
+    raw_rows: list[tuple[object, ...]] = []
+    for index in range(501):
+        content = f"private-raw-body-{index}".encode()
+        relative = f"{run_id}/legacy-bulk/capture-{index:04d}.txt"
+        (store.raw_root / Path(relative)).write_bytes(content)
+        raw_rows.append(
+            (
+                run_id,
+                "2026-08-28T08:00:00.000Z",
+                "oldest-raw-kind" if index == 0 else "session",
+                "MD-01",
+                relative,
+                hashlib.sha256(content).hexdigest(),
+                len(content),
+            )
+        )
+
+    with closing(sqlite3.connect(store.db_path)) as connection, connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.executemany(
+            """
+            INSERT INTO observations (
+                run_id, raw_file_id, observed_at, controller_name,
+                controller_host, protocol, source_ip, destination_ip,
+                source_port, destination_port, counter, priority, tos,
+                age, destination, tunnel_age, packets, bytes_count,
+                flags, cpu_id, session_key
+            ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    run_id,
+                    "2026-08-28T08:01:00.000Z",
+                    "OLDEST-OBSERVATION-CONTROLLER" if index == 0 else "MD-01",
+                    "198.51.100.21",
+                    6,
+                    "192.0.2.100",
+                    "203.0.113.80",
+                    53000,
+                    443,
+                    "0/0",
+                    0,
+                    0,
+                    index,
+                    "local",
+                    index,
+                    index,
+                    index * 128,
+                    "FC",
+                    index % 4,
+                    "one-stable-session-key",
+                )
+                for index in range(2_005)
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO lifecycle_events (
+                run_id, occurred_at, session_key, instance_id,
+                event_type, controller_name, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    run_id,
+                    "2026-08-28T08:02:00.000Z",
+                    "one-stable-session-key",
+                    "OLDEST-LIFECYCLE-INSTANCE" if index == 0 else f"instance-{index:04d}",
+                    "OPENED",
+                    "MD-01",
+                    "{}",
+                )
+                for index in range(1_001)
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO controller_events (
+                run_id, occurred_at, previous_controller, current_controller, reason
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    run_id,
+                    "2026-08-28T08:03:00.000Z",
+                    "MD-01",
+                    "MD-02",
+                    "OLDEST-CONTROLLER-REASON" if index == 0 else f"REASON-{index:04d}",
+                )
+                for index in range(501)
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO diagnostic_events (run_id, occurred_at, stage, code, message)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    run_id,
+                    "2026-08-28T08:04:00.000Z",
+                    "fixture",
+                    None,
+                    "OLDEST-DIAGNOSTIC-MESSAGE" if index == 0 else f"diagnostic-{index:04d}",
+                )
+                for index in range(501)
+            ),
+        )
+        connection.executemany(
+            """
+            INSERT INTO raw_files (
+                run_id, captured_at, kind, controller_name,
+                relative_path, sha256, byte_size
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            raw_rows,
+        )
+
+    store.finish_run(run_id)
+    destination = store.export_run_html(run_id, tmp_path / "all-stored-data.html")
+    document = destination.read_text(encoding="utf-8")
+    history_section = re.search(
+        r'<section id="observation-history">(?P<body>.*?)</section>',
+        document,
+        flags=re.DOTALL,
+    )
+    assert history_section is not None
+    history_body = history_section.group("body")
+    history_table_body = re.search(r"<tbody>(?P<body>.*?)</tbody>", history_body, re.DOTALL)
+    assert history_table_body is not None
+
+    assert history_table_body.group("body").count("<tr>") == 2_005
+    assert "OLDEST-OBSERVATION-CONTROLLER" in history_body
+    assert "OLDEST-LIFECYCLE-INSTANCE" in document
+    assert "OLDEST-CONTROLLER-REASON" in document
+    assert "OLDEST-DIAGNOSTIC-MESSAGE" in document
+    assert "oldest-raw-kind" in document
+    assert "capture-0000.txt" not in document
+    assert "private-raw-body-0" not in document
+    assert 'class="truncate-note">전체 관측 이력' not in document
+    assert 'class="truncate-note">수명주기 이벤트' not in document
+    assert 'class="truncate-note">Controller 전환' not in document
+    assert 'class="truncate-note">진단 이벤트' not in document
+    assert 'class="truncate-note">Raw 파일' not in document
+
+
 def test_record_writes_and_second_finish_require_running_run(tmp_path: Path) -> None:
     store = _store(tmp_path)
     run_id = _run(store)
@@ -1828,7 +2045,8 @@ def test_delete_keeps_manifest_when_post_move_file_cannot_be_restored(
     with pytest.raises(StorageError, match="persistent staging"):
         store.delete(preview, confirmation_token=preview.confirmation_token)
 
-    staged_files = tuple(store.raw_root.glob(".delete-staging-*/*/*.txt"))
+    stage_roots = tuple(store.raw_root.glob(".delete-staging-*"))
+    staged_files = tuple(path for stage_root in stage_roots for path in stage_root.rglob("*.txt"))
     manifests = tuple(store._manifests_root.glob("*.json"))
     assert not raw_path.exists()
     assert len(staged_files) == 1
@@ -1866,3 +2084,569 @@ def test_delete_fails_closed_for_symlink_in_managed_scope(tmp_path: Path) -> Non
         store.preview_delete(run_id)
 
     assert target.read_text(encoding="utf-8") == "keep"
+
+
+def test_storage_health_reports_managed_usage_and_thresholds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(
+        run_id,
+        [_observation()],
+        raw_text="raw-health",
+        captured_at=datetime(2026, 8, 28, 8, 15, tzinfo=UTC),
+    )
+    store.finish_run(run_id)
+    exported = store.export_run_csv(run_id)
+    monkeypatch.setattr(
+        session_store_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=6 * 1024**3),
+    )
+
+    health = store.storage_health()
+
+    assert health.database_bytes == store.db_path.stat().st_size
+    assert health.wal_bytes >= 0
+    assert health.raw_file_count == 1
+    assert health.raw_bytes == len(b"raw-health")
+    assert health.export_file_count == 1
+    assert health.export_bytes == exported.stat().st_size
+    assert health.total_managed_bytes == (
+        health.database_bytes + health.wal_bytes + health.raw_bytes + health.export_bytes
+    )
+    assert health.total_file_count == 2
+    assert health.free_bytes == 6 * 1024**3
+    assert health.warning is False
+    assert health.hard_stop is False
+
+    warning = StorageHealth(0, 0, 0, 0, 0, 0, 5 * 1024**3 - 1)
+    hard_stop = StorageHealth(0, 0, 0, 0, 0, 0, 1024**3 - 1)
+    assert warning.warning is True
+    assert warning.hard_stop is False
+    assert hard_stop.warning is True
+    assert hard_stop.hard_stop is True
+
+
+def test_low_space_blocks_growth_with_stable_error_but_allows_run_finish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    monkeypatch.setattr(
+        session_store_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=1024**3 - 1),
+    )
+
+    store.finish_run(run_id)
+    with pytest.raises(StorageError) as caught:
+        store.start_run(QueryRequest("192.0.2.1", "203.0.113.1"))
+
+    assert caught.value.code is ErrorCode.STORAGE_LOW_SPACE
+    assert len(store.list_runs()) == 1
+    assert store.list_runs()[0]["status"] == "COMPLETED"
+
+
+def test_query_capacity_check_is_fast_and_fails_before_a_poll(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    monkeypatch.setattr(
+        session_store_module,
+        "_storage_tree_stats",
+        lambda _root: pytest.fail("quick query capacity check scanned managed files"),
+    )
+    free_bytes = [2 * 1024**3]
+    monkeypatch.setattr(
+        session_store_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(free=free_bytes[0]),
+    )
+
+    store.ensure_query_capacity()
+    free_bytes[0] = 1024**3 - 1
+    with pytest.raises(StorageError) as caught:
+        store.ensure_query_capacity()
+
+    assert caught.value.code is ErrorCode.STORAGE_LOW_SPACE
+
+
+def test_delete_preview_discard_expiry_sweep_and_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.finish_run(run_id)
+    clock = [100.0]
+    monkeypatch.setattr(session_store_module.time, "monotonic", lambda: clock[0])
+
+    discarded = store.preview_delete(run_id)
+    assert store.discard_delete_preview(discarded) is True
+    assert store.discard_delete_preview(discarded) is False
+    with pytest.raises(StorageError, match="먼저"):
+        store.delete(discarded, confirmation_token=discarded.confirmation_token)
+
+    previews = [store.preview_delete(run_id) for _ in range(16)]
+    with pytest.raises(StorageError, match="최대 16개"):
+        store.preview_delete(run_id)
+
+    clock[0] += 301
+    replacement = store.preview_delete(run_id)
+    assert store.discard_delete_preview(previews[0]) is False
+    assert store.discard_delete_preview(replacement) is True
+
+
+def test_new_raw_paths_are_hour_sharded_and_legacy_flat_paths_remain_usable(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(
+        run_id,
+        [_observation()],
+        raw_text="legacy-compatible",
+        captured_at=datetime(2026, 8, 28, 8, 15, tzinfo=UTC),
+    )
+    with closing(sqlite3.connect(store.db_path)) as connection, connection:
+        relative = str(
+            connection.execute(
+                "SELECT relative_path FROM raw_files WHERE run_id = ?", (run_id,)
+            ).fetchone()[0]
+        )
+        parts = Path(relative).parts
+        assert parts[:3] == (run_id, "20260828", "08")
+        sharded = store.raw_root / Path(relative)
+        legacy = store.raw_root / run_id / "legacy-flat.txt"
+        os.replace(sharded, legacy)
+        connection.execute(
+            "UPDATE raw_files SET relative_path = ? WHERE run_id = ?",
+            (legacy.relative_to(store.raw_root).as_posix(), run_id),
+        )
+
+    store.finish_run(run_id)
+    assert store.export_run_csv(run_id).exists()
+    preview = store.preview_delete(run_id)
+    result = store.delete(preview, confirmation_token=preview.confirmation_token)
+
+    assert result.deleted_raw_files == 1
+    assert not (store.raw_root / run_id).exists()
+
+
+def test_schema_adds_long_run_query_indexes_and_remains_quick_check_clean(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        indexes = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+        quick_check = tuple(row[0] for row in connection.execute("PRAGMA quick_check"))
+
+    assert {
+        "ix_observations_run_session_time",
+        "ix_raw_files_run_time",
+        "ix_exports_run_id",
+    }.issubset(indexes)
+    assert quick_check == ("ok",)
+
+
+def test_managed_export_persists_all_durable_phases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()])
+    store.finish_run(run_id)
+    phases: list[str] = []
+    original_write = store._write_manifest
+    original_replace = store._replace_manifest
+
+    def capture_write(operation_id: str, payload: dict[str, object]) -> Path:
+        phases.append(str(payload.get("phase")))
+        return original_write(operation_id, payload)
+
+    def capture_replace(path: Path, payload: dict[str, object]) -> None:
+        phases.append(str(payload.get("phase")))
+        original_replace(path, payload)
+
+    monkeypatch.setattr(store, "_write_manifest", capture_write)
+    monkeypatch.setattr(store, "_replace_manifest", capture_replace)
+
+    destination = store.export_run_csv(run_id)
+
+    assert destination.exists()
+    assert phases == ["PREPARED", "RENDERED", "INSTALLED", "DB_COMMITTED"]
+    assert not tuple(store._manifests_root.glob("*.json"))
+    assert not tuple(store._leases_root.glob("operation-*.lease"))
+
+
+@pytest.mark.parametrize(
+    ("target_phase", "new_export_committed"),
+    (
+        ("PREPARED", False),
+        ("RENDERED", False),
+        ("INSTALLED", False),
+        ("DB_COMMITTED", True),
+    ),
+)
+def test_startup_recovers_managed_export_after_hard_exit_at_each_phase(
+    tmp_path: Path,
+    target_phase: str,
+    new_export_committed: bool,
+) -> None:
+    store = _store(tmp_path)
+    original_run_id = _run(store)
+    store.record_query(original_run_id, [_observation(packets=12)])
+    store.finish_run(original_run_id)
+    destination = store.exports_root / "shared.csv"
+    store.export_run_csv(original_run_id, destination)
+    original_bytes = destination.read_bytes()
+
+    replacement_run_id = store.start_run(
+        QueryRequest("192.0.2.101", "203.0.113.81", 53001, 8443),
+        run_id=f"replacement-{target_phase.lower()}",
+    )
+    store.record_query(
+        replacement_run_id,
+        [_observation(controller_name="MD-02", packets=99)],
+    )
+    store.finish_run(replacement_run_id)
+    expected_path = tmp_path / f"expected-{target_phase.lower()}.csv"
+    store.export_run_csv(replacement_run_id, expected_path)
+    replacement_bytes = expected_path.read_bytes()
+    assert replacement_bytes != original_bytes
+
+    repository = Path(__file__).resolve().parents[1]
+    worker = Path(__file__).with_name("export_phase_crash_worker.py")
+    environment = os.environ.copy()
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = str(repository / "src") + (
+        os.pathsep + existing_pythonpath if existing_pythonpath else ""
+    )
+    completed = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            str(worker),
+            str(store.db_path),
+            str(store.raw_root),
+            str(store.exports_root),
+            replacement_run_id,
+            str(destination),
+            target_phase,
+        ],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    assert completed.returncode == 91, (completed.stdout, completed.stderr)
+
+    manifests = tuple(store._manifests_root.glob("*.json"))
+    assert len(manifests) == 1
+    assert json.loads(manifests[0].read_text(encoding="utf-8"))["phase"] == target_phase
+    assert len(tuple(store._leases_root.glob("operation-*.lease"))) == 1
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+    expected_run_id = replacement_run_id if new_export_committed else original_run_id
+    expected_bytes = replacement_bytes if new_export_committed else original_bytes
+    expected_sha = hashlib.sha256(expected_bytes).hexdigest()
+    with closing(sqlite3.connect(reopened.db_path)) as connection:
+        export_rows = tuple(
+            connection.execute(
+                "SELECT run_id, sha256, byte_size FROM exports WHERE relative_path = ?",
+                (destination.name,),
+            )
+        )
+        quick_check = tuple(str(row[0]) for row in connection.execute("PRAGMA quick_check"))
+        foreign_key_check = tuple(connection.execute("PRAGMA foreign_key_check"))
+
+    assert destination.read_bytes() == expected_bytes
+    assert export_rows == ((expected_run_id, expected_sha, len(expected_bytes)),)
+    assert quick_check == ("ok",)
+    assert foreign_key_check == ()
+    assert not tuple(reopened.exports_root.rglob("*.staged"))
+    assert not tuple(reopened.exports_root.rglob("*.backup"))
+    assert not tuple(reopened.exports_root.rglob("*.tmp"))
+    assert not tuple(reopened._manifests_root.iterdir())
+    assert not tuple(reopened._leases_root.iterdir())
+
+
+@pytest.mark.parametrize("preexisting_destination", (False, True))
+@pytest.mark.parametrize("export_format", ("csv", "html"))
+@pytest.mark.parametrize(
+    "target_phase",
+    (
+        "PREPARED",
+        "RENDERED",
+        "INSTALLED",
+        "DB_RECEIPT_COMMITTED",
+        "DB_COMMITTED",
+    ),
+)
+def test_startup_recovers_external_export_after_every_durable_boundary(
+    tmp_path: Path,
+    preexisting_destination: bool,
+    export_format: str,
+    target_phase: str,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation(packets=77)])
+    store.finish_run(run_id)
+    suffix = ".csv" if export_format == "csv" else ".html"
+    destination = tmp_path / "user-chosen" / f"report{suffix}"
+    previous_bytes = f"previous-user-file-{export_format}".encode()
+    if preexisting_destination:
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(previous_bytes)
+
+    expected_path = tmp_path / "expected" / f"report{suffix}"
+    if export_format == "csv":
+        store.export_run_csv(run_id, expected_path)
+    else:
+        store.export_run_html(run_id, expected_path)
+    replacement_bytes = expected_path.read_bytes()
+    assert replacement_bytes != previous_bytes
+
+    completed = _run_export_crash(
+        store,
+        run_id,
+        destination,
+        target_phase,
+        export_format,
+    )
+    assert completed.returncode == 91, (completed.stdout, completed.stderr)
+
+    manifests = tuple(store._manifests_root.glob("*.json"))
+    owners = tuple(store._export_owners_root.glob("*.json"))
+    assert len(manifests) == 1
+    assert len(owners) == 1
+    manifest_phase = json.loads(manifests[0].read_text(encoding="utf-8"))["phase"]
+    assert manifest_phase == (
+        "INSTALLED" if target_phase == "DB_RECEIPT_COMMITTED" else target_phase
+    )
+    receipt_expected = target_phase in {"DB_RECEIPT_COMMITTED", "DB_COMMITTED"}
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        receipt_count = int(
+            connection.execute("SELECT count(*) FROM external_export_commits").fetchone()[0]
+        )
+    assert receipt_count == int(receipt_expected)
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+    if receipt_expected:
+        assert destination.read_bytes() == replacement_bytes
+    elif preexisting_destination:
+        assert destination.read_bytes() == previous_bytes
+    else:
+        assert not destination.exists()
+
+    with closing(sqlite3.connect(reopened.db_path)) as connection:
+        quick_check = tuple(str(row[0]) for row in connection.execute("PRAGMA quick_check"))
+        foreign_key_check = tuple(connection.execute("PRAGMA foreign_key_check"))
+        managed_exports = int(connection.execute("SELECT count(*) FROM exports").fetchone()[0])
+        receipts = int(
+            connection.execute("SELECT count(*) FROM external_export_commits").fetchone()[0]
+        )
+    assert quick_check == ("ok",)
+    assert foreign_key_check == ()
+    assert managed_exports == 0
+    assert receipts == 0
+    assert not tuple(destination.parent.glob(f".{destination.name}.*"))
+    assert not tuple(reopened._manifests_root.iterdir())
+    assert not tuple(reopened._leases_root.iterdir())
+    assert not tuple(reopened._export_owners_root.iterdir())
+
+
+def test_external_export_manifest_path_tamper_cannot_touch_unrelated_file(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()])
+    store.finish_run(run_id)
+    destination = tmp_path / "chosen" / "report.csv"
+    destination.parent.mkdir()
+    original_bytes = b"original-external-export"
+    destination.write_bytes(original_bytes)
+    victim = tmp_path / "unrelated-user-file.txt"
+    victim_bytes = b"must-never-be-replaced-or-deleted"
+    victim.write_bytes(victim_bytes)
+
+    completed = _run_export_crash(store, run_id, destination, "RENDERED")
+    assert completed.returncode == 91, (completed.stdout, completed.stderr)
+    manifest = next(store._manifests_root.glob("*.json"))
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["destination_path"] = str(victim)
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    with pytest.raises(StorageError, match="소유권 증표"):
+        reopened.initialize()
+
+    assert victim.read_bytes() == victim_bytes
+    assert destination.read_bytes() == original_bytes
+    assert manifest.exists()
+
+
+def test_external_export_recovery_requires_independent_owner_marker(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()])
+    store.finish_run(run_id)
+    destination = tmp_path / "chosen" / "report.html"
+    destination.parent.mkdir()
+    destination.write_bytes(b"previous-html")
+
+    completed = _run_export_crash(store, run_id, destination, "INSTALLED", "html")
+    assert completed.returncode == 91, (completed.stdout, completed.stderr)
+    owner = next(store._export_owners_root.glob("*.json"))
+    owner.unlink()
+    installed_bytes = destination.read_bytes()
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    with pytest.raises(StorageError, match="소유권 증표가 없습니다"):
+        reopened.initialize()
+
+    assert destination.read_bytes() == installed_bytes
+    assert next(store._manifests_root.glob("*.json")).exists()
+
+
+@pytest.mark.parametrize(
+    "protected_destination",
+    ("database", "wal", "raw", "operations"),
+)
+def test_external_export_rejects_application_managed_destinations(
+    tmp_path: Path,
+    protected_destination: str,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()], raw_text="raw-evidence")
+    store.finish_run(run_id)
+    destinations = {
+        "database": store.db_path,
+        "wal": Path(f"{store.db_path}-wal"),
+        "raw": store.raw_root / "user-report.csv",
+        "operations": store._operations_root / "user-report.csv",
+    }
+
+    with pytest.raises(StorageError, match="관리 저장소"):
+        store.export_run_csv(run_id, destinations[protected_destination])
+
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    assert not tuple(store._manifests_root.glob("*.json"))
+    assert not tuple(store._export_owners_root.glob("*.json"))
+
+
+@pytest.mark.windows
+@pytest.mark.parametrize("unsafe_name", ("report.csv:stream", "CON.csv", "report.csv."))
+def test_external_export_rejects_windows_alias_and_device_names(
+    tmp_path: Path,
+    unsafe_name: str,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows path alias rules apply only on Windows")
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.finish_run(run_id)
+
+    with pytest.raises(StorageError, match="Windows"):
+        store.export_run_csv(run_id, tmp_path / "chosen" / unsafe_name)
+
+    assert not tuple(store._manifests_root.glob("*.json"))
+    assert not tuple(store._export_owners_root.glob("*.json"))
+
+
+def test_startup_recovers_prepared_export_and_partial_renderer_temp(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.finish_run(run_id)
+    operation_id = "4" * 32
+    destination = store.exports_root / f"run-{run_id}.csv"
+    staged = destination.with_name(f".{destination.name}.{operation_id}.staged")
+    backup = destination.with_name(f".{destination.name}.{operation_id}.backup")
+    staged.write_bytes(b"rendered-but-not-recorded")
+    temporary = staged.with_name(f".{staged.name}.partial.tmp")
+    temporary.write_bytes(b"partial")
+    manifest = store._write_manifest(
+        operation_id,
+        {
+            "version": 1,
+            "kind": "export",
+            "phase": "PREPARED",
+            "operation_id": operation_id,
+            "run_id": run_id,
+            "relative_path": destination.name,
+            "staged_relative": staged.name,
+            "backup_relative": backup.name,
+        },
+    )
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+
+    assert not destination.exists()
+    assert not staged.exists()
+    assert not temporary.exists()
+    assert not manifest.exists()
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM exports").fetchone()[0] == 0
+        assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+
+
+def test_startup_finishes_export_after_db_commit_phase_write_fault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()])
+    store.finish_run(run_id)
+    original_replace = store._replace_manifest
+
+    def fail_db_committed_phase(path: Path, payload: dict[str, object]) -> None:
+        if payload.get("phase") == "DB_COMMITTED":
+            raise OSError("forced phase write fault")
+        original_replace(path, payload)
+
+    monkeypatch.setattr(store, "_replace_manifest", fail_db_committed_phase)
+
+    with pytest.raises(StorageError, match="복구 상태"):
+        store.export_run_csv(run_id)
+
+    manifests = tuple(store._manifests_root.glob("*.json"))
+    assert len(manifests) == 1
+    assert json.loads(manifests[0].read_text(encoding="utf-8"))["phase"] == "INSTALLED"
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+    destination = store.exports_root / f"run-{run_id}.csv"
+
+    assert destination.exists()
+    assert not manifests[0].exists()
+    assert not tuple(store.exports_root.glob("*.backup"))
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        row = connection.execute(
+            "SELECT sha256, byte_size FROM exports WHERE relative_path = ?",
+            (destination.name,),
+        ).fetchone()
+        assert row == (
+            hashlib.sha256(destination.read_bytes()).hexdigest(),
+            destination.stat().st_size,
+        )
+        assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"

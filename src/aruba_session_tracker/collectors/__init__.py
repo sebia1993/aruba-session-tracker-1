@@ -3,6 +3,7 @@
 from .ssh import (
     MAX_OUTPUT_BYTES,
     MAX_OUTPUT_LINES,
+    POLL_DEADLINE_SECONDS,
     CancellationToken,
     CollectorError,
     CommandBatch,
@@ -10,6 +11,7 @@ from .ssh import (
     CommandOutput,
     HostKeyApproval,
     HostKeyInfo,
+    PollDeadline,
     SSHCollector,
     SSHConnectionFactory,
     StrictNetmikoFactory,
@@ -18,6 +20,7 @@ from .ssh import (
 __all__ = [
     "MAX_OUTPUT_BYTES",
     "MAX_OUTPUT_LINES",
+    "POLL_DEADLINE_SECONDS",
     "CancellationToken",
     "CollectorError",
     "CommandBatch",
@@ -25,6 +28,7 @@ __all__ = [
     "CommandOutput",
     "HostKeyApproval",
     "HostKeyInfo",
+    "PollDeadline",
     "SSHCollector",
     "SSHConnectionFactory",
     "StrictNetmikoFactory",

@@ -17,6 +17,7 @@ def _snapshot(
     *,
     run: dict[str, object] | None = None,
     observations: tuple[dict[str, object], ...] | None = None,
+    observation_history: tuple[dict[str, object], ...] | None = None,
     diagnostics: tuple[dict[str, object], ...] | None = None,
     observation_total: int | None = None,
     unique_session_total: int | None = None,
@@ -122,6 +123,9 @@ def _snapshot(
         raw_files=raw_rows,
         raw_file_total=(len(raw_rows) if raw_file_total is None else raw_file_total),
         raw_byte_total=3072,
+        observation_history=(
+            observation_rows if observation_history is None else observation_history
+        ),
     )
 
 
@@ -150,6 +154,7 @@ def test_report_is_standalone_offline_html5_with_korean_sections_and_csp() -> No
         "환경정보와 조회 조건",
         "프로그램 조회 흐름",
         "세션 결과와 Flags",
+        "전체 관측 이력",
         "수명주기와 Controller 전환",
         "확인 및 검증 결과",
         "수집 증거",
@@ -163,6 +168,7 @@ def test_report_is_standalone_offline_html5_with_korean_sections_and_csp() -> No
     assert "차단" in document
     assert "SYN 없음" in document
     assert '<caption class="sr-only">최신 고유 세션</caption>' in document
+    assert '<caption class="sr-only">전체 관측 이력</caption>' in document
     assert '<th scope="col">마지막 관측</th>' in document
     assert 'role="region" aria-label="최신 고유 세션 표" tabindex="0"' in document
     assert "DB ID" in document
@@ -263,6 +269,7 @@ def test_report_excludes_raw_body_and_paths_and_marks_truncated_sections() -> No
     assert "must-not-be-rendered.txt" not in document
     assert "Raw CLI 본문과 파일 경로는 보고서에 포함하지 않습니다." in document
     assert "최신 고유 세션 전체 5건 중 최근 1건 표시" in document
+    assert "전체 관측 이력 전체 9건 중 최근 1건 표시" in document
     assert "수명주기 이벤트 전체 7건 중 최근 1건 표시" in document
     assert "Controller 전환 전체 4건 중 최근 1건 표시" in document
     assert "진단 이벤트 전체 6건 중 최근 1건 표시" in document

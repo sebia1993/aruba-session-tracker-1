@@ -143,15 +143,23 @@ jobs:
               throw "Annotated tag moved or does not directly reference the verified commit."
             }
           }
-          Assert-VersionedTagProvenance
-          $mainJson = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/heads/main"
-          if ($LASTEXITCODE -ne 0) { throw "Could not resolve current main." }
-          $main = $mainJson | ConvertFrom-Json
-          if (-not [string]::Equals(
-            $main.object.sha, $env:EXPECTED_COMMIT, [StringComparison]::OrdinalIgnoreCase
-          )) {
-            throw "Remote main moved after the verified build."
+          function Assert-MainAtExpected {
+            $mainJson = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/heads/main"
+            if ($LASTEXITCODE -ne 0) { throw "Could not resolve current main." }
+            $main = $mainJson | ConvertFrom-Json
+            if (
+              $main.object.type -ne "commit" -or
+              -not [string]::Equals(
+                [string]$main.object.sha,
+                $env:EXPECTED_COMMIT,
+                [StringComparison]::OrdinalIgnoreCase
+              )
+            ) {
+              throw "Remote main moved after the verified build."
+            }
           }
+          Assert-VersionedTagProvenance
+          Assert-MainAtExpected
           $version = $env:RELEASE_TAG.Substring(1)
           $releaseRoot = Join-Path $PWD "artifacts/release"
           ./tools/verify_publish_assets.ps1 `
@@ -162,11 +170,18 @@ jobs:
           $sha = "$zip.sha256"
           $sbom = Join-Path $releaseRoot "ArubaSessionTracker_v${version}_sbom.cdx.json"
           $notes = Join-Path $releaseRoot "release-notes-v${version}.md"
-          $assetPaths = @($zip, $sha, $sbom)
+          # The sidecar and external SBOM remain verified build inputs. Only the
+          # Windows x64 ZIP is a public GitHub release asset; the SBOM is also
+          # embedded inside that ZIP and the digest is written into the body.
+          $assetPaths = @($zip)
           $assetNames = @($assetPaths | ForEach-Object { [IO.Path]::GetFileName($_) })
           $marker = "<!-- aruba-session-tracker-release:$env:RELEASE_TAG`:$env:EXPECTED_COMMIT -->"
           $ownedNotes = Join-Path $env:RUNNER_TEMP "owned-release-notes.md"
           $notesText = (Get-Content -LiteralPath $notes -Raw).TrimEnd()
+          $zipDigest = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if (-not $notesText.Contains($zipDigest)) {
+            throw "Release notes do not contain the verified public ZIP SHA-256."
+          }
           Set-Content -LiteralPath $ownedNotes -Encoding utf8 -Value "$notesText`n`n$marker`n"
 
           $releaseListJson = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100"
@@ -239,9 +254,7 @@ jobs:
             --repo $env:GITHUB_REPOSITORY `
             --dir $authenticatedRoot `
             --clobber `
-            --pattern $assetNames[0] `
-            --pattern $assetNames[1] `
-            --pattern $assetNames[2]
+            --pattern $assetNames[0]
           if ($LASTEXITCODE -ne 0) { throw "Could not download draft assets for verification." }
           foreach ($assetPath in $assetPaths) {
             $downloaded = Join-Path $authenticatedRoot ([IO.Path]::GetFileName($assetPath))
@@ -256,6 +269,9 @@ jobs:
 
           # Re-peel the annotated tag immediately before making the draft public.
           Assert-VersionedTagProvenance
+          # This is the final remote read before publication: never publish an
+          # older verified build after main has moved.
+          Assert-MainAtExpected
           gh release edit $env:RELEASE_TAG `
             --repo $env:GITHUB_REPOSITORY `
             --target $env:EXPECTED_COMMIT `

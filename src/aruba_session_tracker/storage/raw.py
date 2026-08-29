@@ -8,6 +8,7 @@ import re
 import stat
 import tempfile
 import threading
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -76,27 +77,34 @@ class RawOutputStore:
         run_segment = safe_segment(run_id, "run_id")
         kind_segment = _filename_segment(kind, "kind")
         controller_segment = _filename_segment(controller_name, "controller_name")
-        timestamp = _as_utc(captured_at).strftime("%Y%m%dT%H%M%S.%fZ")
+        captured_utc = _as_utc(captured_at)
+        timestamp = captured_utc.strftime("%Y%m%dT%H%M%S.%fZ")
         filename = f"{timestamp}_{kind_segment}_{controller_segment}_{uuid4().hex[:8]}.txt"
 
         self.verify()
-        run_directory = contained_path(self.root, Path(run_segment))
-        if os.path.lexists(run_directory):
+        relative_directory = (
+            Path(run_segment) / captured_utc.strftime("%Y%m%d") / captured_utc.strftime("%H")
+        )
+        directory = self.root
+        relative_parent = Path()
+        for part in relative_directory.parts:
+            relative_parent /= part
+            directory = contained_path(self.root, relative_parent)
+            with suppress(FileExistsError):
+                directory.mkdir(parents=False, exist_ok=True)
             try:
-                info = reject_link_or_reparse(run_directory)
+                info = reject_link_or_reparse(directory)
             except UnsafeManagedPath as error:
                 raise UnsafeStoragePath(str(error)) from error
             if not stat.S_ISDIR(info.st_mode):
                 raise UnsafeStoragePath("Raw 실행 경로가 디렉터리가 아닙니다.")
-        else:
-            run_directory.mkdir(parents=False, exist_ok=False)
         self.verify()
-        relative = Path(run_segment) / filename
+        relative = relative_directory / filename
         path = contained_path(self.root, relative)
         data = content.encode("utf-8")
 
         descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{filename}.", suffix=".tmp", dir=run_directory
+            prefix=f".{filename}.", suffix=".tmp", dir=directory
         )
         temporary_path = Path(temporary_name)
         try:

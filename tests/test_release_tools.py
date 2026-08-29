@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -8,7 +10,25 @@ import pytest
 from tools.check_coverage_policy import CoveragePolicyError, check_coverage_policy
 from tools.check_no_secrets import check
 from tools.check_remote_release import ExpectedAsset, RemoteReleaseError, verify_release
-from tools.verify_release import ReleaseVerificationError, _safe_member
+from tools.check_version import VersionError
+from tools.continuous_release_state import (
+    Action,
+    AssetEvidence,
+    ContinuousReleaseStateError,
+    DesiredRelease,
+    DurableState,
+    ReleaseSnapshot,
+    Stage,
+    classify_asset_names,
+    next_action,
+    parse_state,
+    render_body,
+    snapshot_from_document,
+    validate_legacy_files,
+    verify_rollback,
+)
+from tools.release_notes import build_release_notes
+from tools.verify_release import ReleaseVerificationError, _packaged_environment, _safe_member
 
 
 def test_secret_check_scans_extensionless_private_key(tmp_path: Path) -> None:
@@ -35,6 +55,21 @@ def test_secret_check_rejects_private_and_sqlite_sidecar_suffixes(tmp_path: Path
 def test_release_verifier_rejects_generated_html_report() -> None:
     with pytest.raises(ReleaseVerificationError, match="private/runtime suffix"):
         _safe_member(zipfile.ZipInfo("ArubaSessionTracker/session-report.html"))
+
+
+def test_packaged_smoke_environment_excludes_development_python(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    monkeypatch.setenv("PATH", r"C:\Python313;C:\Windows\System32")
+    monkeypatch.setenv("PYTHONHOME", r"C:\Python313")
+    monkeypatch.setenv("VIRTUAL_ENV", r"D:\repo\.venv")
+
+    environment = _packaged_environment()
+
+    assert environment["PATH"] == r"C:\Windows\System32;C:\Windows"
+    assert "PYTHONHOME" not in environment
+    assert "VIRTUAL_ENV" not in environment
 
 
 def test_secret_check_detects_sqlite_magic_without_database_suffix(tmp_path: Path) -> None:
@@ -192,9 +227,321 @@ def test_remote_release_rejects_extra_public_asset(tmp_path: Path) -> None:
         )
 
 
+def test_release_notes_embed_verified_single_zip_download_contract(tmp_path: Path) -> None:
+    archive = tmp_path / "ArubaSessionTracker_v0.4.0_windows_x64.zip"
+    archive.write_bytes(b"verified windows bundle")
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    sidecar = tmp_path / f"{archive.name}.sha256"
+    sidecar.write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+
+    notes = build_release_notes("# 검토된 릴리스\n", archive, sidecar)
+
+    assert f"SHA-256: `{digest}`" in notes
+    assert f"Windows 11 x64 실행 파일: `{archive.name}`" in notes
+    assert "ArubaSessionTracker/sbom.cdx.json" in notes
+    assert "Source code (zip)" in notes
+
+
+def test_release_notes_reject_mismatched_zip_sidecar(tmp_path: Path) -> None:
+    archive = tmp_path / "ArubaSessionTracker_v0.4.0_windows_x64.zip"
+    archive.write_bytes(b"verified windows bundle")
+    sidecar = tmp_path / f"{archive.name}.sha256"
+    sidecar.write_text(f"{'0' * 64}  {archive.name}\n", encoding="utf-8")
+
+    with pytest.raises(VersionError, match="does not match"):
+        build_release_notes("# 검토된 릴리스\n", archive, sidecar)
+
+
+def _desired_release() -> DesiredRelease:
+    return DesiredRelease(
+        commit="a" * 40,
+        zip_name="ArubaSessionTracker_v0.4.0_windows_x64.zip",
+        sha256="b" * 64,
+        size=1234,
+    )
+
+
+def _durable_body(stage: Stage, desired: DesiredRelease | None = None) -> str:
+    target = desired or _desired_release()
+    notes = f"# Continuous\n\n- SHA-256: `{target.sha256}`\n"
+    return render_body(notes, DurableState(stage, target))
+
+
+def _desired_asset(desired: DesiredRelease) -> tuple[AssetEvidence, ...]:
+    return (
+        AssetEvidence(
+            desired.zip_name,
+            desired.size,
+            f"sha256:{desired.sha256}",
+        ),
+    )
+
+
+def test_continuous_durable_marker_round_trips_exact_desired_state() -> None:
+    desired = _desired_release()
+
+    body = _durable_body(Stage.ASSETS_VERIFIED, desired)
+    parsed = parse_state(body)
+
+    assert parsed == DurableState(Stage.ASSETS_VERIFIED, desired)
+    assert body.count("<!-- aruba-session-tracker-continuous:") == 1
+    assert body.count("<!-- aruba-session-tracker-continuous-state:") == 1
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    ((r'"schema":1', r'"schema":true'), (r'"size":1234', r'"size":true')),
+)
+def test_continuous_durable_marker_rejects_boolean_integer_fields(
+    old: str,
+    new: str,
+) -> None:
+    body = _durable_body(Stage.STAGING).replace(old, new)
+
+    with pytest.raises(ContinuousReleaseStateError, match="marker"):
+        parse_state(body)
+
+
+def test_continuous_legacy_trio_requires_one_common_version() -> None:
+    with pytest.raises(ContinuousReleaseStateError, match="same-version trio"):
+        classify_asset_names(
+            (
+                "ArubaSessionTracker_v0.4.0_windows_x64.zip",
+                "ArubaSessionTracker_v0.3.1_windows_x64.zip.sha256",
+                "ArubaSessionTracker_v0.4.0_sbom.cdx.json",
+            )
+        )
+
+
+def test_continuous_legacy_sidecar_must_match_zip(tmp_path: Path) -> None:
+    archive = tmp_path / "ArubaSessionTracker_v0.3.1_windows_x64.zip"
+    archive.write_bytes(b"legacy verified bytes")
+    sidecar = tmp_path / f"{archive.name}.sha256"
+    sbom = tmp_path / "ArubaSessionTracker_v0.3.1_sbom.cdx.json"
+    sbom.write_text('{"bomFormat":"CycloneDX"}', encoding="utf-8")
+    sidecar.write_text(
+        f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n",
+        encoding="utf-8",
+    )
+
+    validate_legacy_files(archive, sidecar, sbom)
+    sidecar.write_text(f"{'0' * 64}  {archive.name}\n", encoding="utf-8")
+
+    with pytest.raises(ContinuousReleaseStateError, match="does not match"):
+        validate_legacy_files(archive, sidecar, sbom)
+
+    sidecar.write_text(
+        f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n",
+        encoding="utf-8",
+    )
+    sbom.write_text("[]", encoding="utf-8")
+    with pytest.raises(ContinuousReleaseStateError, match="CycloneDX"):
+        validate_legacy_files(archive, sidecar, sbom)
+
+
+def test_continuous_snapshot_rejects_coerced_remote_metadata() -> None:
+    document: dict[str, object] = {
+        "draft": True,
+        "prerelease": True,
+        "name": "continuous",
+        "body": "owned",
+        "target_commitish": "a" * 40,
+        "tag_name": "continuous",
+        "assets": [
+            {
+                "name": "ArubaSessionTracker_v0.4.0_windows_x64.zip",
+                "size": True,
+                "digest": f"sha256:{'b' * 64}",
+            }
+        ],
+    }
+
+    with pytest.raises(ContinuousReleaseStateError, match="asset metadata"):
+        snapshot_from_document(document, tag_commit="a" * 40)
+
+
+def _apply_reconcile_action(
+    snapshot: ReleaseSnapshot | None,
+    action: Action,
+    desired: DesiredRelease,
+) -> ReleaseSnapshot:
+    if action is Action.CREATE_DRAFT:
+        return ReleaseSnapshot(
+            draft=True,
+            prerelease=True,
+            title="Aruba Session Tracker continuous",
+            body=_durable_body(Stage.STAGING, desired),
+            target_commitish=desired.commit,
+            tag_commit=desired.commit,
+            assets=(),
+        )
+    assert snapshot is not None
+    if action in {Action.HIDE_AND_MARK_STAGING, Action.MARK_STAGING}:
+        return replace(
+            snapshot,
+            draft=True,
+            body=_durable_body(Stage.STAGING, desired),
+            target_commitish=desired.commit,
+        )
+    if action is Action.REPLACE_ASSETS:
+        return replace(snapshot, assets=_desired_asset(desired))
+    if action is Action.MARK_ASSETS_VERIFIED:
+        return replace(snapshot, body=_durable_body(Stage.ASSETS_VERIFIED, desired))
+    if action is Action.ALIGN_TAG:
+        return replace(
+            snapshot,
+            tag_commit=desired.commit,
+            target_commitish=desired.commit,
+        )
+    if action is Action.MARK_READY:
+        return replace(snapshot, body=_durable_body(Stage.READY, desired))
+    if action is Action.PUBLISH:
+        return replace(snapshot, draft=False)
+    raise AssertionError(f"not a mutating reconcile action: {action}")
+
+
+def _converge_after_every_mutation_restart(
+    initial: ReleaseSnapshot | None,
+    desired: DesiredRelease,
+) -> tuple[ReleaseSnapshot, tuple[Action, ...]]:
+    snapshot = initial
+    actions: list[Action] = []
+    legacy_validated = False
+    authenticated = False
+    public_verified = False
+    for _ in range(30):
+        action = next_action(
+            snapshot,
+            desired,
+            legacy_validated=legacy_validated,
+            authenticated=authenticated,
+            public_verified=public_verified,
+        )
+        actions.append(action)
+        if action is Action.DONE:
+            assert snapshot is not None
+            return snapshot, tuple(actions)
+        if action is Action.VALIDATE_LEGACY:
+            legacy_validated = True
+            continue
+        if action is Action.VERIFY_DRAFT_DOWNLOAD:
+            authenticated = True
+            continue
+        if action is Action.VERIFY_PUBLIC:
+            public_verified = True
+            continue
+        snapshot = _apply_reconcile_action(snapshot, action, desired)
+        # Simulate a worker being killed immediately after every durable
+        # mutation. Only release/tag state survives into the resumed run.
+        legacy_validated = False
+        authenticated = False
+        public_verified = False
+    raise AssertionError("continuous reconciliation did not converge")
+
+
+@pytest.mark.parametrize("source_contract", ["legacy_trio", "single_zip", "absent"])
+def test_continuous_reconciliation_converges_after_every_interruption_boundary(
+    source_contract: str,
+) -> None:
+    desired = _desired_release()
+    if source_contract == "absent":
+        initial = None
+    else:
+        old_commit = "c" * 40
+        old_zip = "ArubaSessionTracker_v0.3.1_windows_x64.zip"
+        assets = (AssetEvidence(old_zip, 10, f"sha256:{'d' * 64}"),)
+        if source_contract == "legacy_trio":
+            assets = (
+                *assets,
+                AssetEvidence(f"{old_zip}.sha256", 100, f"sha256:{'e' * 64}"),
+                AssetEvidence(
+                    "ArubaSessionTracker_v0.3.1_sbom.cdx.json",
+                    200,
+                    f"sha256:{'f' * 64}",
+                ),
+            )
+        initial = ReleaseSnapshot(
+            draft=False,
+            prerelease=True,
+            title="Prior continuous title",
+            body=f"prior body\n<!-- aruba-session-tracker-continuous:{old_commit} -->\n",
+            target_commitish=old_commit,
+            tag_commit=old_commit,
+            assets=assets,
+        )
+
+    final, actions = _converge_after_every_mutation_restart(initial, desired)
+
+    assert final.draft is False
+    assert final.tag_commit == desired.commit
+    assert final.assets == _desired_asset(desired)
+    assert parse_state(final.body) == DurableState(Stage.READY, desired)
+    assert actions[-2:] == (Action.VERIFY_PUBLIC, Action.DONE)
+    if source_contract == "legacy_trio":
+        assert Action.VALIDATE_LEGACY in actions
+
+
+def test_continuous_reconciliation_recovers_partial_asset_replacement() -> None:
+    desired = _desired_release()
+    partial = ReleaseSnapshot(
+        draft=True,
+        prerelease=True,
+        title="Aruba Session Tracker continuous",
+        body=_durable_body(Stage.STAGING, desired),
+        target_commitish=desired.commit,
+        tag_commit="c" * 40,
+        assets=(
+            AssetEvidence(
+                "ArubaSessionTracker_v0.3.1_windows_x64.zip",
+                10,
+                f"sha256:{'d' * 64}",
+            ),
+        ),
+    )
+
+    assert next_action(partial, desired) is Action.REPLACE_ASSETS
+    final, actions = _converge_after_every_mutation_restart(partial, desired)
+    assert final.assets == _desired_asset(desired)
+    assert Action.REPLACE_ASSETS in actions
+
+
+def test_continuous_rollback_verification_includes_exact_body_and_metadata() -> None:
+    expected = ReleaseSnapshot(
+        draft=False,
+        prerelease=True,
+        title="Exact prior title",
+        body="exact prior body without an added newline",
+        target_commitish="c" * 40,
+        tag_commit="c" * 40,
+        assets=(AssetEvidence("prior.zip", 7, f"sha256:{'d' * 64}"),),
+    )
+
+    verify_rollback(expected, expected)
+
+    corruptions = (
+        replace(expected, draft=True),
+        replace(expected, prerelease=False),
+        replace(expected, title=f"{expected.title} changed"),
+        replace(expected, body=f"{expected.body}\n"),
+        replace(expected, target_commitish="e" * 40),
+        replace(expected, tag_commit="f" * 40),
+        replace(expected, tag_name="not-continuous"),
+        replace(
+            expected,
+            assets=(AssetEvidence("prior.zip", 8, f"sha256:{'d' * 64}"),),
+        ),
+    )
+    for actual in corruptions:
+        with pytest.raises(ContinuousReleaseStateError, match="exact prior state"):
+            verify_rollback(actual, expected)
+
+
 def test_versioned_workflow_verifies_draft_and_public_download_before_done() -> None:
     workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
 
+    assert "$assetPaths = @($zip)" in workflow
+    assert "$assetPaths = @($zip, $sha, $sbom)" not in workflow
+    assert "Release notes do not contain the verified public ZIP SHA-256." in workflow
     assert "--draft `" in workflow
     assert "tools/check_remote_release.py" in workflow
     assert "--state draft `" in workflow
@@ -202,53 +549,70 @@ def test_versioned_workflow_verifies_draft_and_public_download_before_done() -> 
     assert "Invoke-WebRequest -Uri $remote[0].browser_download_url" in workflow
     assert "Versioned release is already published; this workflow will not mutate it." in workflow
     assert workflow.count("Assert-VersionedTagProvenance") == 4
+    assert workflow.count("Assert-MainAtExpected") == 3
     assert "# Re-peel the annotated tag immediately before making the draft public." in workflow
+    publish_index = workflow.index("gh release edit $env:RELEASE_TAG")
+    final_main_index = workflow.rfind("Assert-MainAtExpected", 0, publish_index)
+    final_tag_index = workflow.rfind("Assert-VersionedTagProvenance", 0, publish_index)
+    assert final_main_index > final_tag_index > workflow.index("# Re-peel the annotated tag")
 
 
-def test_continuous_workflow_hides_candidates_and_keeps_verified_rollback() -> None:
+def test_continuous_workflow_delegates_to_durable_reconciler() -> None:
     workflow = Path(".github/workflows/continuous.yml").read_text(encoding="utf-8")
 
-    assert "$newReleaseVerified = $false" in workflow
-    hide_index = workflow.index("# Hide the published release before deleting stale temporaries")
-    candidate_upload_index = workflow.index("& gh release upload continuous @candidatePaths")
-    previous_cleanup_index = workflow.index('throw "Could not remove a prior continuous asset."')
-    final_contract_index = workflow.index('throw "Final continuous release contract failed."')
-    verified_index = workflow.index("$newReleaseVerified = $true")
-
-    assert hide_index < candidate_upload_index
-    assert candidate_upload_index < previous_cleanup_index
-    assert previous_cleanup_index < final_contract_index < verified_index
-    assert "Continuous update failed and rollback also failed" in workflow
-    assert "candidate[0].digest" in workflow
-    assert "A public continuous download differs" in workflow
-    assert "tools/check_remote_release.py" in workflow
-    assert "aruba-session-tracker-continuous:" in workflow
-    assert "Could not recover a temporary continuous asset from a prior run." in workflow
-    assert "temporaryAssetPattern" in workflow
-    assert "continuous-rollback" in workflow
-    assert "Could not restore prior continuous assets." in workflow
-    assert "unexpectedDraftAssets" in workflow
-    assert workflow.count("--required-marker $marker") == 4
+    assert "timeout-minutes: 30" in workflow
+    assert "./tools/publish_continuous.ps1" in workflow
+    assert "-ExpectedCommit $env:EXPECTED_COMMIT" in workflow
+    assert "GH_TOKEN: ${{ github.token }}" in workflow
+    assert "gh release" not in workflow
 
 
-def test_continuous_workflow_uses_exact_tag_lookup_and_fail_closed_drafts() -> None:
-    workflow = Path(".github/workflows/continuous.yml").read_text(encoding="utf-8")
+def test_continuous_reconciler_persists_stages_and_keeps_exact_rollback() -> None:
+    script = Path("tools/publish_continuous.ps1").read_text(encoding="utf-8")
 
-    assert "releases/tags/continuous" in workflow
-    assert "releases?per_page=100" not in workflow
-    assert "reservedDraftAssets" not in workflow
-    assert '-X DELETE "repos/$env:GITHUB_REPOSITORY/releases/$' not in workflow
-    marker_gate_index = workflow.index(
-        'throw "The existing continuous draft is not owned by this workflow."'
-    )
-    draft_cleanup_index = workflow.index("$unexpectedDraftAssets = @(")
-    assert marker_gate_index < draft_cleanup_index
+    assert 'Write-StageBody "staging"' in script
+    assert 'Write-StageBody "assets_verified"' in script
+    assert 'Write-StageBody "ready"' in script
+    assert "tools/continuous_release_state.py action" not in script
+    assert '"tools/continuous_release_state.py", "action"' in script
+    assert "tools/continuous_release_state.py validate-legacy" in script
+    assert "[IO.File]::WriteAllText(" in script
+    assert "[string]$restored.body -cne [string]$Rollback.Body" in script
+    assert "[string]$restored.tag_name -cne [string]$Rollback.TagName" in script
+    assert "[string]$restored.name -cne [string]$Rollback.Title" in script
+    assert "$restored.draft -ne $Rollback.Draft" in script
+    assert "$restored.prerelease -ne $Rollback.Prerelease" in script
+    assert "Assert-ContinuousTagAt $Rollback.Commit" in script
+    assert "A restored public asset differs from its exact prior bytes." in script
+    assert "Continuous update failed and exact rollback also failed" in script
+    assert "tag exists without an associated release" not in script
+    save_index = script.index("$rollback = Save-RollbackState")
+    hide_index = script.index('"release", "edit", $tag', save_index)
+    assert save_index < hide_index
 
 
-def test_continuous_workflow_rechecks_tag_around_publish() -> None:
-    workflow = Path(".github/workflows/continuous.yml").read_text(encoding="utf-8")
+def test_continuous_reconciler_rechecks_main_tag_and_exact_single_zip() -> None:
+    script = Path("tools/publish_continuous.ps1").read_text(encoding="utf-8")
 
-    assert "function Assert-ContinuousTagAt" in workflow
-    assert "# Re-resolve immediately before publish" in workflow
-    assert workflow.count("Assert-ContinuousTagAt $env:EXPECTED_COMMIT") >= 4
-    assert "Assert-ContinuousTagAt $oldCommit" in workflow
+    publish_case = script[script.index('"publish" {') : script.index('"verify_public" {')]
+    assert "Assert-MainStillExpected" in publish_case
+    assert "Assert-ContinuousTagAt $ExpectedCommit" in publish_case
+    assert 'Assert-RemoteContract $release "draft"' in publish_case
+    contract_index = publish_case.index('Assert-RemoteContract $release "draft"')
+    tag_index = publish_case.index("Assert-ContinuousTagAt $ExpectedCommit", contract_index)
+    main_index = publish_case.index("Assert-MainStillExpected", tag_index)
+    mutation_index = publish_case.index("Invoke-GhChecked", main_index)
+    assert contract_index < tag_index < main_index < mutation_index
+    public_case = script[script.index('"verify_public" {') : script.index('"done" {')]
+    assert public_case.count("Assert-ContinuousTagAt $ExpectedCommit") == 2
+    assert 'Assert-RemoteContract $release "published"' in public_case
+    assert "The public continuous ZIP differs from the verified input." in public_case
+
+
+def test_nightly_workflow_runs_fixture_only_scaled_soak() -> None:
+    workflow = Path(".github/workflows/nightly.yml").read_text(encoding="utf-8")
+
+    assert 'ARUBA_SOAK_POLLS: "20000"' in workflow
+    assert "python -m pytest -m soak" in workflow
+    assert "QT_QPA_PLATFORM: offscreen" in workflow
+    assert "github.token" not in workflow

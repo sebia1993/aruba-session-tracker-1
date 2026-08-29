@@ -35,6 +35,7 @@ EXPECTED_UI_IDS = {
     "MAIN-QUERY-STOP",
     "MAIN-QUERY-STATE",
     "MAIN-QUERY-CONTEXT",
+    "MAIN-QUERY-DETAIL-COLUMNS-TOGGLE",
     "MAIN-QUERY-RESULT-TABLE",
     "MAIN-QUERY-RESULT-TABLE-HEADER",
     "MAIN-QUERY-RESULT-TABLE-BODY",
@@ -106,8 +107,15 @@ def test_main_window_registers_exact_static_ui_catalog(qtbot: object, tmp_path: 
     qtbot.addWidget(window)  # type: ignore[attr-defined]
 
     catalog = inspector.catalog
-    assert len(catalog) == 60
+    assert len(catalog) == 61
     assert {metadata.stable_id for metadata in catalog} == EXPECTED_UI_IDS
+    assert (
+        sum(
+            metadata.stable_id.startswith("MAIN-QUERY-") and metadata.stable_id != "MAIN-QUERY-VIEW"
+            for metadata in catalog
+        )
+        == 24
+    )
     assert all(
         metadata.source_path == "src/aruba_session_tracker/ui/main_window.py"
         for metadata in catalog

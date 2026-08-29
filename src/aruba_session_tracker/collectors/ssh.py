@@ -21,7 +21,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Protocol, Self
@@ -44,6 +44,7 @@ from aruba_session_tracker.paths import (
 
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_OUTPUT_LINES = 50_000
+POLL_DEADLINE_SECONDS = 300.0
 KNOWN_HOSTS_LOCK_TIMEOUT_SECONDS = 10.0
 MAX_KNOWN_HOSTS_BYTES = 1024 * 1024
 
@@ -65,9 +66,19 @@ class CancellationToken:
 
     def __init__(self) -> None:
         self._event = threading.Event()
+        self._callbacks_lock = threading.RLock()
+        self._callbacks: dict[int, Callable[[], None]] = {}
+        self._next_callback_id = 0
 
     def cancel(self) -> None:
-        self._event.set()
+        with self._callbacks_lock:
+            if self._event.is_set():
+                return
+            self._event.set()
+            callbacks = tuple(self._callbacks.values())
+        for callback in callbacks:
+            with suppress(Exception):
+                callback()
 
     @property
     def is_cancelled(self) -> bool:
@@ -80,6 +91,69 @@ class CancellationToken:
     def raise_if_cancelled(self) -> None:
         if self.is_cancelled:
             raise CollectorError(ErrorCode.CANCELLED, "작업이 취소되었습니다.")
+
+    @contextmanager
+    def abort_on_cancel(self, callback: Callable[[], None]) -> Iterator[None]:
+        """Run a non-blocking abort callback when cancellation wins.
+
+        Registration is race-safe with :meth:`cancel`: a callback registered
+        after cancellation runs immediately, while a callback registered just
+        before cancellation is included in the cancellation snapshot.
+        """
+
+        with self._callbacks_lock:
+            if self._event.is_set():
+                callback_id: int | None = None
+                run_now = True
+            else:
+                self._next_callback_id += 1
+                callback_id = self._next_callback_id
+                self._callbacks[callback_id] = callback
+                run_now = False
+        if run_now:
+            with suppress(Exception):
+                callback()
+        try:
+            yield
+        finally:
+            if callback_id is not None:
+                with self._callbacks_lock:
+                    self._callbacks.pop(callback_id, None)
+
+
+@dataclass(frozen=True, slots=True)
+class PollDeadline:
+    """One monotonic wall-clock budget shared by every operation in a poll."""
+
+    expires_at: float
+    clock: Callable[[], float] = field(default=time.monotonic, repr=False, compare=False)
+
+    @classmethod
+    def after(
+        cls,
+        seconds: float = POLL_DEADLINE_SECONDS,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> PollDeadline:
+        if seconds <= 0:
+            raise ValueError("poll deadline must be positive")
+        return cls(clock() + seconds, clock)
+
+    @property
+    def remaining_seconds(self) -> float:
+        return max(0.0, self.expires_at - self.clock())
+
+    def bounded_timeout(self, configured_timeout: float) -> float:
+        self.raise_if_expired()
+        return max(0.001, min(configured_timeout, self.remaining_seconds))
+
+    def raise_if_expired(self) -> None:
+        if self.remaining_seconds <= 0:
+            raise CollectorError(
+                ErrorCode.POLL_DEADLINE_EXCEEDED,
+                "전체 조회 제한 시간이 초과되었습니다.",
+                retryable_network=True,
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +188,7 @@ class SSHConnectionFactory(Protocol):
         *,
         host_key_approval: HostKeyApproval | None,
         cancel_token: CancellationToken,
+        deadline: PollDeadline,
     ) -> AbstractContextManager[CommandConnection]: ...
 
 
@@ -159,8 +234,10 @@ class SSHCollector:
         *,
         host_key_approval: HostKeyApproval | None = None,
         cancel_token: CancellationToken | None = None,
+        deadline: PollDeadline | None = None,
     ) -> CommandBatch:
         token = cancel_token or CancellationToken()
+        poll_deadline = deadline or PollDeadline.after()
         requested = tuple(commands)
         if not requested:
             raise ValueError("실행할 명령이 없습니다.")
@@ -168,6 +245,7 @@ class SSHCollector:
             _validate_command(command)
 
         token.raise_if_cancelled()
+        poll_deadline.raise_if_expired()
         outputs: list[CommandOutput] = []
         try:
             manager = self._factory.connect(
@@ -175,34 +253,43 @@ class SSHCollector:
                 credentials,
                 host_key_approval=host_key_approval,
                 cancel_token=token,
+                deadline=poll_deadline,
             )
             connection = manager.__enter__()
-            try:
-                for command in requested:
+            abort = getattr(manager, "abort", None)
+            abort_callback = abort if callable(abort) else connection.close
+            with token.abort_on_cancel(abort_callback):
+                try:
+                    for command in requested:
+                        token.raise_if_cancelled()
+                        read_timeout = poll_deadline.bounded_timeout(self._command_timeout)
+                        output = connection.send_command(command, read_timeout=read_timeout)
+                        token.raise_if_cancelled()
+                        poll_deadline.raise_if_expired()
+                        _check_output_limits(
+                            output,
+                            max_bytes=self._max_output_bytes,
+                            max_lines=self._max_output_lines,
+                        )
+                        if command == "no paging":
+                            try:
+                                reject_command_errors(output)
+                            except ParseError as exc:
+                                raise CollectorError(
+                                    ErrorCode.COMMAND_VARIANT_UNVERIFIED,
+                                    "장비가 세션 페이징 해제 명령을 거부했습니다.",
+                                ) from exc
+                        outputs.append(CommandOutput(command=command, output=output))
+                except BaseException as exc:
+                    with suppress(Exception):
+                        manager.__exit__(type(exc), exc, exc.__traceback__)
+                    raise
+                else:
+                    # Keep the abort callback registered during graceful SSH
+                    # teardown so cancellation can wake a blocked disconnect.
+                    manager.__exit__(None, None, None)
                     token.raise_if_cancelled()
-                    output = connection.send_command(command, read_timeout=self._command_timeout)
-                    token.raise_if_cancelled()
-                    _check_output_limits(
-                        output,
-                        max_bytes=self._max_output_bytes,
-                        max_lines=self._max_output_lines,
-                    )
-                    if command == "no paging":
-                        try:
-                            reject_command_errors(output)
-                        except ParseError as exc:
-                            raise CollectorError(
-                                ErrorCode.COMMAND_VARIANT_UNVERIFIED,
-                                "장비가 세션 페이징 해제 명령을 거부했습니다.",
-                            ) from exc
-                    outputs.append(CommandOutput(command=command, output=output))
-            except BaseException as exc:
-                with suppress(Exception):
-                    manager.__exit__(type(exc), exc, exc.__traceback__)
-                raise
-            else:
-                manager.__exit__(None, None, None)
-                token.raise_if_cancelled()
+                    poll_deadline.raise_if_expired()
         except CollectorError as exc:
             if token.is_cancelled and exc.retryable_network:
                 token.raise_if_cancelled()
@@ -211,6 +298,10 @@ class SSHCollector:
             raise CollectorError(ErrorCode.AUTH_FAILED, "SSH 인증에 실패했습니다.") from exc
         except (NetmikoTimeoutException, TimeoutError) as exc:
             token.raise_if_cancelled()
+            try:
+                poll_deadline.raise_if_expired()
+            except CollectorError as deadline_exc:
+                raise deadline_exc from exc
             raise CollectorError(
                 ErrorCode.MM_UNREACHABLE,
                 "SSH 연결 또는 명령 시간이 초과되었습니다.",
@@ -229,6 +320,7 @@ class SSHCollector:
 class _NetmikoConnectionManager(AbstractContextManager[CommandConnection]):
     def __init__(self, connection: Any) -> None:
         self._connection: Any | None = connection
+        self._closing_connection: Any | None = None
         self._lock = threading.Lock()
 
     def __enter__(self) -> Self:
@@ -263,6 +355,8 @@ class _NetmikoConnectionManager(AbstractContextManager[CommandConnection]):
         with self._lock:
             connection = self._connection
             self._connection = None
+            if connection is not None:
+                self._closing_connection = connection
         if connection is None:
             return
         try:
@@ -270,16 +364,49 @@ class _NetmikoConnectionManager(AbstractContextManager[CommandConnection]):
         except CollectorError:
             raise
         except (NetmikoTimeoutException, TimeoutError, OSError, paramiko.SSHException) as exc:
+            _abort_netmiko_connection(connection)
             raise CollectorError(
                 ErrorCode.MM_UNREACHABLE,
                 "SSH 연결 정리에 실패했습니다.",
                 retryable_network=True,
             ) from exc
         except Exception as exc:
+            _abort_netmiko_connection(connection)
             raise CollectorError(
                 ErrorCode.PROMPT_PARSE_FAILED,
                 "SSH 연결을 안전하게 정리하지 못했습니다.",
             ) from exc
+        finally:
+            with self._lock:
+                if self._closing_connection is connection:
+                    self._closing_connection = None
+
+    def abort(self) -> None:
+        """Force-close the active transport without waiting for CLI logout."""
+
+        with self._lock:
+            connection = self._connection or self._closing_connection
+            self._connection = None
+        if connection is not None:
+            _abort_netmiko_connection(connection)
+
+
+def _abort_netmiko_connection(connection: Any) -> None:
+    """Best-effort close of Netmiko/Paramiko transports used to wake blocked reads."""
+
+    remote_channel = getattr(connection, "remote_conn", None)
+    remote_client = getattr(connection, "remote_conn_pre", None)
+    transport = None
+    if remote_client is not None:
+        get_transport = getattr(remote_client, "get_transport", None)
+        if callable(get_transport):
+            with suppress(Exception):
+                transport = get_transport()
+    for resource in (remote_channel, transport, remote_client):
+        close = getattr(resource, "close", None)
+        if callable(close):
+            with suppress(Exception):
+                close()
 
 
 KeyProbe = Callable[[DeviceTarget, float], paramiko.PKey]
@@ -342,26 +469,43 @@ class StrictNetmikoFactory:
         *,
         host_key_approval: HostKeyApproval | None,
         cancel_token: CancellationToken,
+        deadline: PollDeadline | None = None,
     ) -> AbstractContextManager[CommandConnection]:
+        poll_deadline = deadline or PollDeadline.after()
         cancel_token.raise_if_cancelled()
+        poll_deadline.raise_if_expired()
         try:
-            offered_key = self._key_probe(target, self._connect_timeout)
+            offered_key = self._key_probe(
+                target,
+                poll_deadline.bounded_timeout(self._connect_timeout),
+            )
         except CollectorError as exc:
             if exc.retryable_network:
                 cancel_token.raise_if_cancelled()
+                try:
+                    poll_deadline.raise_if_expired()
+                except CollectorError as deadline_exc:
+                    raise deadline_exc from exc
             raise
         except (TimeoutError, OSError, paramiko.SSHException) as exc:
             cancel_token.raise_if_cancelled()
+            try:
+                poll_deadline.raise_if_expired()
+            except CollectorError as deadline_exc:
+                raise deadline_exc from exc
             raise CollectorError(
                 ErrorCode.MM_UNREACHABLE,
                 "SSH 호스트 키 확인 연결에 실패했습니다.",
                 retryable_network=True,
             ) from exc
         cancel_token.raise_if_cancelled()
+        poll_deadline.raise_if_expired()
         self._verify_or_approve(target, offered_key, host_key_approval, cancel_token)
         cancel_token.raise_if_cancelled()
+        poll_deadline.raise_if_expired()
 
         try:
+            connection_timeout = poll_deadline.bounded_timeout(self._connect_timeout)
             connection = self._connector(
                 device_type="aruba_os",
                 host=target.host,
@@ -369,10 +513,10 @@ class StrictNetmikoFactory:
                 username=credentials.username,
                 password=credentials.password,
                 secret=credentials.enable_secret,
-                timeout=self._connect_timeout,
-                conn_timeout=self._connect_timeout,
-                auth_timeout=self._connect_timeout,
-                banner_timeout=self._connect_timeout,
+                timeout=connection_timeout,
+                conn_timeout=connection_timeout,
+                auth_timeout=connection_timeout,
+                banner_timeout=connection_timeout,
                 ssh_strict=True,
                 system_host_keys=False,
                 alt_host_keys=True,
@@ -387,6 +531,10 @@ class StrictNetmikoFactory:
             ) from exc
         except (NetmikoTimeoutException, TimeoutError, OSError) as exc:
             cancel_token.raise_if_cancelled()
+            try:
+                poll_deadline.raise_if_expired()
+            except CollectorError as deadline_exc:
+                raise deadline_exc from exc
             raise CollectorError(
                 ErrorCode.MM_UNREACHABLE,
                 "SSH 연결 시간이 초과되었거나 장비에 연결할 수 없습니다.",
@@ -405,6 +553,10 @@ class StrictNetmikoFactory:
                     "SSH 호스트 키 검증에 실패했습니다.",
                 ) from exc
             cancel_token.raise_if_cancelled()
+            try:
+                poll_deadline.raise_if_expired()
+            except CollectorError as deadline_exc:
+                raise deadline_exc from exc
             raise CollectorError(
                 ErrorCode.MM_UNREACHABLE,
                 "SSH 세션 수립에 실패했습니다.",
@@ -419,8 +571,16 @@ class StrictNetmikoFactory:
 
         if credentials.enable_secret:
             try:
-                cancel_token.raise_if_cancelled()
-                connection.enable()
+                with cancel_token.abort_on_cancel(manager.abort):
+                    cancel_token.raise_if_cancelled()
+                    poll_deadline.raise_if_expired()
+                    connection.enable()
+                    cancel_token.raise_if_cancelled()
+                    poll_deadline.raise_if_expired()
+            except CollectorError:
+                with suppress(Exception):
+                    manager.close()
+                raise
             except (NetmikoAuthenticationException, ValueError) as exc:
                 with suppress(Exception):
                     manager.close()
@@ -433,6 +593,12 @@ class StrictNetmikoFactory:
                     with suppress(Exception):
                         manager.close()
                     cancel_token.raise_if_cancelled()
+                try:
+                    poll_deadline.raise_if_expired()
+                except CollectorError as deadline_exc:
+                    with suppress(Exception):
+                        manager.close()
+                    raise deadline_exc from exc
                 with suppress(Exception):
                     manager.close()
                 raise CollectorError(

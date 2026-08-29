@@ -14,6 +14,7 @@ from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QLabel,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -29,6 +30,20 @@ from aruba_session_tracker.ui.developer_inspector import (
 def _app() -> QApplication:
     application = QApplication.instance()
     return application if isinstance(application, QApplication) else QApplication([])
+
+
+def _next_keyboard_focus(widget: QWidget) -> QWidget:
+    candidate = widget.nextInFocusChain()
+    while candidate is not widget:
+        if (
+            not widget.isAncestorOf(candidate)
+            and candidate.isVisible()
+            and candidate.isEnabled()
+            and candidate.focusPolicy() != Qt.FocusPolicy.NoFocus
+        ):
+            return candidate
+        candidate = candidate.nextInFocusChain()
+    raise AssertionError("keyboard focus chain has no next control")
 
 
 def _metadata(
@@ -225,6 +240,40 @@ def test_selection_climbs_to_registered_parent_and_consumes_the_click(
     assert clicked_spy.count() == 1
 
 
+def test_selection_mode_blocks_operational_keyboard_activation(
+    qtbot: Any,
+    inspector: DeveloperInspectorController,
+) -> None:
+    app = _app()
+    host = QWidget()
+    qtbot.addWidget(host)
+    layout = QVBoxLayout(host)
+    runtime_button = QPushButton("실제 조회", host)
+    runtime_button.setShortcut(QKeySequence("Alt+R"))
+    layout.addWidget(runtime_button)
+    inspector.register_widget(runtime_button, _metadata())
+    clicked_spy = QSignalSpy(runtime_button.clicked)
+    host.show()
+    runtime_button.setFocus()
+    app.processEvents()
+
+    QTest.keyClick(runtime_button, Qt.Key.Key_F12)
+    assert inspector.begin_selection()
+
+    QTest.keyClick(runtime_button, Qt.Key.Key_Space)
+    QTest.keyClick(runtime_button, Qt.Key.Key_Return)
+    QTest.keyClick(host, Qt.Key.Key_R, Qt.KeyboardModifier.AltModifier)
+    app.processEvents()
+
+    assert clicked_spy.count() == 0
+    assert inspector.selection_mode is True
+
+    QTest.keyClick(runtime_button, Qt.Key.Key_Escape)
+    assert inspector.selection_mode is False
+    QTest.keyClick(runtime_button, Qt.Key.Key_Space)
+    assert clicked_spy.count() == 1
+
+
 def test_double_click_tail_and_missing_release_do_not_leak_actions(
     qtbot: Any,
     inspector: DeveloperInspectorController,
@@ -342,6 +391,8 @@ def test_context_menu_is_blocked_and_inspector_widgets_are_excluded(
     layout.addWidget(button)
     inspector.register_widget(host, _metadata("MAIN-WINDOW"))
     bar = inspector.attach_host_layout(host, layout)
+    assert bar.mode_label.text() == "화면 개선 도우미"
+    assert bar.exit_button.text() == "도우미 닫기"
     context_spy = QSignalSpy(button.customContextMenuRequested)
     host.show()
     app.processEvents()
@@ -363,10 +414,17 @@ def test_context_menu_is_blocked_and_inspector_widgets_are_excluded(
     app.processEvents()
     assert inspector.hovered_metadata is None
     assert bar.select_button.isCheckable() is False
-    QTest.mouseClick(bar.select_button, Qt.MouseButton.LeftButton)
-    assert inspector.selection_mode is True
-    assert bar.select_button.text() == "선택 중 (Esc로 취소)"
+    assert all(
+        button.accessibleName() and button.accessibleDescription()
+        for button in (bar.select_button, bar.catalog_button, bar.exit_button)
+    )
+    assert bar.select_button.nextInFocusChain() is bar.catalog_button
+    assert bar.catalog_button.nextInFocusChain() is bar.exit_button
+    QTest.keyClick(bar.select_button, Qt.Key.Key_Space)
+    assert inspector.selection_mode is False
+    assert bar.select_button.text() == "화면에서 선택"
 
+    assert inspector.begin_selection()
     QTest.mouseClick(bar.exit_button, Qt.MouseButton.LeftButton)
     assert inspector.selection_mode is False
     assert inspector.enabled is False
@@ -446,11 +504,39 @@ def test_request_and_clipboard_use_only_registered_static_metadata(
     QTest.keyClick(runtime_widget, Qt.Key.Key_F12)
     dialog = inspector.show_element_detail(metadata)
     assert dialog is not None
+    assert dialog.windowTitle() == "화면 개선 도우미"
+    assert {label.text() for label in dialog.findChildren(QLabel)} >= {
+        "선택한 항목",
+        "어디에 있나요?",
+        "무엇을 하나요?",
+    }
+    assert dialog.technical_toggle.text() == "기술 정보 보기"
+    assert dialog.copy_button.text() == "개선 요청 정보 복사"
+    assert dialog.close_button.text() == "닫기"
+    assert not dialog.technical_widget.isVisible()
+    assert not dialog.request_preview.isVisible()
+    assert all(
+        control.accessibleName() and control.accessibleDescription()
+        for control in (
+            dialog.technical_toggle,
+            dialog.preview_toggle,
+            dialog.copy_button,
+        )
+    )
+    assert dialog.technical_toggle.nextInFocusChain() is dialog.preview_toggle
+    assert dialog.preview_toggle.nextInFocusChain() is dialog.copy_button
+    QTest.keyClick(dialog.technical_toggle, Qt.Key.Key_Space)
+    QTest.keyClick(dialog.preview_toggle, Qt.Key.Key_Space)
+    assert dialog.technical_toggle.isChecked()
+    assert dialog.preview_toggle.isChecked()
+    assert dialog.technical_widget.isVisible()
+    assert dialog.request_preview.isVisible()
     dialog.request_preview.setPlainText("runtime-secret-must-not-be-copied")
     copied = dialog.copy_request()
     assert copied == expected
     assert QApplication.clipboard().text() == expected
     assert "runtime-secret" not in copied
+    assert "자동 전송되지는 않습니다" in dialog.copy_status.text()
 
 
 def test_catalog_dialog_can_open_virtual_entry_details(
@@ -462,7 +548,7 @@ def test_catalog_dialog_can_open_virtual_entry_details(
     virtual = _metadata(
         "MAIN-HISTORY-RUN-TABLE-SELECTION",
         name="기록표 선택 실행",
-        screen="메인 화면 > 기록 및 내보내기 > 실행 기록표",
+        screen="앱 > 공통",
         purpose="기록표에서 선택한 실행을 나타내는 정적 가상 항목입니다.",
     )
     inspector.register_catalog_item(virtual)
@@ -472,7 +558,17 @@ def test_catalog_dialog_can_open_virtual_entry_details(
 
     catalog = inspector.show_catalog(host)
     assert catalog is not None
-    assert catalog.element_list.count() == 1
+    assert catalog.element_list.accessibleName()
+    assert catalog.element_list.accessibleDescription()
+    assert catalog.details_button.accessibleName()
+    assert catalog.details_button.accessibleDescription()
+    assert catalog.windowTitle() == "화면 개선 도우미 - 목록"
+    assert catalog.close_button.text() == "닫기"
+    assert _next_keyboard_focus(catalog.element_list) is catalog.details_button
+    assert catalog.element_list.count() == 2
+    assert catalog.element_list.item(0).text() == "── 공통 화면 ──"
+    assert catalog.element_list.item(0).flags() == Qt.ItemFlag.NoItemFlags
+    assert virtual.stable_id not in catalog.element_list.item(1).text()
     QTest.mouseClick(catalog.details_button, Qt.MouseButton.LeftButton)
     _app().processEvents()
     detail = inspector.detail_dialog

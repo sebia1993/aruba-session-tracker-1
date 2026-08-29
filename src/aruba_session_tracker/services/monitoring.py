@@ -11,23 +11,32 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 
-from aruba_session_tracker.collectors import CancellationToken
+from aruba_session_tracker.collectors import (
+    POLL_DEADLINE_SECONDS,
+    CancellationToken,
+    PollDeadline,
+)
 from aruba_session_tracker.models import (
     Credentials,
+    DeviceTarget,
     DiagnosticEvent,
+    ErrorCode,
     QueryRequest,
     SessionObservation,
 )
 
 from .tracker import (
+    MAX_POLL_OBSERVATIONS,
     FullScanApproval,
     LocationSnapshot,
+    PollBudget,
     QueryOutcome,
     RawSnapshot,
     TrackerService,
 )
 
 _LOGGER = logging.getLogger(__name__)
+_TRANSIENT_BACKOFF_SECONDS = (5, 10, 20, 40, 80, 160, 300)
 
 
 class LifecycleEventType(StrEnum):
@@ -67,6 +76,8 @@ class MonitorPollResult:
     active_sessions: tuple[SessionInstance, ...]
     consecutive_misses: int
     refreshed_location: bool
+    consecutive_transient_failures: int
+    retry_after_seconds: int
 
     @property
     def observations(self) -> tuple[SessionObservation, ...]:
@@ -130,7 +141,9 @@ class _PreparedMonitorPoll:
     location_snapshot: LocationSnapshot | None
     last_location_refresh: float | None
     consecutive_misses: int
+    consecutive_transient_failures: int
     active: dict[str, _ActiveSession]
+    fallback_devices: tuple[DeviceTarget, ...]
 
 
 class MonitorEngine:
@@ -157,7 +170,9 @@ class MonitorEngine:
         self._location_snapshot: LocationSnapshot | None = None
         self._last_location_refresh: float | None = None
         self._consecutive_misses = 0
+        self._consecutive_transient_failures = 0
         self._active: dict[str, _ActiveSession] = {}
+        self._fallback_devices: tuple[DeviceTarget, ...] = ()
         self._thread: threading.Thread | None = None
         self._cancel_token: CancellationToken | None = None
         self._lock = threading.RLock()
@@ -199,7 +214,9 @@ class MonitorEngine:
             location_snapshot = self._location_snapshot
             last_location_refresh = self._last_location_refresh
             consecutive_misses = self._consecutive_misses
+            consecutive_transient_failures = self._consecutive_transient_failures
             active = _clone_active(self._active)
+            fallback_devices = self._fallback_devices
 
         try:
             return self._calculate_prepared_poll(
@@ -208,7 +225,9 @@ class MonitorEngine:
                 location_snapshot=location_snapshot,
                 last_location_refresh=last_location_refresh,
                 consecutive_misses=consecutive_misses,
+                consecutive_transient_failures=consecutive_transient_failures,
                 active=active,
+                fallback_devices=fallback_devices,
             )
         except BaseException:
             with self._lock:
@@ -224,19 +243,32 @@ class MonitorEngine:
         location_snapshot: LocationSnapshot | None,
         last_location_refresh: float | None,
         consecutive_misses: int,
+        consecutive_transient_failures: int,
         active: dict[str, _ActiveSession],
+        fallback_devices: tuple[DeviceTarget, ...],
     ) -> _PreparedMonitorPoll:
         now_monotonic = self._monotonic_clock()
+        deadline = PollDeadline(now_monotonic + POLL_DEADLINE_SECONDS, self._monotonic_clock)
+        poll_budget = PollBudget()
         refresh = (
             location_snapshot is None
             or last_location_refresh is None
             or now_monotonic - last_location_refresh
             >= self._service.config.location_interval_seconds
         )
-        outcome = self._query(token, refresh=refresh, location_snapshot=location_snapshot)
+        outcome = self._query(
+            token,
+            refresh=refresh,
+            location_snapshot=location_snapshot,
+            allow_full_scan=refresh,
+            fallback_devices=() if refresh else fallback_devices,
+            poll_budget=poll_budget,
+            deadline=deadline,
+        )
         if refresh and outcome.used_mm is not None:
             location_snapshot = outcome.location_snapshot
-            last_location_refresh = now_monotonic
+            last_location_refresh = self._monotonic_clock()
+            fallback_devices = self._matched_fallback_devices(outcome)
 
         if outcome.authoritative:
             observed_flows = {_flow_key(item) for item in outcome.observations}
@@ -251,33 +283,66 @@ class MonitorEngine:
                     token,
                     refresh=True,
                     location_snapshot=location_snapshot,
+                    allow_full_scan=True,
+                    fallback_devices=(),
+                    poll_budget=poll_budget,
+                    deadline=deadline,
                 )
                 outcome = _merge_outcomes(outcome, refreshed)
                 refresh = True
                 if refreshed.used_mm is not None:
                     location_snapshot = refreshed.location_snapshot
-                    last_location_refresh = now_monotonic
+                    last_location_refresh = self._monotonic_clock()
+                    fallback_devices = self._matched_fallback_devices(refreshed)
 
         events: list[LifecycleEvent] = []
-        if outcome.observations:
-            consecutive_misses = 0
-        elif outcome.authoritative:
-            consecutive_misses += 1
-        # Positive observations are useful even from a partial multi-device
-        # poll; only an authoritative absence may advance MISS/CLOSED state.
-        events.extend(
-            self._apply_observations(
-                active,
-                outcome.observations,
-                absence_is_authoritative=outcome.authoritative,
+        prospective_flows = set(active)
+        prospective_flows.update(_flow_key(item) for item in outcome.observations)
+        if len(prospective_flows) > MAX_POLL_OBSERVATIONS:
+            outcome = replace(
+                outcome,
+                diagnostics=(
+                    *outcome.diagnostics,
+                    DiagnosticEvent(
+                        stage="MONITOR_STATE",
+                        code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+                        message="모니터링에서 유지할 수 있는 활성 세션 수를 초과했습니다.",
+                    ),
+                ),
+                authoritative=False,
             )
+        else:
+            if outcome.observations:
+                consecutive_misses = 0
+            elif outcome.authoritative:
+                consecutive_misses += 1
+            # Positive observations are useful even from a partial multi-device
+            # poll; only an authoritative absence may advance MISS/CLOSED state.
+            events.extend(
+                self._apply_observations(
+                    active,
+                    outcome.observations,
+                    absence_is_authoritative=outcome.authoritative,
+                )
+            )
+
+        has_transient_failure = any(
+            event.transient and not event.recovered for event in outcome.diagnostics
         )
+        if has_transient_failure:
+            consecutive_transient_failures += 1
+            retry_after_seconds = _transient_backoff(consecutive_transient_failures)
+        else:
+            consecutive_transient_failures = 0
+            retry_after_seconds = 0
         result = MonitorPollResult(
             outcome=outcome,
             events=tuple(events),
             active_sessions=tuple(item.snapshot() for item in active.values()),
             consecutive_misses=consecutive_misses,
             refreshed_location=refresh,
+            consecutive_transient_failures=consecutive_transient_failures,
+            retry_after_seconds=retry_after_seconds,
         )
         return _PreparedMonitorPoll(
             owner_id=id(self),
@@ -286,7 +351,9 @@ class MonitorEngine:
             location_snapshot=location_snapshot,
             last_location_refresh=last_location_refresh,
             consecutive_misses=consecutive_misses,
+            consecutive_transient_failures=consecutive_transient_failures,
             active=active,
+            fallback_devices=fallback_devices,
         )
 
     def _commit_prepared(self, prepared: _PreparedMonitorPoll) -> MonitorPollResult:
@@ -296,7 +363,9 @@ class MonitorEngine:
             self._location_snapshot = prepared.location_snapshot
             self._last_location_refresh = prepared.last_location_refresh
             self._consecutive_misses = prepared.consecutive_misses
+            self._consecutive_transient_failures = prepared.consecutive_transient_failures
             self._active = prepared.active
+            self._fallback_devices = prepared.fallback_devices
             self._last_result = prepared.result
         try:
             for event in prepared.result.events:
@@ -334,8 +403,13 @@ class MonitorEngine:
         current_thread = threading.current_thread()
         try:
             while not token.is_cancelled:
-                self.poll_once(cancel_token=token)
-                if token.wait(self._service.config.session_interval_seconds):
+                result = self.poll_once(cancel_token=token)
+                wait_seconds = (
+                    result.retry_after_seconds
+                    if result.retry_after_seconds > 0
+                    else self._service.config.session_interval_seconds
+                )
+                if token.wait(wait_seconds):
                     break
         finally:
             with self._lock:
@@ -378,6 +452,10 @@ class MonitorEngine:
         *,
         refresh: bool,
         location_snapshot: LocationSnapshot | None,
+        allow_full_scan: bool,
+        fallback_devices: tuple[DeviceTarget, ...],
+        poll_budget: PollBudget,
+        deadline: PollDeadline,
     ) -> QueryOutcome:
         return self._service.query_once(
             self._request,
@@ -386,6 +464,20 @@ class MonitorEngine:
             cancel_token=token,
             location_snapshot=location_snapshot,
             refresh_locations=refresh,
+            allow_full_scan=allow_full_scan,
+            fallback_devices=fallback_devices,
+            poll_budget=poll_budget,
+            deadline=deadline,
+        )
+
+    def _matched_fallback_devices(self, outcome: QueryOutcome) -> tuple[DeviceTarget, ...]:
+        if not outcome.full_scan_eligible:
+            return ()
+        matched_hosts = {item.controller_host for item in outcome.observations}
+        return tuple(
+            device
+            for device in self._service.config.managed_devices
+            if device.enabled and device.host in matched_hosts
         )
 
     def _apply_observations(
@@ -551,7 +643,11 @@ def _merge_outcomes(first: QueryOutcome, second: QueryOutcome) -> QueryOutcome:
         )
     return QueryOutcome(
         observations=tuple(observations.values()),
-        diagnostics=first.diagnostics + second.diagnostics,
+        diagnostics=tuple(
+            replace(event, recovered=True) if second.authoritative and event.transient else event
+            for event in first.diagnostics
+        )
+        + second.diagnostics,
         used_mm=second.used_mm or first.used_mm,
         controllers=tuple(dict.fromkeys(first.controllers + second.controllers)),
         raw_snapshots=tuple(first_raw_snapshots) + second.raw_snapshots,
@@ -560,3 +656,8 @@ def _merge_outcomes(first: QueryOutcome, second: QueryOutcome) -> QueryOutcome:
         full_scan_eligible=second.full_scan_eligible,
         authoritative=second.authoritative,
     )
+
+
+def _transient_backoff(consecutive_failures: int) -> int:
+    index = max(0, min(consecutive_failures - 1, len(_TRANSIENT_BACKOFF_SECONDS) - 1))
+    return _TRANSIENT_BACKOFF_SECONDS[index]
