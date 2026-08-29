@@ -45,14 +45,19 @@ datapath session rows from the relevant 7240XM managed device.
 - Build with `powershell -ExecutionPolicy Bypass -File .\build_windows.ps1`.
 - Keep real device addresses, logs, raw output, SQLite files, exports, and
   known-host files out of Git and release assets.
-- Preserve CSV export as an independent manual path. Result reports are
-  separate single-file HTML5 documents with inline CSS, no external resources,
-  responsive and print layouts, escaped database/device values, and no Raw CLI
-  body. Never invent VLAN, SSID, Role, interface, topology, or device facts that
-  are not stored for the selected run; label missing facts as confirmation
-  required.
-- HTML must include every stored observation row; the 2,000-row cap applies
-  only to the live Qt result table.
+- Preserve CSV export as an independent manual path. HTML is a result-only
+  presentation of the selected run, not an operator guide or diagnostic
+  document. Keep it as a separate single-file HTML5 document with inline CSS,
+  no external resources or JavaScript, responsive and print layouts, and
+  escaped database/device values.
+- Show KST as the primary display time, the latest 50 session results, stored
+  value changes per session, and a collapsed full-history section. HTML must
+  include every stored observation row; the 2,000-row cap applies only to the
+  live Qt result table.
+- Exclude diagnostic events and codes, Raw bodies, paths and hashes, CLI and
+  program-flow material, troubleshooting, developer information, credentials,
+  and logs from HTML. Do not change the SQLite schema, CSV or Raw format for
+  report presentation changes.
 - Keep staged crash recovery for both managed and user-selected external CSV
   and HTML destinations. External recovery must independently validate owner,
   parent identity, destination and commit receipt before mutating user files.

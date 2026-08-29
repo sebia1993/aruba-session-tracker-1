@@ -101,6 +101,7 @@ def _write_coverage_xml(
             "src/aruba_session_tracker/collectors/ssh.py",
             "src/aruba_session_tracker/services/monitoring.py",
             "src/aruba_session_tracker/services/tracker.py",
+            "src/aruba_session_tracker/storage/html_report.py",
             "src/aruba_session_tracker/storage/session_store.py",
             "src/aruba_session_tracker/ui/main_window.py",
         )
