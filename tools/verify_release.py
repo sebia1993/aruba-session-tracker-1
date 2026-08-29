@@ -416,7 +416,6 @@ def smoke_executable(zip_path: Path) -> None:
         required_report_markers = (
             "세션 추적 결과",
             "최신 세션 결과",
-            "세션별 수치 변화",
             "전체 추적 이력",
             "KST",
             "한국어-MD",
@@ -428,10 +427,12 @@ def smoke_executable(zip_path: Path) -> None:
             "report-smoke",
             "Troubleshooting",
             "CLI와 Quick Reference",
+            "세션별 수치 변화",
+            "패킷",
+            "바이트",
         )
         section_positions = tuple(
-            report_text.find(marker)
-            for marker in ("최신 세션 결과", "세션별 수치 변화", "전체 추적 이력")
+            report_text.find(marker) for marker in ("최신 세션 결과", "전체 추적 이력")
         )
         if (
             "<!doctype html>" not in report_text.casefold()

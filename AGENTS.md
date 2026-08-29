@@ -50,10 +50,13 @@ datapath session rows from the relevant 7240XM managed device.
   document. Keep it as a separate single-file HTML5 document with inline CSS,
   no external resources or JavaScript, responsive and print layouts, and
   escaped database/device values.
-- Show KST as the primary display time, the latest 50 session results, stored
-  value changes per session, and a collapsed full-history section. HTML must
-  include every stored observation row; the 2,000-row cap applies only to the
-  live Qt result table.
+- Show KST as the primary display time and focus the latest 50 results and the
+  collapsed full-history section on protocol, source IP:port, and destination
+  IP:port. HTML must include every stored observation row; the 2,000-row cap
+  applies only to the live Qt result table.
+- Omit packet, byte, and counter-delta values from HTML while preserving them
+  in SQLite, CSV, and Raw data. Do not change those storage formats for this
+  presentation-only simplification.
 - Exclude diagnostic events and codes, Raw bodies, paths and hashes, CLI and
   program-flow material, troubleshooting, developer information, credentials,
   and logs from HTML. Do not change the SQLite schema, CSV or Raw format for

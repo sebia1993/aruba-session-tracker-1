@@ -1704,15 +1704,15 @@ def test_html_export_uses_database_id_order_for_equal_observation_and_lifecycle_
     first = _observation(
         controller_name="MD-A",
         controller_host="198.51.100.21",
-        packets=10,
-        bytes_count=1024,
+        packets=987_654_321,
+        bytes_count=123_456_789,
         observed_at=same_time,
     )
     last = _observation(
         controller_name="MD-B",
         controller_host="198.51.100.22",
-        packets=20,
-        bytes_count=2048,
+        packets=987_654_322,
+        bytes_count=123_456_790,
         observed_at=same_time,
     )
     store.record_query(run_id, (first,))
@@ -1736,27 +1736,36 @@ def test_html_export_uses_database_id_order_for_equal_observation_and_lifecycle_
     store.finish_run(run_id, ended_at=same_time)
 
     document = store.export_run_html(run_id).read_text(encoding="utf-8")
+    csv_path = store.export_run_csv(run_id, tmp_path / "counter-preservation.csv")
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as stream:
+        csv_rows = list(csv.DictReader(stream))
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        stored_counters = connection.execute(
+            "SELECT packets, bytes_count FROM observations ORDER BY id"
+        ).fetchall()
     latest = re.search(
         r'<section id="latest-sessions">(?P<body>.*?)</section>', document, re.DOTALL
-    )
-    changes = re.search(
-        r'<section id="session-changes".*?>(?P<body>.*?)</section>', document, re.DOTALL
     )
     history = re.search(
         r'<section id="observation-history">(?P<body>.*?)</section>', document, re.DOTALL
     )
 
-    assert latest is not None and changes is not None and history is not None
+    assert latest is not None and history is not None
     latest_body = latest.group("body")
-    changes_body = changes.group("body")
     history_body = history.group("body")
     assert latest_body.count("<tbody><tr>") == 1
     assert "MD-B" in latest_body
     assert ">확인됨<" in latest_body
-    assert "MD-A → MD-B" in changes_body
-    assert "10 → 20" in changes_body
-    assert "1,024 B (1.0 KiB) → 2,048 B (2.0 KiB)" in changes_body
+    assert "session-changes" not in document
+    assert "세션별 수치 변화" not in document
+    assert "987654321" not in document
+    assert "123456789" not in document
     assert history_body.index("MD-A") < history_body.index("MD-B")
+    assert [(row["packets"], row["bytes_count"]) for row in csv_rows] == [
+        ("987654321", "123456789"),
+        ("987654322", "123456790"),
+    ]
+    assert stored_counters == [(987_654_321, 123_456_789), (987_654_322, 123_456_790)]
 
 
 def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
@@ -1906,8 +1915,9 @@ def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
     assert "capture-0000.txt" not in document
     assert "private-raw-body-0" not in document
     assert "<summary>전체 추적 이력 2,005건 보기</summary>" in document
-    assert "0 → 2,004" in document
-    assert "0 B → 256,512 B (250.5 KiB)" in document
+    assert "세션별 수치 변화" not in document
+    assert "패킷" not in document
+    assert "바이트" not in document
 
 
 def test_record_writes_and_second_finish_require_running_run(tmp_path: Path) -> None:

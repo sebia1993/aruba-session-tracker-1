@@ -77,7 +77,6 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
         )
         for _flow, rows in latest_groups
     )
-    change_rows = "".join(_change_row(rows) for _flow, rows in flow_groups)
     history_rows = "".join(_observation_row(row, "관측됨") for row in history)
 
     logical_session_total = len(flow_groups)
@@ -124,7 +123,6 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
     .table-wrap {{ overflow-x:auto; border:1px solid var(--line); border-radius:9px; }}
     .table-wrap:focus-visible,summary:focus-visible {{ outline:3px solid #63b3ed; outline-offset:2px; }}
     table {{ width:100%; min-width:800px; border-collapse:collapse; font-size:.88rem; }}
-    .changes table {{ min-width:1050px; }}
     th,td {{ padding:9px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }}
     th {{ background:#f0f4f8; color:var(--navy); position:sticky; top:0; white-space:nowrap; }}
     tr:last-child td {{ border-bottom:0; }}
@@ -133,7 +131,6 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
     .badge.missed {{ background:#fffaf0; color:var(--warn); }}
     .badge.closed {{ background:#fff5f5; color:var(--closed); }}
     .badge.observed {{ background:#edf2f7; color:#486581; }}
-    .delta {{ color:var(--muted); font-size:.82rem; white-space:nowrap; }}
     details {{ border:0; }}
     summary {{ cursor:pointer; color:var(--blue); font-weight:700; padding:6px 0 13px; }}
     .details-body {{ padding-top:2px; }}
@@ -153,7 +150,7 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
       .subtitle {{ color:#333; }} .header-inner,.content,.footer {{ width:100%; }} .content {{ padding:0; }}
       section,.result-summary {{ box-shadow:none; border:1px solid #bbb; padding:10px; margin-bottom:8px; }}
       details:not([open]) > .details-body {{ display:block !important; }} summary {{ color:#000; }}
-      .table-wrap {{ overflow:visible; border:0; }} table,.changes table {{ min-width:0; font-size:7.5pt; }}
+      .table-wrap {{ overflow:visible; border:0; }} table {{ min-width:0; font-size:7.5pt; }}
       thead {{ display:table-header-group; }} th {{ position:static; }} th,td {{ padding:4px; overflow-wrap:anywhere; }}
       .card,tr {{ break-inside:avoid; }}
     }}
@@ -187,16 +184,6 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
         <caption class="sr-only">최신 세션 결과</caption>
         <thead><tr><th scope="col">마지막 확인 시각</th><th scope="col">장비명</th><th scope="col">프로토콜</th><th scope="col">출발지 IP:포트</th><th scope="col">목적지 IP:포트</th><th scope="col">추적 상태</th></tr></thead>
         <tbody>{latest_rows or _empty_row(6, "관측된 세션이 없습니다.")}</tbody>
-      </table></div>
-    </section>
-
-    <section id="session-changes" class="changes">
-      <h2>세션별 수치 변화</h2>
-      <p class="section-note">각 세션의 처음 값과 마지막 값을 그대로 비교합니다.</p>
-      <div class="table-wrap" role="region" aria-label="세션별 수치 변화 표" tabindex="0"><table>
-        <caption class="sr-only">세션별 수치 변화</caption>
-        <thead><tr><th scope="col">세션</th><th scope="col">처음 확인</th><th scope="col">마지막 확인</th><th scope="col">패킷</th><th scope="col">바이트</th><th scope="col">장비 변화</th></tr></thead>
-        <tbody>{change_rows or _empty_row(6, "비교할 세션이 없습니다.")}</tbody>
       </table></div>
     </section>
 
@@ -332,43 +319,6 @@ def _observation_row(row: ReportRow, status: str) -> str:
     )
 
 
-def _change_row(rows: tuple[ReportRow, ...]) -> str:
-    first = rows[0]
-    last = rows[-1]
-    first_packets = _optional_int(first.get("packets"))
-    last_packets = _optional_int(last.get("packets"))
-    first_bytes = _optional_int(first.get("bytes_count"))
-    last_bytes = _optional_int(last.get("bytes_count"))
-    return (
-        "<tr>"
-        f"<td>{_e(_flow_label(first))}</td>"
-        f"<td>{_e(_format_kst(first.get('observed_at')))}</td>"
-        f"<td>{_e(_format_kst(last.get('observed_at')))}</td>"
-        f"<td>{_change_cell(first_packets, last_packets, byte_count=False)}</td>"
-        f"<td>{_change_cell(first_bytes, last_bytes, byte_count=True)}</td>"
-        f"<td>{_e(_controller_change(first, last))}</td>"
-        "</tr>"
-    )
-
-
-def _change_cell(first: int | None, last: int | None, *, byte_count: bool) -> str:
-    if byte_count:
-        first_text = "-" if first is None else _format_byte_value(first)
-        last_text = "-" if last is None else _format_byte_value(last)
-    else:
-        first_text = "-" if first is None else _format_integer(first)
-        last_text = "-" if last is None else _format_integer(last)
-    if first is None or last is None:
-        delta_text = "계산 불가"
-    else:
-        delta = last - first
-        delta_text = _format_byte_delta(delta) if byte_count else _format_signed_integer(delta)
-    return (
-        f'<span class="value">{_e(first_text)} → {_e(last_text)}</span>'
-        f'<span class="delta">변화 {_e(delta_text)}</span>'
-    )
-
-
 def _tracking_badge(status: str) -> str:
     kind = {
         "잠시 미확인": "missed",
@@ -394,22 +344,6 @@ def _flow_key_from_session_key(value: str) -> FlowKey | None:
     if len(parts) != 6:
         return None
     return (parts[1], parts[2], parts[3], parts[4], parts[5])
-
-
-def _flow_label(row: ReportRow) -> str:
-    return (
-        f"{_protocol(row.get('protocol'))} · "
-        f"{_endpoint(row.get('source_ip'), row.get('source_port'))} → "
-        f"{_endpoint(row.get('destination_ip'), row.get('destination_port'))}"
-    )
-
-
-def _controller_change(first: ReportRow, last: ReportRow) -> str:
-    first_name = _plain(first.get("controller_name"))
-    last_name = _plain(last.get("controller_name"))
-    if first_name == last_name:
-        return f"{first_name} (변화 없음)"
-    return f"{first_name} → {last_name}"
 
 
 def _endpoint(address: object, port: object) -> str:
@@ -457,40 +391,6 @@ def _datetime_sort_value(value: object) -> datetime:
 
 def _format_integer(value: int) -> str:
     return f"{value:,}"
-
-
-def _format_signed_integer(value: int) -> str:
-    if value > 0:
-        return f"+{value:,}"
-    return f"{value:,}"
-
-
-def _format_byte_value(value: int) -> str:
-    exact = f"{value:,} B"
-    scaled = _scaled_bytes(value)
-    return exact if scaled is None else f"{exact} ({scaled})"
-
-
-def _format_byte_delta(value: int) -> str:
-    sign = "+" if value > 0 else ""
-    exact = f"{sign}{value:,} B"
-    scaled = _scaled_bytes(value, signed=True)
-    return exact if scaled is None else f"{exact} ({scaled})"
-
-
-def _scaled_bytes(value: int, *, signed: bool = False) -> str | None:
-    magnitude = abs(value)
-    if magnitude < 1024:
-        return None
-    size = float(magnitude)
-    unit = "B"
-    for candidate in ("KiB", "MiB", "GiB", "TiB"):
-        size /= 1024
-        unit = candidate
-        if size < 1024 or candidate == "TiB":
-            break
-    prefix = "-" if value < 0 else ("+" if signed and value > 0 else "")
-    return f"{prefix}{size:.1f} {unit}"
 
 
 def _optional_int(value: object) -> int | None:
