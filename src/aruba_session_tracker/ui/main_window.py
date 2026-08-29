@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from aruba_session_tracker import __version__
+from aruba_session_tracker.analysis import protocol_label, service_definition
 from aruba_session_tracker.collectors.ssh import CancellationToken, CollectorError, HostKeyInfo
 from aruba_session_tracker.config import ConfigError, ConfigRepository
 from aruba_session_tracker.models import (
@@ -1720,7 +1721,7 @@ class MainWindow(QMainWindow):
         )
         values = (
             observation.controller_name,
-            str(observation.protocol),
+            _safe_protocol_label(observation.protocol),
             observation.source_ip,
             str(observation.source_port),
             observation.destination_ip,
@@ -1739,6 +1740,16 @@ class MainWindow(QMainWindow):
             item = QTableWidgetItem(value)
             if column == 0:
                 item.setData(_raw_data_role(), observation.raw_line)
+            if column in (3, 5):
+                port = observation.source_port if column == 3 else observation.destination_port
+                try:
+                    service = service_definition(observation.protocol, port)
+                except (TypeError, ValueError):
+                    service = None
+                if service is not None:
+                    item.setToolTip(
+                        f"포트 번호 기준 대표 서비스 후보: {service.label} ({service.port})"
+                    )
             if column in (13, 14):
                 item.setForeground(_severity_color(severity.name))
             self.result_table.setItem(row, column, item)
@@ -2245,6 +2256,12 @@ def _ui_metadata(
 
 def _display_number(value: int | None) -> str:
     return "-" if value is None else f"{value:,}"
+
+
+def _safe_protocol_label(value: object) -> str:
+    if type(value) is not int or not 0 <= value <= 255:
+        return str(value)
+    return protocol_label(value)
 
 
 def _display_observed_at(observation: SessionObservation) -> str:

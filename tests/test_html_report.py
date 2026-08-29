@@ -323,6 +323,23 @@ def test_lifecycle_statuses_are_korean_and_diagnostics_do_not_change_status() ->
     assert "transient communication failure" not in document
 
 
+def test_report_uses_static_protocol_labels_without_guessing_unknown_values() -> None:
+    gre = _observation(protocol=47, source_port=0, destination_port=0)
+    unknown = _observation(protocol=253, source_port=1, destination_port=1)
+
+    document = render_html_report(
+        _snapshot(
+            observations=(gre, unknown),
+            observation_history=(gre, unknown),
+            lifecycle_events=(),
+            observation_total=2,
+        )
+    )
+
+    assert "GRE (47)" in document
+    assert "Protocol 253" in document
+
+
 def test_latest_lifecycle_event_wins_and_equal_times_keep_database_order() -> None:
     observation = _observation()
     reopened = render_html_report(

@@ -96,9 +96,16 @@ def _write_coverage_xml(
     classes = "".join(
         f'<class filename="{filename}" branch-rate="{branch_rate}" />'
         for filename in (
+            "src/aruba_session_tracker/analysis/catalog.py",
+            "src/aruba_session_tracker/analysis/offline.py",
+            "src/aruba_session_tracker/analysis/summary.py",
+            "src/aruba_session_tracker/analysis/tos.py",
             "src/aruba_session_tracker/main.py",
             "src/aruba_session_tracker/runtime.py",
             "src/aruba_session_tracker/collectors/ssh.py",
+            "src/aruba_session_tracker/offline/io.py",
+            "src/aruba_session_tracker/offline/parser.py",
+            "src/aruba_session_tracker/parsers/global_users.py",
             "src/aruba_session_tracker/services/monitoring.py",
             "src/aruba_session_tracker/services/tracker.py",
             "src/aruba_session_tracker/storage/html_report.py",

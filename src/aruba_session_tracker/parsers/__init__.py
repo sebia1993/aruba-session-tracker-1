@@ -11,6 +11,7 @@ from .flags import (
     overall_flag_severity,
 )
 from .global_users import (
+    GlobalUserEntry,
     GlobalUserLookup,
     GlobalUserStatus,
     parse_global_user_table,
@@ -21,6 +22,7 @@ __all__ = [
     "FLAG_DEFINITIONS",
     "FlagDefinition",
     "FlagSeverity",
+    "GlobalUserEntry",
     "GlobalUserLookup",
     "GlobalUserStatus",
     "InterpretedFlag",

@@ -115,6 +115,10 @@ def test_main_window_runs_query_and_renders_korean_flag_status(
     qtbot.mouseClick(window.query_button, Qt.MouseButton.LeftButton)  # type: ignore[attr-defined]
     qtbot.waitUntil(lambda: window.result_table.rowCount() == 1, timeout=3000)  # type: ignore[attr-defined]
 
+    assert window.result_table.item(0, 1).text() == "TCP (6)"
+    assert window.result_table.item(0, 5).toolTip() == (
+        "포트 번호 기준 대표 서비스 후보: HTTPS (443)"
+    )
     assert window.result_table.item(0, 14).text() == "차단, SYN 없음"
     assert "MM-Conductor" in window.context_label.text()
     assert window.password_edit.text() == "session-only"
@@ -126,6 +130,32 @@ def test_counter_delta_is_only_shown_for_monotonic_samples() -> None:
     assert _counter_delta(10, 10) == "+0"
     assert _counter_delta(2, 10) == "-"
     assert _counter_delta(None, 10) == "-"
+
+
+def test_result_semantic_labels_fall_back_for_out_of_range_legacy_values(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "tracker.db", tmp_path / "raw", tmp_path / "exports")
+    store.initialize()
+    window = MainWindow(ConfigRepository(tmp_path / "config.json"), store, _Executor())
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    observation = SessionObservation(
+        controller_name="MD-legacy",
+        controller_host="198.51.100.21",
+        protocol=999,
+        source_ip="192.0.2.10",
+        destination_ip="203.0.113.20",
+        source_port=70_000,
+        destination_port=70_001,
+    )
+
+    window._append_observation(observation)
+
+    assert window.result_table.item(0, 1).text() == "999"
+    assert window.result_table.item(0, 3).toolTip() == ""
+    assert window.result_table.item(0, 5).toolTip() == ""
+    window.close()
 
 
 def test_operator_state_vocabulary_is_fixed_to_five_plain_states() -> None:

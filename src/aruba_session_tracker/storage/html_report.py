@@ -10,6 +10,8 @@ from datetime import UTC, datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 
+from aruba_session_tracker.analysis import protocol_label
+
 ReportRow = dict[str, object]
 FlowKey = tuple[str, str, str, str, str]
 
@@ -422,7 +424,9 @@ def _protocol(value: object) -> str:
     number = _optional_int(value)
     if number is None:
         return _plain(value)
-    return {1: "ICMP (1)", 6: "TCP (6)", 17: "UDP (17)"}.get(number, str(number))
+    if not 0 <= number <= 255:
+        return str(number)
+    return protocol_label(number)
 
 
 def _format_kst(value: object) -> str:

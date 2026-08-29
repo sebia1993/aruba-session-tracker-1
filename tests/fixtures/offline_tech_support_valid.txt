@@ -1,0 +1,20 @@
+show datapath session internal
+Datapath Session Table Entries
+Source IP or MAC  Destination IP  Prot SPort DPort Cntr     Prio ToS Age Destination TAge Packets    Bytes      SIDX     SRTI     SRCI     SRTRCV   MI_TUN   SRTMIV   UsrIdx   UsrVer   AclVer   NhlIdx   NhIdx    NhlNhVer  Int-Flag   Sess-Flag2 PktsDpi  UplinkVlan AppID                WebCCRep  WebCCID              Threat     Country Flags      DpiTIdx  WebCCURL                 CPU ID
+----------------- --------------- ---- ----- ----- -------- ---- --- --- ----------- ---- ---------- ---------- -------- -------- -------- -------- -------- -------- -------- -------- -------- -------- -------- --------- ---------- ---------- -------- ---------- -------------------- --------- -------------------- ---------- ------- ---------- -------- ------------------------ ------
+192.0.2.10        198.51.100.20   6    54321 443   0/0      0    0   12  local       a    10         800        1        2        3        4        0        0        12       1        abc      0        0        0         0          0          2        none       https (443)          N/A       Not-Classified (0)   N/A        KR      FCI        1a       https://example.invalid/ 1
+198.51.100.20     192.0.2.10      6    443   54321 0/0      0    0   9   local       b    f          400        2        3        4        5        0        0        12       1        abc      0        0        0         0          0          1        none       https (443)          N/A       Not-Classified (0)   N/A        KR      FC         1b       -                        2
+Entries: 2
+show user-table verbose
+Users
+IP              MAC               Name         Role
+--------------- ----------------- ------------ ----------
+192.0.2.10      00:00:5e:00:53:01 sample-user  employee
+User Entries: 1/1
+show station-table
+Station Entry
+MAC               Name         Role
+----------------- ------------ ----------
+00:00:5e:00:53:02 sample-ap    station
+Station Entries: 1
+show clock
