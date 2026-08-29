@@ -105,6 +105,13 @@ class ReleaseSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class ReleaseSelection:
+    keeper_id: int
+    cleanup_ids: tuple[int, ...]
+    cleanup_asset_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class AssetContract:
     kind: str
     version: str
@@ -301,6 +308,107 @@ def snapshot_from_document(document: dict[str, Any], *, tag_commit: str | None) 
     )
 
 
+def select_release_candidates(documents: list[dict[str, Any]]) -> ReleaseSelection:
+    """Choose one owned continuous release and only disposable empty duplicates."""
+
+    if not documents:
+        raise ContinuousReleaseStateError("continuous release candidates are empty")
+    candidates: list[tuple[int, ReleaseSnapshot, str | None]] = []
+    cleanup_asset_ids: list[int] = []
+    seen_ids: set[int] = set()
+    for document in documents:
+        if not isinstance(document, dict):
+            raise ContinuousReleaseStateError("continuous release candidate is not an object")
+        release_id = document.get("id")
+        published_at = document.get("published_at")
+        if type(release_id) is not int or release_id <= 0 or release_id in seen_ids:
+            raise ContinuousReleaseStateError("continuous release id is invalid or duplicated")
+        if published_at is not None and (
+            not isinstance(published_at, str) or not published_at.strip()
+        ):
+            raise ContinuousReleaseStateError("continuous published timestamp is malformed")
+        seen_ids.add(release_id)
+        if not isinstance(document.get("body"), str) or not has_legacy_ownership(document["body"]):
+            raise ContinuousReleaseStateError("continuous release candidate is not workflow-owned")
+        raw_assets = document.get("assets")
+        if not isinstance(raw_assets, list):
+            raise ContinuousReleaseStateError("continuous release assets are missing")
+        retained_assets: list[dict[str, Any]] = []
+        for asset in raw_assets:
+            if not isinstance(asset, dict):
+                raise ContinuousReleaseStateError("continuous release asset metadata is malformed")
+            if asset.get("state") != "starter":
+                retained_assets.append(asset)
+                continue
+            name = asset.get("name")
+            asset_id = asset.get("id")
+            if (
+                document.get("draft") is not True
+                or not isinstance(name, str)
+                or (
+                    CANONICAL_ASSET_PATTERN.fullmatch(name) is None
+                    and TEMPORARY_ASSET_PATTERN.fullmatch(name) is None
+                )
+                or type(asset_id) is not int
+                or asset_id <= 0
+                or asset.get("size") != 0
+                or asset.get("digest") is not None
+            ):
+                raise ContinuousReleaseStateError(
+                    "starter asset is not a disposable owned draft upload"
+                )
+            cleanup_asset_ids.append(asset_id)
+        sanitized = {**document, "assets": retained_assets}
+        snapshot = snapshot_from_document(sanitized, tag_commit=None)
+        if snapshot.tag_name != "continuous" or not snapshot.prerelease:
+            raise ContinuousReleaseStateError("continuous release candidate is not a prerelease")
+        validate_owned_asset_names(
+            tuple(asset.name for asset in snapshot.assets),
+            draft=snapshot.draft,
+        )
+        candidates.append((release_id, snapshot, published_at))
+
+    published = tuple(item for item in candidates if not item[1].draft)
+    if len(published) > 1:
+        raise ContinuousReleaseStateError("multiple published continuous releases exist")
+    if published:
+        keeper = published[0]
+    else:
+        historical = tuple(item for item in candidates if item[2] is not None)
+        if len(historical) > 1:
+            raise ContinuousReleaseStateError(
+                "multiple previously published continuous drafts exist"
+            )
+        if historical:
+            keeper = historical[0]
+        else:
+            non_empty = tuple(item for item in candidates if item[1].assets)
+            if len(non_empty) > 1:
+                raise ContinuousReleaseStateError("multiple non-empty continuous drafts exist")
+            keeper = non_empty[0] if non_empty else min(candidates, key=lambda item: item[0])
+
+    cleanup: list[int] = []
+    for release_id, snapshot, published_at in candidates:
+        if release_id == keeper[0]:
+            continue
+        if not snapshot.draft or snapshot.assets or published_at is not None:
+            raise ContinuousReleaseStateError(
+                "duplicate continuous release is not an empty unpublished draft"
+            )
+        if parse_state(snapshot.body) is None:
+            raise ContinuousReleaseStateError(
+                "duplicate continuous draft has no durable state marker"
+            )
+        cleanup.append(release_id)
+    if len(cleanup_asset_ids) != len(set(cleanup_asset_ids)):
+        raise ContinuousReleaseStateError("starter asset id is duplicated")
+    return ReleaseSelection(
+        keeper_id=keeper[0],
+        cleanup_ids=tuple(sorted(cleanup)),
+        cleanup_asset_ids=tuple(sorted(cleanup_asset_ids)),
+    )
+
+
 def next_action(
     snapshot: ReleaseSnapshot | None,
     desired: DesiredRelease,
@@ -435,6 +543,9 @@ def main() -> int:
     legacy.add_argument("--sha256-file", type=Path, required=True)
     legacy.add_argument("--sbom", type=Path, required=True)
 
+    select = subparsers.add_parser("select-release")
+    select.add_argument("--releases-json", type=Path, required=True)
+
     action = subparsers.add_parser("action")
     action.add_argument("--release-json", type=Path)
     action.add_argument("--tag-commit")
@@ -452,6 +563,23 @@ def main() -> int:
         return 0
     if args.command == "validate-legacy":
         validate_legacy_files(args.zip, args.sha256_file, args.sbom)
+        return 0
+    if args.command == "select-release":
+        document = json.loads(args.releases_json.read_text(encoding="utf-8-sig"))
+        if not isinstance(document, list) or not all(isinstance(item, dict) for item in document):
+            raise ContinuousReleaseStateError("release candidate JSON is not an object list")
+        selection = select_release_candidates(document)
+        print(
+            json.dumps(
+                {
+                    "cleanup_asset_ids": selection.cleanup_asset_ids,
+                    "cleanup_ids": selection.cleanup_ids,
+                    "keeper_id": selection.keeper_id,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
         return 0
     desired = _desired_from_args(args)
     snapshot = None
