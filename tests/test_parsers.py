@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from aruba_session_tracker.models import ErrorCode
 from aruba_session_tracker.parsers import (
     FLAG_DEFINITIONS,
     FlagSeverity,
@@ -29,6 +30,18 @@ def test_global_user_parser_returns_one_current_switch() -> None:
     assert result.current_switch == "198.51.100.11"
     assert result.current_switches == ("198.51.100.11",)
     assert result.row_count == 1
+
+
+def test_datapath_parser_enforces_observation_capacity_before_append() -> None:
+    with pytest.raises(ParseError) as caught:
+        parse_datapath_sessions(
+            fixture("datapath_sessions.txt"),
+            controller_name="MD-1",
+            controller_host="198.51.100.11",
+            max_observations=1,
+        )
+
+    assert caught.value.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
 
 
 def test_global_user_parser_distinguishes_zero_rows() -> None:

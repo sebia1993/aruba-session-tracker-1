@@ -12,6 +12,7 @@ from aruba_session_tracker.storage.session_store import (
     DeletionResult,
     SessionStore,
     StorageError,
+    StorageHealth,
 )
 
 __all__ = [
@@ -22,6 +23,7 @@ __all__ = [
     "RunReportSnapshot",
     "SessionStore",
     "StorageError",
+    "StorageHealth",
     "UnsafeStoragePath",
     "guard_csv_cell",
     "render_html_report",

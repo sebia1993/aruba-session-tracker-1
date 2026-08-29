@@ -11,16 +11,19 @@ datapath session rows from the relevant 7240XM managed device.
 - Never send configuration-changing commands. The runtime allowlist is limited
   to validated `show global-user-table list ip`, `show datapath session table`,
   session-only `no paging`, and optional `enable` handling.
-- Do not run live-device tests without explicit authorization and supplied
-  access details. Tests use sanitized fixtures and local fakes.
+- Do not run live-device tests for this project. The user owns field validation
+  and will report sanitized symptoms or error codes when follow-up is needed.
+  Tests use sanitized fixtures and local fakes.
 - Never persist usernames, passwords, or enable secrets. Session credentials
   remain in memory only.
 - Treat parser, SSH, and collection failures as unknown/partial results, never
   as proof that a controller or client is down.
 - Never fall back to an unfiltered datapath table query.
-- Keep the F12 UI Inspector disabled at every process start. Only an unmodified,
+- Keep the F12 `화면 개선 도우미` (internally, the UI Inspector) disabled at
+  every process start. Only an unmodified,
   non-repeating `F12` may toggle it; `Esc` cancels selection without disabling
-  the Inspector, and selection clicks must never reach operational controls.
+  the Inspector, and selection mouse or keyboard activation must never reach
+  operational controls.
 - The Inspector may use and copy only the program version, registered static
   Korean names, stable IDs, screen paths, repository-relative source paths, purposes, and blank
   symptom/change fields. It must never read or copy runtime IP addresses,
@@ -48,23 +51,34 @@ datapath session rows from the relevant 7240XM managed device.
   body. Never invent VLAN, SSID, Role, interface, topology, or device facts that
   are not stored for the selected run; label missing facts as confirmation
   required.
+- HTML must include every stored observation row; the 2,000-row cap applies
+  only to the live Qt result table.
+- Keep staged crash recovery for both managed and user-selected external CSV
+  and HTML destinations. External recovery must independently validate owner,
+  parent identity, destination and commit receipt before mutating user files.
 - Treat generated HTML reports as private runtime data. Do not add real reports
   to Git, tests, documentation fixtures, CI artifacts, or public packages.
-- Preserve the exact 60-ID static Inspector catalog: 7 common, 23 Session Query,
+- Preserve the exact 61-ID static Inspector catalog: 7 common, 24 Session Query,
   20 Device Settings, and 10 History and Export entries. Keep catalog IDs stable
   and cover additions or removals with tests that also enforce the static-data
   and click-blocking boundaries.
+- Preserve the labels `지속 모니터링 시작`, `현재 조회`, `고급 조건 보기/숨기기`,
+  and `상세 정보 보기/숨기기`. Operator state must be one of only `대기`,
+  `조회 중`, `정상`, `재시도 중`, or `확인 필요`.
 
 ## Release
 
 - Public builds are unsigned Windows x64 onedir ZIP files.
 - Versioned tags and releases are immutable by workflow policy. The moving
   `continuous` prerelease may be updated only by the verified `main` workflow.
-- Every release must contain the ZIP, SHA-256 sidecar, and CycloneDX SBOM.
+- Every public release must contain exactly one uploaded Windows x64 ZIP. Keep
+  the verified SHA-256 in the release body and the CycloneDX SBOM inside the ZIP.
+  Local build inputs still include the sidecar and external SBOM for verification.
 - Verify release assets while draft, compare GitHub-reported SHA-256 digests,
   re-download authenticated bytes before publish, and re-download public bytes
   after publish. A published versioned release must never be repaired in place.
 - CI/package evidence is not live Aruba or clean field-PC evidence.
-- Automated GUI checks do not replace Windows 11 field checks for a physical
-  F12/Fn Lock key, focus handling, restart-off behavior, clipboard output,
-  100/125/150 percent scaling, high contrast, and multiple monitors.
+- Keep deterministic offscreen checks for 100/125/150 percent scaling and an
+  injected high-contrast palette. They do not replace Windows 11 field checks
+  for a physical F12/Fn Lock key, focus handling, restart-off behavior,
+  clipboard output, native high contrast, or multiple monitors.

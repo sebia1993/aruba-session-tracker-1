@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aruba-session-tracker"
-version = "0.3.1"
+version = "0.4.0"
 description = "Read-only Aruba AOS 8 datapath session tracker for Windows 11."
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
@@ -34,6 +34,7 @@ pythonpath = ["src"]
 markers = [
   "gui: Qt GUI test",
   "integration: local fake integration test",
+  "soak: accelerated fixture-only long-running stability test",
   "windows: Windows-only test",
 ]
 

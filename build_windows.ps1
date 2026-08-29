@@ -3,7 +3,7 @@ param(
     [string]$PythonPath = "python",
 
     [ValidatePattern("^\d+\.\d+\.\d+$")]
-    [string]$Version = "0.3.1",
+    [string]$Version = "0.4.0",
 
     [switch]$SkipValidation,
     [switch]$UseCurrentEnvironment,
@@ -279,7 +279,9 @@ try {
     Invoke-Checked $toolPython $verifyArguments
     Invoke-Checked $toolPython @(
         "tools/release_notes.py", "--version", $Version,
-        "--output", (Join-Path $releaseRoot "release-notes-v$Version.md")
+        "--output", (Join-Path $releaseRoot "release-notes-v$Version.md"),
+        "--zip", $zipPath,
+        "--sha256", $sidecarPath
     )
     if ($gitStateAvailable -and (Get-GitStatusSnapshot) -ne $gitStateBefore) {
         throw "The source tree changed before release asset completion."

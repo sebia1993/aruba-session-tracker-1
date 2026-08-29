@@ -17,7 +17,7 @@ from pathlib import PurePosixPath, PureWindowsPath
 from time import monotonic
 from typing import Any, ClassVar, cast
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, Qt, Signal, Slot
 from PySide6.QtGui import QColor, QCursor, QKeyEvent, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -134,32 +134,47 @@ class DeveloperInspectorBar(QFrame):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self._controller = controller
         self.setProperty("uiInspectorInternal", True)
         self.setObjectName("developerInspectorBar")
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setStyleSheet(
             "#developerInspectorBar {"
-            " background: #fff4e5; border: 1px solid #d96c00; color: #5f3100; }"
+            " background: palette(alternate-base); border: 1px solid palette(highlight);"
+            " color: palette(text); }"
         )
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 4, 8, 4)
         layout.setSpacing(6)
-        self.mode_label = QLabel("개발자 UI 식별 모드", self)
+        self.mode_label = QLabel("화면 개선 도우미", self)
         self.mode_label.setObjectName("developerInspectorModeLabel")
+        self.mode_label.setAccessibleName("화면 개선 도우미 상태")
         layout.addWidget(self.mode_label)
         layout.addStretch(1)
 
-        self.select_button = QPushButton("요소 선택", self)
-        self.catalog_button = QPushButton("요소 목록", self)
-        self.exit_button = QPushButton("종료", self)
+        self.select_button = QPushButton("화면에서 선택", self)
+        self.select_button.setAccessibleName("화면에서 요소 선택 또는 선택 취소")
+        self.select_button.setAccessibleDescription(
+            "화면 요소를 선택하는 안전한 식별 모드를 시작하거나 취소합니다."
+        )
+        self.catalog_button = QPushButton("목록에서 찾기", self)
+        self.catalog_button.setAccessibleName("화면 요소 목록에서 찾기")
+        self.catalog_button.setAccessibleDescription(
+            "등록된 화면 요소를 화면 위치별 목록으로 엽니다."
+        )
+        self.exit_button = QPushButton("도우미 닫기", self)
+        self.exit_button.setAccessibleName("화면 개선 도우미 닫기")
+        self.exit_button.setAccessibleDescription("F12 화면 개선 도우미를 종료합니다.")
         layout.addWidget(self.select_button)
         layout.addWidget(self.catalog_button)
         layout.addWidget(self.exit_button)
 
-        self.select_button.clicked.connect(controller.begin_selection)
+        self.select_button.clicked.connect(self._toggle_selection)
         self.catalog_button.clicked.connect(lambda: controller.show_catalog(self.window()))
         self.exit_button.clicked.connect(controller.deactivate)
+        QWidget.setTabOrder(self.select_button, self.catalog_button)
+        QWidget.setTabOrder(self.catalog_button, self.exit_button)
         controller.enabled_changed.connect(self._sync_enabled)
         controller.selection_mode_changed.connect(self._sync_selection_mode)
         self._sync_selection_mode(False)
@@ -169,7 +184,19 @@ class DeveloperInspectorBar(QFrame):
         self.setVisible(enabled)
 
     def _sync_selection_mode(self, selecting: bool) -> None:
-        self.select_button.setText("선택 중 (Esc로 취소)" if selecting else "요소 선택")
+        self.mode_label.setText(
+            "화면 개선 도우미 · 확인할 요소를 클릭하세요. "
+            "선택용 클릭은 실제 기능을 실행하지 않습니다."
+            if selecting
+            else "화면 개선 도우미"
+        )
+        self.select_button.setText("선택 취소" if selecting else "화면에서 선택")
+
+    def _toggle_selection(self) -> None:
+        if self._controller.selection_mode:
+            self._controller.cancel_selection()
+        else:
+            self._controller.begin_selection()
 
 
 class DeveloperInspectorDetailDialog(QDialog):
@@ -180,41 +207,103 @@ class DeveloperInspectorDetailDialog(QDialog):
         self.setProperty("uiInspectorInternal", True)
         self._app_version = _application_version(app_version)
         self._metadata: UiElementMetadata | None = None
-        self.setWindowTitle("UI 요소 정보")
+        self.setWindowTitle("화면 개선 도우미")
         self.setModal(False)
-        self.resize(560, 430)
+        self.resize(580, 390)
 
         root = QVBoxLayout(self)
-        form = QFormLayout()
+        self.intro_label = QLabel(
+            "이 정보는 화면 개선 요청을 정확히 전달할 때 사용합니다. "
+            "현재 입력값, 비밀번호, 장비 데이터는 포함되지 않습니다.",
+            self,
+        )
+        self.intro_label.setWordWrap(True)
+        root.addWidget(self.intro_label)
+
+        summary_form = QFormLayout()
         self.name_value = self._read_only_line()
-        self.id_value = self._read_only_line()
         self.screen_value = self._read_only_line()
-        self.source_value = self._read_only_line()
         self.purpose_value = QTextEdit(self)
         self.purpose_value.setReadOnly(True)
         self.purpose_value.setAcceptRichText(False)
         self.purpose_value.setMaximumHeight(90)
-        form.addRow("사용자용 이름", self.name_value)
-        form.addRow("고정 식별자", self.id_value)
-        form.addRow("화면 위치", self.screen_value)
-        form.addRow("소스 위치", self.source_value)
-        form.addRow("기능", self.purpose_value)
-        root.addLayout(form)
+        summary_form.addRow("선택한 항목", self.name_value)
+        summary_form.addRow("어디에 있나요?", self.screen_value)
+        summary_form.addRow("무엇을 하나요?", self.purpose_value)
+        root.addLayout(summary_form)
+
+        self.technical_toggle = QPushButton("기술 정보 보기", self)
+        self.technical_toggle.setCheckable(True)
+        self.technical_toggle.setAccessibleName("기술 정보 펼치기 또는 접기")
+        self.technical_toggle.setAccessibleDescription(
+            "프로그램 버전, UI 식별자, 관련 코드 위치를 표시하거나 숨깁니다."
+        )
+        self.technical_toggle.toggled.connect(self._sync_technical_visibility)
+        root.addWidget(self.technical_toggle)
+        self.technical_widget = QWidget(self)
+        technical_form = QFormLayout(self.technical_widget)
+        technical_form.setContentsMargins(0, 0, 0, 0)
+        self.version_value = self._read_only_line()
+        self.id_value = self._read_only_line()
+        self.source_value = self._read_only_line()
+        technical_form.addRow("프로그램 버전", self.version_value)
+        technical_form.addRow("UI 식별자", self.id_value)
+        technical_form.addRow("관련 코드 위치", self.source_value)
+        self.technical_widget.setVisible(False)
+        root.addWidget(self.technical_widget)
+
+        request_title = QLabel("개선 요청 정보", self)
+        request_title.setStyleSheet("font-weight: 600;")
+        root.addWidget(request_title)
+        self.request_help = QLabel(
+            "정보를 복사한 뒤 채팅이나 이슈에 붙여넣고 '현재 현상'과 "
+            "'원하는 변경'을 작성하세요. 자동으로 전송되지 않습니다.",
+            self,
+        )
+        self.request_help.setWordWrap(True)
+        root.addWidget(self.request_help)
+
+        self.preview_toggle = QPushButton("복사할 정보 미리보기", self)
+        self.preview_toggle.setCheckable(True)
+        self.preview_toggle.setAccessibleName("복사할 정보 미리보기 펼치기 또는 접기")
+        self.preview_toggle.setAccessibleDescription(
+            "클립보드에 복사될 정적 개선 요청 정보를 표시하거나 숨깁니다."
+        )
+        self.preview_toggle.toggled.connect(self._sync_preview_visibility)
+        root.addWidget(self.preview_toggle)
 
         self.request_preview = QTextEdit(self)
         self.request_preview.setReadOnly(True)
         self.request_preview.setAcceptRichText(False)
+        self.request_preview.setAccessibleName("복사할 개선 요청 정보 미리보기")
+        self.request_preview.setAccessibleDescription(
+            "현재 입력값이나 장비 데이터를 포함하지 않는 읽기 전용 정적 문구입니다."
+        )
+        self.request_preview.setVisible(False)
         root.addWidget(self.request_preview)
 
         buttons = QDialogButtonBox(self)
         self.copy_button = buttons.addButton(
-            "작업 요청 복사",
+            "개선 요청 정보 복사",
             QDialogButtonBox.ButtonRole.ActionRole,
         )
-        close_button = buttons.addButton(QDialogButtonBox.StandardButton.Close)
+        self.copy_button.setAccessibleName("개선 요청 정보 클립보드에 복사")
+        self.copy_button.setAccessibleDescription(
+            "정적 화면 요소 정보만 클립보드에 복사하며 자동 전송하지 않습니다."
+        )
+        self.close_button = buttons.addButton(QDialogButtonBox.StandardButton.Close)
+        self.close_button.setText("닫기")
+        self.close_button.setAccessibleName("화면 요소 정보 닫기")
         self.copy_button.clicked.connect(self.copy_request)
-        close_button.clicked.connect(self.hide)
+        self.close_button.clicked.connect(self.hide)
         root.addWidget(buttons)
+        self.copy_status = QLabel("", self)
+        self.copy_status.setAccessibleName("복사 상태")
+        self.copy_status.setWordWrap(True)
+        root.addWidget(self.copy_status)
+        QWidget.setTabOrder(self.technical_toggle, self.preview_toggle)
+        QWidget.setTabOrder(self.preview_toggle, self.copy_button)
+        QWidget.setTabOrder(self.copy_button, self.close_button)
 
     def _read_only_line(self) -> QLineEdit:
         line = QLineEdit(self)
@@ -228,11 +317,23 @@ class DeveloperInspectorDetailDialog(QDialog):
     def set_metadata(self, metadata: UiElementMetadata) -> None:
         self._metadata = metadata
         self.name_value.setText(metadata.name_ko)
+        self.version_value.setText(self._app_version)
         self.id_value.setText(metadata.stable_id)
         self.screen_value.setText(metadata.screen_path)
         self.source_value.setText(metadata.source_path)
         self.purpose_value.setPlainText(metadata.purpose)
         self.request_preview.setPlainText(build_static_request_text(metadata, self._app_version))
+        self.copy_status.clear()
+
+    @Slot(bool)
+    def _sync_technical_visibility(self, visible: bool) -> None:
+        self.technical_widget.setVisible(visible)
+        self.technical_toggle.setText("기술 정보 숨기기" if visible else "기술 정보 보기")
+
+    @Slot(bool)
+    def _sync_preview_visibility(self, visible: bool) -> None:
+        self.request_preview.setVisible(visible)
+        self.preview_toggle.setText("복사할 정보 숨기기" if visible else "복사할 정보 미리보기")
 
     def copy_request(self) -> str:
         metadata = self._metadata
@@ -240,6 +341,7 @@ class DeveloperInspectorDetailDialog(QDialog):
             return ""
         text = build_static_request_text(metadata, self._app_version)
         QApplication.clipboard().setText(text)
+        self.copy_status.setText("클립보드에 복사했습니다. 외부로 자동 전송되지는 않습니다.")
         return text
 
 
@@ -251,25 +353,41 @@ class DeveloperInspectorCatalogDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setProperty("uiInspectorInternal", True)
-        self.setWindowTitle("UI 요소 목록")
+        self.setWindowTitle("화면 개선 도우미 - 목록")
         self.setModal(False)
         self.resize(590, 420)
         self._metadata_by_id: dict[str, UiElementMetadata] = {}
 
         root = QVBoxLayout(self)
+        self.guide_label = QLabel(
+            "확인할 항목을 선택하세요. 현재 입력값이나 장비 정보는 표시되지 않습니다.",
+            self,
+        )
+        self.guide_label.setWordWrap(True)
+        root.addWidget(self.guide_label)
         self.element_list = QListWidget(self)
+        self.element_list.setAccessibleName("화면 요소 목록")
+        self.element_list.setAccessibleDescription("화면 위치별로 묶인 정적 요소 이름 목록입니다.")
         self.element_list.itemDoubleClicked.connect(self._request_item)
         root.addWidget(self.element_list)
 
         buttons = QDialogButtonBox(self)
         self.details_button = buttons.addButton(
-            "상세 보기",
+            "선택한 요소 보기",
             QDialogButtonBox.ButtonRole.ActionRole,
         )
+        self.details_button.setAccessibleName("선택한 화면 요소 정보 보기")
+        self.details_button.setAccessibleDescription(
+            "목록에서 선택한 요소의 용도와 개선 요청 정보를 엽니다."
+        )
         self.close_button = buttons.addButton(QDialogButtonBox.StandardButton.Close)
+        self.close_button.setText("닫기")
+        self.close_button.setAccessibleName("화면 요소 목록 닫기")
         self.details_button.clicked.connect(self._request_current)
         self.close_button.clicked.connect(self.hide)
         root.addWidget(buttons)
+        QWidget.setTabOrder(self.element_list, self.details_button)
+        QWidget.setTabOrder(self.details_button, self.close_button)
 
     def set_catalog(self, metadata_items: Iterable[UiElementMetadata]) -> None:
         selected_id: str | None = None
@@ -280,17 +398,26 @@ class DeveloperInspectorCatalogDialog(QDialog):
                 selected_id = selected_value
         self.element_list.clear()
         self._metadata_by_id.clear()
+        grouped: OrderedDict[str, list[UiElementMetadata]] = OrderedDict()
         for metadata in metadata_items:
-            self._metadata_by_id[metadata.stable_id] = metadata
-            item = QListWidgetItem(
-                f"{metadata.name_ko}  ({metadata.stable_id})",
-                self.element_list,
-            )
-            item.setData(Qt.ItemDataRole.UserRole, metadata.stable_id)
-            if metadata.stable_id == selected_id:
-                self.element_list.setCurrentItem(item)
-        if self.element_list.currentRow() < 0 and self.element_list.count():
-            self.element_list.setCurrentRow(0)
+            grouped.setdefault(metadata.screen_path, []).append(metadata)
+        first_selectable: QListWidgetItem | None = None
+        for screen_path, group in grouped.items():
+            group_name = screen_path.rsplit(" > ", maxsplit=1)[-1]
+            if group_name == "공통":
+                group_name = "공통 화면"
+            header = QListWidgetItem(f"── {group_name} ──", self.element_list)
+            header.setFlags(Qt.ItemFlag.NoItemFlags)
+            for metadata in group:
+                self._metadata_by_id[metadata.stable_id] = metadata
+                item = QListWidgetItem(metadata.name_ko, self.element_list)
+                item.setData(Qt.ItemDataRole.UserRole, metadata.stable_id)
+                if first_selectable is None:
+                    first_selectable = item
+                if metadata.stable_id == selected_id:
+                    self.element_list.setCurrentItem(item)
+        if self.element_list.currentRow() < 0 and first_selectable is not None:
+            self.element_list.setCurrentItem(first_selectable)
 
     def _request_current(self) -> None:
         item = self.element_list.currentItem()
@@ -723,6 +850,23 @@ class DeveloperInspectorController(QObject):
                 self._suppress_escape_release = False
                 event.accept()
                 return True
+
+            if self._selection_mode and not self._is_inspector_internal(watched):
+                # Selection is identification-only.  Consume every operational
+                # key event so Space/Enter, mnemonics, and widget-specific keys
+                # cannot invoke the focused control while the crosshair is
+                # active.  F12 and Escape are handled above, and inspector-owned
+                # controls remain keyboard-operable.
+                event.accept()
+                return True
+
+        if (
+            self._selection_mode
+            and event_type == QEvent.Type.Shortcut
+            and not self._is_inspector_internal(watched)
+        ):
+            event.accept()
+            return True
 
         if event_type in self._MOUSE_EVENTS and isinstance(event, QMouseEvent):
             if self._is_inspector_internal(watched):

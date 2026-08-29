@@ -21,9 +21,11 @@ class ErrorCode(StrEnum):
     MD_UNREACHABLE = "MD_UNREACHABLE"
     MM_UNREACHABLE = "MM_UNREACHABLE"
     OUTPUT_LIMIT_EXCEEDED = "OUTPUT_LIMIT_EXCEEDED"
+    POLL_DEADLINE_EXCEEDED = "POLL_DEADLINE_EXCEEDED"
     PARSE_PARTIAL = "PARSE_PARTIAL"
     PROMPT_PARSE_FAILED = "PROMPT_PARSE_FAILED"
     SESSION_NOT_FOUND = "SESSION_NOT_FOUND"
+    STORAGE_LOW_SPACE = "STORAGE_LOW_SPACE"
     CANCELLED = "CANCELLED"
 
 
@@ -232,6 +234,8 @@ class DiagnosticEvent:
     code: ErrorCode | None
     message: str
     occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    transient: bool = False
+    recovered: bool = False
 
 
 def _dict(value: object) -> dict[str, Any]:

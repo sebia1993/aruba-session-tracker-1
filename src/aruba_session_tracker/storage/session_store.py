@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import stat
 import threading
@@ -20,7 +21,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO
 from uuid import uuid4
 
-from aruba_session_tracker.models import DiagnosticEvent, QueryRequest, SessionObservation
+from aruba_session_tracker.models import (
+    DiagnosticEvent,
+    ErrorCode,
+    QueryRequest,
+    SessionObservation,
+)
 from aruba_session_tracker.paths import (
     DirectoryIdentity,
     UnsafeManagedPath,
@@ -31,11 +37,6 @@ from aruba_session_tracker.paths import (
 )
 from aruba_session_tracker.storage.csv_export import write_csv_atomic
 from aruba_session_tracker.storage.html_report import (
-    HTML_CONTROLLER_LIMIT,
-    HTML_DIAGNOSTIC_LIMIT,
-    HTML_LIFECYCLE_LIMIT,
-    HTML_OBSERVATION_LIMIT,
-    HTML_RAW_FILE_LIMIT,
     RunReportSnapshot,
     write_html_report_atomic,
 )
@@ -56,6 +57,9 @@ _DELETE_PREVIEW_TTL_SECONDS = 300
 _CSV_FETCH_BATCH = 1000
 _HASH_CHUNK_SIZE = 1024 * 1024
 _MANIFEST_VERSION = 1
+_MAX_PENDING_DELETIONS = 16
+STORAGE_WARNING_FREE_BYTES = 5 * 1024**3
+STORAGE_HARD_STOP_FREE_BYTES = 1024**3
 _OPERATION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _MANIFEST_TEMP_NAME = re.compile(r"\.(?P<operation_id>[0-9a-f]{32})\.json\.[0-9a-f]{32}\.tmp\Z")
 _EVENT_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,31}\Z")
@@ -175,6 +179,15 @@ CREATE TABLE IF NOT EXISTS exports (
     byte_size INTEGER NOT NULL CHECK (byte_size >= 0)
 );
 
+CREATE TABLE IF NOT EXISTS external_export_commits (
+    operation_id TEXT PRIMARY KEY CHECK (length(operation_id) = 32),
+    target_key TEXT NOT NULL CHECK (length(target_key) = 64),
+    run_id TEXT NOT NULL,
+    committed_at TEXT NOT NULL,
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+    byte_size INTEGER NOT NULL CHECK (byte_size >= 0)
+);
+
 CREATE INDEX IF NOT EXISTS ix_observations_run_time
     ON observations(run_id, observed_at);
 CREATE INDEX IF NOT EXISTS ix_lifecycle_run_time
@@ -183,11 +196,48 @@ CREATE INDEX IF NOT EXISTS ix_controller_run_time
     ON controller_events(run_id, occurred_at);
 CREATE INDEX IF NOT EXISTS ix_diagnostic_run_time
     ON diagnostic_events(run_id, occurred_at);
+CREATE INDEX IF NOT EXISTS ix_observations_run_session_time
+    ON observations(run_id, session_key, observed_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS ix_raw_files_run_time
+    ON raw_files(run_id, captured_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS ix_exports_run_id
+    ON exports(run_id, id);
 """
 
 
 class StorageError(RuntimeError):
     """Local history could not be read or safely changed."""
+
+    def __init__(self, message: str, *, code: ErrorCode | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class StorageHealth:
+    database_bytes: int
+    wal_bytes: int
+    raw_bytes: int
+    raw_file_count: int
+    export_bytes: int
+    export_file_count: int
+    free_bytes: int
+
+    @property
+    def total_managed_bytes(self) -> int:
+        return self.database_bytes + self.wal_bytes + self.raw_bytes + self.export_bytes
+
+    @property
+    def total_file_count(self) -> int:
+        return self.raw_file_count + self.export_file_count
+
+    @property
+    def warning(self) -> bool:
+        return self.free_bytes < STORAGE_WARNING_FREE_BYTES
+
+    @property
+    def hard_stop(self) -> bool:
+        return self.free_bytes < STORAGE_HARD_STOP_FREE_BYTES
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +314,19 @@ class _ManagedExportStage:
     operation_id: str
     path: Path
     lease: _RunLease
+    manifest_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class _ExternalExportOwner:
+    operation_id: str
+    run_id: str
+    destination: Path
+    target_key: str
+    token: str
+    parent_device: int
+    parent_inode: int
+    path: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +356,7 @@ class SessionStore:
         self._operations_root = self.db_path.parent / ".operations"
         self._manifests_root = self._operations_root / "manifests"
         self._leases_root = self._operations_root / "leases"
+        self._export_owners_root = self._operations_root / "export-owners"
         self._raw = RawOutputStore(self.raw_root)
         self._initialized = False
         self._lock = threading.RLock()
@@ -345,6 +409,27 @@ class SessionStore:
             except (OSError, sqlite3.Error, UnsafeManagedPath, UnsafeStoragePath) as error:
                 raise StorageError(f"데이터베이스를 초기화할 수 없습니다: {error}") from error
 
+    def storage_health(self) -> StorageHealth:
+        """Return a conservative snapshot of managed disk use and free capacity."""
+
+        self._ensure_initialized()
+        try:
+            with self._lock:
+                return self._storage_health_unlocked()
+        except (OSError, UnsafeManagedPath, UnsafeStoragePath) as error:
+            raise StorageError(f"저장소 상태를 확인할 수 없습니다: {error}") from error
+
+    def ensure_query_capacity(self) -> None:
+        """Fail before network I/O when the next query cannot be stored safely.
+
+        Unlike :meth:`storage_health`, this intentionally performs only the
+        inexpensive free-space and managed-path checks.  The UI calls it before
+        every poll, while the full recursive usage snapshot remains rate-limited.
+        """
+
+        self._ensure_initialized()
+        self._require_storage_capacity()
+
     def start_run(
         self,
         query: QueryRequest,
@@ -353,6 +438,7 @@ class SessionStore:
         started_at: datetime | None = None,
     ) -> str:
         self._ensure_initialized()
+        self._require_storage_capacity()
         identifier = run_id or str(uuid4())
         safe_segment(identifier, "run_id")
         timestamp = _iso(started_at)
@@ -446,6 +532,7 @@ class SessionStore:
         """Record one poll and optionally link all rows to its raw UTF-8 file."""
 
         self._ensure_initialized()
+        self._require_storage_capacity()
         self._require_owned_running_run(run_id)
         values = tuple(observations)
         artifact: RawArtifact | None = None
@@ -541,6 +628,7 @@ class SessionStore:
         """Persist one complete query/poll as one recoverable SQLite transaction."""
 
         self._ensure_initialized()
+        self._require_storage_capacity()
         safe_segment(run_id, "run_id")
         self._require_owned_running_run(run_id)
         operation_id = uuid4().hex
@@ -642,6 +730,7 @@ class SessionStore:
         occurred_at: datetime | None = None,
     ) -> int:
         self._ensure_initialized()
+        self._require_storage_capacity()
         self._require_owned_running_run(run_id)
         normalized_event = _event_name(event_type, "event_type")
         normalized_instance = _instance_id(instance_id)
@@ -680,6 +769,7 @@ class SessionStore:
         occurred_at: datetime | None = None,
     ) -> int:
         self._ensure_initialized()
+        self._require_storage_capacity()
         self._require_owned_running_run(run_id)
         try:
             with self._lock, self._connection() as connection:
@@ -705,6 +795,7 @@ class SessionStore:
 
     def record_diagnostic(self, event: DiagnosticEvent, *, run_id: str | None = None) -> int:
         self._ensure_initialized()
+        self._require_storage_capacity()
         if run_id is not None:
             self._require_owned_running_run(run_id)
         try:
@@ -760,13 +851,12 @@ class SessionStore:
             if destination is not None
             else self.exports_root / f"run-{run_id}.csv"
         )
-        stage: _ManagedExportStage | None = None
+        managed_destination, export_destination = self._resolve_export_destination(path)
         try:
-            managed_destination = self._managed_export_destination(path)
-            output_path = path
-            if managed_destination is not None:
-                stage = self._prepare_managed_export(managed_destination)
-                output_path = stage.path
+            if managed_destination is None:
+                stage = self._prepare_external_export(run_id, export_destination)
+            else:
+                stage = self._prepare_managed_export(run_id, managed_destination)
             try:
                 with self._lock, self._connection() as connection:
                     connection.execute("BEGIN")
@@ -789,26 +879,35 @@ class SessionStore:
                         (run_id,),
                     )
                     write_csv_atomic(
-                        output_path,
+                        stage.path,
                         columns=_CSV_COLUMNS,
                         rows=_iter_cursor_dicts(cursor, batch_size=_CSV_FETCH_BATCH),
                     )
             except BaseException as error:
-                if stage is not None:
-                    cleanup_error = self._discard_managed_export_stage(stage)
-                    if cleanup_error is not None:
-                        error.add_note(
-                            f"내보내기 staging 정리도 실패했습니다: {type(cleanup_error).__name__}"
-                        )
+                cleanup_error = (
+                    self._discard_external_export_stage(stage)
+                    if managed_destination is None
+                    else self._discard_managed_export_stage(stage)
+                )
+                if cleanup_error is not None:
+                    error.add_note(
+                        f"내보내기 staging 정리도 실패했습니다: {type(cleanup_error).__name__}"
+                    )
                 raise
             if managed_destination is None:
+                self._commit_external_export(run_id, export_destination, stage)
                 return path
-            assert stage is not None
             self._commit_managed_export(run_id, managed_destination, stage)
             return managed_destination
         except StorageError:
             raise
-        except (OSError, sqlite3.Error) as error:
+        except (
+            OSError,
+            sqlite3.Error,
+            UnsafeManagedPath,
+            UnsafeStoragePath,
+            ValueError,
+        ) as error:
             raise StorageError(f"CSV를 내보낼 수 없습니다: {error}") from error
 
     def export_run_html(self, run_id: str, destination: Path | str | None = None) -> Path:
@@ -821,6 +920,7 @@ class SessionStore:
             if destination is not None
             else self.exports_root / f"run-{run_id}.html"
         )
+        managed_destination, export_destination = self._resolve_export_destination(path)
         try:
             with self._lock, self._connection() as connection:
                 connection.execute("BEGIN")
@@ -905,9 +1005,20 @@ class SessionStore:
                     FROM ranked
                     WHERE rank_in_session = 1
                     ORDER BY observed_at DESC, id DESC
-                    LIMIT ?
                     """,
-                    (run_id, HTML_OBSERVATION_LIMIT),
+                    (run_id,),
+                ).fetchall()
+                observation_history = connection.execute(
+                    """
+                    SELECT observed_at, controller_name, controller_host, protocol,
+                           source_ip, destination_ip, source_port, destination_port,
+                           counter, priority, tos, age, destination, tunnel_age,
+                           packets, bytes_count, flags, cpu_id, session_key
+                    FROM observations
+                    WHERE run_id = ?
+                    ORDER BY observed_at, id
+                    """,
+                    (run_id,),
                 ).fetchall()
 
                 lifecycle_total = int(
@@ -932,9 +1043,8 @@ class SessionStore:
                     FROM lifecycle_events
                     WHERE run_id = ?
                     ORDER BY occurred_at DESC, id DESC
-                    LIMIT ?
                     """,
-                    (run_id, HTML_LIFECYCLE_LIMIT),
+                    (run_id,),
                 ).fetchall()
 
                 controller_total = int(
@@ -948,9 +1058,8 @@ class SessionStore:
                     FROM controller_events
                     WHERE run_id = ?
                     ORDER BY occurred_at DESC, id DESC
-                    LIMIT ?
                     """,
-                    (run_id, HTML_CONTROLLER_LIMIT),
+                    (run_id,),
                 ).fetchall()
 
                 diagnostic_total = int(
@@ -964,9 +1073,8 @@ class SessionStore:
                     FROM diagnostic_events
                     WHERE run_id = ?
                     ORDER BY occurred_at DESC, id DESC
-                    LIMIT ?
                     """,
-                    (run_id, HTML_DIAGNOSTIC_LIMIT),
+                    (run_id,),
                 ).fetchall()
 
                 raw_totals = connection.execute(
@@ -983,9 +1091,8 @@ class SessionStore:
                     FROM raw_files
                     WHERE run_id = ?
                     ORDER BY captured_at DESC, id DESC
-                    LIMIT ?
                     """,
-                    (run_id, HTML_RAW_FILE_LIMIT),
+                    (run_id,),
                 ).fetchall()
 
                 snapshot = RunReportSnapshot(
@@ -1009,25 +1116,39 @@ class SessionStore:
                     raw_files=tuple(dict(row) for row in raw_files),
                     raw_file_total=int(raw_totals["file_count"]),
                     raw_byte_total=int(raw_totals["byte_count"]),
+                    observation_history=tuple(dict(row) for row in observation_history),
                 )
-            managed_destination = self._managed_export_destination(path)
             if managed_destination is None:
-                return write_html_report_atomic(path, snapshot)
-            stage = self._prepare_managed_export(managed_destination)
+                stage = self._prepare_external_export(run_id, export_destination)
+            else:
+                stage = self._prepare_managed_export(run_id, managed_destination)
             try:
                 write_html_report_atomic(stage.path, snapshot)
             except BaseException as error:
-                cleanup_error = self._discard_managed_export_stage(stage)
+                cleanup_error = (
+                    self._discard_external_export_stage(stage)
+                    if managed_destination is None
+                    else self._discard_managed_export_stage(stage)
+                )
                 if cleanup_error is not None:
                     error.add_note(
                         f"HTML staging 정리도 실패했습니다: {type(cleanup_error).__name__}"
                     )
                 raise
+            if managed_destination is None:
+                self._commit_external_export(run_id, export_destination, stage)
+                return path
             self._commit_managed_export(run_id, managed_destination, stage)
             return managed_destination
         except StorageError:
             raise
-        except (OSError, sqlite3.Error, ValueError) as error:
+        except (
+            OSError,
+            sqlite3.Error,
+            UnsafeManagedPath,
+            UnsafeStoragePath,
+            ValueError,
+        ) as error:
             raise StorageError(f"HTML 보고서를 내보낼 수 없습니다: {error}") from error
 
     def preview_delete(self, run_id: str | None = None) -> DeletePreview:
@@ -1035,6 +1156,12 @@ class SessionStore:
 
         self._ensure_initialized()
         with self._lock:
+            self._sweep_expired_delete_previews_unlocked()
+            if len(self._pending_deletions) >= _MAX_PENDING_DELETIONS:
+                raise StorageError(
+                    "동시에 유지할 수 있는 삭제 미리보기는 최대 16개입니다. "
+                    "기존 미리보기를 취소하거나 만료 후 다시 시도하십시오."
+                )
             try:
                 snapshot = self._collect_deletion_snapshot(run_id)
             except UnsafeStoragePath as error:
@@ -1066,17 +1193,32 @@ class SessionStore:
             )
             return preview
 
+    def discard_delete_preview(self, preview: DeletePreview) -> bool:
+        """Discard one exact pending preview without deleting any data."""
+
+        self._ensure_initialized()
+        with self._lock:
+            self._sweep_expired_delete_previews_unlocked()
+            pending = self._pending_deletions.get(preview.preview_id)
+            if pending is None or pending.preview != preview:
+                return False
+            self._pending_deletions.pop(preview.preview_id, None)
+            return True
+
     def delete(self, preview: DeletePreview, *, confirmation_token: str) -> DeletionResult:
         """Delete exactly the unchanged items described by a valid preview."""
 
         self._ensure_initialized()
         with self._lock:
+            now = time.monotonic()
             pending = self._pending_deletions.get(preview.preview_id)
+            if pending is not None and now >= pending.expires_monotonic:
+                self._pending_deletions.pop(preview.preview_id, None)
+                self._sweep_expired_delete_previews_unlocked(now)
+                raise StorageError("삭제 미리보기가 만료되었습니다. 다시 확인하십시오.")
+            self._sweep_expired_delete_previews_unlocked(now)
             if pending is None or pending.preview != preview:
                 raise StorageError("먼저 현재 삭제 대상을 미리 확인해야 합니다.")
-            if time.monotonic() > pending.expires_monotonic:
-                self._pending_deletions.pop(preview.preview_id, None)
-                raise StorageError("삭제 미리보기가 만료되었습니다. 다시 확인하십시오.")
             if not secrets.compare_digest(pending.preview.confirmation_token, confirmation_token):
                 raise StorageError("삭제 확인 토큰이 일치하지 않습니다.")
 
@@ -1195,6 +1337,17 @@ class SessionStore:
                 deleted_export_files=deleted_exports,
             )
 
+    def _sweep_expired_delete_previews_unlocked(self, now: float | None = None) -> int:
+        current = time.monotonic() if now is None else now
+        expired = tuple(
+            preview_id
+            for preview_id, pending in self._pending_deletions.items()
+            if current >= pending.expires_monotonic
+        )
+        for preview_id in expired:
+            self._pending_deletions.pop(preview_id, None)
+        return len(expired)
+
     def _prepare_managed_layout(self) -> None:
         db_parent = Path(os.path.abspath(self.db_path.parent))
         raw_root = Path(os.path.abspath(self.raw_root))
@@ -1216,6 +1369,7 @@ class SessionStore:
             self._operations_root,
             self._manifests_root,
             self._leases_root,
+            self._export_owners_root,
         ):
             absolute, identity = ensure_managed_directory(directory)
             self._directory_identities[absolute] = identity
@@ -1228,6 +1382,43 @@ class SessionStore:
             verify_managed_directory(directory, identity)
         reject_managed_file_link(self.db_path)
         self._raw.verify()
+
+    def _storage_health_unlocked(self) -> StorageHealth:
+        self._assert_managed_layout()
+        raw_bytes, raw_count = _storage_tree_stats(self.raw_root)
+        export_bytes, export_count = _storage_tree_stats(self.exports_root)
+        free_bytes = _minimum_free_bytes((self.db_path.parent, self.raw_root, self.exports_root))
+        return StorageHealth(
+            database_bytes=_regular_file_size(self.db_path),
+            wal_bytes=_regular_file_size(Path(f"{self.db_path}-wal")),
+            raw_bytes=raw_bytes,
+            raw_file_count=raw_count,
+            export_bytes=export_bytes,
+            export_file_count=export_count,
+            free_bytes=free_bytes,
+        )
+
+    def _require_storage_capacity(self, destination: Path | None = None) -> None:
+        try:
+            with self._lock:
+                self._assert_managed_layout()
+                free_bytes = _minimum_free_bytes(
+                    (self.db_path.parent, self.raw_root, self.exports_root)
+                )
+                if destination is not None:
+                    free_bytes = min(
+                        free_bytes,
+                        _minimum_free_bytes((_nearest_existing_directory(destination.parent),)),
+                    )
+                if free_bytes < STORAGE_HARD_STOP_FREE_BYTES:
+                    raise StorageError(
+                        "저장 공간이 1 GiB 미만이므로 새 기록을 안전하게 저장할 수 없습니다.",
+                        code=ErrorCode.STORAGE_LOW_SPACE,
+                    )
+        except StorageError:
+            raise
+        except (OSError, UnsafeManagedPath, UnsafeStoragePath) as error:
+            raise StorageError(f"저장소 여유 공간을 확인할 수 없습니다: {error}") from error
 
     def _acquire_run_lease(self, run_id: str) -> _RunLease | None:
         safe_segment(run_id, "run_id")
@@ -1269,6 +1460,15 @@ class SessionStore:
             raise StorageError("같은 저장 작업 manifest가 이미 존재합니다.")
         _write_json_atomic(path, payload)
         return path
+
+    def _replace_manifest(self, path: Path, payload: dict[str, object]) -> None:
+        operation_id = _manifest_text(payload, "operation_id")
+        _validate_operation_id(operation_id)
+        expected = self._manifests_root / f"{operation_id}.json"
+        if path != expected or not os.path.lexists(path):
+            raise StorageError("갱신할 저장 작업 manifest가 올바르지 않습니다.")
+        self._assert_managed_layout()
+        _write_json_atomic(path, payload)
 
     def _remove_operation_artifacts(self, manifest_path: Path | None, stage_root: Path) -> None:
         if os.path.lexists(stage_root):
@@ -1410,10 +1610,15 @@ class SessionStore:
                     self._recover_delete_manifest(path, payload)
                 elif kind == "export":
                     self._recover_export_manifest(path, payload)
+                elif kind == "external_export":
+                    self._recover_external_export_manifest(path, payload)
                 else:
                     raise StorageError("지원하지 않는 저장 작업 manifest 종류입니다.")
             finally:
                 _release_run_lease(lease, remove=not os.path.lexists(path))
+
+        self._recover_orphan_external_export_owners()
+        self._recover_orphan_external_export_receipts()
 
     def _recover_raw_batch_manifest(self, path: Path, payload: dict[str, Any]) -> None:
         operation_id = _manifest_text(payload, "operation_id")
@@ -1523,6 +1728,22 @@ class SessionStore:
         destination = _managed_file_path(self.exports_root, relative, allow_missing=True)
         staged = _managed_file_path(self.exports_root, staged_relative, allow_missing=True)
         backup = _managed_file_path(self.exports_root, backup_relative, allow_missing=True)
+        phase_value = payload.get("phase")
+        if phase_value is not None and phase_value not in {
+            "PREPARED",
+            "RENDERED",
+            "INSTALLED",
+            "DB_COMMITTED",
+        }:
+            raise StorageError("내보내기 manifest 단계가 올바르지 않습니다.")
+        if phase_value == "PREPARED":
+            if os.path.lexists(backup):
+                raise StorageError("PREPARED 내보내기에 예상하지 못한 backup 파일이 있습니다.")
+            if os.path.lexists(staged):
+                _unlink_regular(staged, missing_ok=False)
+            _remove_export_temporary_files(staged)
+            _unlink_regular(path, missing_ok=False)
+            return
         new_sha, new_size = _manifest_fingerprint(payload, "sha256", "byte_size")
         previous_file = _manifest_optional_fingerprint(
             payload,
@@ -1551,6 +1772,8 @@ class SessionStore:
             and str(row["sha256"]) == previous_db[0]
             and int(row["byte_size"]) == previous_db[1]
         )
+        if phase_value == "DB_COMMITTED" and not db_is_new:
+            raise StorageError("DB_COMMITTED 내보내기의 DB 기록이 일치하지 않습니다.")
         if db_is_new:
             if os.path.lexists(staged):
                 _verify_file_fingerprint(staged, new_sha, new_size)
@@ -1591,7 +1814,177 @@ class SessionStore:
         for candidate in (staged, backup):
             if os.path.lexists(candidate):
                 _unlink_regular(candidate, missing_ok=False)
+        _remove_export_temporary_files(staged)
         _unlink_regular(path, missing_ok=False)
+
+    def _recover_external_export_manifest(
+        self,
+        path: Path,
+        payload: dict[str, Any],
+    ) -> None:
+        operation_id = _manifest_text(payload, "operation_id")
+        owner = self._read_external_export_owner(operation_id, payload)
+        destination = owner.destination
+        staged = _external_export_operation_path(destination, operation_id, "staged")
+        backup = _external_export_operation_path(destination, operation_id, "backup")
+        phase = payload.get("phase")
+        if phase not in {"PREPARED", "RENDERED", "INSTALLED", "DB_COMMITTED"}:
+            raise StorageError("외부 내보내기 manifest 단계가 올바르지 않습니다.")
+        with self._connection(uninitialized=True) as connection:
+            receipt = connection.execute(
+                """
+                SELECT target_key, run_id, sha256, byte_size
+                FROM external_export_commits WHERE operation_id = ?
+                """,
+                (operation_id,),
+            ).fetchone()
+
+        if phase == "PREPARED":
+            if receipt is not None:
+                raise StorageError("PREPARED 외부 내보내기에 commit receipt가 있습니다.")
+            if os.path.lexists(backup):
+                raise StorageError("PREPARED 외부 내보내기에 backup 파일이 있습니다.")
+            if os.path.lexists(staged):
+                _unlink_regular(staged, missing_ok=False)
+            _remove_export_temporary_files(staged)
+            _unlink_regular(path, missing_ok=False)
+            _unlink_regular(owner.path, missing_ok=False)
+            return
+
+        new_sha, new_size = _manifest_fingerprint(payload, "sha256", "byte_size")
+        previous_file = _manifest_optional_fingerprint(
+            payload,
+            "previous_file_sha256",
+            "previous_file_byte_size",
+        )
+        database_committed = receipt is not None
+        if receipt is not None and (
+            str(receipt["target_key"]) != owner.target_key
+            or str(receipt["run_id"]) != owner.run_id
+            or str(receipt["sha256"]) != new_sha
+            or int(receipt["byte_size"]) != new_size
+        ):
+            raise StorageError("외부 내보내기 commit receipt가 manifest와 다릅니다.")
+        if database_committed and phase not in {"INSTALLED", "DB_COMMITTED"}:
+            raise StorageError("외부 내보내기 commit receipt와 단계가 일치하지 않습니다.")
+        if phase == "DB_COMMITTED" and not database_committed:
+            raise StorageError("DB_COMMITTED 외부 내보내기에 commit receipt가 없습니다.")
+
+        if database_committed:
+            if not os.path.lexists(destination):
+                raise StorageError("완료된 외부 내보내기 파일이 없습니다.")
+            _verify_file_fingerprint(destination, new_sha, new_size)
+            if os.path.lexists(staged):
+                _verify_file_fingerprint(staged, new_sha, new_size)
+                _unlink_regular(staged, missing_ok=False)
+            if os.path.lexists(backup):
+                if previous_file is None:
+                    raise StorageError("예상하지 못한 외부 내보내기 backup 파일이 있습니다.")
+                _verify_file_fingerprint(backup, *previous_file)
+                _unlink_regular(backup, missing_ok=False)
+        else:
+            if os.path.lexists(staged):
+                _verify_file_fingerprint(staged, new_sha, new_size)
+            if os.path.lexists(backup):
+                if previous_file is None:
+                    raise StorageError("예상하지 못한 외부 내보내기 backup 파일이 있습니다.")
+                _verify_file_fingerprint(backup, *previous_file)
+                if os.path.lexists(destination):
+                    _verify_file_fingerprint(destination, new_sha, new_size)
+                    _unlink_regular(destination, missing_ok=False)
+                os.replace(backup, destination)
+            elif previous_file is None:
+                if os.path.lexists(destination):
+                    _verify_file_fingerprint(destination, new_sha, new_size)
+                    _unlink_regular(destination, missing_ok=False)
+            elif os.path.lexists(destination):
+                _verify_file_fingerprint(destination, *previous_file)
+            else:
+                raise StorageError("이전 외부 내보내기 파일을 복구할 수 없습니다.")
+            if os.path.lexists(staged):
+                _unlink_regular(staged, missing_ok=False)
+
+        _remove_export_temporary_files(staged)
+        _unlink_regular(path, missing_ok=False)
+        _unlink_regular(owner.path, missing_ok=False)
+        if database_committed:
+            with self._connection(uninitialized=True) as connection:
+                deleted = connection.execute(
+                    "DELETE FROM external_export_commits WHERE operation_id = ?",
+                    (operation_id,),
+                ).rowcount
+                if deleted != 1:
+                    raise StorageError("외부 내보내기 commit receipt를 정리하지 못했습니다.")
+
+    def _recover_orphan_external_export_owners(self) -> None:
+        with os.scandir(self._export_owners_root) as entries:
+            owner_paths: list[Path] = []
+            temporary_paths: list[tuple[Path, str]] = []
+            for entry in entries:
+                candidate = Path(entry.path)
+                reject_link_or_reparse(candidate)
+                if entry.is_dir(follow_symlinks=False):
+                    raise StorageError("외부 내보내기 소유권 디렉터리에 하위 폴더가 있습니다.")
+                if entry.name.endswith(".tmp"):
+                    match = _MANIFEST_TEMP_NAME.fullmatch(entry.name)
+                    if match is None:
+                        raise StorageError("인식할 수 없는 소유권 증표 임시 파일이 있습니다.")
+                    temporary_paths.append((candidate, match.group("operation_id")))
+                    continue
+                if not entry.name.endswith(".json") or not _OPERATION_ID.fullmatch(
+                    entry.name.removesuffix(".json")
+                ):
+                    raise StorageError("인식할 수 없는 외부 내보내기 소유권 증표가 있습니다.")
+                owner_paths.append(candidate)
+
+        for candidate, operation_id in sorted(temporary_paths):
+            lease = self._acquire_operation_lease(operation_id)
+            if lease is None:
+                continue
+            try:
+                _unlink_regular(candidate, missing_ok=False)
+            finally:
+                _release_run_lease(lease, remove=not os.path.lexists(candidate))
+
+        for candidate in sorted(owner_paths):
+            operation_id = candidate.stem
+            manifest_path = self._manifests_root / f"{operation_id}.json"
+            if os.path.lexists(manifest_path):
+                continue
+            lease = self._acquire_operation_lease(operation_id)
+            if lease is None:
+                continue
+            try:
+                if not os.path.lexists(manifest_path):
+                    _unlink_regular(candidate, missing_ok=False)
+            finally:
+                _release_run_lease(lease, remove=not os.path.lexists(candidate))
+
+    def _recover_orphan_external_export_receipts(self) -> None:
+        with self._connection(uninitialized=True) as connection:
+            operation_ids = tuple(
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT operation_id FROM external_export_commits ORDER BY operation_id"
+                )
+            )
+        for operation_id in operation_ids:
+            _validate_operation_id(operation_id)
+            manifest_path = self._manifests_root / f"{operation_id}.json"
+            if os.path.lexists(manifest_path):
+                continue
+            lease = self._acquire_operation_lease(operation_id)
+            if lease is None:
+                continue
+            try:
+                if not os.path.lexists(manifest_path):
+                    with self._connection(uninitialized=True) as connection:
+                        connection.execute(
+                            "DELETE FROM external_export_commits WHERE operation_id = ?",
+                            (operation_id,),
+                        )
+            finally:
+                _release_run_lease(lease, remove=not os.path.lexists(manifest_path))
 
     def _recover_legacy_export_artifacts(self) -> None:
         # v0.3.0 could leave these exact same-directory names after a hard exit.
@@ -1723,21 +2116,250 @@ class SessionStore:
             )
         return absolute
 
-    def _prepare_managed_export(self, destination: Path) -> _ManagedExportStage:
+    def _resolve_export_destination(self, path: Path) -> tuple[Path | None, Path]:
+        try:
+            managed = self._managed_export_destination(path)
+            resolved = self._external_export_destination(path) if managed is None else managed
+            self._require_storage_capacity(resolved)
+            return managed, resolved
+        except StorageError:
+            raise
+        except (
+            OSError,
+            UnsafeManagedPath,
+            UnsafeStoragePath,
+            ValueError,
+        ) as error:
+            raise StorageError(f"내보내기 경로가 안전하지 않습니다: {error}") from error
+
+    def _external_export_destination(self, path: Path) -> Path:
+        """Return one external user path after rejecting application-managed storage."""
+
+        self._assert_managed_layout()
+        _validate_external_export_aliases(path)
+        absolute = Path(os.path.abspath(path))
+        _validate_external_export_aliases(absolute)
+        protected_roots = (self.raw_root, self.exports_root, self._operations_root)
+        protected_files = {
+            self.db_path,
+            Path(f"{self.db_path}-journal"),
+            Path(f"{self.db_path}-shm"),
+            Path(f"{self.db_path}-wal"),
+        }
+        if absolute in protected_files or any(
+            _path_is_within(absolute, root) for root in protected_roots
+        ):
+            raise StorageError("외부 내보내기 경로가 프로그램 관리 저장소와 겹칩니다.")
+        if not absolute.name:
+            raise StorageError("외부 내보내기 파일 이름이 올바르지 않습니다.")
+        if os.path.lexists(absolute):
+            _reject_link_or_reparse(absolute)
+            if not stat.S_ISREG(os.lstat(absolute).st_mode):
+                raise StorageError("외부 내보내기 대상은 일반 파일이어야 합니다.")
+        return absolute
+
+    def _prepare_external_export(
+        self,
+        run_id: str,
+        destination: Path,
+    ) -> _ManagedExportStage:
+        safe_segment(run_id, "run_id")
+        destination = self._external_export_destination(destination)
+        parent_info = _ensure_plain_directory(destination.parent)
+        destination = self._external_export_destination(destination)
         operation_id = uuid4().hex
         lease = self._acquire_operation_lease(operation_id)
         if lease is None:  # pragma: no cover - UUID collision defense
             raise StorageError("내보내기 작업 잠금을 획득할 수 없습니다.")
+        staged = _external_export_operation_path(destination, operation_id, "staged")
+        backup = _external_export_operation_path(destination, operation_id, "backup")
+        owner_path = self._export_owners_root / f"{operation_id}.json"
+        token = secrets.token_hex(32)
+        target_key = _external_export_target_key(
+            destination,
+            int(parent_info.st_dev),
+            int(parent_info.st_ino),
+        )
+        if any(os.path.lexists(path) for path in (staged, backup, owner_path)):
+            _release_run_lease(lease, remove=True)
+            raise StorageError("외부 내보내기 복구 경로가 이미 존재합니다.")
+        owner_payload: dict[str, object] = {
+            "version": _MANIFEST_VERSION,
+            "kind": "external_export_owner",
+            "operation_id": operation_id,
+            "run_id": run_id,
+            "destination_path": str(destination),
+            "target_key": target_key,
+            "ownership_token": token,
+            "parent_device": int(parent_info.st_dev),
+            "parent_inode": int(parent_info.st_ino),
+        }
+        try:
+            _write_json_atomic(owner_path, owner_payload)
+            manifest_path = self._write_manifest(
+                operation_id,
+                {
+                    "version": _MANIFEST_VERSION,
+                    "kind": "external_export",
+                    "destination_scope": "external",
+                    "phase": "PREPARED",
+                    "operation_id": operation_id,
+                    "run_id": run_id,
+                    "destination_path": str(destination),
+                    "target_key": target_key,
+                    "ownership_token": token,
+                    "parent_device": int(parent_info.st_dev),
+                    "parent_inode": int(parent_info.st_ino),
+                },
+            )
+        except BaseException:
+            try:
+                _unlink_regular(owner_path, missing_ok=True)
+            finally:
+                _release_run_lease(lease, remove=True)
+            raise
+        return _ManagedExportStage(operation_id, staged, lease, manifest_path)
+
+    def _read_external_export_owner(
+        self,
+        operation_id: str,
+        manifest: dict[str, Any],
+    ) -> _ExternalExportOwner:
+        if (
+            manifest.get("kind") != "external_export"
+            or manifest.get("destination_scope") != "external"
+        ):
+            raise StorageError("외부 내보내기 manifest 범위가 올바르지 않습니다.")
+        owner_path = self._export_owners_root / f"{operation_id}.json"
+        if not os.path.lexists(owner_path):
+            raise StorageError("외부 내보내기 소유권 증표가 없습니다.")
+        owner = _read_manifest(owner_path, operation_id)
+        if owner.get("kind") != "external_export_owner":
+            raise StorageError("외부 내보내기 소유권 증표 형식이 올바르지 않습니다.")
+        run_id = _manifest_text(owner, "run_id")
+        safe_segment(run_id, "run_id")
+        destination_text = _manifest_text(owner, "destination_path")
+        target_key = _manifest_text(owner, "target_key")
+        if re.fullmatch(r"[0-9a-f]{64}", target_key) is None:
+            raise StorageError("외부 내보내기 대상 키가 올바르지 않습니다.")
+        token = _manifest_text(owner, "ownership_token")
+        if re.fullmatch(r"[0-9a-f]{64}", token) is None:
+            raise StorageError("외부 내보내기 소유권 토큰이 올바르지 않습니다.")
+        parent_device = _manifest_int(owner, "parent_device")
+        parent_inode = _manifest_int(owner, "parent_inode")
+        expected_manifest_values = {
+            "run_id": run_id,
+            "destination_path": destination_text,
+            "target_key": target_key,
+            "ownership_token": token,
+            "parent_device": parent_device,
+            "parent_inode": parent_inode,
+        }
+        if any(manifest.get(key) != value for key, value in expected_manifest_values.items()):
+            raise StorageError("외부 내보내기 manifest가 소유권 증표와 일치하지 않습니다.")
+        destination = Path(destination_text)
+        if not destination.is_absolute() or str(Path(os.path.abspath(destination))) != str(
+            destination
+        ):
+            raise StorageError("외부 내보내기 소유권 경로가 정규 절대 경로가 아닙니다.")
+        destination = self._external_export_destination(destination)
+        _verify_plain_directory_identity(
+            destination.parent,
+            parent_device,
+            parent_inode,
+        )
+        if target_key != _external_export_target_key(
+            destination,
+            parent_device,
+            parent_inode,
+        ):
+            raise StorageError("외부 내보내기 대상 키가 소유권 경로와 일치하지 않습니다.")
+        return _ExternalExportOwner(
+            operation_id=operation_id,
+            run_id=run_id,
+            destination=destination,
+            target_key=target_key,
+            token=token,
+            parent_device=parent_device,
+            parent_inode=parent_inode,
+            path=owner_path,
+        )
+
+    def _discard_external_export_stage(
+        self,
+        stage: _ManagedExportStage,
+    ) -> BaseException | None:
+        cleanup_error: BaseException | None = None
+        owner_path = self._export_owners_root / f"{stage.operation_id}.json"
+        try:
+            manifest = _read_manifest(stage.manifest_path, stage.operation_id)
+            owner = self._read_external_export_owner(stage.operation_id, manifest)
+            expected_stage = _external_export_operation_path(
+                owner.destination,
+                stage.operation_id,
+                "staged",
+            )
+            if stage.path != expected_stage:
+                raise StorageError("외부 내보내기 staging 경로가 소유권 증표와 다릅니다.")
+            if os.path.lexists(stage.path):
+                _unlink_regular(stage.path, missing_ok=False)
+            _remove_export_temporary_files(stage.path)
+            _unlink_regular(stage.manifest_path, missing_ok=True)
+            _unlink_regular(owner.path, missing_ok=True)
+        except (OSError, StorageError, UnsafeStoragePath, UnsafeManagedPath) as error:
+            cleanup_error = error
+        try:
+            _release_run_lease(stage.lease, remove=cleanup_error is None)
+        except (OSError, UnsafeStoragePath, UnsafeManagedPath) as error:
+            if cleanup_error is None:
+                cleanup_error = error
+            else:
+                cleanup_error.add_note(
+                    f"외부 내보내기 작업 잠금 정리도 실패했습니다: {type(error).__name__}"
+                )
+        if cleanup_error is None and os.path.lexists(owner_path):
+            return StorageError("외부 내보내기 소유권 증표를 정리하지 못했습니다.")
+        return cleanup_error
+
+    def _prepare_managed_export(
+        self,
+        run_id: str,
+        destination: Path,
+    ) -> _ManagedExportStage:
+        safe_segment(run_id, "run_id")
+        operation_id = uuid4().hex
+        lease = self._acquire_operation_lease(operation_id)
+        if lease is None:  # pragma: no cover - UUID collision defense
+            raise StorageError("내보내기 작업 잠금을 획득할 수 없습니다.")
+        relative = destination.relative_to(self.exports_root).as_posix()
         staged_relative = _export_operation_relative(
-            destination.relative_to(self.exports_root).as_posix(),
+            relative,
             operation_id,
             "staged",
         )
+        backup_relative = _export_operation_relative(relative, operation_id, "backup")
         staged = self.exports_root / Path(staged_relative)
         if os.path.lexists(staged):  # pragma: no cover - UUID collision defense
             _release_run_lease(lease, remove=True)
             raise StorageError("내보내기 staging 경로가 이미 존재합니다.")
-        return _ManagedExportStage(operation_id, staged, lease)
+        try:
+            manifest_path = self._write_manifest(
+                operation_id,
+                {
+                    "version": _MANIFEST_VERSION,
+                    "kind": "export",
+                    "phase": "PREPARED",
+                    "operation_id": operation_id,
+                    "run_id": run_id,
+                    "relative_path": relative,
+                    "staged_relative": staged_relative,
+                    "backup_relative": backup_relative,
+                },
+            )
+        except BaseException:
+            _release_run_lease(lease, remove=True)
+            raise
+        return _ManagedExportStage(operation_id, staged, lease, manifest_path)
 
     @staticmethod
     def _discard_managed_export_stage(stage: _ManagedExportStage) -> BaseException | None:
@@ -1745,6 +2367,8 @@ class SessionStore:
         try:
             if os.path.lexists(stage.path):
                 _unlink_regular(stage.path, missing_ok=False)
+            _remove_export_temporary_files(stage.path)
+            _unlink_regular(stage.manifest_path, missing_ok=True)
         except (OSError, UnsafeStoragePath, UnsafeManagedPath) as error:
             cleanup_error = error
         try:
@@ -1773,6 +2397,9 @@ class SessionStore:
             expected_staged = exports_root / Path(staged_relative)
             if stage.path != expected_staged:
                 raise StorageError("내보내기 staging 경로가 작업 ID와 일치하지 않습니다.")
+            expected_manifest = self._manifests_root / f"{operation_id}.json"
+            if stage.manifest_path != expected_manifest:
+                raise StorageError("내보내기 manifest 경로가 작업 ID와 일치하지 않습니다.")
             backup = destination.with_name(f".{destination.name}.{operation_id}.backup")
             backup_relative = backup.relative_to(exports_root).as_posix()
             new_sha, new_size = _file_fingerprint(stage.path)
@@ -1794,31 +2421,32 @@ class SessionStore:
                     f"{type(prepare_cleanup_error).__name__}"
                 )
             raise
-        manifest_path: Path | None = None
         installed = False
+        db_committed = False
+        phase_payload: dict[str, object] | None = None
         try:
-            with self._lock, self._connection() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                self._require_run(connection, run_id)
-                previous_row = connection.execute(
-                    "SELECT sha256, byte_size FROM exports WHERE relative_path = ?",
-                    (relative,),
-                ).fetchone()
-                previous_db_sha = str(previous_row["sha256"]) if previous_row else None
-                previous_db_size = int(previous_row["byte_size"]) if previous_row else None
-                if previous_row is not None and (
-                    previous_file_sha is None
-                    or (
-                        previous_file_sha != previous_db_sha
-                        or previous_file_size != previous_db_size
-                    )
-                ):
-                    raise StorageError("기존 관리 내보내기 파일의 무결성이 일치하지 않습니다.")
-                manifest_path = self._write_manifest(
-                    operation_id,
-                    {
+            with self._lock:
+                with self._connection() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    self._require_run(connection, run_id)
+                    previous_row = connection.execute(
+                        "SELECT sha256, byte_size FROM exports WHERE relative_path = ?",
+                        (relative,),
+                    ).fetchone()
+                    previous_db_sha = str(previous_row["sha256"]) if previous_row else None
+                    previous_db_size = int(previous_row["byte_size"]) if previous_row else None
+                    if previous_row is not None and (
+                        previous_file_sha is None
+                        or (
+                            previous_file_sha != previous_db_sha
+                            or previous_file_size != previous_db_size
+                        )
+                    ):
+                        raise StorageError("기존 관리 내보내기 파일의 무결성이 일치하지 않습니다.")
+                    phase_payload = {
                         "version": _MANIFEST_VERSION,
                         "kind": "export",
+                        "phase": "RENDERED",
                         "operation_id": operation_id,
                         "run_id": run_id,
                         "relative_path": relative,
@@ -1830,31 +2458,37 @@ class SessionStore:
                         "previous_file_byte_size": previous_file_size,
                         "previous_db_sha256": previous_db_sha,
                         "previous_db_byte_size": previous_db_size,
-                    },
-                )
-                if os.path.lexists(destination):
-                    os.replace(destination, backup)
-                os.replace(stage.path, destination)
-                installed = True
-                connection.execute(
-                    """
-                    INSERT INTO exports (
-                        run_id, created_at, relative_path, sha256, byte_size
-                    ) VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(relative_path) DO UPDATE SET
-                        run_id = excluded.run_id,
-                        created_at = excluded.created_at,
-                        sha256 = excluded.sha256,
-                        byte_size = excluded.byte_size
-                    """,
-                    (
-                        run_id,
-                        _iso(None),
-                        relative,
-                        new_sha,
-                        new_size,
-                    ),
-                )
+                    }
+                    self._replace_manifest(stage.manifest_path, phase_payload)
+                    if os.path.lexists(destination):
+                        os.replace(destination, backup)
+                    os.replace(stage.path, destination)
+                    installed = True
+                    phase_payload = {**phase_payload, "phase": "INSTALLED"}
+                    self._replace_manifest(stage.manifest_path, phase_payload)
+                    connection.execute(
+                        """
+                        INSERT INTO exports (
+                            run_id, created_at, relative_path, sha256, byte_size
+                        ) VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(relative_path) DO UPDATE SET
+                            run_id = excluded.run_id,
+                            created_at = excluded.created_at,
+                            sha256 = excluded.sha256,
+                            byte_size = excluded.byte_size
+                        """,
+                        (
+                            run_id,
+                            _iso(None),
+                            relative,
+                            new_sha,
+                            new_size,
+                        ),
+                    )
+                db_committed = True
+                assert phase_payload is not None
+                phase_payload = {**phase_payload, "phase": "DB_COMMITTED"}
+                self._replace_manifest(stage.manifest_path, phase_payload)
         except (
             OSError,
             sqlite3.Error,
@@ -1862,6 +2496,16 @@ class SessionStore:
             UnsafeManagedPath,
             UnsafeStoragePath,
         ) as error:
+            if db_committed:
+                try:
+                    _release_run_lease(stage.lease, remove=False)
+                except (OSError, UnsafeManagedPath, UnsafeStoragePath) as release_error:
+                    error.add_note(
+                        f"내보내기 복구 잠금 해제도 실패했습니다: {type(release_error).__name__}"
+                    )
+                raise StorageError(
+                    "관리 내보내기는 완료되었지만 복구 상태 기록을 마치지 못했습니다."
+                ) from error
             rollback_error: BaseException | None = None
             try:
                 if os.path.lexists(backup):
@@ -1874,8 +2518,8 @@ class SessionStore:
                     _unlink_regular(destination, missing_ok=False)
                 if os.path.lexists(stage.path):
                     _unlink_regular(stage.path, missing_ok=False)
-                if manifest_path is not None:
-                    _unlink_regular(manifest_path, missing_ok=True)
+                _remove_export_temporary_files(stage.path)
+                _unlink_regular(stage.manifest_path, missing_ok=True)
             except (OSError, UnsafeManagedPath, UnsafeStoragePath, StorageError) as restore_error:
                 rollback_error = restore_error
             try:
@@ -1897,8 +2541,8 @@ class SessionStore:
         try:
             if os.path.lexists(backup):
                 _unlink_regular(backup, missing_ok=False)
-            if manifest_path is not None:
-                _unlink_regular(manifest_path, missing_ok=False)
+            _remove_export_temporary_files(stage.path)
+            _unlink_regular(stage.manifest_path, missing_ok=False)
         except (OSError, UnsafeManagedPath, UnsafeStoragePath) as error:
             final_cleanup_error = error
         try:
@@ -1913,6 +2557,214 @@ class SessionStore:
         if final_cleanup_error is not None:
             raise StorageError(
                 "관리 내보내기는 완료되었지만 복구 파일을 정리하지 못했습니다."
+            ) from final_cleanup_error
+
+    def _commit_external_export(
+        self,
+        run_id: str,
+        destination: Path,
+        stage: _ManagedExportStage,
+    ) -> None:
+        try:
+            manifest = _read_manifest(stage.manifest_path, stage.operation_id)
+            owner = self._read_external_export_owner(stage.operation_id, manifest)
+            if owner.run_id != run_id or owner.destination != destination:
+                raise StorageError("외부 내보내기 대상이 소유권 증표와 일치하지 않습니다.")
+            expected_manifest = self._manifests_root / f"{stage.operation_id}.json"
+            expected_stage = _external_export_operation_path(
+                destination,
+                stage.operation_id,
+                "staged",
+            )
+            if stage.manifest_path != expected_manifest or stage.path != expected_stage:
+                raise StorageError("외부 내보내기 복구 경로가 작업 ID와 일치하지 않습니다.")
+            backup = _external_export_operation_path(
+                destination,
+                stage.operation_id,
+                "backup",
+            )
+            new_sha, new_size = _file_fingerprint(stage.path)
+            previous_file_sha: str | None = None
+            previous_file_size: int | None = None
+            if os.path.lexists(destination):
+                previous_file_sha, previous_file_size = _file_fingerprint(destination)
+        except (
+            OSError,
+            StorageError,
+            UnsafeManagedPath,
+            UnsafeStoragePath,
+            ValueError,
+        ) as error:
+            prepare_cleanup_error = self._discard_external_export_stage(stage)
+            if prepare_cleanup_error is not None:
+                error.add_note(
+                    "외부 내보내기 준비 실패 후 staging 정리도 실패했습니다: "
+                    f"{type(prepare_cleanup_error).__name__}"
+                )
+            raise
+
+        installed = False
+        database_committed = False
+        phase_payload: dict[str, object] = {
+            **manifest,
+            "phase": "RENDERED",
+            "sha256": new_sha,
+            "byte_size": new_size,
+            "previous_file_sha256": previous_file_sha,
+            "previous_file_byte_size": previous_file_size,
+        }
+        try:
+            with self._lock:
+                with self._connection() as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    self._require_run(connection, run_id)
+                    self._read_external_export_owner(stage.operation_id, manifest)
+                    self._replace_manifest(stage.manifest_path, phase_payload)
+                    if os.path.lexists(destination):
+                        assert previous_file_sha is not None
+                        assert previous_file_size is not None
+                        _verify_file_fingerprint(
+                            destination,
+                            previous_file_sha,
+                            previous_file_size,
+                        )
+                        os.replace(destination, backup)
+                        _verify_file_fingerprint(
+                            backup,
+                            previous_file_sha,
+                            previous_file_size,
+                        )
+                    os.replace(stage.path, destination)
+                    installed = True
+                    _verify_file_fingerprint(destination, new_sha, new_size)
+                    phase_payload = {**phase_payload, "phase": "INSTALLED"}
+                    self._replace_manifest(stage.manifest_path, phase_payload)
+                    connection.execute(
+                        """
+                        INSERT INTO external_export_commits (
+                            operation_id, target_key, run_id,
+                            committed_at, sha256, byte_size
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            stage.operation_id,
+                            owner.target_key,
+                            run_id,
+                            _iso(None),
+                            new_sha,
+                            new_size,
+                        ),
+                    )
+                database_committed = True
+                phase_payload = {**phase_payload, "phase": "DB_COMMITTED"}
+                self._replace_manifest(stage.manifest_path, phase_payload)
+        except (
+            OSError,
+            sqlite3.Error,
+            StorageError,
+            UnsafeManagedPath,
+            UnsafeStoragePath,
+        ) as error:
+            if database_committed:
+                try:
+                    _release_run_lease(stage.lease, remove=False)
+                except (OSError, UnsafeManagedPath, UnsafeStoragePath) as release_error:
+                    error.add_note(
+                        "외부 내보내기 복구 잠금 해제도 실패했습니다: "
+                        f"{type(release_error).__name__}"
+                    )
+                raise StorageError(
+                    "외부 내보내기는 완료되었지만 복구 상태를 정리하지 못했습니다."
+                ) from error
+
+            rollback_error: BaseException | None = None
+            try:
+                current_manifest = _read_manifest(stage.manifest_path, stage.operation_id)
+                current_owner = self._read_external_export_owner(
+                    stage.operation_id,
+                    current_manifest,
+                )
+                if os.path.lexists(backup):
+                    if previous_file_sha is None or previous_file_size is None:
+                        raise StorageError("예상하지 못한 외부 내보내기 backup 파일이 있습니다.")
+                    _verify_file_fingerprint(backup, previous_file_sha, previous_file_size)
+                    if os.path.lexists(destination):
+                        _verify_file_fingerprint(destination, new_sha, new_size)
+                        _unlink_regular(destination, missing_ok=False)
+                    os.replace(backup, destination)
+                elif installed or (previous_file_sha is None and os.path.lexists(destination)):
+                    _verify_file_fingerprint(destination, new_sha, new_size)
+                    _unlink_regular(destination, missing_ok=False)
+                elif previous_file_sha is not None:
+                    assert previous_file_size is not None
+                    _verify_file_fingerprint(
+                        destination,
+                        previous_file_sha,
+                        previous_file_size,
+                    )
+                if os.path.lexists(stage.path):
+                    _verify_file_fingerprint(stage.path, new_sha, new_size)
+                    _unlink_regular(stage.path, missing_ok=False)
+                _remove_export_temporary_files(stage.path)
+                _unlink_regular(stage.manifest_path, missing_ok=True)
+                _unlink_regular(current_owner.path, missing_ok=True)
+            except (OSError, UnsafeManagedPath, UnsafeStoragePath, StorageError) as restore_error:
+                rollback_error = restore_error
+            try:
+                _release_run_lease(stage.lease, remove=rollback_error is None)
+            except (OSError, UnsafeManagedPath, UnsafeStoragePath) as release_error:
+                if rollback_error is None:
+                    rollback_error = release_error
+                else:
+                    rollback_error.add_note(
+                        "외부 내보내기 작업 잠금 정리도 실패했습니다: "
+                        f"{type(release_error).__name__}"
+                    )
+            if rollback_error is not None:
+                error.add_note(
+                    "외부 내보내기 실패 후 이전 상태 정리도 실패했습니다: "
+                    f"{type(rollback_error).__name__}"
+                )
+            raise
+
+        final_cleanup_error: BaseException | None = None
+        try:
+            final_manifest = _read_manifest(stage.manifest_path, stage.operation_id)
+            final_owner = self._read_external_export_owner(
+                stage.operation_id,
+                final_manifest,
+            )
+            if final_manifest.get("phase") != "DB_COMMITTED":
+                raise StorageError("외부 내보내기 완료 단계가 올바르지 않습니다.")
+            if os.path.lexists(backup):
+                if previous_file_sha is None or previous_file_size is None:
+                    raise StorageError("예상하지 못한 외부 내보내기 backup 파일이 있습니다.")
+                _verify_file_fingerprint(backup, previous_file_sha, previous_file_size)
+                _unlink_regular(backup, missing_ok=False)
+            _remove_export_temporary_files(stage.path)
+            _unlink_regular(stage.manifest_path, missing_ok=False)
+            _unlink_regular(final_owner.path, missing_ok=False)
+            with self._connection() as connection:
+                deleted = connection.execute(
+                    "DELETE FROM external_export_commits WHERE operation_id = ?",
+                    (stage.operation_id,),
+                ).rowcount
+                if deleted != 1:
+                    raise StorageError("외부 내보내기 commit receipt가 일치하지 않습니다.")
+        except (OSError, StorageError, UnsafeManagedPath, UnsafeStoragePath) as error:
+            final_cleanup_error = error
+        try:
+            _release_run_lease(stage.lease, remove=final_cleanup_error is None)
+        except (OSError, UnsafeManagedPath, UnsafeStoragePath) as error:
+            if final_cleanup_error is None:
+                final_cleanup_error = error
+            else:
+                final_cleanup_error.add_note(
+                    f"외부 내보내기 작업 잠금 정리도 실패했습니다: {type(error).__name__}"
+                )
+        if final_cleanup_error is not None:
+            raise StorageError(
+                "외부 내보내기는 완료되었지만 복구 파일을 정리하지 못했습니다."
             ) from final_cleanup_error
 
     def _verify_run_raw_integrity(
@@ -2131,12 +2983,23 @@ _REQUIRED_SCHEMA_COLUMNS = {
     },
     "diagnostic_events": {"id", "run_id", "occurred_at", "stage", "code", "message"},
     "exports": {"id", "run_id", "created_at", "relative_path", "sha256", "byte_size"},
+    "external_export_commits": {
+        "operation_id",
+        "target_key",
+        "run_id",
+        "committed_at",
+        "sha256",
+        "byte_size",
+    },
 }
 _REQUIRED_INDEXES = {
     "ix_observations_run_time",
+    "ix_observations_run_session_time",
     "ix_lifecycle_run_time",
     "ix_controller_run_time",
     "ix_diagnostic_run_time",
+    "ix_raw_files_run_time",
+    "ix_exports_run_id",
 }
 
 
@@ -2373,11 +3236,28 @@ def _file_fingerprint(path: Path) -> tuple[str, int]:
     digest = hashlib.sha256()
     size = 0
     with path.open("rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if (int(opened.st_dev), int(opened.st_ino)) != (
+            int(info.st_dev),
+            int(info.st_ino),
+        ):
+            raise StorageError("fingerprint 대상 파일이 열기 전에 변경되었습니다.")
         while chunk := stream.read(_HASH_CHUNK_SIZE):
             digest.update(chunk)
             size += len(chunk)
+        opened_after = os.fstat(stream.fileno())
     after = os.lstat(path)
     if (
+        int(opened_after.st_dev),
+        int(opened_after.st_ino),
+        int(opened_after.st_size),
+        int(opened_after.st_mtime_ns),
+    ) != (
+        int(info.st_dev),
+        int(info.st_ino),
+        int(info.st_size),
+        int(info.st_mtime_ns),
+    ) or (
         int(after.st_dev),
         int(after.st_ino),
         int(after.st_size),
@@ -2454,13 +3334,16 @@ def _raw_artifact_for_batch(
     run_segment = safe_segment(run_id, "run_id")
     if captured_at.tzinfo is None:
         raise ValueError("시간 값에는 timezone 정보가 필요합니다.")
-    timestamp = captured_at.astimezone(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
+    captured_utc = captured_at.astimezone(UTC)
+    timestamp = captured_utc.strftime("%Y%m%dT%H%M%S.%fZ")
     filename = (
         f"{timestamp}_{_raw_filename_segment(kind, 'kind')}_"
         f"{_raw_filename_segment(controller_name, 'controller_name')}_"
         f"{uuid4().hex[:8]}.txt"
     )
-    relative = (Path(run_segment) / filename).as_posix()
+    relative = (
+        Path(run_segment) / captured_utc.strftime("%Y%m%d") / captured_utc.strftime("%H") / filename
+    ).as_posix()
     data = content.encode("utf-8")
     return (
         RawArtifact(relative, hashlib.sha256(data).hexdigest(), len(data)),
@@ -2785,6 +3668,103 @@ def _export_operation_relative(relative: str, operation_id: str, kind: str) -> s
     return path.with_name(f".{path.name}.{operation_id}.{kind}").as_posix()
 
 
+def _external_export_operation_path(
+    destination: Path,
+    operation_id: str,
+    kind: str,
+) -> Path:
+    _validate_operation_id(operation_id)
+    if kind not in {"backup", "staged"}:
+        raise ValueError("지원하지 않는 외부 내보내기 작업 파일 종류입니다.")
+    absolute = Path(os.path.abspath(destination))
+    if not absolute.name:
+        raise UnsafeStoragePath("외부 내보내기 파일 이름이 올바르지 않습니다.")
+    return absolute.with_name(f".{absolute.name}.{operation_id}.{kind}")
+
+
+def _external_export_target_key(
+    destination: Path,
+    parent_device: int,
+    parent_inode: int,
+) -> str:
+    normalized = os.path.normcase(str(Path(os.path.abspath(destination))))
+    payload = f"{parent_device}\0{parent_inode}\0{normalized}".encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _validate_external_export_aliases(path: Path) -> None:
+    if os.name != "nt":
+        return
+    text = str(path).replace("/", "\\")
+    lowered = text.casefold()
+    if lowered.startswith(("\\\\?\\", "\\\\.\\", "\\??\\")):
+        raise StorageError("Windows 장치 경로에는 내보낼 수 없습니다.")
+    anchor = Path(path.anchor)
+    reserved = {"CON", "PRN", "AUX", "NUL"} | {
+        f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)
+    }
+    for part in path.relative_to(anchor).parts:
+        if part.endswith((" ", ".")) or ":" in part:
+            raise StorageError("Windows 별칭 또는 ADS 경로에는 내보낼 수 없습니다.")
+        base = part.split(".", 1)[0].upper()
+        if base in reserved:
+            raise StorageError("Windows 예약 장치 이름에는 내보낼 수 없습니다.")
+
+
+def _plain_directory_info(directory: Path, *, create: bool) -> os.stat_result:
+    absolute = Path(os.path.abspath(directory))
+    anchor = Path(absolute.anchor)
+    if not absolute.is_absolute() or not anchor.anchor:
+        raise UnsafeStoragePath("외부 내보내기 디렉터리가 절대 경로가 아닙니다.")
+    current = anchor
+    if not os.path.lexists(current):
+        raise FileNotFoundError(current)
+    _reject_link_or_reparse(current)
+    if not stat.S_ISDIR(os.lstat(current).st_mode):
+        raise NotADirectoryError(current)
+    for part in absolute.relative_to(anchor).parts:
+        current /= part
+        if not os.path.lexists(current):
+            if not create:
+                raise FileNotFoundError(current)
+            with suppress(FileExistsError):
+                current.mkdir()
+        _reject_link_or_reparse(current)
+        if not stat.S_ISDIR(os.lstat(current).st_mode):
+            raise NotADirectoryError(current)
+    return os.lstat(absolute)
+
+
+def _ensure_plain_directory(directory: Path) -> os.stat_result:
+    return _plain_directory_info(directory, create=True)
+
+
+def _verify_plain_directory_identity(
+    directory: Path,
+    expected_device: int,
+    expected_inode: int,
+) -> None:
+    info = _plain_directory_info(directory, create=False)
+    if (int(info.st_dev), int(info.st_ino)) != (expected_device, expected_inode):
+        raise StorageError("외부 내보내기 디렉터리가 준비 이후 변경되었습니다.")
+
+
+def _remove_export_temporary_files(staged: Path) -> None:
+    parent = staged.parent
+    if not os.path.lexists(parent):
+        return
+    _reject_link_or_reparse(parent)
+    prefix = f".{staged.name}."
+    with os.scandir(parent) as entries:
+        candidates = [
+            Path(entry.path)
+            for entry in entries
+            if entry.name.startswith(prefix) and entry.name.endswith(".tmp")
+        ]
+    for candidate in candidates:
+        _unlink_regular(candidate, missing_ok=False)
+
+
 def _safe_relative_parts(relative: str | Path) -> tuple[str, ...]:
     path = Path(relative)
     if path.is_absolute() or not path.parts:
@@ -2820,6 +3800,40 @@ def _reject_link_or_reparse(path: Path) -> None:
     attributes = int(getattr(info, "st_file_attributes", 0))
     if stat.S_ISLNK(info.st_mode) or (reparse_flag and attributes & reparse_flag):
         raise UnsafeStoragePath("심볼릭 링크나 reparse point는 관리 대상으로 삭제할 수 없습니다.")
+
+
+def _regular_file_size(path: Path) -> int:
+    if not os.path.lexists(path):
+        return 0
+    _reject_link_or_reparse(path)
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode):
+        raise UnsafeStoragePath("저장소 크기 확인 대상이 일반 파일이 아닙니다.")
+    return int(info.st_size)
+
+
+def _storage_tree_stats(root: Path) -> tuple[int, int]:
+    files = _scan_regular_files(root, include_internal=True)
+    return sum(_regular_file_size(root / Path(relative)) for relative in files), len(files)
+
+
+def _minimum_free_bytes(paths: Iterable[Path]) -> int:
+    roots = {Path(os.path.abspath(path)) for path in paths}
+    if not roots:
+        raise ValueError("여유 공간 확인 경로가 필요합니다.")
+    return min(int(shutil.disk_usage(path).free) for path in roots)
+
+
+def _nearest_existing_directory(path: Path) -> Path:
+    current = Path(os.path.abspath(path))
+    while not os.path.lexists(current):
+        parent = current.parent
+        if parent == current:
+            raise FileNotFoundError(path)
+        current = parent
+    if not current.is_dir():
+        raise NotADirectoryError(current)
+    return current
 
 
 def _scan_regular_files(
@@ -2958,8 +3972,25 @@ def _remove_staging_directories(staged: list[_StagedFile]) -> None:
 
 def _remove_known_empty_run_directories(root: Path, run_ids: tuple[str, ...]) -> None:
     for run_id in run_ids:
-        directory = contained_path(root, Path(run_id))
-        try:
-            directory.rmdir()
-        except (FileNotFoundError, OSError):
+        run_directory = contained_path(root, Path(run_id))
+        if not os.path.lexists(run_directory):
             continue
+        _reject_link_or_reparse(run_directory)
+        if not stat.S_ISDIR(os.lstat(run_directory).st_mode):
+            raise UnsafeStoragePath("Raw 실행 경로가 디렉터리가 아닙니다.")
+        directories = [run_directory]
+        ordered: list[Path] = []
+        while directories:
+            directory = directories.pop()
+            ordered.append(directory)
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    _reject_link_or_reparse(path)
+                    if entry.is_dir(follow_symlinks=False):
+                        directories.append(path)
+        for directory in reversed(ordered):
+            try:
+                directory.rmdir()
+            except (FileNotFoundError, OSError):
+                continue

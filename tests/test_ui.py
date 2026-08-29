@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import gc
+import os
+import subprocess
+import sys
 import threading
 import time
 import tracemalloc
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QFileDialog, QMessageBox, QWidget
+from PySide6.QtGui import QColor, QPalette
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QWidget
 
 from aruba_session_tracker.collectors.ssh import CancellationToken, CollectorError, HostKeyInfo
 from aruba_session_tracker.config import ConfigRepository
@@ -21,9 +26,10 @@ from aruba_session_tracker.models import (
     SessionObservation,
 )
 from aruba_session_tracker.services import QueryOutcome
-from aruba_session_tracker.storage import SessionStore, StorageError
+from aruba_session_tracker.storage import DeletePreview, SessionStore, StorageError
 from aruba_session_tracker.ui import MainWindow
 from aruba_session_tracker.ui.main_window import (
+    _OPERATOR_STATES,
     ApprovalBridge,
     _counter_delta,
     _display_bytes,
@@ -79,6 +85,20 @@ def _configure_valid_query(window: MainWindow) -> None:
     window.destination_port_edit.setText("443")
 
 
+def _next_keyboard_focus(widget: QWidget) -> QWidget:
+    candidate = widget.nextInFocusChain()
+    while candidate is not widget:
+        if (
+            not widget.isAncestorOf(candidate)
+            and candidate.isVisible()
+            and candidate.isEnabled()
+            and candidate.focusPolicy() != Qt.FocusPolicy.NoFocus
+        ):
+            return candidate
+        candidate = candidate.nextInFocusChain()
+    raise AssertionError("keyboard focus chain has no next control")
+
+
 def test_main_window_runs_query_and_renders_korean_flag_status(
     qtbot: object,
     tmp_path: Path,
@@ -108,6 +128,16 @@ def test_counter_delta_is_only_shown_for_monotonic_samples() -> None:
     assert _counter_delta(None, 10) == "-"
 
 
+def test_operator_state_vocabulary_is_fixed_to_five_plain_states() -> None:
+    assert {
+        "대기",
+        "조회 중",
+        "정상",
+        "재시도 중",
+        "확인 필요",
+    } == _OPERATOR_STATES
+
+
 def test_optional_port_accepts_only_blank_or_ascii_port_range() -> None:
     assert _optional_port("  ", "출발지 포트") is None
     assert _optional_port(" 443 ", "목적지 포트") == 443
@@ -130,6 +160,12 @@ def test_safe_query_failure_maps_known_storage_and_unexpected_errors() -> None:
     assert _safe_query_failure(StorageError("sensitive database path")) == (
         ErrorCode.DB_WRITE_FAILED.value,
         "로컬 조회 기록을 안전하게 저장하지 못했습니다.",
+    )
+    assert _safe_query_failure(
+        StorageError("sensitive disk detail", code=ErrorCode.STORAGE_LOW_SPACE)
+    ) == (
+        ErrorCode.STORAGE_LOW_SPACE.value,
+        "저장 공간이 부족합니다. 오래된 기록을 정리한 뒤 다시 시도하십시오.",
     )
     assert _safe_query_failure(RuntimeError("sensitive runtime detail")) == (
         "UNEXPECTED",
@@ -183,8 +219,32 @@ def test_lifecycle_status_distinguishes_uncertain_missing_and_active_changes() -
 def test_fatal_diagnostic_code_and_file_size_display_cover_boundaries() -> None:
     nonfatal = SimpleNamespace(code=ErrorCode.PARSE_PARTIAL)
     fatal = SimpleNamespace(code=ErrorCode.AUTH_FAILED)
+    command_policy = SimpleNamespace(code=ErrorCode.COMMAND_VARIANT_UNVERIFIED)
+    storage = SimpleNamespace(code=ErrorCode.STORAGE_LOW_SPACE)
+    transient_mm = SimpleNamespace(
+        code=ErrorCode.MM_UNREACHABLE,
+        transient=True,
+        recovered=False,
+    )
 
     assert _fatal_diagnostic_code(SimpleNamespace(diagnostics=(nonfatal, fatal))) == "AUTH_FAILED"
+    assert (
+        _fatal_diagnostic_code(SimpleNamespace(diagnostics=(command_policy,)))
+        == "COMMAND_VARIANT_UNVERIFIED"
+    )
+    for safety_code in (
+        ErrorCode.CURRENT_SWITCH_AMBIGUOUS,
+        ErrorCode.CURRENT_SWITCH_UNMAPPED,
+        ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+    ):
+        assert (
+            _fatal_diagnostic_code(
+                SimpleNamespace(diagnostics=(SimpleNamespace(code=safety_code),))
+            )
+            == safety_code.value
+        )
+    assert _fatal_diagnostic_code(SimpleNamespace(diagnostics=(storage,))) == "STORAGE_LOW_SPACE"
+    assert _fatal_diagnostic_code(SimpleNamespace(diagnostics=(transient_mm,))) is None
     assert _fatal_diagnostic_code(SimpleNamespace(diagnostics=(nonfatal,))) is None
     assert _fatal_diagnostic_code(SimpleNamespace()) is None
 
@@ -221,6 +281,10 @@ def test_html_report_export_is_independent_from_csv(
     store.finish_run(run_id)
     window = MainWindow(ConfigRepository(tmp_path / "config.json"), store, _Executor())
     qtbot.addWidget(window)  # type: ignore[attr-defined]
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: not window._history_task_running and window.history_table.rowCount() == 1,
+        timeout=5000,
+    )
     window.history_table.selectRow(0)
     destination = tmp_path / "사용자 선택" / "result.html"
     messages: list[tuple[str, str]] = []
@@ -236,6 +300,10 @@ def test_html_report_export_is_independent_from_csv(
     )
 
     window._export_selected_run_html()
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: not window._storage_task_running and destination.is_file(),
+        timeout=5000,
+    )
 
     assert window.export_button.text() == "선택 실행 CSV 내보내기"
     assert window.html_export_button.text() == "선택 실행 HTML 보고서"
@@ -255,6 +323,10 @@ def test_history_export_failure_does_not_display_sensitive_exception_text(
     store.finish_run(run_id)
     window = MainWindow(ConfigRepository(tmp_path / "config.json"), store, _Executor())
     qtbot.addWidget(window)  # type: ignore[attr-defined]
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: not window._history_task_running and window.history_table.rowCount() == 1,
+        timeout=5000,
+    )
     window.history_table.selectRow(0)
     sensitive_details = "password=do-not-display C:\\sensitive\\customer.db"
     warnings: list[str] = []
@@ -275,6 +347,7 @@ def test_history_export_failure_does_not_display_sensitive_exception_text(
     )
 
     window._export_selected_run()
+    qtbot.waitUntil(lambda: not window._storage_task_running, timeout=5000)  # type: ignore[attr-defined]
 
     assert warnings == ["CSV 파일을 안전하게 내보내지 못했습니다."]
     assert sensitive_details not in warnings[0]
@@ -424,6 +497,115 @@ class _EmptyStore:
         return ()
 
 
+class _StorageHealthStore(_EmptyStore):
+    def __init__(
+        self,
+        *,
+        warning: bool = False,
+        hard_stop: bool = False,
+        capacity_failure: StorageError | None = None,
+    ) -> None:
+        self.warning = warning
+        self.hard_stop = hard_stop
+        self.capacity_failure = capacity_failure
+        self.capacity_calls = 0
+        self.health_calls = 0
+
+    def ensure_query_capacity(self) -> None:
+        self.capacity_calls += 1
+        if self.capacity_failure is not None:
+            raise self.capacity_failure
+
+    def storage_health(self) -> object:
+        self.health_calls += 1
+        return SimpleNamespace(warning=self.warning, hard_stop=self.hard_stop)
+
+
+def _delete_preview_fixture() -> DeletePreview:
+    return DeletePreview(
+        preview_id="preview-1",
+        confirmation_token="-".join(("confirmation", "fixture")),
+        run_ids=("run-1",),
+        database_rows=3,
+        raw_files=1,
+        export_files=1,
+        total_file_bytes=1024,
+        expires_at=datetime.now(UTC),
+        summary="fixture preview",
+    )
+
+
+class _DelayedPreviewStore(_EmptyStore):
+    def __init__(self, *, discard_fails: bool = False) -> None:
+        self.preview = _delete_preview_fixture()
+        self.discard_fails = discard_fails
+        self.preview_started = threading.Event()
+        self.preview_release = threading.Event()
+        self.preview_threads: list[int] = []
+        self.discard_threads: list[int] = []
+        self.discarded: list[DeletePreview] = []
+
+    def preview_delete(self, _run_id: str | None = None) -> DeletePreview:
+        self.preview_threads.append(threading.get_ident())
+        self.preview_started.set()
+        if not self.preview_release.wait(timeout=3):
+            raise TimeoutError("delayed preview fixture was not released")
+        return self.preview
+
+    def discard_delete_preview(self, preview: DeletePreview) -> bool:
+        self.discard_threads.append(threading.get_ident())
+        self.discarded.append(preview)
+        if self.discard_fails:
+            raise StorageError("sanitized discard fixture")
+        return preview == self.preview
+
+
+class _CommitFailureStore(_EmptyStore):
+    def __init__(self) -> None:
+        self.preview = _delete_preview_fixture()
+        self.delete_calls = 0
+        self.discarded: list[DeletePreview] = []
+
+    def preview_delete(self, _run_id: str | None = None) -> DeletePreview:
+        return self.preview
+
+    def delete(self, preview: DeletePreview, *, confirmation_token: str) -> object:
+        assert preview == self.preview
+        assert confirmation_token == self.preview.confirmation_token
+        self.delete_calls += 1
+        raise StorageError("sanitized commit fixture")
+
+    def discard_delete_preview(self, preview: DeletePreview) -> bool:
+        self.discarded.append(preview)
+        return preview == self.preview
+
+
+class _DelayedHistoryStore(_EmptyStore):
+    def __init__(self, *, fail: bool) -> None:
+        self.fail = fail
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.thread_ids: list[int] = []
+
+    def list_runs(self, *, limit: int = 100) -> tuple[object, ...]:
+        del limit
+        self.thread_ids.append(threading.get_ident())
+        self.started.set()
+        if not self.release.wait(timeout=3):
+            raise TimeoutError("delayed history fixture was not released")
+        if self.fail:
+            raise StorageError("sanitized history fixture")
+        return (
+            {
+                "id": "run-after-close",
+                "started_at": "2026-08-29T00:00:00+00:00",
+                "ended_at": None,
+                "status": "RUNNING",
+                "observation_count": 0,
+            },
+        )
+
+
 class _ApprovalExecutor(_Executor):
     def __init__(self) -> None:
         super().__init__()
@@ -451,6 +633,7 @@ def test_close_drains_open_approval_and_suppresses_late_result(
         executor,
     )
     qtbot.addWidget(window)  # type: ignore[attr-defined]
+    window.show()
     _configure_valid_query(window)
     messages: list[str] = []
     monkeypatch.setattr(  # type: ignore[attr-defined]
@@ -466,14 +649,16 @@ def test_close_drains_open_approval_and_suppresses_late_result(
     )
 
     assert not window.close()
-    qtbot.waitUntil(lambda: not window._query_running, timeout=3000)  # type: ignore[attr-defined]
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: not window._query_running and not window.isVisible(),
+        timeout=3000,
+    )
 
     assert executor.answer is False
     assert window._approval.pending_count == 0
     assert window.result_table.rowCount() == 0
     assert window.diagnostics_list.count() == 0
-    assert messages == ["진행 중인 SSH 작업을 취소했습니다. 정리 후 다시 종료하십시오."]
-    assert window.close()
+    assert messages == []
 
 
 def test_invalid_input_keeps_input_status_instead_of_stop_status(
@@ -496,7 +681,7 @@ def test_invalid_input_keeps_input_status_instead_of_stop_status(
     window._start_query()
 
     assert not window._query_running
-    assert window.state_label.text() == "입력 확인 필요"
+    assert window.state_label.text() == "확인 필요"
     window.close()
 
 
@@ -526,7 +711,7 @@ def test_unexpected_query_failure_is_sanitized_and_remains_failed(
     qtbot.waitUntil(lambda: not window._query_running, timeout=3000)  # type: ignore[attr-defined]
 
     diagnostic = window.diagnostics_list.item(window.diagnostics_list.count() - 1).text()
-    assert window.state_label.text() == "실패"
+    assert window.state_label.text() == "확인 필요"
     assert "UNEXPECTED" in diagnostic
     assert "RuntimeError" in diagnostic
     assert sensitive_details not in diagnostic
@@ -558,8 +743,493 @@ def test_cancelled_query_failure_remains_stopped_without_warning(
     window._start_query()
     qtbot.waitUntil(lambda: not window._query_running, timeout=3000)  # type: ignore[attr-defined]
 
-    assert window.state_label.text() == "중지됨"
+    assert window.state_label.text() == "대기"
     assert warnings == []
+    window.close()
+
+
+def test_query_screen_defaults_to_primary_monitoring_and_progressive_details(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        _EmptyStore(),  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    window.show()
+
+    assert window.setup_guide.isVisible()
+    assert window.monitor_button.isDefault()
+    assert window.monitor_button.text() == "지속 모니터링 시작"
+    assert window.query_button.text() == "현재 조회"
+    assert window.advanced_toggle_button.text() == "고급 조건 보기"
+    assert window.advanced_panel.title() == "고급 조건"
+    assert window.raw_diagnostics_toggle.text() == "상세 정보 보기"
+    assert not window.advanced_panel.isVisible()
+    assert not window.details.isVisible()
+    assert all(window.result_table.isColumnHidden(column) for column in range(5, 12))
+
+    window.advanced_toggle_button.setChecked(True)
+    window.detail_columns_toggle.setChecked(True)
+    window.raw_diagnostics_toggle.setChecked(True)
+    assert window.advanced_panel.isVisible()
+    assert window.details.isVisible()
+    assert window.advanced_toggle_button.text() == "고급 조건 숨기기"
+    assert window.raw_diagnostics_toggle.text() == "상세 정보 숨기기"
+    assert all(not window.result_table.isColumnHidden(column) for column in range(5, 12))
+
+    _configure_valid_query(window)
+    window._update_setup_guide()
+    assert not window.setup_guide.isVisible()
+    window.close()
+
+
+def test_query_progressive_controls_are_keyboard_and_accessibility_ready(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        _EmptyStore(),  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    window.show()
+
+    controls = (
+        window.open_settings_button,
+        window.advanced_toggle_button,
+        window.detail_columns_toggle,
+        window.raw_diagnostics_toggle,
+    )
+    assert all(control.accessibleName() for control in controls)
+    assert all(control.accessibleDescription() for control in controls)
+
+    assert _next_keyboard_focus(window.username_edit) is window.password_edit
+    assert _next_keyboard_focus(window.password_edit) is window.source_ip_edit
+    assert _next_keyboard_focus(window.destination_ip_edit) is window.advanced_toggle_button
+
+    qtbot.keyClick(window.advanced_toggle_button, Qt.Key.Key_Space)  # type: ignore[attr-defined]
+    assert window.advanced_toggle_button.isChecked()
+    assert window.advanced_panel.isVisible()
+    assert _next_keyboard_focus(window.advanced_toggle_button) is window.enable_edit
+    qtbot.keyClick(window.detail_columns_toggle, Qt.Key.Key_Space)  # type: ignore[attr-defined]
+    assert window.detail_columns_toggle.isChecked()
+    assert all(not window.result_table.isColumnHidden(column) for column in range(5, 12))
+    qtbot.keyClick(window.raw_diagnostics_toggle, Qt.Key.Key_Space)  # type: ignore[attr-defined]
+    assert window.raw_diagnostics_toggle.isChecked()
+    assert window.details.isVisible()
+    window.close()
+
+
+@pytest.mark.parametrize("scale_factor", ["1", "1.25", "1.5"])
+def test_query_layout_smoke_at_supported_scale_in_isolated_process(
+    tmp_path: Path,
+    scale_factor: str,
+) -> None:
+    fixture_root = tmp_path / "한글 UI 경로" / scale_factor.replace(".", "_")
+    script = r"""
+import sys
+import time
+from pathlib import Path
+
+from PySide6.QtWidgets import QApplication
+
+from aruba_session_tracker.config import ConfigRepository
+from aruba_session_tracker.services import QueryOutcome
+from aruba_session_tracker.storage import SessionStore
+from aruba_session_tracker.ui import MainWindow
+
+
+class Executor:
+    def execute(self, *_args, **_kwargs):
+        return QueryOutcome()
+
+    def stop_monitor(self):
+        return None
+
+
+app = QApplication([])
+root = Path(sys.argv[1])
+store = SessionStore(root / "세션.db", root / "원본", root / "내보내기")
+store.initialize()
+window = MainWindow(ConfigRepository(root / "설정.json"), store, Executor())
+window.show()
+deadline = time.monotonic() + 3
+while window._history_task_running and time.monotonic() < deadline:
+    app.processEvents()
+    time.sleep(0.01)
+app.processEvents()
+assert not window._history_task_running
+assert window.width() >= window.minimumWidth()
+assert window.height() >= window.minimumHeight()
+assert window.monitor_button.isVisible()
+assert window.query_button.isVisible()
+assert window.result_table.isVisible()
+assert window.monitor_button.geometry().width() > 0
+assert window.result_table.viewport().geometry().width() > 100
+assert window.monitor_button.accessibleName()
+assert window.advanced_toggle_button.accessibleDescription()
+assert window.advanced_panel.isHidden()
+assert window.details.isHidden()
+assert all(window.result_table.isColumnHidden(column) for column in range(5, 12))
+window.close()
+app.processEvents()
+"""
+    environment = os.environ.copy()
+    environment["QT_QPA_PLATFORM"] = "offscreen"
+    environment["QT_SCALE_FACTOR"] = scale_factor
+    completed = subprocess.run(  # noqa: S603 - fixed interpreter and static smoke script.
+        [sys.executable, "-c", script, str(fixture_root)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_high_contrast_palette_and_korean_storage_path_keep_controls_visible(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    application = QApplication.instance()
+    assert isinstance(application, QApplication)
+    original_palette = application.palette()
+    palette = QPalette(original_palette)
+    palette.setColor(QPalette.ColorRole.Window, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#ffff00"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#000000"))
+    application.setPalette(palette)
+    fixture_root = tmp_path / "한글 경로" / "세션 기록"
+    store = SessionStore(
+        fixture_root / "세션.db",
+        fixture_root / "원본",
+        fixture_root / "내보내기",
+    )
+    store.initialize()
+    window = MainWindow(
+        ConfigRepository(fixture_root / "설정.json"),
+        store,
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    try:
+        window.show()
+        qtbot.waitUntil(lambda: not window._history_task_running, timeout=3000)  # type: ignore[attr-defined]
+        controls = (
+            window.open_settings_button,
+            window.username_edit,
+            window.monitor_button,
+            window.query_button,
+            window.detail_columns_toggle,
+            window.raw_diagnostics_toggle,
+        )
+        assert all(control.isVisible() for control in controls)
+        assert all(control.sizeHint().width() > 0 for control in controls)
+        assert window.monitor_button.text() == "지속 모니터링 시작"
+        assert window.state_label.text() == "대기"
+        line_palette = window.username_edit.palette()
+        assert line_palette.color(QPalette.ColorRole.Base) != line_palette.color(
+            QPalette.ColorRole.Text
+        )
+    finally:
+        window.close()
+        application.setPalette(original_palette)
+
+
+def test_result_rendering_caps_visible_rows_without_dropping_outcome_count(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        _EmptyStore(),  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    observations = tuple(
+        SessionObservation(
+            controller_name="MD-01",
+            controller_host="198.51.100.21",
+            protocol=6,
+            source_ip="192.0.2.10",
+            destination_ip="203.0.113.20",
+            source_port=10_000 + index,
+            destination_port=443,
+            raw_line=f"fixture row {index}",
+        )
+        for index in range(2_005)
+    )
+
+    window._display_outcome(
+        SimpleNamespace(
+            observations=observations,
+            active_sessions=(),
+            events=(),
+            diagnostics=(),
+            controllers=("MD-01",),
+            used_mm="MM-01",
+            authoritative=True,
+            cancelled=False,
+        )
+    )
+
+    assert window.result_table.rowCount() == 2_000
+    assert "화면 표시: 2000/2005" in window.context_label.text()
+    assert "DISPLAY_LIMIT" in window.diagnostics_list.item(0).text()
+    raw_role = int(Qt.ItemDataRole.UserRole)
+    assert window.result_table.item(0, 0).data(raw_role)
+    assert window.result_table.item(0, 1).data(raw_role) is None
+    assert window._history_dirty
+    window.close()
+
+
+class _CountingHistoryStore(_EmptyStore):
+    def __init__(self) -> None:
+        self.list_calls = 0
+
+    def list_runs(self, *, limit: int = 100) -> tuple[object, ...]:
+        del limit
+        self.list_calls += 1
+        return ()
+
+
+def test_history_refresh_is_dirty_driven_instead_of_running_after_every_poll(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    store = _CountingHistoryStore()
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        store,  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: not window._history_task_running and store.list_calls == 1,
+        timeout=3000,
+    )
+
+    window._display_outcome(_Executor().execute())
+    assert store.list_calls == 1
+    assert window._history_dirty
+
+    window.tabs.setCurrentWidget(window.history_page)
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: not window._history_task_running and store.list_calls == 2,
+        timeout=3000,
+    )
+    assert not window._history_dirty
+    window.close()
+
+
+def test_cancelled_delete_preview_is_discarded_in_background(
+    qtbot: object,
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    store = SessionStore(tmp_path / "tracker.db", tmp_path / "raw", tmp_path / "exports")
+    store.initialize()
+    run_id = store.start_run(QueryRequest("192.0.2.10", "203.0.113.20"))
+    store.finish_run(run_id)
+    window = MainWindow(ConfigRepository(tmp_path / "config.json"), store, _Executor())
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: not window._history_task_running and window.history_table.rowCount() == 1,
+        timeout=5000,
+    )
+    window.history_table.selectRow(0)
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        QMessageBox,
+        "warning",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.No,
+    )
+
+    window._delete_history(all_runs=False)
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: not window._storage_task_running and not store._pending_deletions,
+        timeout=5000,
+    )
+
+    assert len(store.list_runs()) == 1
+    window.close()
+
+
+def test_close_waits_for_delayed_preview_and_discard_failure_without_stranding(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    store = _DelayedPreviewStore(discard_fails=True)
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        store,  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    window.show()
+    qtbot.waitUntil(lambda: not window._history_task_running, timeout=3000)  # type: ignore[attr-defined]
+
+    window._delete_history(all_runs=True)
+    assert store.preview_started.wait(timeout=3)
+    assert not window.close()
+    store.preview_release.set()
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: not window.isVisible() and not window._storage_task_running,
+        timeout=5000,
+    )
+
+    assert store.discarded == [store.preview]
+    assert store.preview_threads
+    assert store.discard_threads
+    assert all(thread_id != threading.get_ident() for thread_id in store.discard_threads)
+    assert window._pending_preview_discards == []
+
+
+def test_delete_commit_failure_asynchronously_discards_exact_preview(
+    qtbot: object,
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    store = _CommitFailureStore()
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        store,  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    qtbot.waitUntil(lambda: not window._history_task_running, timeout=3000)  # type: ignore[attr-defined]
+    warnings: list[str] = []
+
+    def answer_warning(
+        _parent: object,
+        title: str,
+        message: str,
+        *_args: object,
+    ) -> QMessageBox.StandardButton:
+        if title == "기록 삭제 확인":
+            return QMessageBox.StandardButton.Yes
+        warnings.append(str(message))
+        return QMessageBox.StandardButton.Ok
+
+    monkeypatch.setattr(QMessageBox, "warning", answer_warning)  # type: ignore[attr-defined]
+
+    window._delete_history(all_runs=True)
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: not window._storage_task_running and bool(store.discarded),
+        timeout=5000,
+    )
+
+    assert store.delete_calls == 1
+    assert store.discarded == [store.preview]
+    assert window._pending_preview_discards == []
+    assert warnings == ["확인된 기록을 안전하게 삭제하지 못했습니다."]
+    window.close()
+
+
+def test_confirmation_start_failure_queues_exact_preview_cleanup(
+    qtbot: object,
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    store = _CommitFailureStore()
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        store,  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    qtbot.waitUntil(lambda: not window._history_task_running, timeout=3000)  # type: ignore[attr-defined]
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        QMessageBox,
+        "warning",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    window._closing_requested = True
+
+    window._confirm_delete_preview(store.preview)
+    qtbot.waitUntil(lambda: not window._storage_task_running, timeout=5000)  # type: ignore[attr-defined]
+
+    assert store.delete_calls == 0
+    assert store.discarded == [store.preview]
+    assert window._pending_preview_discards == []
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=("success", "failure"))
+def test_close_waits_for_background_history_result_and_skips_late_render(
+    qtbot: object,
+    tmp_path: Path,
+    fail: bool,
+) -> None:
+    store = _DelayedHistoryStore(fail=fail)
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        store,  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    window.show()
+    assert store.started.wait(timeout=3)
+    assert not window.close()
+
+    store.release.set()
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: not window._history_task_running and not window.isVisible(),
+        timeout=5000,
+    )
+
+    assert store.thread_ids
+    assert all(thread_id != threading.get_ident() for thread_id in store.thread_ids)
+    assert window.history_table.rowCount() == 0
+
+
+def test_transient_monitor_failure_uses_retry_delay_without_becoming_fatal(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        _EmptyStore(),  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    window._monitoring = True
+    diagnostic = SimpleNamespace(
+        code=ErrorCode.MM_UNREACHABLE,
+        stage="MM_QUERY",
+        message="sanitized transient fixture",
+        transient=True,
+        recovered=False,
+    )
+    outcome = SimpleNamespace(
+        observations=(),
+        active_sessions=(),
+        events=(),
+        diagnostics=(diagnostic,),
+        controllers=(),
+        used_mm=None,
+        authoritative=False,
+        cancelled=False,
+        consecutive_transient_failures=3,
+        retry_after_seconds=20,
+    )
+
+    window._display_outcome(outcome)
+
+    assert _fatal_diagnostic_code(outcome) is None
+    assert window.state_label.text() == "재시도 중"
+    assert window._next_monitor_delay_seconds == 20
+    window._monitoring = False
     window.close()
 
 
@@ -586,6 +1256,92 @@ class _CountingExecutor(_Executor):
     def execute(self, *_args: object, **_kwargs: object) -> QueryOutcome:
         self.call_count += 1
         return super().execute()
+
+
+def test_monitor_rechecks_storage_health_on_a_bounded_interval(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    store = _StorageHealthStore(warning=True)
+    executor = _CountingExecutor()
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        store,  # type: ignore[arg-type]
+        executor,
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    _configure_valid_query(window)
+
+    window._start_monitoring()
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: executor.call_count == 1 and not window._query_running,
+        timeout=3000,
+    )
+    window._monitor_timer.stop()
+    assert store.capacity_calls == 1
+    assert store.health_calls == 1
+    assert "저장 공간이 부족" in window.statusBar().currentMessage()
+
+    window._start_query()
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: executor.call_count == 2 and not window._query_running,
+        timeout=3000,
+    )
+    window._monitor_timer.stop()
+    assert store.capacity_calls == 2
+    assert store.health_calls == 1
+
+    window._next_storage_health_check_at = 0.0
+    window._start_query()
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: executor.call_count == 3 and not window._query_running,
+        timeout=3000,
+    )
+    window._monitor_timer.stop()
+    assert store.capacity_calls == 3
+    assert store.health_calls == 2
+
+    window._stop_work()
+    window.close()
+
+
+def test_storage_hard_stop_blocks_query_before_executor(
+    qtbot: object,
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    store = _StorageHealthStore(
+        capacity_failure=StorageError(
+            "sensitive capacity detail",
+            code=ErrorCode.STORAGE_LOW_SPACE,
+        )
+    )
+    executor = _CountingExecutor()
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        store,  # type: ignore[arg-type]
+        executor,
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    _configure_valid_query(window)
+    warnings: list[str] = []
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        QMessageBox,
+        "warning",
+        lambda _parent, _title, message, *_args: warnings.append(str(message)),
+    )
+
+    window._start_query()
+    qtbot.waitUntil(lambda: not window._query_running, timeout=3000)  # type: ignore[attr-defined]
+
+    assert store.capacity_calls == 1
+    assert store.health_calls == 0
+    assert executor.call_count == 0
+    assert "STORAGE_LOW_SPACE" in window.diagnostics_list.item(0).text()
+    assert warnings == [
+        "STORAGE_LOW_SPACE: 저장 공간이 부족합니다. 오래된 기록을 정리한 뒤 다시 시도하십시오."
+    ]
+    window.close()
 
 
 def test_query_worker_lifecycle_soak_leaves_no_owned_task_or_approval(
@@ -647,12 +1403,12 @@ def test_user_stop_suppresses_late_success_and_finishes_stopped(
     window._start_query()
     assert executor.started.wait(timeout=3)
     window._stop_work()
-    assert window.state_label.text() == "중지 요청"
+    assert window.state_label.text() == "조회 중"
 
     executor.release.set()
     qtbot.waitUntil(lambda: not window._query_running, timeout=3000)  # type: ignore[attr-defined]
 
-    assert window.state_label.text() == "중지됨"
+    assert window.state_label.text() == "대기"
     assert window.result_table.rowCount() == 0
     window.close()
 
@@ -685,6 +1441,6 @@ def test_slow_monitor_ignores_heartbeat_and_stale_task_signals(
     executor.release.set()
     qtbot.waitUntil(lambda: not window._query_running, timeout=3000)  # type: ignore[attr-defined]
     assert window.result_table.rowCount() == 1
-    assert window.state_label.text() == "모니터링"
+    assert window.state_label.text() == "정상"
     window._stop_work()
     window.close()

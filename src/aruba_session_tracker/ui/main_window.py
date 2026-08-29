@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from time import monotonic
 from typing import Protocol
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThread, QThreadPool, QTimer, Signal, Slot
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -45,13 +47,17 @@ from aruba_session_tracker.models import (
     SessionObservation,
 )
 from aruba_session_tracker.parsers import interpret_flags, overall_flag_severity
-from aruba_session_tracker.storage import SessionStore, StorageError
+from aruba_session_tracker.storage import DeletePreview, SessionStore, StorageError
 from aruba_session_tracker.ui.developer_inspector import (
     DeveloperInspectorController,
     UiElementMetadata,
 )
 
 _UI_SOURCE_PATH = "src/aruba_session_tracker/ui/main_window.py"
+_MAX_VISIBLE_RESULT_ROWS = 2_000
+_DETAIL_COLUMN_INDEXES = range(5, 12)
+_STORAGE_HEALTH_INTERVAL_SECONDS = 60.0
+_OPERATOR_STATES = frozenset({"대기", "조회 중", "정상", "재시도 중", "확인 필요"})
 
 
 class QueryExecutor(Protocol):
@@ -74,6 +80,7 @@ class _TaskSignals(QObject):
     succeeded = Signal(int, object)
     failed = Signal(int, object)
     finished = Signal(int)
+    storage_warning = Signal(int, bool)
 
 
 class _QueryTask(QRunnable):
@@ -88,6 +95,8 @@ class _QueryTask(QRunnable):
         host_key_approval: Callable[[DeviceTarget, HostKeyInfo], bool],
         full_scan_approval: Callable[..., bool],
         generation: int,
+        query_capacity_check: Callable[[], None] | None = None,
+        storage_health_check: Callable[[], object] | None = None,
     ) -> None:
         super().__init__()
         self.signals = _TaskSignals()
@@ -100,10 +109,27 @@ class _QueryTask(QRunnable):
         self._token = token
         self._host_key_approval = host_key_approval
         self._full_scan_approval = full_scan_approval
+        self._query_capacity_check = query_capacity_check
+        self._storage_health_check = storage_health_check
 
     @Slot()
     def run(self) -> None:
         try:
+            if self._query_capacity_check is not None:
+                self._query_capacity_check()
+            if self._storage_health_check is not None:
+                health = self._storage_health_check()
+                if bool(getattr(health, "warning", False)):
+                    hard_stop = bool(getattr(health, "hard_stop", False))
+                    self.signals.storage_warning.emit(
+                        self.generation,
+                        hard_stop,
+                    )
+                    if hard_stop:
+                        raise StorageError(
+                            "저장 공간이 부족하여 새 조회를 시작할 수 없습니다.",
+                            code=ErrorCode.STORAGE_LOW_SPACE,
+                        )
             outcome = self._executor.execute(
                 self._config,
                 self._request,
@@ -119,6 +145,39 @@ class _QueryTask(QRunnable):
             self.signals.succeeded.emit(self.generation, outcome)
         finally:
             self.signals.finished.emit(self.generation)
+
+
+class _StorageTaskSignals(QObject):
+    succeeded = Signal(int, str, object)
+    failed = Signal(int, str, object)
+    finished = Signal(int, str)
+
+
+class _StorageTask(QRunnable):
+    def __init__(
+        self,
+        generation: int,
+        kind: str,
+        operation: Callable[[], object],
+        context: object | None = None,
+    ) -> None:
+        super().__init__()
+        self.signals = _StorageTaskSignals()
+        self.generation = generation
+        self.kind = kind
+        self.context = context
+        self._operation = operation
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = self._operation()
+        except Exception as exc:
+            self.signals.failed.emit(self.generation, self.kind, exc)
+        else:
+            self.signals.succeeded.emit(self.generation, self.kind, result)
+        finally:
+            self.signals.finished.emit(self.generation, self.kind)
 
 
 class _ApprovalRequest:
@@ -316,6 +375,8 @@ class MainWindow(QMainWindow):
         self._developer_inspector = developer_inspector
         self._thread_pool = QThreadPool(self)
         self._thread_pool.setMaxThreadCount(1)
+        self._history_thread_pool = QThreadPool(self)
+        self._history_thread_pool.setMaxThreadCount(1)
         self._approval = ApprovalBridge(self)
         self._cancel_token: CancellationToken | None = None
         self._current_task: _QueryTask | None = None
@@ -324,8 +385,21 @@ class MainWindow(QMainWindow):
         self._query_running = False
         self._monitoring = False
         self._closing_requested = False
+        self._close_when_idle = False
+        self._storage_task_running = False
+        self._storage_task_generation = 0
+        self._current_storage_task: _StorageTask | None = None
+        self._pending_preview_discards: list[DeletePreview] = []
+        self._history_task_running = False
+        self._history_task_generation = 0
+        self._current_history_task: _StorageTask | None = None
+        self._history_dirty = False
+        self._history_revision = 0
+        self._next_monitor_delay_seconds = 0.0
+        self._next_storage_health_check_at = 0.0
         self._last_counters: dict[str, tuple[int | None, int | None]] = {}
         self._monitor_timer = QTimer(self)
+        self._monitor_timer.setSingleShot(True)
         self._monitor_timer.timeout.connect(self._start_query)
 
         self.setWindowTitle(f"Aruba Session Tracker {__version__}")
@@ -334,6 +408,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_style()
         self._load_config()
+        self._update_setup_guide()
         self._refresh_history()
 
     def _build_ui(self) -> None:
@@ -354,6 +429,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.query_page, "세션 조회")
         self.tabs.addTab(self.settings_page, "장비 설정")
         self.tabs.addTab(self.history_page, "기록 및 내보내기")
+        self.tabs.currentChanged.connect(self._tab_changed)
         self.central_layout.addWidget(self.tabs, 1)
         self.setCentralWidget(self.central_root)
         self.statusBar().showMessage("실제 장비 접속 전 SSH 지문을 반드시 확인하십시오.")
@@ -363,48 +439,116 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
 
+        self.setup_guide = QFrame()
+        self.setup_guide.setObjectName("setupGuide")
+        guide_layout = QHBoxLayout(self.setup_guide)
+        guide_layout.setContentsMargins(10, 8, 10, 8)
+        self.setup_guide_label = QLabel(
+            "아직 조회할 장비가 설정되지 않았습니다. 먼저 MM과 MD 주소를 등록해 주세요."
+        )
+        self.setup_guide_label.setWordWrap(True)
+        self.open_settings_button = QPushButton("장비 설정 열기")
+        self.open_settings_button.setAccessibleName("장비 설정 열기")
+        self.open_settings_button.setAccessibleDescription(
+            "조회할 MM과 MD 주소를 입력하는 장비 설정 탭으로 이동합니다."
+        )
+        self.open_settings_button.clicked.connect(self._open_settings)
+        guide_layout.addWidget(self.setup_guide_label, 1)
+        guide_layout.addWidget(self.open_settings_button)
+        layout.addWidget(self.setup_guide)
+
         self.connection_group = QGroupBox("실행 세션 자격증명 (저장하지 않음)")
         connection_layout = QGridLayout(self.connection_group)
         self.username_edit = QLineEdit()
+        self.username_edit.setAccessibleName("사용자 이름")
+        self.username_edit.setAccessibleDescription(
+            "현재 실행에만 사용하는 장비 로그인 사용자 이름입니다."
+        )
         self.password_edit = QLineEdit()
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.enable_edit = QLineEdit()
-        self.enable_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_edit.setAccessibleName("암호")
+        self.password_edit.setAccessibleDescription(
+            "현재 실행에만 사용하는 장비 로그인 암호이며 저장되지 않습니다."
+        )
         connection_layout.addWidget(QLabel("사용자 이름"), 0, 0)
         connection_layout.addWidget(self.username_edit, 0, 1)
         connection_layout.addWidget(QLabel("암호"), 0, 2)
         connection_layout.addWidget(self.password_edit, 0, 3)
-        connection_layout.addWidget(QLabel("Enable 암호(선택)"), 0, 4)
-        connection_layout.addWidget(self.enable_edit, 0, 5)
 
         self.query_group = QGroupBox("세션 조건")
         query_layout = QGridLayout(self.query_group)
         self.source_ip_edit = QLineEdit()
+        self.source_ip_edit.setAccessibleName("Source IP")
+        self.source_ip_edit.setAccessibleDescription("조회할 출발지 IP 주소입니다.")
         self.destination_ip_edit = QLineEdit()
-        self.source_port_edit = QLineEdit()
-        self.destination_port_edit = QLineEdit()
-        self.bidirectional_check = QCheckBox("양방향 검색 (IP와 포트를 함께 교환)")
-        self.bidirectional_check.setChecked(True)
+        self.destination_ip_edit.setAccessibleName("Destination IP")
+        self.destination_ip_edit.setAccessibleDescription("조회할 목적지 IP 주소입니다.")
         query_layout.addWidget(QLabel("Source IP"), 0, 0)
         query_layout.addWidget(self.source_ip_edit, 0, 1)
         query_layout.addWidget(QLabel("Destination IP"), 0, 2)
         query_layout.addWidget(self.destination_ip_edit, 0, 3)
-        query_layout.addWidget(QLabel("SPort (선택)"), 1, 0)
-        query_layout.addWidget(self.source_port_edit, 1, 1)
-        query_layout.addWidget(QLabel("DPort (선택)"), 1, 2)
-        query_layout.addWidget(self.destination_port_edit, 1, 3)
-        query_layout.addWidget(self.bidirectional_check, 2, 0, 1, 4)
+
+        self.advanced_toggle_button = QPushButton("고급 조건 보기")
+        self.advanced_toggle_button.setCheckable(True)
+        self.advanced_toggle_button.setAccessibleName("고급 조건 펼치기 또는 접기")
+        self.advanced_toggle_button.setAccessibleDescription(
+            "Enable 암호, 포트, 양방향 검색 조건을 표시하거나 숨깁니다."
+        )
+        self.advanced_toggle_button.toggled.connect(self._set_advanced_visible)
+        self.advanced_panel = QGroupBox("고급 조건")
+        advanced_layout = QGridLayout(self.advanced_panel)
+        self.enable_edit = QLineEdit()
+        self.enable_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.enable_edit.setAccessibleName("Enable 암호")
+        self.enable_edit.setAccessibleDescription(
+            "필요한 장비에서만 현재 실행에 사용할 Enable 암호입니다."
+        )
+        self.source_port_edit = QLineEdit()
+        self.source_port_edit.setAccessibleName("Source 포트")
+        self.source_port_edit.setAccessibleDescription(
+            "선택 사항인 출발지 포트 번호입니다. 비우면 모든 포트를 조회합니다."
+        )
+        self.destination_port_edit = QLineEdit()
+        self.destination_port_edit.setAccessibleName("Destination 포트")
+        self.destination_port_edit.setAccessibleDescription(
+            "선택 사항인 목적지 포트 번호입니다. 비우면 모든 포트를 조회합니다."
+        )
+        self.bidirectional_check = QCheckBox("양방향 검색 (IP와 포트를 함께 교환)")
+        self.bidirectional_check.setAccessibleName("양방향 검색")
+        self.bidirectional_check.setAccessibleDescription(
+            "Source와 Destination IP 및 포트를 서로 바꾼 방향도 함께 검색합니다."
+        )
+        self.bidirectional_check.setChecked(True)
+        advanced_layout.addWidget(QLabel("Enable 암호(선택)"), 0, 0)
+        advanced_layout.addWidget(self.enable_edit, 0, 1, 1, 3)
+        advanced_layout.addWidget(QLabel("SPort (선택)"), 1, 0)
+        advanced_layout.addWidget(self.source_port_edit, 1, 1)
+        advanced_layout.addWidget(QLabel("DPort (선택)"), 1, 2)
+        advanced_layout.addWidget(self.destination_port_edit, 1, 3)
+        advanced_layout.addWidget(self.bidirectional_check, 2, 0, 1, 4)
+        self.advanced_panel.setVisible(False)
 
         actions = QHBoxLayout()
-        self.query_button = QPushButton("현재 조회")
         self.monitor_button = QPushButton("지속 모니터링 시작")
+        self.monitor_button.setDefault(True)
+        self.monitor_button.setAccessibleName("지속 모니터링 시작")
+        self.monitor_button.setAccessibleDescription(
+            "입력한 조건으로 반복 세션 모니터링을 시작합니다."
+        )
+        self.query_button = QPushButton("현재 조회")
+        self.query_button.setAccessibleName("현재 조회")
+        self.query_button.setAccessibleDescription("입력한 조건으로 세션을 한 번만 조회합니다.")
         self.stop_button = QPushButton("중지")
+        self.stop_button.setAccessibleName("조회 또는 모니터링 중지")
+        self.stop_button.setAccessibleDescription(
+            "진행 중인 조회나 반복 모니터링을 안전하게 중지합니다."
+        )
         self.stop_button.setEnabled(False)
         self.query_button.clicked.connect(self._start_query)
         self.monitor_button.clicked.connect(self._start_monitoring)
         self.stop_button.clicked.connect(self._stop_work)
-        actions.addWidget(self.query_button)
         actions.addWidget(self.monitor_button)
+        actions.addWidget(self.query_button)
         actions.addWidget(self.stop_button)
         actions.addStretch(1)
         self.state_label = QLabel("대기")
@@ -413,12 +557,28 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self.connection_group)
         layout.addWidget(self.query_group)
+        layout.addWidget(self.advanced_toggle_button, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.advanced_panel)
         layout.addLayout(actions)
 
         splitter = QSplitter()
         result_panel = QWidget()
         result_layout = QVBoxLayout(result_panel)
+        result_options = QHBoxLayout()
         self.context_label = QLabel("MM/MD: 아직 조회하지 않음")
+        self.detail_columns_toggle = QCheckBox("상세 열 보기")
+        self.detail_columns_toggle.setAccessibleName("상세 결과 열 보기")
+        self.detail_columns_toggle.setAccessibleDescription(
+            "DPort, 패킷, 바이트, 변화량, Age, CPU 열을 표시하거나 숨깁니다."
+        )
+        self.raw_diagnostics_toggle = QCheckBox("상세 정보 보기")
+        self.raw_diagnostics_toggle.setAccessibleName("Raw 및 진단 패널 보기")
+        self.raw_diagnostics_toggle.setAccessibleDescription(
+            "선택한 Raw 행과 진단 이벤트 패널을 표시하거나 숨깁니다."
+        )
+        result_options.addWidget(self.context_label, 1)
+        result_options.addWidget(self.detail_columns_toggle)
+        result_options.addWidget(self.raw_diagnostics_toggle)
         self.result_table = QTableWidget(0, 15)
         self.result_table.setHorizontalHeaderLabels(
             [
@@ -441,12 +601,17 @@ class MainWindow(QMainWindow):
         )
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.result_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.result_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.ResizeToContents
-        )
-        self.result_table.horizontalHeader().setStretchLastSection(True)
+        header = self.result_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(True)
+        widths = (110, 70, 125, 70, 125, 70, 85, 95, 85, 85, 70, 55, 150, 80)
+        for column, width in enumerate(widths):
+            header.resizeSection(column, width)
+        for column in _DETAIL_COLUMN_INDEXES:
+            self.result_table.setColumnHidden(column, True)
+        self.detail_columns_toggle.toggled.connect(self._set_detail_columns_visible)
         self.result_table.itemSelectionChanged.connect(self._show_selected_raw)
-        result_layout.addWidget(self.context_label)
+        result_layout.addLayout(result_options)
         result_layout.addWidget(self.result_table)
 
         self.details = QTabWidget()
@@ -455,12 +620,58 @@ class MainWindow(QMainWindow):
         self.diagnostics_list = QListWidget()
         self.details.addTab(self.raw_view, "선택 행 Raw")
         self.details.addTab(self.diagnostics_list, "진단 이벤트")
+        self.details.setVisible(False)
+        self.raw_diagnostics_toggle.toggled.connect(self._set_details_visible)
         splitter.addWidget(result_panel)
         splitter.addWidget(self.details)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 2)
         layout.addWidget(splitter, 1)
+        focus_order = (
+            self.open_settings_button,
+            self.username_edit,
+            self.password_edit,
+            self.source_ip_edit,
+            self.destination_ip_edit,
+            self.advanced_toggle_button,
+            self.enable_edit,
+            self.source_port_edit,
+            self.destination_port_edit,
+            self.bidirectional_check,
+            self.monitor_button,
+            self.query_button,
+            self.stop_button,
+            self.detail_columns_toggle,
+            self.raw_diagnostics_toggle,
+            self.result_table,
+        )
+        for index, widget in enumerate(focus_order[:-1]):
+            QWidget.setTabOrder(widget, focus_order[index + 1])
         return page
+
+    @Slot()
+    def _open_settings(self) -> None:
+        self.tabs.setCurrentWidget(self.settings_page)
+
+    @Slot(bool)
+    def _set_advanced_visible(self, visible: bool) -> None:
+        self.advanced_panel.setVisible(visible)
+        self.advanced_toggle_button.setText("고급 조건 숨기기" if visible else "고급 조건 보기")
+
+    @Slot(bool)
+    def _set_detail_columns_visible(self, visible: bool) -> None:
+        for column in _DETAIL_COLUMN_INDEXES:
+            self.result_table.setColumnHidden(column, not visible)
+
+    @Slot(bool)
+    def _set_details_visible(self, visible: bool) -> None:
+        self.details.setVisible(visible)
+        self.raw_diagnostics_toggle.setText("상세 정보 숨기기" if visible else "상세 정보 보기")
+
+    def _set_state(self, state: str) -> None:
+        if state not in _OPERATOR_STATES:
+            raise ValueError("invalid operator state")
+        self.state_label.setText(state)
 
     def _build_settings_tab(self) -> QWidget:
         page = QWidget()
@@ -575,6 +786,26 @@ class MainWindow(QMainWindow):
         self.history_privacy_notice.setWordWrap(True)
         layout.addWidget(self.history_privacy_notice)
         return page
+
+    def _update_setup_guide(self) -> None:
+        configured_mm = any(
+            enabled.isChecked() and bool(host.text().strip())
+            for enabled, host in (
+                (self.mm_primary_enabled, self.mm_primary_host),
+                (self.mm_standby_enabled, self.mm_standby_host),
+            )
+        )
+        configured_md = any(
+            self._setting_item(row, 0).checkState() == _checked_state()
+            and bool(self._setting_item(row, 2).text().strip())
+            for row in range(self.md_table.rowCount())
+        )
+        self.setup_guide.setVisible(not (configured_mm and configured_md))
+
+    @Slot(int)
+    def _tab_changed(self, index: int) -> None:
+        if self.tabs.widget(index) is self.history_page and self._history_dirty:
+            self._refresh_history()
 
     def _register_developer_inspector_catalog(self) -> None:
         inspector = self._developer_inspector
@@ -709,7 +940,10 @@ class MainWindow(QMainWindow):
             (
                 self.monitor_button,
                 _ui_metadata(
-                    "지속 모니터링 시작", "MAIN-QUERY-MONITOR-START", query, "지속 모니터링 시작"
+                    "지속 모니터링 시작",
+                    "MAIN-QUERY-MONITOR-START",
+                    query,
+                    "지속 모니터링 시작",
                 ),
             ),
             (
@@ -724,6 +958,15 @@ class MainWindow(QMainWindow):
                 self.context_label,
                 _ui_metadata(
                     "MM/MD 문맥", "MAIN-QUERY-CONTEXT", query, "조회에 사용된 장비 문맥 표시"
+                ),
+            ),
+            (
+                self.detail_columns_toggle,
+                _ui_metadata(
+                    "상세 열 보기",
+                    "MAIN-QUERY-DETAIL-COLUMNS-TOGGLE",
+                    query,
+                    "결과 표의 상세 열을 현재 프로세스에서만 표시하거나 숨김",
                 ),
             ),
             (
@@ -1123,6 +1366,7 @@ class MainWindow(QMainWindow):
                 "설정 파일을 안전하게 저장하지 못했습니다. 저장 위치의 권한을 확인하십시오.",
             )
             return
+        self._update_setup_guide()
         self.statusBar().showMessage("장비 설정을 안전하게 저장했습니다.", 5000)
 
     def _read_query(self) -> tuple[AppConfig, QueryRequest, Credentials]:
@@ -1145,7 +1389,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _start_query(self) -> None:
-        if self._query_running or self._closing_requested:
+        if self._query_running or self._storage_task_running or self._closing_requested:
             return
         if not self._monitoring:
             self._last_counters.clear()
@@ -1154,7 +1398,8 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "입력 확인", str(exc))
             self._cancel_active_work()
-            self.state_label.setText("입력 확인 필요")
+            self._set_state("확인 필요")
+            self.statusBar().showMessage("입력값을 확인한 뒤 다시 시도해 주세요.", 5000)
             return
         self._query_running = True
         self._task_generation += 1
@@ -1162,7 +1407,7 @@ class MainWindow(QMainWindow):
         token = CancellationToken()
         self._cancel_token = token
         self._set_busy(True)
-        self.state_label.setText("조회 중")
+        self._set_state("조회 중")
 
         def approve_host_key(target: DeviceTarget, info: HostKeyInfo) -> bool:
             return self._approval.approve_host_key(
@@ -1183,6 +1428,18 @@ class MainWindow(QMainWindow):
                 generation=generation,
             )
 
+        query_capacity_check = getattr(self._store, "ensure_query_capacity", None)
+        if not callable(query_capacity_check):
+            query_capacity_check = None
+        storage_health_check = getattr(self._store, "storage_health", None)
+        if not callable(storage_health_check):
+            storage_health_check = None
+        elif self._monitoring:
+            now = monotonic()
+            if now < self._next_storage_health_check_at:
+                storage_health_check = None
+            else:
+                self._next_storage_health_check_at = now + _STORAGE_HEALTH_INTERVAL_SECONDS
         task = _QueryTask(
             self._executor,
             config,
@@ -1193,11 +1450,14 @@ class MainWindow(QMainWindow):
             approve_host_key,
             approve_full_scan,
             generation,
+            query_capacity_check,
+            storage_health_check,
         )
         self._current_task = task
         task.signals.succeeded.connect(self._task_succeeded)
         task.signals.failed.connect(self._task_failed)
         task.signals.finished.connect(self._query_finished)
+        task.signals.storage_warning.connect(self._show_storage_warning)
         self._thread_pool.start(task)
 
     @Slot()
@@ -1206,15 +1466,17 @@ class MainWindow(QMainWindow):
             return
         self._last_counters.clear()
         self._monitoring = True
+        self._next_storage_health_check_at = 0.0
+        self._next_monitor_delay_seconds = float(self.session_interval.value())
         self._set_monitor_inputs_enabled(False)
-        self._monitor_timer.setInterval(self.session_interval.value() * 1000)
         self.monitor_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self._start_query()
 
     @Slot()
     def _stop_work(self) -> None:
-        status = "중지 요청" if self._query_running else "중지됨"
+        status = "조회 중" if self._query_running else "대기"
+        self.statusBar().showMessage("진행 중인 조회를 안전하게 중지하고 있습니다.", 5000)
         self._cancel_active_work(status=status, user_requested=True)
 
     def _cancel_active_work(
@@ -1242,7 +1504,7 @@ class MainWindow(QMainWindow):
                 "[UNEXPECTED] 모니터링 중지 정리 중 내부 오류가 발생했습니다."
             )
         if status is not None and was_active:
-            self.state_label.setText(status)
+            self._set_state(status)
         self._set_monitor_inputs_enabled(True)
         self._set_busy(self._query_running)
 
@@ -1291,7 +1553,7 @@ class MainWindow(QMainWindow):
             if event_type == "CLOSED":
                 closed_observations[flow_key] = event_observation
 
-        self.result_table.setRowCount(0)
+        rows: list[tuple[SessionObservation, str, str, str | None]] = []
         next_counters: dict[str, tuple[int | None, int | None]] = {}
         if active_sessions:
             for session in active_sessions:
@@ -1317,24 +1579,30 @@ class MainWindow(QMainWindow):
                     if is_observed
                     else "-"
                 )
-                self._append_observation(
-                    observation,
-                    packet_delta=packet_delta,
-                    byte_delta=byte_delta,
-                    lifecycle_status=_lifecycle_status(
-                        event_types_by_flow.get(flow_key, set()),
-                        miss_count=int(getattr(session, "miss_count", 0)),
-                        close_after_misses=self.close_misses.value(),
-                        is_observed=is_observed,
-                        authoritative=authoritative,
-                    ),
+                rows.append(
+                    (
+                        observation,
+                        packet_delta,
+                        byte_delta,
+                        _lifecycle_status(
+                            event_types_by_flow.get(flow_key, set()),
+                            miss_count=int(getattr(session, "miss_count", 0)),
+                            close_after_misses=self.close_misses.value(),
+                            is_observed=is_observed,
+                            authoritative=authoritative,
+                        ),
+                    )
                 )
                 next_counters[flow_key] = (observation.packets, observation.bytes_count)
             for flow_key, observation in closed_observations.items():
                 if flow_key not in next_counters:
-                    self._append_observation(
-                        observation,
-                        lifecycle_status=(f"종료 확인 ({self.close_misses.value()}회 연속 MISS)"),
+                    rows.append(
+                        (
+                            observation,
+                            "-",
+                            "-",
+                            f"종료 확인 ({self.close_misses.value()}회 연속 MISS)",
+                        )
                     )
         else:
             for observation in observations:
@@ -1342,24 +1610,44 @@ class MainWindow(QMainWindow):
                     continue
                 flow_key = _flow_key(observation)
                 previous = self._last_counters.get(flow_key)
-                self._append_observation(
-                    observation,
-                    packet_delta=_counter_delta(
-                        observation.packets,
-                        None if previous is None else previous[0],
-                    ),
-                    byte_delta=_counter_delta(
-                        observation.bytes_count,
-                        None if previous is None else previous[1],
+                rows.append(
+                    (
+                        observation,
+                        _counter_delta(
+                            observation.packets,
+                            None if previous is None else previous[0],
+                        ),
+                        _counter_delta(
+                            observation.bytes_count,
+                            None if previous is None else previous[1],
+                        ),
+                        None,
                     ),
                 )
                 next_counters[flow_key] = (observation.packets, observation.bytes_count)
+
+        self.result_table.setUpdatesEnabled(False)
+        try:
+            self.result_table.setRowCount(0)
+            for observation, packet_delta, byte_delta, lifecycle_status in rows[
+                :_MAX_VISIBLE_RESULT_ROWS
+            ]:
+                self._append_observation(
+                    observation,
+                    packet_delta=packet_delta,
+                    byte_delta=byte_delta,
+                    lifecycle_status=lifecycle_status,
+                )
+        finally:
+            self.result_table.setUpdatesEnabled(True)
+            self.result_table.viewport().update()
         self._last_counters = next_counters if self._monitoring else {}
         used_mm = getattr(outcome, "used_mm", None) or "-"
         controllers = ", ".join(getattr(outcome, "controllers", ())) or "-"
         self.context_label.setText(
             f"MM: {used_mm}   |   조회 MD: {controllers}   |   "
-            f"현재 일치: {len(observations)}   |   표시: {self.result_table.rowCount()}"
+            f"현재 일치: {len(observations)}   |   "
+            f"화면 표시: {self.result_table.rowCount()}/{len(rows)}"
         )
         self.diagnostics_list.clear()
         for event in getattr(outcome, "diagnostics", ()):
@@ -1368,36 +1656,51 @@ class MainWindow(QMainWindow):
             self.diagnostics_list.addItem(
                 f"[{getattr(event, 'stage', '-')}] {code_text}: {getattr(event, 'message', '')}"
             )
-        raw_snapshots = getattr(outcome, "raw_snapshots", ())
-        if raw_snapshots:
-            raw_text = "\n\n".join(
-                str(getattr(snapshot, "output", snapshot)) for snapshot in raw_snapshots
+        if len(rows) > _MAX_VISIBLE_RESULT_ROWS:
+            self.diagnostics_list.addItem(
+                "[UI] DISPLAY_LIMIT: 화면에는 처음 2,000행만 표시했습니다. "
+                "전체 결과는 저장된 기록 또는 내보내기에서 확인하십시오."
             )
-            self.raw_view.setPlainText(raw_text)
+        self.raw_view.setPlainText("결과 행을 선택하면 해당 Raw 행을 표시합니다.")
+
+        retry_after = _nonnegative_float(getattr(outcome, "retry_after_seconds", 0))
+        transient_failures = _nonnegative_int(getattr(outcome, "consecutive_transient_failures", 0))
+        self._next_monitor_delay_seconds = (
+            retry_after if retry_after > 0 else float(self.session_interval.value())
+        )
         fatal_code = _fatal_diagnostic_code(outcome)
         if bool(getattr(outcome, "cancelled", False)):
-            self.state_label.setText("중지됨")
+            self._set_state("대기")
         elif fatal_code is not None:
             if self._monitoring:
                 self._cancel_active_work()
-            state = {
-                "AUTH_FAILED": "인증 실패",
-                "HOST_KEY_CHANGED": "호스트 키 변경 감지",
-                "HOST_KEY_UNKNOWN": "호스트 키 승인 안 됨",
-                "PROMPT_PARSE_FAILED": "프롬프트 확인 실패",
-            }.get(fatal_code, "접속 실패")
-            self.state_label.setText(state)
+            reason = {
+                "AUTH_FAILED": "인증 확인",
+                "HOST_KEY_CHANGED": "호스트 키 확인",
+                "HOST_KEY_UNKNOWN": "호스트 키 승인 필요",
+                "PROMPT_PARSE_FAILED": "장비 응답 확인",
+                "COMMAND_REJECTED": "명령 권한 확인",
+                "COMMAND_VARIANT_UNVERIFIED": "장비 명령 변형 확인",
+                "DB_WRITE_FAILED": "로컬 기록 저장 확인",
+                "STORAGE_LOW_SPACE": "저장 공간 확인",
+            }.get(fatal_code, "연결 확인")
+            self._set_state("확인 필요")
+            self.statusBar().showMessage(
+                f"{reason}: 진단 이벤트의 안전한 오류 코드를 확인해 주세요.", 10000
+            )
             if fatal_code != "HOST_KEY_UNKNOWN":
                 QMessageBox.warning(
                     self,
                     "조회 중단",
-                    f"{state}: 진단 이벤트에서 안전한 오류 코드를 확인하십시오.",
+                    f"{reason}: 진단 이벤트에서 안전한 오류 코드를 확인하십시오.",
                 )
+        elif self._monitoring and transient_failures > 0:
+            self._set_state("재시도 중")
         elif authoritative:
-            self.state_label.setText("모니터링" if self._monitoring else "완료")
+            self._set_state("정상")
         else:
-            self.state_label.setText("확인 불가 · 진단 확인")
-        self._refresh_history()
+            self._set_state("확인 필요")
+        self._mark_history_dirty()
 
     def _append_observation(
         self,
@@ -1434,26 +1737,31 @@ class MainWindow(QMainWindow):
         )
         for column, value in enumerate(values):
             item = QTableWidgetItem(value)
-            item.setData(_raw_data_role(), observation.raw_line)
+            if column == 0:
+                item.setData(_raw_data_role(), observation.raw_line)
             if column in (13, 14):
                 item.setForeground(_severity_color(severity.name))
             self.result_table.setItem(row, column, item)
 
     @Slot()
     def _show_selected_raw(self) -> None:
-        items = self.result_table.selectedItems()
-        if not items:
+        row = self.result_table.currentRow()
+        if row < 0:
             return
-        raw = items[0].data(_raw_data_role())
+        item = self.result_table.item(row, 0)
+        raw = item.data(_raw_data_role()) if item is not None else ""
         self.raw_view.setPlainText(str(raw or ""))
 
     @Slot(object)
     def _display_failure(self, exc: Exception) -> None:
         code, message = _safe_query_failure(exc)
         self._cancel_active_work()
+        self.diagnostics_list.clear()
         self.diagnostics_list.addItem(f"[{code}] {message}")
-        self.state_label.setText("중지됨" if code == ErrorCode.CANCELLED.value else "실패")
+        self._set_state("대기" if code == ErrorCode.CANCELLED.value else "확인 필요")
         if code != ErrorCode.CANCELLED.value:
+            self.raw_diagnostics_toggle.setChecked(True)
+            self.details.setCurrentWidget(self.diagnostics_list)
             QMessageBox.warning(self, "조회 실패", f"{code}: {message}")
 
     @Slot(int)
@@ -1468,17 +1776,25 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
         self._cancel_token = None
         if user_cancelled and not self._closing_requested:
-            self.state_label.setText("중지됨")
+            self._set_state("대기")
         if self._monitoring and not self._closing_requested:
-            self._monitor_timer.start()
+            interval_ms = max(1_000, round(self._next_monitor_delay_seconds * 1_000))
+            self._monitor_timer.start(interval_ms)
+        self._drain_preview_discard_queue()
+        if self._close_when_idle:
+            self._close_if_idle()
 
     def _set_busy(self, busy: bool) -> None:
         interactive = not self._closing_requested
-        self.query_button.setEnabled(interactive and not busy and not self._monitoring)
-        self.stop_button.setEnabled(interactive and (busy or self._monitoring))
+        available = interactive and not self._storage_task_running
+        self.query_button.setEnabled(available and not busy and not self._monitoring)
+        self.stop_button.setEnabled(available and (busy or self._monitoring))
         if not self._monitoring:
-            self.monitor_button.setEnabled(interactive and not busy)
-        history_mutable = interactive and not busy and not self._monitoring
+            self.monitor_button.setEnabled(available and not busy)
+        history_mutable = (
+            available and not busy and not self._monitoring and not self._history_task_running
+        )
+        self.refresh_history_button.setEnabled(history_mutable)
         self.export_button.setEnabled(history_mutable)
         self.html_export_button.setEnabled(history_mutable)
         self.delete_button.setEnabled(history_mutable)
@@ -1488,6 +1804,8 @@ class MainWindow(QMainWindow):
         for widget in (
             self.connection_group,
             self.query_group,
+            self.advanced_toggle_button,
+            self.advanced_panel,
             self.mm_group,
             self.md_group,
             self.timing_group,
@@ -1504,14 +1822,86 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _refresh_history(self) -> None:
-        try:
-            runs = self._store.list_runs(limit=100)
-        except Exception:
+        if self._closing_requested or self._history_task_running or self._storage_task_running:
+            return
+        self._history_task_generation += 1
+        generation = self._history_task_generation
+        context = (self._selected_run_id(), self._history_revision)
+        task = _StorageTask(
+            generation,
+            "history-list",
+            lambda: tuple(self._store.list_runs(limit=100)),
+            context,
+        )
+        self._history_task_running = True
+        self._current_history_task = task
+        task.signals.succeeded.connect(self._history_task_succeeded)
+        task.signals.failed.connect(self._history_task_failed)
+        self._set_busy(self._query_running)
+        self._history_thread_pool.start(task)
+
+    def _mark_history_dirty(self) -> None:
+        self._history_revision += 1
+        self._history_dirty = True
+
+    def _finish_history_task(self, generation: int, kind: str) -> _StorageTask | None:
+        task = self._current_history_task
+        if task is None or task.generation != generation or task.kind != kind:
+            return None
+        self._history_task_running = False
+        self._current_history_task = None
+        self._set_busy(self._query_running)
+        return task
+
+    @Slot(int, str, object)
+    def _history_task_succeeded(self, generation: int, kind: str, result: object) -> None:
+        task = self._finish_history_task(generation, kind)
+        if task is None:
+            return
+        if self._closing_requested:
+            self._drain_preview_discard_queue()
+            self._close_if_idle()
+            return
+        if not isinstance(result, tuple):
+            self._history_dirty = True
             self.statusBar().showMessage(
                 "기록 읽기 실패: 로컬 기록을 안전하게 읽지 못했습니다.", 5000
             )
+            self._drain_preview_discard_queue()
+            self._close_if_idle()
             return
+        selected_run_id: str | None = None
+        requested_revision = -1
+        if isinstance(task.context, tuple) and len(task.context) == 2:
+            selected_value, revision_value = task.context
+            if isinstance(selected_value, str):
+                selected_run_id = selected_value
+            if isinstance(revision_value, int):
+                requested_revision = revision_value
+        self._render_history(result, selected_run_id)
+        self._history_dirty = requested_revision != self._history_revision
+        self._drain_preview_discard_queue()
+        self._close_if_idle()
+
+    @Slot(int, str, object)
+    def _history_task_failed(self, generation: int, kind: str, _exc: object) -> None:
+        if self._finish_history_task(generation, kind) is None:
+            return
+        self._history_dirty = True
+        if not self._closing_requested:
+            self.statusBar().showMessage(
+                "기록 읽기 실패: 로컬 기록을 안전하게 읽지 못했습니다.", 5000
+            )
+        self._drain_preview_discard_queue()
+        self._close_if_idle()
+
+    def _render_history(
+        self,
+        runs: tuple[object, ...],
+        selected_run_id: str | None,
+    ) -> None:
         self.history_table.setRowCount(0)
+        selected_row = -1
         for run in runs:
             row = self.history_table.rowCount()
             self.history_table.insertRow(row)
@@ -1533,6 +1923,10 @@ class MainWindow(QMainWindow):
                 )
             for column, value in enumerate(values):
                 self.history_table.setItem(row, column, QTableWidgetItem(value))
+            if values[0] == selected_run_id:
+                selected_row = row
+        if selected_row >= 0:
+            self.history_table.selectRow(selected_row)
 
     @Slot()
     def _export_selected_run(self) -> None:
@@ -1549,16 +1943,12 @@ class MainWindow(QMainWindow):
         )
         if not destination:
             return
-        try:
-            exported = self._store.export_run_csv(run_id, Path(destination))
-        except Exception:
-            QMessageBox.warning(
-                self,
-                "내보내기 실패",
-                "CSV 파일을 안전하게 내보내지 못했습니다.",
-            )
-            return
-        QMessageBox.information(self, "내보내기 완료", str(exported))
+        output_path = Path(destination)
+        self._start_storage_task(
+            "export-csv",
+            lambda: self._store.export_run_csv(run_id, output_path),
+            status="CSV 내보내기 중",
+        )
 
     @Slot()
     def _export_selected_run_html(self) -> None:
@@ -1575,72 +1965,202 @@ class MainWindow(QMainWindow):
         )
         if not destination:
             return
-        try:
-            exported = self._store.export_run_html(run_id, Path(destination))
-        except Exception:
-            QMessageBox.warning(
-                self,
-                "HTML 보고서 실패",
-                "HTML 보고서를 안전하게 만들지 못했습니다.",
-            )
-            return
-        QMessageBox.information(self, "HTML 보고서 완료", str(exported))
+        output_path = Path(destination)
+        self._start_storage_task(
+            "export-html",
+            lambda: self._store.export_run_html(run_id, output_path),
+            status="HTML 보고서 만드는 중",
+        )
 
     def _delete_history(self, *, all_runs: bool) -> None:
         run_id = None if all_runs else self._selected_run_id()
         if not all_runs and run_id is None:
             QMessageBox.information(self, "기록 삭제", "삭제할 실행 기록을 선택하십시오.")
             return
-        try:
-            preview = self._store.preview_delete(run_id)
-        except Exception:
-            QMessageBox.warning(
-                self,
-                "삭제 준비 실패",
-                "삭제 대상을 안전하게 확인하지 못했습니다.",
-            )
+        self._start_storage_task(
+            "delete-preview",
+            lambda: self._store.preview_delete(run_id),
+            status="삭제 대상 확인 중",
+        )
+
+    def _start_storage_task(
+        self,
+        kind: str,
+        operation: Callable[[], object],
+        *,
+        status: str,
+        context: object | None = None,
+        allow_while_closing: bool = False,
+    ) -> bool:
+        if (
+            self._storage_task_running
+            or self._history_task_running
+            or self._query_running
+            or self._monitoring
+        ):
+            return False
+        if self._closing_requested and not allow_while_closing:
+            return False
+        self._storage_task_generation += 1
+        generation = self._storage_task_generation
+        task = _StorageTask(generation, kind, operation, context)
+        self._storage_task_running = True
+        self._current_storage_task = task
+        task.signals.succeeded.connect(self._storage_task_succeeded)
+        task.signals.failed.connect(self._storage_task_failed)
+        self._set_busy(self._query_running)
+        self.statusBar().showMessage(status)
+        self._thread_pool.start(task)
+        return True
+
+    @Slot(int, bool)
+    def _show_storage_warning(self, generation: int, hard_stop: bool) -> None:
+        if not self._owns_task(generation) or self._closing_requested:
             return
-        run_count = len(getattr(preview, "run_ids", ()))
+        message = (
+            "저장 공간이 매우 부족합니다. 오래된 기록을 정리한 뒤 다시 시도하세요."
+            if hard_stop
+            else "저장 공간이 부족해지고 있습니다. 오래된 기록을 정리해 주세요."
+        )
+        self.statusBar().showMessage(message, 15000)
+
+    def _finish_storage_task(self, generation: int, kind: str) -> _StorageTask | None:
+        task = self._current_storage_task
+        if task is None or task.generation != generation or task.kind != kind:
+            return None
+        self._storage_task_running = False
+        self._current_storage_task = None
+        self._set_busy(self._query_running)
+        return task
+
+    def _queue_preview_discard(self, preview: DeletePreview) -> None:
+        if preview not in self._pending_preview_discards:
+            self._pending_preview_discards.append(preview)
+
+    def _drain_preview_discard_queue(self) -> bool:
+        if not self._pending_preview_discards:
+            return False
+        preview = self._pending_preview_discards[0]
+        started = self._start_storage_task(
+            "delete-discard",
+            lambda: self._store.discard_delete_preview(preview),
+            status="삭제 확인 정리 중",
+            context=preview,
+            allow_while_closing=True,
+        )
+        if started:
+            self._pending_preview_discards.pop(0)
+        return started
+
+    @Slot(int, str, object)
+    def _storage_task_succeeded(self, generation: int, kind: str, result: object) -> None:
+        task = self._finish_storage_task(generation, kind)
+        if task is None:
+            return
+        if kind == "delete-preview":
+            if not isinstance(result, DeletePreview):
+                self._show_storage_failure(kind)
+                self._close_if_idle()
+                return
+            if self._closing_requested:
+                self._queue_preview_discard(result)
+                self._drain_preview_discard_queue()
+                self._close_if_idle()
+                return
+            self._confirm_delete_preview(result)
+            return
+        if kind == "delete-commit":
+            self._mark_history_dirty()
+            self.statusBar().showMessage("선택한 기록을 삭제했습니다.", 5000)
+            if not self._closing_requested:
+                self._refresh_history()
+        elif kind == "delete-discard":
+            if not self._closing_requested:
+                self.statusBar().showMessage("삭제를 취소했습니다.", 3000)
+        elif kind == "export-csv":
+            self.statusBar().showMessage("CSV 내보내기를 완료했습니다.", 5000)
+            if not self._closing_requested:
+                QMessageBox.information(self, "내보내기 완료", str(result))
+        elif kind == "export-html":
+            self.statusBar().showMessage("HTML 보고서를 만들었습니다.", 5000)
+            if not self._closing_requested:
+                QMessageBox.information(self, "HTML 보고서 완료", str(result))
+        self._drain_preview_discard_queue()
+        self._close_if_idle()
+
+    def _confirm_delete_preview(self, preview: DeletePreview) -> None:
         answer = QMessageBox.warning(
             self,
             "기록 삭제 확인",
-            f"실행: {run_count}건\n"
-            f"DB 행: {getattr(preview, 'database_rows', 0)}개\n"
-            f"Raw TXT: {getattr(preview, 'raw_files', 0)}개\n"
-            f"관리 내보내기(CSV/HTML): {getattr(preview, 'export_files', 0)}개\n"
-            f"파일 크기: {_display_bytes(int(getattr(preview, 'total_file_bytes', 0)))}\n\n"
+            f"실행: {len(preview.run_ids)}건\n"
+            f"DB 행: {preview.database_rows}개\n"
+            f"Raw TXT: {preview.raw_files}개\n"
+            f"관리 내보내기(CSV/HTML): {preview.export_files}개\n"
+            f"파일 크기: {_display_bytes(preview.total_file_bytes)}\n\n"
             "위 대상을 영구 삭제합니다. 계속하시겠습니까?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            self._store.delete(preview, confirmation_token=preview.confirmation_token)
-        except Exception:
-            QMessageBox.warning(
-                self,
-                "삭제 실패",
-                "확인된 기록을 안전하게 삭제하지 못했습니다.",
+        if answer == QMessageBox.StandardButton.Yes:
+            started = self._start_storage_task(
+                "delete-commit",
+                lambda: self._store.delete(
+                    preview,
+                    confirmation_token=preview.confirmation_token,
+                ),
+                status="기록 삭제 중",
+                context=preview,
             )
+            if not started:
+                self._queue_preview_discard(preview)
+                self._drain_preview_discard_queue()
             return
-        self._refresh_history()
-        self.statusBar().showMessage("선택한 기록을 삭제했습니다.", 5000)
+        self._queue_preview_discard(preview)
+        self._drain_preview_discard_queue()
+
+    @Slot(int, str, object)
+    def _storage_task_failed(self, generation: int, kind: str, _exc: object) -> None:
+        task = self._finish_storage_task(generation, kind)
+        if task is None:
+            return
+        if kind == "delete-commit" and isinstance(task.context, DeletePreview):
+            self._queue_preview_discard(task.context)
+        self._show_storage_failure(kind)
+        self._drain_preview_discard_queue()
+        self._close_if_idle()
+
+    def _show_storage_failure(self, kind: str) -> None:
+        if kind == "delete-discard":
+            self.statusBar().showMessage("삭제 취소 상태를 정리하지 못했습니다.", 5000)
+            return
+        title, message = {
+            "export-csv": ("내보내기 실패", "CSV 파일을 안전하게 내보내지 못했습니다."),
+            "export-html": ("HTML 보고서 실패", "HTML 보고서를 안전하게 만들지 못했습니다."),
+            "delete-preview": ("삭제 준비 실패", "삭제 대상을 안전하게 확인하지 못했습니다."),
+            "delete-commit": ("삭제 실패", "확인된 기록을 안전하게 삭제하지 못했습니다."),
+        }.get(kind, ("작업 실패", "로컬 파일 작업을 안전하게 마치지 못했습니다."))
+        self.statusBar().showMessage(message, 5000)
+        if not self._closing_requested:
+            QMessageBox.warning(self, title, message)
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
             """
-            QMainWindow { background: #f4f6f8; }
-            QGroupBox { font-weight: 600; border: 1px solid #c8d0d8; border-radius: 5px;
-                        margin-top: 8px; padding-top: 10px; background: white; }
+            QMainWindow { background: palette(window); color: palette(window-text); }
+            #setupGuide { background: palette(alternate-base); border: 1px solid palette(mid);
+                          border-radius: 4px; }
+            QGroupBox { font-weight: 600; border: 1px solid palette(mid); border-radius: 5px;
+                        margin-top: 8px; padding-top: 10px; background: palette(window); }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
             QPushButton { min-height: 30px; padding: 0 14px; }
-            QPushButton:default { background: #1769aa; color: white; }
+            QPushButton:default { background: palette(highlight);
+                                  color: palette(highlighted-text); }
             QLineEdit, QSpinBox, QTableWidget, QPlainTextEdit, QListWidget {
-                background: white; border: 1px solid #b8c2cc; border-radius: 3px;
+                background: palette(base); color: palette(text);
+                border: 1px solid palette(mid); border-radius: 3px;
             }
-            #stateLabel { font-weight: 700; color: #174a72; padding: 6px 12px;
-                          background: #e4f1fb; border-radius: 4px; }
+            #stateLabel { font-weight: 700; color: palette(window-text); padding: 6px 12px;
+                          background: palette(alternate-base); border-radius: 4px; }
             """
         )
         font = QFont("Malgun Gothic", 9)
@@ -1650,17 +2170,35 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._closing_requested = True
-        self._cancel_active_work(status="중지 요청", user_requested=True)
+        self._close_when_idle = True
+        self._cancel_active_work(user_requested=True)
         self._approval.shutdown()
-        if self._query_running:
-            QMessageBox.information(
-                self,
-                "종료 대기",
-                "진행 중인 SSH 작업을 취소했습니다. 정리 후 다시 종료하십시오.",
-            )
+        self._drain_preview_discard_queue()
+        if (
+            self._query_running
+            or self._storage_task_running
+            or self._history_task_running
+            or self._pending_preview_discards
+        ):
+            self._set_state("확인 필요")
+            self.statusBar().showMessage("진행 중인 작업을 안전하게 정리한 뒤 종료합니다.")
             event.ignore()
             return
         event.accept()
+
+    def _close_if_idle(self) -> None:
+        if not self._close_when_idle:
+            return
+        if self._pending_preview_discards:
+            self._drain_preview_discard_queue()
+        if (
+            self._query_running
+            or self._storage_task_running
+            or self._history_task_running
+            or self._pending_preview_discards
+        ):
+            return
+        QTimer.singleShot(0, self.close)
 
 
 def _optional_port(text: str, label: str) -> int | None:
@@ -1681,6 +2219,8 @@ def _safe_query_failure(exc: Exception) -> tuple[str, str]:
     if isinstance(exc, CollectorError) and isinstance(raw_code, str) and raw_code in known_codes:
         return raw_code, str(exc) or "안전하게 처리할 수 없는 조회 오류가 발생했습니다."
     if isinstance(exc, StorageError):
+        if raw_code == ErrorCode.STORAGE_LOW_SPACE.value:
+            return raw_code, "저장 공간이 부족합니다. 오래된 기록을 정리한 뒤 다시 시도하십시오."
         return ErrorCode.DB_WRITE_FAILED.value, "로컬 조회 기록을 안전하게 저장하지 못했습니다."
     return (
         "UNEXPECTED",
@@ -1754,16 +2294,39 @@ def _lifecycle_status(
 def _fatal_diagnostic_code(outcome: object) -> str | None:
     fatal = {
         "AUTH_FAILED",
+        "COMMAND_REJECTED",
+        "COMMAND_VARIANT_UNVERIFIED",
+        "CURRENT_SWITCH_AMBIGUOUS",
+        "CURRENT_SWITCH_UNMAPPED",
+        "DB_WRITE_FAILED",
         "HOST_KEY_CHANGED",
         "HOST_KEY_UNKNOWN",
         "MM_UNREACHABLE",
+        "OUTPUT_LIMIT_EXCEEDED",
         "PROMPT_PARSE_FAILED",
+        "STORAGE_LOW_SPACE",
     }
     for diagnostic in getattr(outcome, "diagnostics", ()):
+        if bool(getattr(diagnostic, "transient", False)) or bool(
+            getattr(diagnostic, "recovered", False)
+        ):
+            continue
         code = getattr(getattr(diagnostic, "code", None), "value", None)
         if code in fatal:
             return str(code)
     return None
+
+
+def _nonnegative_float(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return max(0.0, float(value))
+
+
+def _nonnegative_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(0, value)
 
 
 def _display_bytes(value: int) -> str:

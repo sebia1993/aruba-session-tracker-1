@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from contextlib import AbstractContextManager
 from pathlib import Path
-from threading import Barrier, Thread
+from threading import Barrier, Event, Thread
 from types import TracebackType
 from typing import Self
 
@@ -17,10 +17,14 @@ from aruba_session_tracker.collectors import (
     CollectorError,
     CommandConnection,
     HostKeyInfo,
+    PollDeadline,
     SSHCollector,
     StrictNetmikoFactory,
 )
-from aruba_session_tracker.collectors.ssh import _known_hosts_file_lock
+from aruba_session_tracker.collectors.ssh import (
+    _known_hosts_file_lock,
+    _NetmikoConnectionManager,
+)
 from aruba_session_tracker.models import Credentials, DeviceTarget, ErrorCode
 
 
@@ -133,6 +137,165 @@ def test_cancellation_wins_over_timeout_and_cleanup_failure() -> None:
 
     assert caught.value.code is ErrorCode.CANCELLED
     assert connection.closed is True
+
+
+def test_expired_poll_deadline_fails_before_opening_connection() -> None:
+    connection = FakeConnection({"no paging": ""})
+    factory = FakeFactory(connection)
+
+    with pytest.raises(CollectorError) as caught:
+        SSHCollector(factory).collect(
+            TARGET,
+            CREDENTIALS,
+            ("no paging",),
+            deadline=PollDeadline(1.0, lambda: 1.0),
+        )
+
+    assert caught.value.code is ErrorCode.POLL_DEADLINE_EXCEEDED
+    assert caught.value.retryable_network is True
+    assert factory.connect_count == 0
+
+
+def test_command_timeout_at_poll_deadline_uses_deadline_error_code() -> None:
+    now = [0.0]
+
+    class DeadlineTimeout(FakeConnection):
+        def send_command(self, command: str, *, read_timeout: float) -> str:
+            del command, read_timeout
+            now[0] = 5.0
+            raise TimeoutError("fixture command timeout")
+
+    with pytest.raises(CollectorError) as caught:
+        SSHCollector(FakeFactory(DeadlineTimeout({"no paging": ""}))).collect(
+            TARGET,
+            CREDENTIALS,
+            ("no paging",),
+            deadline=PollDeadline(5.0, lambda: now[0]),
+        )
+
+    assert caught.value.code is ErrorCode.POLL_DEADLINE_EXCEEDED
+    assert caught.value.retryable_network is True
+
+
+def test_cancellation_callback_is_idempotent() -> None:
+    token = CancellationToken()
+    callback_calls = 0
+
+    def callback() -> None:
+        nonlocal callback_calls
+        callback_calls += 1
+
+    with token.abort_on_cancel(callback):
+        token.cancel()
+        token.cancel()
+
+    assert callback_calls == 1
+
+
+def test_cancellation_callback_aborts_a_blocked_netmiko_transport() -> None:
+    entered = Event()
+    channel_closed = Event()
+
+    class BlockingNetmiko:
+        remote_conn = None
+        remote_conn_pre = None
+
+        def __init__(self) -> None:
+            self.remote_conn = self
+
+        def send_command(self, *_args: object, **_kwargs: object) -> str:
+            entered.set()
+            assert channel_closed.wait(timeout=5)
+            raise OSError("fixture transport aborted")
+
+        def close(self) -> None:
+            channel_closed.set()
+
+        def disconnect(self) -> None:
+            channel_closed.set()
+
+    connection = BlockingNetmiko()
+    manager = _NetmikoConnectionManager(connection)
+
+    class ManagerFactory:
+        def connect(self, *_args: object, **_kwargs: object) -> _NetmikoConnectionManager:
+            return manager
+
+    token = CancellationToken()
+    failures: list[CollectorError] = []
+
+    def collect() -> None:
+        try:
+            SSHCollector(ManagerFactory()).collect(
+                TARGET,
+                CREDENTIALS,
+                ("no paging",),
+                cancel_token=token,
+            )
+        except CollectorError as exc:
+            failures.append(exc)
+
+    worker = Thread(target=collect)
+    worker.start()
+    assert entered.wait(timeout=5)
+    token.cancel()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert channel_closed.is_set()
+    assert [failure.code for failure in failures] == [ErrorCode.CANCELLED]
+
+
+def test_cancellation_callback_remains_active_during_ssh_teardown() -> None:
+    disconnect_started = Event()
+    channel_closed = Event()
+
+    class BlockingDisconnect:
+        remote_conn = None
+        remote_conn_pre = None
+
+        def __init__(self) -> None:
+            self.remote_conn = self
+
+        def send_command(self, *_args: object, **_kwargs: object) -> str:
+            return ""
+
+        def disconnect(self) -> None:
+            disconnect_started.set()
+            assert channel_closed.wait(timeout=5)
+
+        def close(self) -> None:
+            channel_closed.set()
+
+    manager = _NetmikoConnectionManager(BlockingDisconnect())
+
+    class ManagerFactory:
+        def connect(self, *_args: object, **_kwargs: object) -> _NetmikoConnectionManager:
+            return manager
+
+    token = CancellationToken()
+    failures: list[CollectorError] = []
+
+    def collect() -> None:
+        try:
+            SSHCollector(ManagerFactory()).collect(
+                TARGET,
+                CREDENTIALS,
+                ("no paging",),
+                cancel_token=token,
+            )
+        except CollectorError as exc:
+            failures.append(exc)
+
+    worker = Thread(target=collect)
+    worker.start()
+    assert disconnect_started.wait(timeout=5)
+    token.cancel()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert channel_closed.is_set()
+    assert [failure.code for failure in failures] == [ErrorCode.CANCELLED]
 
 
 def test_cancellation_does_not_hide_an_authentication_failure() -> None:

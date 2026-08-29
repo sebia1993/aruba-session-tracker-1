@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from ipaddress import IPv4Address
 
-from aruba_session_tracker.models import SessionObservation
+from aruba_session_tracker.models import ErrorCode, SessionObservation
 
 from .common import ParseError, reject_command_errors
 
@@ -21,6 +21,7 @@ def parse_datapath_sessions(
     *,
     controller_name: str,
     controller_host: str,
+    max_observations: int | None = None,
 ) -> tuple[SessionObservation, ...]:
     """Parse standard AOS 8 IPv4 session rows without column guessing."""
 
@@ -56,6 +57,11 @@ def parse_datapath_sessions(
             raise ParseError(f"Truncated datapath row ({len(fields)} fields).")
         if not _is_ipv4(fields[1]):
             raise ParseError("Datapath destination is not an IPv4 address.")
+        if max_observations is not None and len(observations) >= max_observations:
+            raise ParseError(
+                "Datapath session observation limit exceeded.",
+                code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+            )
         observations.append(
             _parse_row(
                 fields,

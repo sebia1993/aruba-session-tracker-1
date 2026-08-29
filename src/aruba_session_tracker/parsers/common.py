@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import re
 
+from aruba_session_tracker.models import ErrorCode
+
 
 class ParseError(ValueError):
     """Raised when device output cannot be interpreted without guessing."""
+
+    def __init__(self, message: str, *, code: ErrorCode | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 _COMMAND_ERROR_PATTERNS = (

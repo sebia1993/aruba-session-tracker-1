@@ -16,12 +16,6 @@ from aruba_session_tracker.parsers.flags import interpret_flags, overall_flag_se
 
 ReportRow = dict[str, object]
 
-HTML_OBSERVATION_LIMIT = 2_000
-HTML_LIFECYCLE_LIMIT = 1_000
-HTML_CONTROLLER_LIMIT = 500
-HTML_DIAGNOSTIC_LIMIT = 500
-HTML_RAW_FILE_LIMIT = 500
-
 _IPV4_TEXT = re.compile(r"(?<![0-9.])(?:\d{1,3}\.){3}\d{1,3}(?![0-9.])")
 _CREDENTIAL_TEXT = re.compile(
     r"(?i)\b(username|user|password|passwd|secret|token)\s*[:=]\s*([^\s,;]+)"
@@ -72,6 +66,7 @@ class RunReportSnapshot:
     raw_files: tuple[ReportRow, ...]
     raw_file_total: int
     raw_byte_total: int
+    observation_history: tuple[ReportRow, ...] = ()
 
 
 def render_html_report(snapshot: RunReportSnapshot) -> str:
@@ -89,6 +84,8 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
         severity_counts[overall_flag_severity(str(row.get("flags") or "")).value] += 1
 
     observation_rows = "".join(_observation_row(row) for row in snapshot.observations)
+    observation_history = snapshot.observation_history or snapshot.observations
+    observation_history_rows = "".join(_observation_row(row) for row in observation_history)
     lifecycle_rows = "".join(_lifecycle_row(row) for row in snapshot.lifecycle_events)
     controller_rows = "".join(_controller_row(row) for row in snapshot.controller_events)
     diagnostic_rows = "".join(_diagnostic_row(row) for row in snapshot.diagnostics)
@@ -165,7 +162,7 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
   <div class="layout">
     <nav aria-label="문서 목차"><strong>목차</strong>
       <a href="#summary">Executive Summary</a><a href="#environment">환경·조회 조건</a>
-      <a href="#flow">조회 흐름</a><a href="#sessions">세션 결과</a>
+      <a href="#flow">조회 흐름</a><a href="#sessions">세션 결과</a><a href="#observation-history">전체 관측 이력</a>
       <a href="#lifecycle">수명주기</a><a href="#diagnostics">진단·검증</a>
       <a href="#evidence">수집 증거</a><a href="#troubleshooting">Troubleshooting</a>
       <a href="#quick-reference">Quick Reference</a><a href="#warnings">Warning</a>
@@ -204,6 +201,11 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
         <p>{_severity_badges(severity_counts)}</p>
         {_truncation("최신 고유 세션", len(snapshot.observations), snapshot.unique_session_total)}
         <div class="table-wrap" role="region" aria-label="최신 고유 세션 표" tabindex="0"><table><caption class="sr-only">최신 고유 세션</caption><thead><tr><th scope="col">마지막 관측</th><th scope="col">Controller</th><th scope="col">Protocol</th><th scope="col">Source</th><th scope="col">Destination</th><th scope="col">Packets</th><th scope="col">Bytes</th><th scope="col">Age</th><th scope="col">Flags 해석</th><th scope="col">CPU</th></tr></thead><tbody>{observation_rows or _empty_row(10, "관측된 세션이 없습니다.")}</tbody></table></div>
+      </section>
+      <section id="observation-history"><h2>전체 관측 이력</h2>
+        <p>화면 표시 행 수와 관계없이 이 실행의 SQLite 관측 행을 시간순으로 모두 포함합니다. Raw CLI 본문과 Raw 파일 경로는 포함하지 않습니다.</p>
+        {_truncation("전체 관측 이력", len(observation_history), snapshot.observation_total)}
+        <div class="table-wrap" role="region" aria-label="전체 관측 이력 표" tabindex="0"><table><caption class="sr-only">전체 관측 이력</caption><thead><tr><th scope="col">관측 시각</th><th scope="col">Controller</th><th scope="col">Protocol</th><th scope="col">Source</th><th scope="col">Destination</th><th scope="col">Packets</th><th scope="col">Bytes</th><th scope="col">Age</th><th scope="col">Flags 해석</th><th scope="col">CPU</th></tr></thead><tbody>{observation_history_rows or _empty_row(10, "저장된 관측 이력이 없습니다.")}</tbody></table></div>
       </section>
       <section id="lifecycle"><h2>수명주기와 Controller 전환</h2>
         <p>{lifecycle_badges}</p>
