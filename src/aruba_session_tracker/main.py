@@ -23,6 +23,7 @@ from aruba_session_tracker.paths import AppPaths, UnsafeManagedPath
 from aruba_session_tracker.runtime import RuntimeExecutor
 from aruba_session_tracker.storage import SessionStore, StorageError
 from aruba_session_tracker.ui import DeveloperInspectorController, MainWindow
+from aruba_session_tracker.ui.theme import apply_main_window_theme
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -76,6 +77,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             executor,
             developer_inspector=developer_inspector,
         )
+        apply_main_window_theme(window)
         window.show()
         if options.gui_smoke_test:
             QTimer.singleShot(
