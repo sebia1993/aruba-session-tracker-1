@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import re
+from html.parser import HTMLParser
 from inspect import signature
 from pathlib import Path
 
@@ -195,12 +196,31 @@ def _element_start_tag(document: str, tag_name: str, element_id: str) -> str:
     return match.group(0)
 
 
+class _InlineScriptParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.scripts: list[str] = []
+        self._current: list[str] | None = None
+
+    def handle_starttag(self, tag: str, _attrs: list[tuple[str, str | None]]) -> None:
+        if tag.casefold() == "script":
+            self._current = []
+
+    def handle_data(self, data: str) -> None:
+        if self._current is not None:
+            self._current.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() == "script" and self._current is not None:
+            self.scripts.append("".join(self._current))
+            self._current = None
+
+
 def _inline_scripts(document: str) -> list[str]:
-    return re.findall(
-        r"<script(?:\s[^>]*)?>(?P<body>.*?)</script\s*>",
-        document,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
+    parser = _InlineScriptParser()
+    parser.feed(document)
+    parser.close()
+    return parser.scripts
 
 
 def test_report_is_concise_standalone_result_only_html5() -> None:
