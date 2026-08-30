@@ -197,7 +197,7 @@ def _element_start_tag(document: str, tag_name: str, element_id: str) -> str:
 
 def _inline_scripts(document: str) -> list[str]:
     return re.findall(
-        r"<script(?:\s[^>]*)?>(?P<body>.*?)</script>",
+        r"<script(?:\s[^>]*)?>(?P<body>.*?)</script\s*>",
         document,
         flags=re.DOTALL | re.IGNORECASE,
     )
@@ -252,6 +252,10 @@ def test_report_is_concise_standalone_result_only_html5() -> None:
     assert 'role="region" aria-label="최신 세션 결과 표" tabindex="0"' in document
     assert 'role="region" aria-label="전체 추적 이력 표" tabindex="0"' in document
     assert document.count('<th scope="col">') == 12
+
+
+def test_inline_script_test_parser_accepts_html_whitespace_before_closing_bracket() -> None:
+    assert _inline_scripts("<script>safe()</script >") == ["safe()"]
 
 
 def test_filter_uses_one_exactly_hash_authorized_inline_script() -> None:
