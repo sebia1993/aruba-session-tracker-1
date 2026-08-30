@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- 이동형 `continuous` 사전릴리스의 별도 게시 runner에도 고정 runtime lock과
+  `pip check`를 적용해 검증 도구가 `paramiko` 누락으로 중단되지 않도록 수정.
+
 ## 0.5.1 - 2026-08-30
 
 - Versioned release 게시 작업에도 고정 runtime 검증 의존성을 설치하고

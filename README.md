@@ -52,7 +52,8 @@ GitHub 기본 토큰에 없는 과거 워크플로 수정 권한을 요구하지
 태그 릴리스는 자동화가 기존 릴리스 덮어쓰기를 거부하는 1회성
 사전릴리스입니다. 공개 자산은 Windows x64 ZIP 하나이며 SHA-256은 릴리스
 본문에, CycloneDX SBOM은 ZIP 내부 `ArubaSessionTracker/sbom.cdx.json`에
-포함됩니다.
+포함됩니다. 두 게시 runner 모두 고정 runtime lock 설치와 `pip check`를
+통과한 뒤 검증 도구를 실행합니다.
 
 ### 소스 실행
 
