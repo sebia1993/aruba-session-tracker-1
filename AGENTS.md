@@ -94,6 +94,11 @@ datapath session rows from the relevant 7240XM managed device.
   value or enters an exact value and presses Enter. Filters apply only to
   presentation, never remove an observation row from the document, are never
   persisted, and must reset whenever the report is reopened.
+- Keep the report summary ordered as query source IP:port, direction, query
+  destination IP:port, run status, and four core cards: start, end, total
+  observations, and unique sessions. Protocol and device distributions may use
+  only the same latest logical flows shown in the latest-results table, are
+  limited to five values each, and must be hidden from filtered print output.
 - Build autocomplete candidates from one full-history reverse index. Partial
   keystrokes may search only the cached unique candidate set, must discard any
   stale active option immediately, and must not rescan the report DOM. Touch
@@ -134,6 +139,9 @@ datapath session rows from the relevant 7240XM managed device.
 - Preserve the labels `지속 모니터링 시작`, `현재 조회`, `고급 조건 보기/숨기기`,
   and `상세 정보 보기/숨기기`. Operator state must be one of only `대기`,
   `조회 중`, `정상`, `재시도 중`, or `확인 필요`.
+- Desktop presentation changes must not replace Qt widgets or Inspector IDs.
+  Keep role-aware keyboard focus visible, retain clickable scrollbar line
+  controls, and use native palette roles for high-contrast scrollbars.
 
 ## Release
 

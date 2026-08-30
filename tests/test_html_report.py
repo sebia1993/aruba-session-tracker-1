@@ -16,6 +16,20 @@ from aruba_session_tracker.storage import (
 )
 
 
+def _html_contrast_ratio(foreground: str, background: str) -> float:
+    def luminance(value: str) -> float:
+        channels = tuple(int(value[index : index + 2], 16) / 255 for index in (1, 3, 5))
+
+        def linear(channel: float) -> float:
+            return channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4
+
+        red, green, blue = (linear(channel) for channel in channels)
+        return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+    lighter, darker = sorted((luminance(foreground), luminance(background)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
 def _observation(
     *,
     observed_at: str = "2026-08-28T08:01:00.000Z",
@@ -475,10 +489,93 @@ def test_report_renders_kst_with_utc_date_rollover_and_missing_values_as_dash() 
     assert "2026-08-29 01:05:00 KST" in document
     assert "2026-08-28T16:00:00.000Z" not in document
     assert "2026-08-28T16:05:00+00:00" not in document
-    assert '<div class="label">수집 상태</div><span class="value">일부 수집</span>' in document
-    assert '<div class="label">출발지 IP</div><span class="value">-</span>' in document
-    assert '<div class="label">목적지 포트</div><span class="value">-</span>' in document
+    assert '<div class="run-state">일부 수집</div>' in document
+    assert '<span class="endpoint-label">조회 출발지</span>' in document
+    assert '<span class="endpoint-label">조회 목적지</span>' in document
+    assert document.count('<span class="endpoint-value">-</span>') == 2
     assert "PARTIAL" not in document
+
+
+def test_summary_prioritizes_query_flow_and_keeps_only_four_core_cards() -> None:
+    document = render_html_report(_snapshot())
+
+    assert '<span class="endpoint-value">192.0.2.100:53000</span>' in document
+    assert '<span class="endpoint-value">203.0.113.80:443</span>' in document
+    assert '<div class="direction" aria-label="양방향 검색">' in document
+    assert '<span class="direction-arrow" aria-hidden="true">↔</span>' in document
+    assert '<div class="run-state">수집 완료</div>' in document
+    assert document.count('<div class="card">') == 4
+    for label in ("출발지 IP", "출발지 포트", "목적지 IP", "목적지 포트", "검색 방향", "수집 상태"):
+        assert f'<div class="label">{label}</div>' not in document
+    for label in ("추적 시작", "추적 종료", "전체 관측", "고유 세션"):
+        assert f'<div class="label">{label}</div>' in document
+    assert "프로토콜별 최신 세션" in document
+    assert "장비별 최신 세션" in document
+    assert ".insights,.insights-note { display:none !important; }" in document
+    assert ".direction-arrow { transform:none; margin-left:0; }" in document
+
+
+def test_muted_report_text_meets_normal_text_contrast_on_used_backgrounds() -> None:
+    document = render_html_report(_snapshot())
+    match = re.search(r"--muted:(#[0-9a-f]{6})", document)
+
+    assert match is not None
+    muted = match.group(1)
+    for background in ("#ffffff", "#f7fafc", "#f2f7fb", "#edf3f7"):
+        assert _html_contrast_ratio(muted, background) >= 4.5
+
+
+def test_single_direction_flow_uses_right_arrow_and_accessible_korean_label() -> None:
+    run = dict(_snapshot().run)
+    run["bidirectional"] = 0
+
+    document = render_html_report(_snapshot(run=run))
+
+    assert '<div class="direction" aria-label="단방향 검색">' in document
+    assert '<span class="direction-arrow" aria-hidden="true">→</span>' in document
+    assert '<span class="direction-pill">단방향</span>' in document
+
+
+def test_latest_distributions_are_bounded_sorted_and_use_latest_fifty_flows() -> None:
+    rows = tuple(
+        _observation(
+            observed_at=f"2026-08-28T08:{index:02d}:00.000Z",
+            controller_name="OLD-MD"
+            if index < 5
+            else ("RECENT-MD-A" if index % 2 else "RECENT-MD-B"),
+            controller_host=f"198.51.100.{(index % 200) + 1}",
+            protocol=17 if index % 3 == 0 else 6,
+            source_port=53000 + index,
+        )
+        for index in range(55)
+    )
+    document = render_html_report(
+        _snapshot(
+            observations=rows,
+            observation_history=rows,
+            lifecycle_events=(),
+            observation_total=len(rows),
+        )
+    )
+
+    assert 'aria-label="RECENT-MD-A 25건"' in document
+    assert 'aria-label="RECENT-MD-B 25건"' in document
+    assert 'aria-label="OLD-MD 5건"' not in document
+    assert 'aria-label="TCP (6) 33건"' in document
+    assert 'aria-label="UDP (17) 17건"' in document
+    assert "아래 분포는 필터 적용 전 최신 50개 세션 기준입니다." in document
+
+
+def test_distribution_helper_limits_to_five_and_uses_deterministic_tie_order() -> None:
+    values = ("z", "b", "a", "m", "q", "c", "a", "b")
+
+    assert html_report._distribution(values) == (
+        ("a", 2, 25),
+        ("b", 2, 25),
+        ("c", 1, 12),
+        ("m", 1, 12),
+        ("q", 1, 12),
+    )
 
 
 def test_lifecycle_statuses_are_korean_and_diagnostics_do_not_change_status() -> None:

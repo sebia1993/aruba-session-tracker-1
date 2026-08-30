@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QWidget
+from PySide6.QtWidgets import QApplication, QFileDialog, QGridLayout, QMessageBox, QWidget
 
 from aruba_session_tracker.collectors.ssh import (
     CancellationToken,
@@ -938,6 +938,18 @@ def test_query_screen_defaults_to_primary_monitoring_and_progressive_details(
     assert window.advanced_toggle_button.text() == "고급 조건 숨기기"
     assert window.raw_diagnostics_toggle.text() == "상세 정보 숨기기"
     assert all(not window.result_table.isColumnHidden(column) for column in range(5, 12))
+    advanced_layout = window.advanced_panel.layout()
+    assert isinstance(advanced_layout, QGridLayout)
+    for control in (
+        window.enable_edit,
+        window.source_port_edit,
+        window.destination_port_edit,
+        window.bidirectional_check,
+    ):
+        row, _column, _row_span, _column_span = advanced_layout.getItemPosition(
+            advanced_layout.indexOf(control)
+        )
+        assert row == 0
 
     _configure_valid_query(window)
     window._update_setup_guide()
@@ -997,9 +1009,11 @@ from pathlib import Path
 from PySide6.QtWidgets import QApplication
 
 from aruba_session_tracker.config import ConfigRepository
+from aruba_session_tracker.models import AppConfig, DeviceTarget
 from aruba_session_tracker.services import QueryOutcome
 from aruba_session_tracker.storage import SessionStore
 from aruba_session_tracker.ui import MainWindow
+from aruba_session_tracker.ui.theme import apply_main_window_theme
 
 
 class Executor:
@@ -1014,7 +1028,17 @@ app = QApplication([])
 root = Path(sys.argv[1])
 store = SessionStore(root / "세션.db", root / "원본", root / "내보내기")
 store.initialize()
-window = MainWindow(ConfigRepository(root / "설정.json"), store, Executor())
+repository = ConfigRepository(root / "설정.json")
+repository.save(
+    AppConfig(
+        mm_primary=DeviceTarget("MM-Primary", "192.0.2.10"),
+        mm_standby=DeviceTarget("MM-Standby", "192.0.2.11"),
+        managed_devices=(DeviceTarget("MD-01", "198.51.100.21"),),
+    )
+)
+window = MainWindow(repository, store, Executor())
+apply_main_window_theme(window)
+window.resize(window.minimumSize())
 window.show()
 deadline = time.monotonic() + 3
 while window._history_task_running and time.monotonic() < deadline:
@@ -1034,6 +1058,24 @@ assert window.advanced_toggle_button.accessibleDescription()
 assert window.advanced_panel.isHidden()
 assert window.details.isHidden()
 assert all(window.result_table.isColumnHidden(column) for column in range(5, 12))
+window.advanced_toggle_button.setChecked(True)
+window.raw_diagnostics_toggle.setChecked(True)
+app.processEvents()
+assert window.advanced_panel.isVisible()
+assert window.details.isVisible()
+assert window.advanced_panel.height() >= window.advanced_panel.sizeHint().height()
+for control in (
+    window.enable_edit,
+    window.source_port_edit,
+    window.destination_port_edit,
+    window.bidirectional_check,
+):
+    assert control.isVisible()
+    assert control.geometry().height() > 0
+    assert window.advanced_panel.rect().contains(control.geometry().topLeft())
+    assert window.advanced_panel.rect().contains(control.geometry().bottomRight())
+assert window.result_table.viewport().geometry().height() >= 40
+assert window.details.width() >= 300
 window.close()
 app.processEvents()
 """

@@ -7,6 +7,7 @@ import base64
 import hashlib
 import os
 import tempfile
+from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
@@ -21,6 +22,7 @@ FlowKey = tuple[str, str, str, str, str]
 
 _KST = timezone(timedelta(hours=9), "KST")
 _LATEST_SESSION_LIMIT = 50
+_DISTRIBUTION_LIMIT = 5
 _CONFIRMED_EVENTS = {
     "STARTED",
     "OPENED",  # Older databases and imported fixtures may use this legacy name.
@@ -543,6 +545,7 @@ def _report_chunks(
     flow_groups = _group_observations(latest_source)
     flow_statuses, session_statuses = _lifecycle_statuses(snapshot.lifecycle_events)
     latest_groups = flow_groups[:_LATEST_SESSION_LIMIT]
+    latest_summary_rows = tuple(rows[-1] for _flow, rows in latest_groups)
 
     latest_rows = "".join(
         _observation_row(
@@ -562,7 +565,16 @@ def _report_chunks(
         )
     )
     query_direction = "양방향" if bool(run.get("bidirectional")) else "단방향"
+    direction_symbol = "↔" if bool(run.get("bidirectional")) else "→"
     run_status = _RUN_STATUS_KO.get(str(run.get("status") or "").upper(), "상태 확인 필요")
+    source_endpoint = _endpoint(run.get("source_ip"), run.get("source_port"))
+    destination_endpoint = _endpoint(run.get("destination_ip"), run.get("destination_port"))
+    protocol_distribution = _distribution(
+        _protocol(row.get("protocol")) for row in latest_summary_rows
+    )
+    controller_distribution = _distribution(
+        _plain(row.get("controller_name")) for row in latest_summary_rows
+    )
 
     yield f"""<!doctype html>
 <html lang="ko">
@@ -573,21 +585,40 @@ def _report_chunks(
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-{_FILTER_SCRIPT_SHA256}'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>Aruba Session Tracker 추적 결과</title>
   <style>
-    :root {{ color-scheme:light; --navy:#17324d; --blue:#1769aa; --ink:#243b53;
-      --muted:#627d98; --line:#d9e2ec; --paper:#fff; --bg:#f3f6f9;
+    :root {{ color-scheme:light; --navy:#102f49; --blue:#1769aa; --ink:#243b53;
+      --muted:#526b82; --line:#d6e0e8; --paper:#fff; --bg:#edf3f7; --soft:#f7fafc;
       --ok:#147d64; --warn:#9c6615; --closed:#9b2c2c; }}
     * {{ box-sizing:border-box; }}
     body {{ margin:0; overflow-x:hidden; background:var(--bg); color:var(--ink);
       font-family:system-ui,-apple-system,"Segoe UI","Malgun Gothic",sans-serif; line-height:1.5; }}
-    .header {{ background:var(--navy); color:#fff; padding:22px; }}
+    .header {{ background:var(--navy); color:#fff; padding:26px 0 22px; border-bottom:4px solid #2784c7; }}
     .header-inner,.content,.footer {{ width:min(1240px,calc(100% - 32px)); margin:0 auto; }}
     h1 {{ margin:0; font-size:clamp(1.55rem,3vw,2.25rem); }}
     .subtitle {{ margin:.35rem 0 0; color:#d9e8f5; }}
     .content {{ padding:18px 0; }}
     section,.result-summary {{ min-width:0; background:var(--paper); border:1px solid var(--line);
-      border-radius:12px; padding:20px; margin-bottom:16px; box-shadow:0 5px 18px #102a430d; }}
+      border-radius:14px; padding:20px; margin-bottom:16px; box-shadow:0 6px 20px #102a430d; }}
     h2 {{ margin:0 0 6px; color:var(--navy); font-size:1.25rem; }}
     .section-note {{ margin:0 0 14px; color:var(--muted); }}
+    .result-summary {{ padding:0; overflow:hidden; }}
+    .flow-panel {{ display:grid; grid-template-columns:minmax(0,1fr) auto minmax(0,1fr); gap:14px;
+      align-items:center; padding:20px; background:#f2f7fb; border-bottom:1px solid var(--line); }}
+    .endpoint {{ min-width:0; }}
+    .endpoint.destination {{ text-align:right; }}
+    .endpoint-label {{ color:var(--muted); font-size:.76rem; font-weight:800; }}
+    .endpoint-value {{ display:block; margin-top:3px; color:var(--navy); font-size:1.05rem;
+      font-weight:800; overflow-wrap:anywhere; }}
+    .direction {{ min-width:108px; text-align:center; }}
+    .direction-arrow {{ display:block; color:var(--blue); font-size:1.45rem; line-height:1; font-weight:800; }}
+    .direction-pill {{ display:inline-block; margin-top:7px; padding:3px 9px; border-radius:999px;
+      color:#0b4f82; background:#dcecf8; border:1px solid #9fc6e2; font-size:.75rem; font-weight:800; }}
+    .summary-body {{ padding:18px 20px 20px; }}
+    .summary-heading {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+      justify-content:space-between; margin-bottom:12px; }}
+    .summary-title {{ color:var(--navy); font-size:.95rem; font-weight:800; }}
+    .run-state {{ display:inline-flex; align-items:center; gap:6px; padding:4px 9px; border-radius:999px;
+      background:#e8f2fb; color:#0b4f82; border:1px solid #b8d6eb; font-size:.75rem; font-weight:800; }}
+    .run-state::before {{ content:""; width:7px; height:7px; border-radius:50%; background:#2784c7; }}
     .filter-panel[hidden] {{ display:none !important; }}
     .filter-panel {{ position:relative; }}
     .filter-heading {{ margin:0 0 6px; color:var(--navy); font-size:1.25rem; font-weight:700; }}
@@ -622,15 +653,29 @@ def _report_chunks(
     .print-filter-summary {{ display:none; }}
     .print-filter-summary[hidden] {{ display:none !important; }}
     tr[hidden],.filter-empty-row[hidden] {{ display:none !important; }}
-    .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:10px; }}
-    .card {{ min-width:0; border:1px solid var(--line); border-radius:9px; padding:12px; background:#fbfdff; }}
-    .label {{ color:var(--muted); font-size:.82rem; }}
-    .value {{ display:block; margin-top:3px; font-weight:700; overflow-wrap:anywhere; }}
-    .table-wrap {{ overflow-x:auto; border:1px solid var(--line); border-radius:9px; }}
+    .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(145px,1fr)); gap:10px; }}
+    .card {{ min-width:0; border:1px solid var(--line); border-radius:10px; padding:12px 13px; background:var(--soft); }}
+    .label {{ color:var(--muted); font-size:.78rem; font-weight:650; }}
+    .value {{ display:block; margin-top:4px; color:#17324d; font-weight:800; overflow-wrap:anywhere; }}
+    .insights-note {{ margin:14px 0 8px; color:var(--muted); font-size:.8rem; }}
+    .insights {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }}
+    .insight-card {{ min-width:0; padding:14px; border:1px solid var(--line); border-radius:10px; background:#fff; }}
+    .insight-title {{ margin-bottom:10px; color:var(--navy); font-size:.84rem; font-weight:800; }}
+    .distribution {{ display:grid; gap:8px; }}
+    .dist-row {{ display:grid; grid-template-columns:minmax(95px,1fr) minmax(100px,2fr) auto;
+      gap:10px; align-items:center; font-size:.78rem; }}
+    .dist-label {{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#334e68; }}
+    .dist-count {{ color:var(--muted); font-variant-numeric:tabular-nums; }}
+    .bar-track {{ height:7px; overflow:hidden; background:#e8eef3; border-radius:999px; }}
+    .bar-fill {{ display:block; height:100%; background:#2d82bd; border-radius:999px; }}
+    .empty-insight {{ color:var(--muted); font-size:.8rem; }}
+    .table-wrap {{ overflow-x:auto; border:1px solid var(--line); border-radius:10px; background:#fff; }}
     .table-wrap:focus-visible,summary:focus-visible {{ outline:3px solid #63b3ed; outline-offset:2px; }}
     table {{ width:100%; min-width:800px; border-collapse:collapse; font-size:.88rem; }}
-    th,td {{ padding:9px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }}
-    th {{ background:#f0f4f8; color:var(--navy); position:sticky; top:0; white-space:nowrap; }}
+    th,td {{ padding:10px 11px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }}
+    th {{ background:#edf3f7; color:var(--navy); position:sticky; top:0; white-space:nowrap; font-size:.8rem; }}
+    tbody tr:nth-child(even) {{ background:#fbfdff; }}
+    tbody tr:hover {{ background:#f2f8fc; }}
     tr:last-child td {{ border-bottom:0; }}
     .badge {{ display:inline-block; border-radius:999px; padding:3px 9px; font-size:.78rem;
       font-weight:700; background:#e6fffa; color:var(--ok); white-space:nowrap; }}
@@ -648,26 +693,38 @@ def _report_chunks(
     .footer {{ padding:0 0 24px; color:var(--muted); font-size:.82rem; }}
     @media (max-width:850px) {{
       .header-inner,.content,.footer {{ width:min(100% - 20px,1240px); }}
-      section,.result-summary {{ padding:14px; }}
-      .grid {{ grid-template-columns:repeat(auto-fit,minmax(145px,1fr)); }}
+      section {{ padding:14px; }} .summary-body {{ padding:14px; }}
+      .flow-panel {{ grid-template-columns:1fr; gap:10px; padding:16px; }}
+      .endpoint.destination {{ text-align:left; }} .direction {{ text-align:left; min-width:0; }}
+      .direction-arrow {{ transform:rotate(90deg); transform-origin:left center; margin-left:8px; }}
+      .grid {{ grid-template-columns:repeat(auto-fit,minmax(135px,1fr)); }}
+      .insights {{ grid-template-columns:1fr; }}
       .filter-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
     }}
     @media (max-width:520px) {{
-      .grid,.filter-grid {{ grid-template-columns:1fr; }} .header {{ padding:18px 10px; }}
+      .grid {{ grid-template-columns:1fr 1fr; }} .filter-grid {{ grid-template-columns:1fr; }}
+      .header {{ padding:20px 0 18px; }}
+      .dist-row {{ grid-template-columns:minmax(85px,1fr) minmax(80px,1.6fr) auto; gap:7px; }}
       .filter-reset {{ width:100%; }}
     }}
     @page {{ size:A4 landscape; margin:10mm; }}
     @media print {{
-      body {{ background:#fff; color:#000; }} .header {{ background:#fff; color:#000; padding:0 0 10px; }}
+      body {{ background:#fff; color:#000; }} .header {{ background:#fff; color:#000; padding:0 0 10px; border:0; }}
       .subtitle {{ color:#333; }} .header-inner,.content,.footer {{ width:100%; }} .content {{ padding:0; }}
       section,.result-summary {{ box-shadow:none; border:1px solid #bbb; padding:10px; margin-bottom:8px; }}
+      .result-summary {{ padding:0; }}
+      .flow-panel {{ grid-template-columns:minmax(0,1fr) auto minmax(0,1fr); gap:14px; background:#fff; }}
+      .endpoint.destination {{ text-align:right; }} .direction {{ min-width:108px; text-align:center; }}
+      .direction-arrow {{ transform:none; margin-left:0; }} .summary-body {{ padding:10px; }}
+      .insights,.insights-note {{ display:none !important; }}
       section {{ border:0; border-radius:0; padding:0; }}
       .history-toggle {{ display:none; }} .history-toggle + .details-body {{ display:block !important; }}
       .filter-panel {{ display:none !important; }} .print-filter-summary {{ display:block; margin:0 0 10px;
         padding:7px 9px; border:1px solid #bbb; font-size:8.5pt; }}
       .table-wrap {{ overflow:visible; border:0; }} table {{ min-width:0; font-size:7.5pt; }}
       thead {{ display:table-header-group; }} th {{ position:static; }} th,td {{ padding:4px; overflow-wrap:anywhere; }}
-      .card,tr {{ break-inside:avoid; }}
+      .card,.flow-panel,tr {{ break-inside:avoid; }}
+      tbody tr:nth-child(even),tbody tr:hover {{ background:#fff; }}
     }}
   </style>
 </head>
@@ -677,18 +734,37 @@ def _report_chunks(
     <p class="subtitle">저장된 세션 값을 조회 실행별로 정리한 보고서입니다.</p>
   </div></header>
   <main class="content">
-    <div class="result-summary" aria-label="조회 결과 정보">
-      <div class="grid">
-        {_card("추적 시작", _format_kst(run.get("started_at")))}
-        {_card("추적 종료", _format_kst(run.get("ended_at")))}
-        {_card("출발지 IP", run.get("source_ip"))}
-        {_card("출발지 포트", run.get("source_port"))}
-        {_card("목적지 IP", run.get("destination_ip"))}
-        {_card("목적지 포트", run.get("destination_port"))}
-        {_card("검색 방향", query_direction)}
-        {_card("전체 관측", f"{_format_integer(snapshot.observation_total)}건")}
-        {_card("고유 세션", f"{_format_integer(total_sessions)}개")}
-        {_card("수집 상태", run_status)}
+    <div class="result-summary" aria-labelledby="query-summary-title">
+      <div class="flow-panel">
+        <div class="endpoint">
+          <span class="endpoint-label">조회 출발지</span>
+          <span class="endpoint-value">{_e(source_endpoint)}</span>
+        </div>
+        <div class="direction" aria-label="{_e(query_direction)} 검색">
+          <span class="direction-arrow" aria-hidden="true">{_e(direction_symbol)}</span>
+          <span class="direction-pill">{_e(query_direction)}</span>
+        </div>
+        <div class="endpoint destination">
+          <span class="endpoint-label">조회 목적지</span>
+          <span class="endpoint-value">{_e(destination_endpoint)}</span>
+        </div>
+      </div>
+      <div class="summary-body">
+        <div class="summary-heading">
+          <div id="query-summary-title" class="summary-title">조회 요약</div>
+          <div class="run-state">{_e(run_status)}</div>
+        </div>
+        <div class="grid">
+          {_card("추적 시작", _format_kst(run.get("started_at")))}
+          {_card("추적 종료", _format_kst(run.get("ended_at")))}
+          {_card("전체 관측", f"{_format_integer(snapshot.observation_total)}건")}
+          {_card("고유 세션", f"{_format_integer(total_sessions)}개")}
+        </div>
+        <p class="insights-note">아래 분포는 필터 적용 전 최신 {_format_integer(displayed_latest)}개 세션 기준입니다.</p>
+        <div class="insights" aria-label="최신 세션 분포">
+          {_distribution_panel("프로토콜별 최신 세션", protocol_distribution)}
+          {_distribution_panel("장비별 최신 세션", controller_distribution)}
+        </div>
       </div>
     </div>
 
@@ -832,6 +908,40 @@ def _card(label: str, value: object) -> str:
     return (
         f'<div class="card"><div class="label">{_e(label)}</div>'
         f'<span class="value">{_e(value)}</span></div>'
+    )
+
+
+def _distribution(values: Iterable[str]) -> tuple[tuple[str, int, int], ...]:
+    counts = Counter(value for value in values if value and value != "-")
+    total = sum(counts.values())
+    if total == 0:
+        return ()
+    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:_DISTRIBUTION_LIMIT]
+    return tuple(
+        (label, count, min(100, max(1, round((count / total) * 100)))) for label, count in ordered
+    )
+
+
+def _distribution_panel(title: str, rows: tuple[tuple[str, int, int], ...]) -> str:
+    if rows:
+        body = "".join(
+            (
+                f'<div class="dist-row" aria-label="{_e(label)} {_format_integer(count)}건">'
+                f'<span class="dist-label" title="{_e(label)}">{_e(label)}</span>'
+                '<span class="bar-track" aria-hidden="true">'
+                f'<span class="bar-fill" style="width:{percent}%"></span></span>'
+                f'<span class="dist-count">{_format_integer(count)}건</span>'
+                "</div>"
+            )
+            for label, count, percent in rows
+        )
+    else:
+        body = '<div class="empty-insight">표시할 최신 세션이 없습니다.</div>'
+    return (
+        '<div class="insight-card">'
+        f'<div class="insight-title">{_e(title)}</div>'
+        f'<div class="distribution">{body}</div>'
+        "</div>"
     )
 
 

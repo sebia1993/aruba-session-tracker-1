@@ -91,6 +91,7 @@ def test_packaged_report_verifier_requires_printable_history_structure() -> None
     report = f"""<!doctype html>
     <meta http-equiv="Content-Security-Policy" content="{csp}">
     세션 추적 결과 KST 한국어-MD
+    <div class="flow-panel">조회 출발지 프로토콜별 최신 세션 장비별 최신 세션</div>
     결과 필터
     <section id="result-filter"></section>
     <input id="filter-ip"><select id="filter-protocol"></select><input id="filter-port">

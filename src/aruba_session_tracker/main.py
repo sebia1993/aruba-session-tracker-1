@@ -332,6 +332,9 @@ def _report_smoke_test(destination: Path) -> int:
         "결과 필터",
         "최신 세션 결과",
         "전체 추적 이력",
+        "조회 출발지",
+        "프로토콜별 최신 세션",
+        "장비별 최신 세션",
         "KST",
         "한국어-MD",
         'id="result-filter"',
@@ -339,6 +342,7 @@ def _report_smoke_test(destination: Path) -> int:
         'id="filter-protocol"',
         'id="filter-port"',
         'class="report-row"',
+        'class="flow-panel"',
         "script-src 'sha256-",
     )
     forbidden = (

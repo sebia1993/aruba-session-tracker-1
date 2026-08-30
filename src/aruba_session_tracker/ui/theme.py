@@ -1,7 +1,7 @@
 """Visual system for the Aruba Session Tracker Qt interface.
 
 The operational widgets and their stable Developer Inspector identifiers live in
-``main_window.py``.  This module deliberately limits itself to presentation and
+``main_window.py``. This module deliberately limits itself to presentation and
 non-destructive usability settings so the network, storage, and Inspector
 contracts remain unchanged.
 """
@@ -12,7 +12,14 @@ from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QPalette
-from PySide6.QtWidgets import QApplication, QGroupBox, QLayout, QTableWidget, QWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QGroupBox,
+    QLayout,
+    QSizePolicy,
+    QTableWidget,
+    QWidget,
+)
 
 if TYPE_CHECKING:
     from aruba_session_tracker.ui.main_window import MainWindow
@@ -42,7 +49,7 @@ def apply_main_window_theme(window: MainWindow) -> None:
     if isinstance(application, QApplication):
         application.setFont(font)
 
-    # MainWindow applies a legacy local stylesheet during construction.  Set the
+    # MainWindow applies a legacy local stylesheet during construction. Set the
     # complete theme last so one source of truth controls all presentation.
     window.setStyleSheet(build_stylesheet())
 
@@ -51,88 +58,96 @@ def build_stylesheet() -> str:
     """Return the self-contained QSS used by the desktop application."""
 
     return """
-    /* Aruba Session Tracker — dense enterprise operations console */
+    /* Aruba Session Tracker — enterprise network operations console */
     QMainWindow#mainWindow {
-        background-color: #F3F6F9;
-        color: #0F172A;
+        background-color: #EEF3F8;
+        color: #102A43;
     }
 
     QMainWindow#mainWindow QWidget {
-        color: #0F172A;
-        selection-background-color: #CFE4FA;
-        selection-color: #0B253F;
+        color: #102A43;
+        selection-background-color: #CDE6FA;
+        selection-color: #08243B;
     }
 
+    /* Primary navigation: quiet tabs with a strong active-state underline. */
     QTabWidget#mainTabs::pane {
-        background-color: #F3F6F9;
+        background-color: #EEF3F8;
         border: 0;
         top: -1px;
     }
 
+    QTabWidget#mainTabs QTabBar {
+        background-color: #E4EBF2;
+    }
+
     QTabWidget#mainTabs QTabBar::tab {
-        min-height: 34px;
-        padding: 0 18px;
-        margin: 0 2px 0 0;
-        color: #475569;
-        background-color: #E8EDF3;
-        border: 1px solid #CBD5E1;
-        border-bottom: 0;
-        border-top-left-radius: 7px;
-        border-top-right-radius: 7px;
+        min-height: 36px;
+        padding: 0 14px;
+        margin: 0;
+        color: #52667A;
+        background-color: #E4EBF2;
+        border: 0;
+        border-bottom: 3px solid transparent;
     }
 
     QTabWidget#mainTabs QTabBar::tab:selected {
         color: #0B4F82;
-        background-color: #F3F6F9;
-        border-color: #9FB3C8;
+        background-color: #F7FAFC;
+        border-bottom: 3px solid #1976B9;
         font-weight: 700;
     }
 
     QTabWidget#mainTabs QTabBar::tab:hover:!selected {
-        color: #163A59;
-        background-color: #F8FAFC;
+        color: #173A57;
+        background-color: #EDF3F8;
     }
 
     QTabWidget#mainTabs QTabBar::tab:focus {
         border: 2px solid #1976B9;
+        border-bottom: 3px solid #1976B9;
     }
 
+    /* Progressive detail panel remains visually subordinate to the main table. */
     QTabWidget#detailsTabs::pane {
-        background-color: #FFFFFF;
-        border: 1px solid #CBD5E1;
-        border-radius: 7px;
+        background-color: #0F1C29;
+        border: 1px solid #25394C;
+        border-radius: 8px;
         top: -1px;
     }
 
     QTabWidget#detailsTabs QTabBar::tab {
-        min-height: 30px;
-        padding: 0 13px;
-        color: #52657A;
-        background-color: #E8EDF3;
-        border: 1px solid #CBD5E1;
+        min-height: 31px;
+        padding: 0 14px;
+        color: #B7C7D8;
+        background-color: #172736;
+        border: 1px solid #2A3F53;
         border-bottom: 0;
     }
 
     QTabWidget#detailsTabs QTabBar::tab:selected {
-        color: #0B4F82;
-        background-color: #FFFFFF;
+        color: #FFFFFF;
+        background-color: #0F1C29;
+        border-color: #38536D;
         font-weight: 700;
     }
 
     QFrame#setupGuide {
         color: #17324D;
-        background-color: #EAF2FA;
-        border: 1px solid #9DBBD5;
-        border-radius: 7px;
+        background-color: #E6F2FC;
+        border: 1px solid #9EC4E4;
+        border-left: 4px solid #1976B9;
+        border-radius: 8px;
     }
 
+    /* Operational cards. Dynamic panelRole values are presentation-only. */
     QGroupBox {
         margin-top: 12px;
-        padding: 18px 14px 14px 14px;
+        padding: 16px 12px 11px 12px;
         color: #17324D;
         background-color: #FFFFFF;
-        border: 1px solid #CBD5E1;
-        border-radius: 8px;
+        border: 1px solid #CCD8E4;
+        border-radius: 9px;
         font-weight: 700;
     }
 
@@ -140,9 +155,32 @@ def build_stylesheet() -> str:
         subcontrol-origin: margin;
         subcontrol-position: top left;
         left: 12px;
-        padding: 0 6px;
+        padding: 0 7px;
         color: #17324D;
         background-color: #FFFFFF;
+    }
+
+    QGroupBox[panelRole="query"] {
+        border-left: 4px solid #1976B9;
+    }
+
+    QGroupBox[panelRole="credentials"] {
+        background-color: #F9FBFD;
+        border-color: #D8E2EC;
+    }
+
+    QGroupBox[panelRole="advanced"] {
+        background-color: #FAFCFE;
+        border-style: dashed;
+        border-color: #B9C9D8;
+    }
+
+    QGroupBox[panelRole="controller"] {
+        border-left: 4px solid #4B7F9E;
+    }
+
+    QGroupBox[panelRole="timing"] {
+        border-left: 4px solid #6D7F90;
     }
 
     QLabel {
@@ -150,60 +188,63 @@ def build_stylesheet() -> str:
     }
 
     QLabel#contextSummary {
-        min-height: 30px;
-        padding: 3px 10px;
-        color: #17324D;
-        background-color: #EAF2FA;
-        border: 1px solid #BED2E6;
-        border-radius: 6px;
+        min-height: 32px;
+        padding: 4px 11px;
+        color: #123A58;
+        background-color: #EAF3FA;
+        border: 1px solid #B9D2E6;
+        border-radius: 7px;
         font-weight: 600;
     }
 
     QLabel#stateLabel {
-        min-height: 26px;
-        padding: 2px 12px;
-        color: #0B4F82;
-        background-color: #DCECFB;
-        border: 1px solid #9EC5E8;
-        border-radius: 13px;
+        min-height: 28px;
+        padding: 2px 13px;
+        color: #0A527E;
+        background-color: #DDF0FC;
+        border: 1px solid #8FC2E2;
+        border-radius: 14px;
         font-weight: 700;
     }
 
     QLabel#privacyNotice {
-        padding: 8px 10px;
+        padding: 9px 11px;
         color: #5E4A18;
         background-color: #FFF8E7;
-        border: 1px solid #E7C978;
-        border-radius: 6px;
+        border: 1px solid #E5C86E;
+        border-left: 4px solid #C69214;
+        border-radius: 7px;
     }
 
     QLineEdit,
     QSpinBox {
         min-height: 32px;
-        padding: 0 9px;
-        color: #0F172A;
+        padding: 0 10px;
+        color: #102A43;
         background-color: #FFFFFF;
-        border: 1px solid #AEBCCA;
-        border-radius: 6px;
+        border: 1px solid #A9BBCB;
+        border-radius: 7px;
     }
 
     QLineEdit:hover,
     QSpinBox:hover {
-        border-color: #7F96AB;
+        border-color: #718CA4;
+        background-color: #FCFDFE;
     }
 
     QLineEdit:focus,
     QSpinBox:focus {
         border: 2px solid #1976B9;
-        padding-left: 8px;
-        padding-right: 8px;
+        padding-left: 9px;
+        padding-right: 9px;
+        background-color: #FFFFFF;
     }
 
     QLineEdit:disabled,
     QSpinBox:disabled {
-        color: #7A8998;
-        background-color: #EEF2F6;
-        border-color: #D5DEE7;
+        color: #7D8B99;
+        background-color: #EDF1F5;
+        border-color: #D4DEE7;
     }
 
     QCheckBox {
@@ -212,24 +253,29 @@ def build_stylesheet() -> str:
         color: #263B50;
     }
 
+    QCheckBox::indicator {
+        width: 16px;
+        height: 16px;
+    }
+
     QPushButton {
         min-height: 32px;
-        padding: 0 14px;
+        padding: 0 15px;
         color: #17324D;
         background-color: #FFFFFF;
-        border: 1px solid #A9B8C7;
-        border-radius: 6px;
+        border: 1px solid #A7B8C8;
+        border-radius: 7px;
         font-weight: 600;
     }
 
     QPushButton:hover {
-        background-color: #F3F7FB;
-        border-color: #6F8CA6;
+        background-color: #F2F7FB;
+        border-color: #6987A2;
     }
 
     QPushButton:pressed {
-        background-color: #E3ECF5;
-        border-color: #526F89;
+        background-color: #E1EBF3;
+        border-color: #4E6E88;
     }
 
     QPushButton:focus {
@@ -261,27 +307,28 @@ def build_stylesheet() -> str:
 
     QPushButton[buttonRole="secondary"] {
         color: #0B4F82;
-        background-color: #EAF2FA;
-        border-color: #9DBBD5;
+        background-color: #E9F3FB;
+        border-color: #9CBFDA;
     }
 
     QPushButton[buttonRole="secondary"]:hover {
-        background-color: #DCEAF7;
+        background-color: #DCECF8;
         border-color: #6F9FC4;
     }
 
     QPushButton[buttonRole="tertiary"] {
+        min-height: 30px;
         color: #0B4F82;
         background-color: transparent;
         border-color: transparent;
-        padding-left: 8px;
-        padding-right: 8px;
+        padding-left: 9px;
+        padding-right: 9px;
     }
 
     QPushButton[buttonRole="tertiary"]:hover,
     QPushButton[buttonRole="tertiary"]:checked {
-        background-color: #EAF2FA;
-        border-color: #9DBBD5;
+        background-color: #E7F1F9;
+        border-color: #A8C7DE;
     }
 
     QPushButton[buttonRole="danger"] {
@@ -308,25 +355,39 @@ def build_stylesheet() -> str:
         border-color: #8F1C14;
     }
 
+    QPushButton[buttonRole="primary"]:focus,
+    QPushButton[buttonRole="dangerStrong"]:focus {
+        border: 3px solid #FFC857;
+        padding-left: 12px;
+        padding-right: 12px;
+    }
+
+    QPushButton[buttonRole="secondary"]:focus,
+    QPushButton[buttonRole="tertiary"]:focus,
+    QPushButton[buttonRole="danger"]:focus {
+        border: 2px solid #1976B9;
+    }
+
+    /* Data grid is the visual center of gravity. */
     QTableWidget {
         color: #172A3D;
         background-color: #FFFFFF;
-        alternate-background-color: #F6F9FC;
-        border: 1px solid #C4D0DC;
-        border-radius: 7px;
-        gridline-color: #E2E8F0;
+        alternate-background-color: #F7FAFC;
+        border: 1px solid #C6D3DF;
+        border-radius: 8px;
+        gridline-color: #E6EDF3;
         outline: 0;
     }
 
     QTableWidget::item {
         min-height: 27px;
-        padding: 4px 7px;
+        padding: 4px 8px;
         border-bottom: 1px solid #E7EDF3;
     }
 
     QTableWidget::item:selected {
-        color: #0B253F;
-        background-color: #CFE4FA;
+        color: #08243B;
+        background-color: #CDE6FA;
     }
 
     QTableWidget::item:focus {
@@ -335,21 +396,74 @@ def build_stylesheet() -> str:
 
     QHeaderView::section {
         min-height: 32px;
-        padding: 4px 7px;
-        color: #263B50;
-        background-color: #E8EEF4;
+        padding: 4px 8px;
+        color: #294359;
+        background-color: #E7EEF4;
         border: 0;
-        border-right: 1px solid #CBD5E1;
-        border-bottom: 1px solid #AEBCCA;
+        border-right: 1px solid #CBD7E2;
+        border-bottom: 1px solid #AABBCB;
         font-weight: 700;
     }
 
-    QPlainTextEdit#rawConsole {
-        color: #DCE7F2;
-        background-color: #111C27;
+    QAbstractScrollArea::corner {
+        background-color: #E7EEF4;
         border: 0;
-        border-radius: 6px;
-        padding: 8px;
+    }
+
+    QScrollBar:vertical {
+        width: 11px;
+        margin: 0;
+        background-color: #EEF3F7;
+    }
+
+    QScrollBar::handle:vertical {
+        min-height: 28px;
+        margin: 2px;
+        background-color: #607D94;
+        border-radius: 4px;
+    }
+
+    QScrollBar::handle:vertical:hover {
+        background-color: #3F607C;
+    }
+
+    QScrollBar:horizontal {
+        height: 11px;
+        margin: 0;
+        background-color: #EEF3F7;
+    }
+
+    QScrollBar::handle:horizontal {
+        min-width: 28px;
+        margin: 2px;
+        background-color: #607D94;
+        border-radius: 4px;
+    }
+
+    QScrollBar::handle:horizontal:hover {
+        background-color: #3F607C;
+    }
+
+    QScrollBar::add-line:vertical,
+    QScrollBar::sub-line:vertical {
+        height: 11px;
+        background-color: #D4DEE7;
+        border: 1px solid #A7B8C8;
+    }
+
+    QScrollBar::add-line:horizontal,
+    QScrollBar::sub-line:horizontal {
+        width: 11px;
+        background-color: #D4DEE7;
+        border: 1px solid #A7B8C8;
+    }
+
+    QPlainTextEdit#rawConsole {
+        color: #DDE8F2;
+        background-color: #0F1C29;
+        border: 0;
+        border-radius: 7px;
+        padding: 10px;
         font-family: Consolas;
         selection-background-color: #28557D;
         selection-color: #FFFFFF;
@@ -359,38 +473,39 @@ def build_stylesheet() -> str:
         color: #1E3347;
         background-color: #FFFFFF;
         border: 0;
-        border-radius: 6px;
+        border-radius: 7px;
         outline: 0;
     }
 
     QListWidget#diagnosticsList::item {
-        min-height: 28px;
-        padding: 4px 8px;
-        border-bottom: 1px solid #E7EDF3;
+        min-height: 29px;
+        padding: 5px 9px;
+        border-bottom: 1px solid #E4EBF1;
     }
 
     QListWidget#diagnosticsList::item:selected {
-        color: #0B253F;
-        background-color: #CFE4FA;
+        color: #08243B;
+        background-color: #CDE6FA;
     }
 
     QSplitter::handle {
-        background-color: #D8E1EA;
+        background-color: #D4DEE7;
     }
 
     QSplitter::handle:horizontal {
-        width: 6px;
+        width: 7px;
         margin: 2px 1px;
     }
 
     QSplitter::handle:hover {
-        background-color: #8FB5D4;
+        background-color: #86AFCF;
     }
 
     QStatusBar {
-        color: #40566B;
-        background-color: #E8EEF4;
-        border-top: 1px solid #C4D0DC;
+        min-height: 26px;
+        color: #425A70;
+        background-color: #E2EAF1;
+        border-top: 1px solid #C2CFDA;
     }
 
     QStatusBar::item {
@@ -462,6 +577,23 @@ def build_stylesheet() -> str:
         background-color: palette(highlight);
     }
 
+    QMainWindow#mainWindow[themeContrast="high"] QScrollBar:vertical,
+    QMainWindow#mainWindow[themeContrast="high"] QScrollBar:horizontal {
+        background-color: palette(window);
+    }
+
+    QMainWindow#mainWindow[themeContrast="high"] QScrollBar::handle:vertical,
+    QMainWindow#mainWindow[themeContrast="high"] QScrollBar::handle:horizontal {
+        background-color: palette(highlight);
+        border: 1px solid palette(window-text);
+    }
+
+    QMainWindow#mainWindow[themeContrast="high"] QScrollBar::add-line,
+    QMainWindow#mainWindow[themeContrast="high"] QScrollBar::sub-line {
+        background-color: palette(button);
+        border: 1px solid palette(highlight);
+    }
+
     QMainWindow#mainWindow[themeContrast="high"] QPushButton,
     QMainWindow#mainWindow[themeContrast="high"] QPushButton[buttonRole="primary"],
     QMainWindow#mainWindow[themeContrast="high"] QPushButton[buttonRole="secondary"],
@@ -484,7 +616,7 @@ def build_stylesheet() -> str:
 
 def _configure_layout_density(window: MainWindow) -> None:
     for page in (window.query_page, window.settings_page, window.history_page):
-        _set_layout(page.layout(), margins=(18, 14, 18, 18), spacing=12)
+        _set_layout(page.layout(), margins=(14, 10, 14, 14), spacing=8)
 
     for group in (
         window.connection_group,
@@ -498,13 +630,18 @@ def _configure_layout_density(window: MainWindow) -> None:
 
     window.tabs.setObjectName("mainTabs")
     window.tabs.setDocumentMode(True)
-    window.tabs.setElideMode(Qt.TextElideMode.ElideRight)
+    window.tabs.setElideMode(Qt.TextElideMode.ElideNone)
     window.details.setObjectName("detailsTabs")
     window.details.setDocumentMode(True)
+    window.details.setMinimumWidth(300)
+    window.advanced_panel.setSizePolicy(
+        QSizePolicy.Policy.Preferred,
+        QSizePolicy.Policy.Fixed,
+    )
 
 
 def _configure_group_layout(group: QGroupBox) -> None:
-    _set_layout(group.layout(), margins=(14, 18, 14, 14), spacing=10)
+    _set_layout(group.layout(), margins=(12, 16, 12, 10), spacing=8)
 
 
 def _set_layout(
@@ -532,6 +669,13 @@ def _configure_component_roles(window: MainWindow) -> None:
     _set_role(window.delete_button, "danger")
     _set_role(window.delete_all_button, "dangerStrong")
 
+    _set_panel_role(window.connection_group, "credentials")
+    _set_panel_role(window.query_group, "query")
+    _set_panel_role(window.advanced_panel, "advanced")
+    _set_panel_role(window.mm_group, "controller")
+    _set_panel_role(window.md_group, "controller")
+    _set_panel_role(window.timing_group, "timing")
+
     window.context_label.setObjectName("contextSummary")
     window.state_label.setObjectName("stateLabel")
     window.settings_privacy_notice.setObjectName("privacyNotice")
@@ -542,6 +686,10 @@ def _configure_component_roles(window: MainWindow) -> None:
 
 def _set_role(widget: QWidget, role: str) -> None:
     widget.setProperty("buttonRole", role)
+
+
+def _set_panel_role(widget: QWidget, role: str) -> None:
+    widget.setProperty("panelRole", role)
 
 
 def _configure_tables(window: MainWindow) -> None:
