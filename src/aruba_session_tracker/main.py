@@ -31,7 +31,7 @@ from aruba_session_tracker.observability import CrashJournal, ExceptionHookManag
 from aruba_session_tracker.paths import AppPaths, UnsafeManagedPath
 from aruba_session_tracker.runtime import RuntimeExecutor
 from aruba_session_tracker.single_instance import SingleInstanceGuard
-from aruba_session_tracker.storage import SessionStore
+from aruba_session_tracker.storage import SessionStore, StorageError
 from aruba_session_tracker.ui import DeveloperInspectorController, MainWindow
 from aruba_session_tracker.ui.startup import StartupCoordinator, StartupWindow
 from aruba_session_tracker.ui.theme import apply_main_window_theme
@@ -195,10 +195,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         if developer_inspector is not None:
             developer_inspector.close()
         hook_manager.restore()
-        clean_shutdown = bool(
+        ui_clean = bool(
             (window is not None and window.clean_shutdown_completed)
             or (options.gui_smoke_test and exit_code == 0)
         )
+        storage_closed = ui_clean
+        if ui_clean:
+            try:
+                bundle.store.close()
+            except StorageError:
+                storage_closed = False
+        # A grace-timeout path must never wait on a worker-held store lock.
+        # The exiting process releases those handles and startup recovery marks
+        # unfinished DB runs safely on the next launch.
+        clean_shutdown = ui_clean and storage_closed
         with suppress(OSError, UnsafeManagedPath):
             if clean_shutdown:
                 bundle.journal.mark_clean_exit()
@@ -271,38 +281,49 @@ def _report_smoke_test(destination: Path) -> int:
             QueryRequest("192.0.2.10", "203.0.113.20", 53000, 443),
             started_at=observed_at,
         )
-        observation = SessionObservation(
-            controller_name="한국어-MD",
-            controller_host="198.51.100.21",
-            protocol=6,
-            source_ip="192.0.2.10",
-            destination_ip="203.0.113.20",
-            source_port=53000,
-            destination_port=443,
-            packets=12,
-            bytes_count=2048,
-            flags="DY",
-            cpu_id=1,
-            observed_at=observed_at,
-        )
-        store.record_query(
-            run_id,
-            (observation,),
-            raw_text="PACKAGE-RAW-CANARY",
-            controller_name=observation.controller_name,
-            captured_at=observed_at,
-        )
-        store.record_diagnostic(
-            DiagnosticEvent(
-                stage="report-smoke",
-                code=ErrorCode.PARSE_PARTIAL,
-                message="PACKAGE-DIAGNOSTIC-CANARY",
-                occurred_at=observed_at,
-            ),
-            run_id=run_id,
-        )
-        store.finish_run(run_id, ended_at=observed_at)
-        written = store.export_run_html(run_id, destination)
+        run_finished = False
+        try:
+            observation = SessionObservation(
+                controller_name="한국어-MD",
+                controller_host="198.51.100.21",
+                protocol=6,
+                source_ip="192.0.2.10",
+                destination_ip="203.0.113.20",
+                source_port=53000,
+                destination_port=443,
+                packets=12,
+                bytes_count=2048,
+                flags="DY",
+                cpu_id=1,
+                observed_at=observed_at,
+            )
+            store.record_query(
+                run_id,
+                (observation,),
+                raw_text="PACKAGE-RAW-CANARY",
+                controller_name=observation.controller_name,
+                captured_at=observed_at,
+            )
+            store.record_diagnostic(
+                DiagnosticEvent(
+                    stage="report-smoke",
+                    code=ErrorCode.PARSE_PARTIAL,
+                    message="PACKAGE-DIAGNOSTIC-CANARY",
+                    occurred_at=observed_at,
+                ),
+                run_id=run_id,
+            )
+            store.finish_run(run_id, ended_at=observed_at)
+            run_finished = True
+            written = store.export_run_html(run_id, destination)
+        finally:
+            if not run_finished:
+                # A failed package self-test must not leave a Windows lease
+                # handle open and hide the original failure during temp cleanup.
+                with suppress(StorageError):
+                    store.finish_run(run_id, status="FAILED")
+            with suppress(StorageError):
+                store.close()
     text = written.read_text(encoding="utf-8")
     required = (
         "세션 추적 결과",

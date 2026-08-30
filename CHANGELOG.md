@@ -25,6 +25,10 @@
 - Raw/DB poll 기록, 관리·외부 CSV/HTML 내보내기와 삭제를 manifest 기반으로
   복구하며 파일 hash·fsync·이동을 SQLite writer transaction 밖에서 끝내
   모니터링 기록과의 잠금 경합을 줄임.
+- Windows 8.3 짧은 경로와 긴 경로가 섞여도 디렉터리 identity로 같은 관리
+  루트를 확인하고, 양방향 별칭 아래의 junction/reparse 구성 요소는 계속
+  거부하도록 보완. 종료 시 lease handle을 먼저 닫고 일시적 공유 위반은
+  제한적으로 재시도하며 불완전 종료 경로는 worker lock을 기다리지 않음.
 - HTML/CSV 행을 cursor로 스트리밍하고 Raw 무결성 hash에 chunk별 취소·진행
   확인을 추가해 대용량 보고서가 GUI 종료와 WAL 정리를 장시간 막지 않도록 함.
 - 저장소 상태의 빠른 DB 집계와 명시적 background 파일 대조를 분리하고,

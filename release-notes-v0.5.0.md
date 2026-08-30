@@ -28,6 +28,10 @@ SSH 중단, 저장·내보내기·삭제, 시작과 종료의 실패 경계를 �
   새로 고침 때 다시 확인합니다.
 - 관리 파일과 crash journal, manifest, lease는 symbolic link, Windows
   reparse point, hardlink 및 열기 전후 identity 변경을 거부합니다.
+- Windows 8.3 짧은 경로와 긴 경로가 함께 사용되는 환경에서도 관리 루트의
+  directory identity를 확인하고, 어느 별칭 방향이든 중간 junction은
+  거부합니다. lease handle은 종료 전에 닫고 일시적 공유 위반만 제한적으로
+  재시도합니다.
 - 자동 삭제는 하지 않습니다. 저장 공간 5 GiB 미만은 경고하고 1 GiB 미만은
   다음 SSH 조회 전에 안전하게 중단합니다.
 

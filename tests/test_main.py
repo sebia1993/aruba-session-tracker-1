@@ -9,7 +9,7 @@ import aruba_session_tracker.main as main_module
 from aruba_session_tracker.config import ConfigError
 from aruba_session_tracker.main import main
 from aruba_session_tracker.paths import AppPaths, UnsafeManagedPath
-from aruba_session_tracker.storage import StorageError
+from aruba_session_tracker.storage import SessionStore, StorageError
 
 
 @pytest.mark.parametrize(
@@ -187,6 +187,52 @@ def test_report_smoke_writes_standalone_html_to_korean_path(tmp_path: Path) -> N
     assert "http://" not in text.casefold()
 
 
+def test_report_smoke_releases_run_lease_after_storage_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statuses: list[str] = []
+    original_finish = SessionStore.finish_run
+
+    def fail_record_query(self: SessionStore, *_args: object, **_kwargs: object) -> object:
+        raise StorageError("fixture storage failure")
+
+    def record_finish(
+        self: SessionStore,
+        run_id: str,
+        *,
+        status: str = "COMPLETED",
+        ended_at: object = None,
+    ) -> None:
+        statuses.append(status)
+        original_finish(self, run_id, status=status, ended_at=ended_at)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(SessionStore, "record_query", fail_record_query)
+    monkeypatch.setattr(SessionStore, "finish_run", record_finish)
+
+    with pytest.raises(StorageError, match="fixture storage failure"):
+        main_module._report_smoke_test(tmp_path / "failure.html")
+
+    assert statuses == ["FAILED"]
+
+
+def test_report_smoke_closes_run_lease_when_finish_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_record_query(self: SessionStore, *_args: object, **_kwargs: object) -> object:
+        raise StorageError("original record failure")
+
+    def fail_finish(self: SessionStore, *_args: object, **_kwargs: object) -> None:
+        raise StorageError("finish failure")
+
+    monkeypatch.setattr(SessionStore, "record_query", fail_record_query)
+    monkeypatch.setattr(SessionStore, "finish_run", fail_finish)
+
+    with pytest.raises(StorageError, match="original record failure"):
+        main_module._report_smoke_test(tmp_path / "failure.html")
+
+
 @pytest.mark.parametrize(
     "error", [StorageError("storage"), ConfigError("config"), UnsafeManagedPath("path")]
 )
@@ -260,6 +306,13 @@ def test_main_window_failure_is_sanitized_and_journaled_before_hook_restore(
     monkeypatch.setattr(main_module.AppPaths, "default", lambda: paths)
     monkeypatch.setattr(main_module, "CrashJournal", lambda *_args, **_kwargs: _Journal())
     monkeypatch.setattr(main_module, "MainWindow", fail_main_window)
+    monkeypatch.setattr(
+        main_module.SessionStore,
+        "close",
+        lambda _self: (_ for _ in ()).throw(
+            AssertionError("incomplete UI shutdown must not wait on the store lock")
+        ),
+    )
 
     with pytest.raises(RuntimeError, match="MAIN_WINDOW_SECRET_CANARY"):
         main([])

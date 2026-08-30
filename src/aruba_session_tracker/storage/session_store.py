@@ -441,6 +441,31 @@ class SessionStore:
             except (OSError, sqlite3.Error, UnsafeManagedPath, UnsafeStoragePath) as error:
                 raise StorageError(f"데이터베이스를 초기화할 수 없습니다: {error}") from error
 
+    def close(self) -> None:
+        """Release every locally owned run lease without masking earlier failures.
+
+        A run whose database status remains ``RUNNING`` is intentionally left
+        for the normal abandoned-run recovery on the next initialization.
+        This method only guarantees that this process no longer owns an open
+        file handle, which is also required before Windows temporary trees can
+        be removed safely.
+        """
+
+        first_error: Exception | None = None
+        with self._lock:
+            leases = tuple(self._run_leases.values())
+            self._run_leases.clear()
+            for lease in leases:
+                try:
+                    _release_run_lease(lease, remove=True)
+                except (OSError, StorageError, UnsafeManagedPath, UnsafeStoragePath) as error:
+                    if first_error is None:
+                        first_error = error
+        if first_error is not None:
+            raise StorageError(
+                f"실행 잠금 파일을 모두 정리할 수 없습니다: {type(first_error).__name__}"
+            ) from first_error
+
     def storage_health(self) -> StorageHealth:
         """Return a conservative snapshot of managed disk use and free capacity."""
 
@@ -3823,19 +3848,50 @@ def _release_run_lease(lease: _RunLease, *, remove: bool) -> None:
     try:
         if not lease.stream.closed:
             lease.stream.seek(0)
-            if os.name == "nt":
-                import msvcrt
+            try:
+                if os.name == "nt":
+                    import msvcrt
 
-                msvcrt.locking(lease.stream.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl: Any = importlib.import_module("fcntl")
-                fcntl.flock(lease.stream.fileno(), int(fcntl.LOCK_UN))
+                    msvcrt.locking(lease.stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl: Any = importlib.import_module("fcntl")
+                    fcntl.flock(lease.stream.fileno(), int(fcntl.LOCK_UN))
+            except OSError:
+                # Closing the descriptor below releases the OS lock even when
+                # an explicit unlock reports a transient Windows error.
+                pass
     finally:
         lease.stream.close()
-    if remove and os.path.lexists(lease.path):
-        info = os.lstat(lease.path)
-        if int(info.st_dev) == lease.device and int(info.st_ino) == lease.inode:
-            _unlink_regular(lease.path, missing_ok=False)
+    if remove:
+        _remove_released_lease_with_retry(lease)
+
+
+def _remove_released_lease_with_retry(lease: _RunLease) -> None:
+    delays = (0.0, 0.05, 0.1, 0.2, 0.4)
+    for attempt, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        if not os.path.lexists(lease.path):
+            return
+        try:
+            info = os.lstat(lease.path)
+        except FileNotFoundError:
+            return
+        _validate_lease_file_info(info)
+        if (int(info.st_dev), int(info.st_ino)) != (lease.device, lease.inode):
+            return
+        try:
+            lease.path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            retryable = os.name == "nt" and (
+                getattr(error, "winerror", None) in {5, 32, 33}
+                or (getattr(error, "winerror", None) is None and isinstance(error, PermissionError))
+            )
+            if attempt == len(delays) - 1 or not retryable:
+                raise
 
 
 def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
@@ -4558,14 +4614,31 @@ def _report_flow_key_from_session_key(
 def _reject_managed_chain(root: Path, directory: Path) -> None:
     root_absolute = Path(os.path.abspath(root))
     directory_absolute = Path(os.path.abspath(directory))
-    if not directory_absolute.is_relative_to(root_absolute):
-        raise UnsafeStoragePath("관리 경로가 루트 밖을 가리킵니다.")
-    current = root_absolute
-    _reject_link_or_reparse(current)
-    for part in directory_absolute.relative_to(root_absolute).parts:
-        current /= part
+    root_info = os.lstat(root_absolute)
+    _reject_link_or_reparse(root_absolute)
+    if not stat.S_ISDIR(root_info.st_mode):
+        raise UnsafeStoragePath("관리 루트가 디렉터리가 아닙니다.")
+    root_identity = int(root_info.st_dev), int(root_info.st_ino)
+
+    # Walk the caller's original namespace upward instead of resolving the
+    # child first.  This catches every junction component and treats Windows
+    # 8.3 and long-name spellings as the same root by their directory identity,
+    # in either alias direction.  Missing tail components are allowed because
+    # callers also validate paths before creating them.
+    current = directory_absolute
+    while True:
         if os.path.lexists(current):
+            info = os.lstat(current)
             _reject_link_or_reparse(current)
+            if not stat.S_ISDIR(info.st_mode):
+                raise UnsafeStoragePath("관리 경로 구성 요소가 디렉터리가 아닙니다.")
+            if (int(info.st_dev), int(info.st_ino)) == root_identity:
+                return
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    raise UnsafeStoragePath("관리 경로가 루트 밖을 가리킵니다.")
 
 
 def _unlink_regular(path: Path, *, missing_ok: bool) -> None:

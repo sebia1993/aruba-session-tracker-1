@@ -300,6 +300,68 @@ def test_file_lease_rejects_hardlink_without_modifying_external_file(tmp_path: P
     assert os.stat(external).st_nlink >= 2
 
 
+def test_release_run_lease_closes_stream_before_removing_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    lease = store._acquire_operation_lease("a" * 32)
+    assert lease is not None
+    original_unlink = Path.unlink
+    closed_when_removed: list[bool] = []
+
+    def observe_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path == lease.path:
+            closed_when_removed.append(lease.stream.closed)
+        original_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "unlink", observe_unlink)
+    try:
+        session_store_module._release_run_lease(lease, remove=True)
+    finally:
+        if not lease.stream.closed:
+            lease.stream.close()
+        if os.path.lexists(lease.path):
+            original_unlink(lease.path)
+
+    assert closed_when_removed == [True]
+    assert not os.path.lexists(lease.path)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sharing-violation retry test")
+def test_release_run_lease_retries_transient_windows_unlink_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    lease = store._acquire_operation_lease("b" * 32)
+    assert lease is not None
+    original_unlink = Path.unlink
+    attempts = 0
+
+    def transient_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal attempts
+        if path == lease.path:
+            attempts += 1
+            if attempts == 1:
+                raise PermissionError("fixture sharing violation")
+        original_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "unlink", transient_unlink)
+    monkeypatch.setattr(session_store_module.time, "sleep", lambda _seconds: None)
+    try:
+        session_store_module._release_run_lease(lease, remove=True)
+    finally:
+        if not lease.stream.closed:
+            lease.stream.close()
+        if os.path.lexists(lease.path):
+            original_unlink(lease.path)
+
+    assert attempts == 2
+    assert lease.stream.closed
+    assert not os.path.lexists(lease.path)
+
+
 def test_second_store_cannot_mutate_another_process_owned_run(tmp_path: Path) -> None:
     owner = _store(tmp_path)
     run_id = _run(owner)
@@ -1232,10 +1294,102 @@ def test_initialize_rejects_a_windows_junction_managed_root(tmp_path: Path) -> N
     )
     assert completed.returncode == 0, completed.stderr
     try:
+        with pytest.raises(session_store_module.UnsafeStoragePath, match="reparse point"):
+            session_store_module._reject_managed_chain(junction, target)
         store = SessionStore(tmp_path / "tracker.db", junction, tmp_path / "exports")
         with pytest.raises(StorageError, match="reparse point"):
             store.initialize()
         assert sentinel.read_text(encoding="utf-8") == "keep"
+    finally:
+        junction.rmdir()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows 8.3 path-alias test")
+def test_record_query_accepts_equivalent_windows_short_root_alias(tmp_path: Path) -> None:
+    import ctypes
+
+    managed_root = tmp_path / "managed root with spaces"
+    managed_root.mkdir()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_short_path = kernel32.GetShortPathNameW
+    get_short_path.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+    )
+    get_short_path.restype = ctypes.c_uint32
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = get_short_path(str(managed_root), buffer, len(buffer))
+    if length == 0:
+        pytest.skip(f"8.3 path alias is unavailable: WinError {ctypes.get_last_error()}")
+    if length >= len(buffer):  # pragma: no cover - impossible for pytest temp paths
+        pytest.skip("8.3 path alias exceeds the test buffer")
+    short_root = Path(buffer.value)
+    if os.path.normcase(os.path.abspath(short_root)) == os.path.normcase(
+        os.path.abspath(managed_root)
+    ):
+        pytest.skip("8.3 short-name generation is disabled on this volume")
+
+    store = SessionStore(
+        short_root / "tracker.db",
+        short_root / "raw",
+        short_root / "exports",
+    )
+    store.initialize()
+    run_id = _run(store)
+    try:
+        observation_ids = store.record_query(
+            run_id,
+            [_observation()],
+            raw_text="short-alias-raw",
+        )
+    finally:
+        if run_id in store._run_leases:
+            store.finish_run(run_id)
+
+    assert len(observation_ids) == 1
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM raw_files").fetchone()[0] == 1
+    assert len(tuple(store.raw_root.rglob("*.txt"))) == 1
+    assert not tuple(store._leases_root.glob("operation-*.lease"))
+
+    target = managed_root / "raw" / "junction-target"
+    (target / "child").mkdir(parents=True)
+    junction = managed_root / "raw" / "junction-alias"
+    completed = subprocess.run(  # noqa: S603
+        [
+            os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"),
+            "/d",
+            "/c",
+            "mklink",
+            "/J",
+            str(junction),
+            str(target),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+    try:
+        with pytest.raises(session_store_module.UnsafeStoragePath, match="reparse point"):
+            session_store_module._reject_managed_chain(
+                short_root / "raw",
+                junction / "child",
+            )
+        inverse_length = get_short_path(
+            str(junction / "child"),
+            buffer,
+            len(buffer),
+        )
+        assert 0 < inverse_length < len(buffer)
+        with pytest.raises(session_store_module.UnsafeStoragePath, match="reparse point"):
+            session_store_module._reject_managed_chain(
+                managed_root / "raw",
+                Path(buffer.value),
+            )
     finally:
         junction.rmdir()
 
