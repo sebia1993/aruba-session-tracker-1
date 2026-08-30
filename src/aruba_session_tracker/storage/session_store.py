@@ -4945,10 +4945,14 @@ def _reject_link_or_reparse(path: Path) -> None:
 
 
 def _regular_file_size(path: Path) -> int:
-    if not os.path.lexists(path):
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
         return 0
-    _reject_link_or_reparse(path)
-    info = os.lstat(path)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = int(getattr(info, "st_file_attributes", 0))
+    if stat.S_ISLNK(info.st_mode) or (reparse_flag and attributes & reparse_flag):
+        raise UnsafeStoragePath("심볼릭 링크나 reparse point는 관리 대상으로 삭제할 수 없습니다.")
     if not stat.S_ISREG(info.st_mode):
         raise UnsafeStoragePath("저장소 크기 확인 대상이 일반 파일이 아닙니다.")
     return int(info.st_size)

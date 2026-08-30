@@ -103,6 +103,20 @@ class QueryExecutor(Protocol):
     def stop_monitor(self) -> None: ...
 
 
+class _SignalEmitter(Protocol):
+    def emit(self, *args: object) -> None: ...
+
+
+def _emit_if_alive(signal: _SignalEmitter, *args: object) -> bool:
+    """Emit from a daemon worker unless Qt is already tearing the sender down."""
+
+    try:
+        signal.emit(*args)
+    except RuntimeError:
+        return False
+    return True
+
+
 class _TaskSignals(QObject):
     succeeded = Signal(int, object)
     failed = Signal(int, object)
@@ -152,7 +166,8 @@ class _QueryTask(QRunnable):
                 health = self._storage_health_check()
                 if bool(getattr(health, "warning", False)):
                     hard_stop = bool(getattr(health, "hard_stop", False))
-                    self.signals.storage_warning.emit(
+                    _emit_if_alive(
+                        self.signals.storage_warning,
                         self.generation,
                         hard_stop,
                     )
@@ -177,11 +192,11 @@ class _QueryTask(QRunnable):
                 monitoring=self._monitoring,
             )
         except Exception as exc:
-            self.signals.failed.emit(self.generation, exc)
+            _emit_if_alive(self.signals.failed, self.generation, exc)
         else:
-            self.signals.succeeded.emit(self.generation, prepared)
+            _emit_if_alive(self.signals.succeeded, self.generation, prepared)
         finally:
-            self.signals.finished.emit(self.generation)
+            _emit_if_alive(self.signals.finished, self.generation)
 
 
 class _StorageTaskSignals(QObject):
@@ -217,7 +232,8 @@ class _StorageTask(QRunnable):
         return self._cancel_requested.is_set()
 
     def _report_progress(self, phase: str, completed: int, total: int | None) -> None:
-        self.signals.progress.emit(
+        _emit_if_alive(
+            self.signals.progress,
             self.generation,
             self.kind,
             phase,
@@ -230,11 +246,11 @@ class _StorageTask(QRunnable):
         try:
             result = self._operation(self.cancelled, self._report_progress)
         except Exception as exc:
-            self.signals.failed.emit(self.generation, self.kind, exc)
+            _emit_if_alive(self.signals.failed, self.generation, self.kind, exc)
         else:
-            self.signals.succeeded.emit(self.generation, self.kind, result)
+            _emit_if_alive(self.signals.succeeded, self.generation, self.kind, result)
         finally:
-            self.signals.finished.emit(self.generation, self.kind)
+            _emit_if_alive(self.signals.finished, self.generation, self.kind)
 
 
 class _ApprovalRequest:
@@ -2423,7 +2439,7 @@ class MainWindow(QMainWindow):
         self._current_history_task = None
         self._pending_preview_discards.clear()
         self.statusBar().showMessage("완료되지 않은 로컬 작업은 다음 실행에서 안전하게 복구합니다.")
-        QTimer.singleShot(0, self.close)
+        QTimer.singleShot(0, self, self.close)
 
     def _close_if_idle(self) -> None:
         if not self._close_when_idle:
@@ -2438,7 +2454,7 @@ class MainWindow(QMainWindow):
             or self._pending_preview_discards
         ):
             return
-        QTimer.singleShot(0, self.close)
+        QTimer.singleShot(0, self, self.close)
 
 
 def _optional_port(text: str, label: str) -> int | None:

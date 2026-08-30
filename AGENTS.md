@@ -45,6 +45,13 @@ datapath session rows from the relevant 7240XM managed device.
   shutdown work off the Qt GUI thread. Every new lifecycle worker must have a
   bounded wait, cancellation boundary, sanitized failure result and recovery
   behavior that is safe after process interruption.
+- Bind deferred Qt callbacks to their owning `QObject` lifetime. Daemon workers
+  must tolerate their signal sender being deleted during final Qt teardown;
+  never leave an unowned callback that can call a deleted window later.
+- Treat SQLite WAL disappearance during a read-only size snapshot as a normal
+  zero-byte transient. Keep a single `lstat` snapshot for file type, reparse and
+  size checks instead of weakening the managed-path boundary or serializing the
+  complete background storage scan behind the store lock.
 - Run `powershell -ExecutionPolicy Bypass -File .\tools\validate.ps1` before
   packaging.
 - Keep global line coverage at or above 83 percent and branch coverage for the
