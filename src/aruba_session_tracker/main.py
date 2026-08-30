@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import hmac
 import re
 import sys
@@ -327,10 +329,17 @@ def _report_smoke_test(destination: Path) -> int:
     text = written.read_text(encoding="utf-8")
     required = (
         "세션 추적 결과",
+        "결과 필터",
         "최신 세션 결과",
         "전체 추적 이력",
         "KST",
         "한국어-MD",
+        'id="result-filter"',
+        'id="filter-ip"',
+        'id="filter-protocol"',
+        'id="filter-port"',
+        'class="report-row"',
+        "script-src 'sha256-",
     )
     forbidden = (
         "PACKAGE-RAW-CANARY",
@@ -342,8 +351,16 @@ def _report_smoke_test(destination: Path) -> int:
         "세션별 수치 변화",
         "패킷",
         "바이트",
+        "XMLHttpRequest",
+        "WebSocket",
+        "navigator.clipboard",
+        "localStorage",
+        "sessionStorage",
+        "eval(",
     )
-    section_positions = tuple(text.find(marker) for marker in ("최신 세션 결과", "전체 추적 이력"))
+    section_positions = tuple(
+        text.find(marker) for marker in ("결과 필터", "최신 세션 결과", "전체 추적 이력")
+    )
     history_markers = (
         '<details class="history-toggle">',
         '<div class="details-body" id="observation-history-body">',
@@ -355,6 +372,7 @@ def _report_smoke_test(destination: Path) -> int:
         or any(marker in text for marker in forbidden)
         or section_positions != tuple(sorted(section_positions))
         or any(marker not in text for marker in history_markers)
+        or not _report_filter_script_is_hash_authorized(text)
         or "<details open" in text
         or "https://" in text.casefold()
         or "http://" in text.casefold()
@@ -363,6 +381,14 @@ def _report_smoke_test(destination: Path) -> int:
         return 1
     print(f"ARUBA_SESSION_TRACKER_REPORT_SMOKE_OK {__version__}")
     return 0
+
+
+def _report_filter_script_is_hash_authorized(text: str) -> bool:
+    scripts = re.findall(r"<script>(.*?)</script>", text, flags=re.IGNORECASE | re.DOTALL)
+    if len(scripts) != 1:
+        return False
+    digest = base64.b64encode(hashlib.sha256(scripts[0].encode("utf-8")).digest()).decode("ascii")
+    return f"script-src 'sha256-{digest}'" in text
 
 
 def _loopback_runtime_smoke(port: int, fingerprint: str, mode: str) -> int:

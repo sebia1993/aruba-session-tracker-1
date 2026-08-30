@@ -83,12 +83,31 @@ datapath session rows from the relevant 7240XM managed device.
 - Preserve CSV export as an independent manual path. HTML is a result-only
   presentation of the selected run, not an operator guide or diagnostic
   document. Keep it as a separate single-file HTML5 document with inline CSS,
-  no external resources or JavaScript, responsive and print layouts, and
-  escaped database/device values.
+  no external resources or external JavaScript, responsive and print layouts,
+  and escaped database/device values. The only permitted script is exactly one
+  deterministic inline result-filter script authorized by its exact SHA-256 in
+  the Content Security Policy.
 - Show KST as the primary display time and focus the latest 50 results and the
   collapsed full-history section on protocol, source IP:port, and destination
-  IP:port. HTML must include every stored observation row on screen and in
-  print; the 2,000-row cap applies only to the live Qt result table.
+  IP:port. Partial IP or port input may offer at most 12 values from the stored
+  full history, but filtering must begin only after the user selects an exact
+  value or enters an exact value and presses Enter. Filters apply only to
+  presentation, never remove an observation row from the document, are never
+  persisted, and must reset whenever the report is reopened.
+- Build autocomplete candidates from one full-history reverse index. Partial
+  keystrokes may search only the cached unique candidate set, must discard any
+  stale active option immediately, and must not rescan the report DOM. Touch
+  pointer-down and list scrolling must never select a value; selection occurs
+  only after a completed tap/click or explicit keyboard confirmation.
+- HTML must preserve every stored observation row regardless of the live Qt
+  table's 2,000-row cap. Screen and print show the current exact filter result;
+  clearing all filters restores and prints the complete stored history. Show
+  both filtered and total counts so hidden rows cannot be mistaken for missing
+  data.
+- The local report-filter script must not use network access, external
+  libraries, browser storage, URLs, clipboard APIs, `eval`, or database/device
+  values as executable markup. If CSP blocks it, hide the filter controls and
+  leave the complete static report readable.
 - Omit packet, byte, and counter-delta values from HTML while preserving them
   in SQLite, CSV, and Raw data. Do not change those storage formats for this
   presentation-only simplification.

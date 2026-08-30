@@ -725,10 +725,17 @@ def smoke_executable(zip_path: Path) -> None:
 def _verify_packaged_report_text(report_text: str) -> None:
     required_report_markers = (
         "세션 추적 결과",
+        "결과 필터",
         "최신 세션 결과",
         "전체 추적 이력",
         "KST",
         "한국어-MD",
+        'id="result-filter"',
+        'id="filter-ip"',
+        'id="filter-protocol"',
+        'id="filter-port"',
+        'class="report-row"',
+        "script-src 'sha256-",
         '<details class="history-toggle">',
         '<div class="details-body" id="observation-history-body">',
         ".history-toggle + .details-body { display:block !important; }",
@@ -743,20 +750,35 @@ def _verify_packaged_report_text(report_text: str) -> None:
         "세션별 수치 변화",
         "패킷",
         "바이트",
+        "XMLHttpRequest",
+        "WebSocket",
+        "navigator.clipboard",
+        "localStorage",
+        "sessionStorage",
+        "eval(",
     )
     section_positions = tuple(
-        report_text.find(marker) for marker in ("최신 세션 결과", "전체 추적 이력")
+        report_text.find(marker) for marker in ("결과 필터", "최신 세션 결과", "전체 추적 이력")
     )
     if (
         "<!doctype html>" not in report_text.casefold()
         or any(marker not in report_text for marker in required_report_markers)
         or any(marker in report_text for marker in forbidden_report_markers)
         or section_positions != tuple(sorted(section_positions))
+        or not _report_filter_script_is_hash_authorized(report_text)
         or "<details open" in report_text
         or "https://" in report_text.casefold()
         or "http://" in report_text.casefold()
     ):
         raise ReleaseVerificationError("packaged HTML report is not standalone and complete")
+
+
+def _report_filter_script_is_hash_authorized(report_text: str) -> bool:
+    scripts = re.findall(r"<script>(.*?)</script>", report_text, flags=re.IGNORECASE | re.DOTALL)
+    if len(scripts) != 1:
+        return False
+    digest = base64.b64encode(hashlib.sha256(scripts[0].encode("utf-8")).digest()).decode("ascii")
+    return f"script-src 'sha256-{digest}'" in report_text
 
 
 def _packaged_environment() -> dict[str, str]:

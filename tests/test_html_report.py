@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import re
+from inspect import signature
 from pathlib import Path
 
 import pytest
@@ -156,9 +159,34 @@ def _section(document: str, section_id: str) -> str:
 
 
 def _table_body(section: str) -> str:
-    match = re.search(r"<tbody>(?P<body>.*?)</tbody>", section, flags=re.DOTALL)
+    match = re.search(r"<tbody\b[^>]*>(?P<body>.*?)</tbody>", section, flags=re.DOTALL)
     assert match is not None
     return match.group("body")
+
+
+def _report_rows(markup: str) -> list[str]:
+    return re.findall(
+        r'<tr\b(?=[^>]*\bclass="[^"]*\breport-row\b)[^>]*>.*?</tr>',
+        markup,
+        flags=re.DOTALL,
+    )
+
+
+def _element_start_tag(document: str, tag_name: str, element_id: str) -> str:
+    match = re.search(
+        rf'<{re.escape(tag_name)}\b[^>]*\bid="{re.escape(element_id)}"[^>]*>',
+        document,
+    )
+    assert match is not None
+    return match.group(0)
+
+
+def _inline_scripts(document: str) -> list[str]:
+    return re.findall(
+        r"<script(?:\s[^>]*)?>(?P<body>.*?)</script>",
+        document,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
 
 
 def test_report_is_concise_standalone_result_only_html5() -> None:
@@ -171,21 +199,22 @@ def test_report_is_concise_standalone_result_only_html5() -> None:
     assert "Content-Security-Policy" in document
     assert "default-src 'none'" in document
     assert "style-src 'unsafe-inline'" in document
+    assert "script-src 'sha256-" in document
     assert "<style>" in lowered
     assert "@media (max-width:850px)" in document
     assert "@page { size:A4 landscape" in document
     assert "@media print" in document
-    assert "<script" not in lowered
+    assert len(_inline_scripts(document)) == 1
     assert "<link" not in lowered
     assert "http://" not in lowered
     assert "https://" not in lowered
     assert not re.search(r"\b(?:src|href)=[\"'](?:https?:)?//", lowered)
     assert "<nav" not in lowered
 
-    headings = ("최신 세션 결과", "전체 추적 이력")
-    positions = [document.index(f"<h2>{heading}</h2>") for heading in headings]
+    headings = ("결과 필터", "최신 세션 결과", "전체 추적 이력")
+    positions = [document.index(heading) for heading in headings]
     assert positions == sorted(positions)
-    assert document.count("<h2>") == 2
+    assert document.count("<h2") == 2
     assert re.findall(r'<th scope="col">([^<]+)</th>', _section(document, "latest-sessions")) == [
         "마지막 확인 시각",
         "장비명",
@@ -204,13 +233,172 @@ def test_report_is_concise_standalone_result_only_html5() -> None:
         "목적지 IP:포트",
         "추적 상태",
     ]
-    assert (
-        '<summary aria-controls="observation-history-body">전체 추적 이력 1건 보기</summary>'
-    ) in document
+    assert "전체 추적 이력 1/1건 보기</summary>" in document
     assert "<details open" not in document
     assert 'role="region" aria-label="최신 세션 결과 표" tabindex="0"' in document
     assert 'role="region" aria-label="전체 추적 이력 표" tabindex="0"' in document
     assert document.count('<th scope="col">') == 12
+
+
+def test_filter_uses_one_exactly_hash_authorized_inline_script() -> None:
+    document = render_html_report(_snapshot())
+    scripts = _inline_scripts(document)
+    assert len(scripts) == 1
+    script = scripts[0]
+    empty_script = _inline_scripts(
+        render_html_report(
+            _snapshot(
+                observations=(),
+                observation_history=(),
+                lifecycle_events=(),
+                observation_total=0,
+            )
+        )
+    )[0]
+    assert script == empty_script
+    expected_hash = base64.b64encode(hashlib.sha256(script.encode("utf-8")).digest()).decode(
+        "ascii"
+    )
+
+    csp = re.search(
+        r'<meta http-equiv="Content-Security-Policy" content="(?P<value>[^"]+)">',
+        document,
+    )
+    assert csp is not None
+    assert re.findall(r"script-src\s+'sha256-([^']+)'", csp.group("value")) == [expected_hash]
+    assert "'unsafe-inline'" not in re.search(
+        r"script-src(?P<value>[^;]+)", csp.group("value")
+    ).group("value")
+    assert not re.search(r"<script\b[^>]+\bsrc=", document, flags=re.IGNORECASE)
+    assert not re.search(r"<[^>]+\son[a-z]+\s*=", document, flags=re.IGNORECASE)
+    assert "<link" not in document.casefold()
+    assert not re.search(r"\b(?:src|href)=[\"'](?:https?:)?//", document, flags=re.IGNORECASE)
+    assert "http://" not in document.casefold()
+    assert "https://" not in document.casefold()
+
+
+def test_filter_controls_are_hidden_until_initialized_and_keyboard_accessible() -> None:
+    document = render_html_report(_snapshot())
+    filter_section = _element_start_tag(document, "section", "result-filter")
+    ip_input = _element_start_tag(document, "input", "filter-ip")
+    port_input = _element_start_tag(document, "input", "filter-port")
+    protocol_select = _element_start_tag(document, "select", "filter-protocol")
+    reset_button = _element_start_tag(document, "button", "filter-reset")
+    ip_list = _element_start_tag(document, "div", "filter-ip-list")
+    port_list = _element_start_tag(document, "div", "filter-port-list")
+    filter_status = _element_start_tag(document, "p", "filter-status")
+
+    assert re.search(r"\bclass=\"[^\"]*\bfilter-panel\b", filter_section)
+    assert re.search(r"\bclass=\"[^\"]*\bjs-only\b", filter_section)
+    assert re.search(r"\shidden(?:\s|>)", filter_section)
+    assert re.search(r'<label\b[^>]*\bfor="filter-ip"[^>]*>IP 검색</label>', document)
+    assert re.search(r'<label\b[^>]*\bfor="filter-protocol"[^>]*>프로토콜</label>', document)
+    assert re.search(r'<label\b[^>]*\bfor="filter-port"[^>]*>포트 검색</label>', document)
+    for input_tag, list_id in ((ip_input, "filter-ip-list"), (port_input, "filter-port-list")):
+        assert 'role="combobox"' in input_tag
+        assert 'aria-autocomplete="list"' in input_tag
+        assert f'aria-controls="{list_id}"' in input_tag
+        assert 'aria-expanded="false"' in input_tag
+        assert 'autocomplete="off"' in input_tag
+    assert 'aria-label="프로토콜"' in protocol_select
+    assert 'aria-describedby="filter-status"' in protocol_select
+    assert '<option value="">전체</option>' in document
+    assert 'type="button"' in reset_button
+    assert ">전체 초기화</button>" in document
+    assert 'role="listbox"' in ip_list
+    assert 'role="listbox"' in port_list
+    assert 'aria-live="polite"' in filter_status
+    assert 'id="latest-filter-count"' in document
+    assert 'id="history-filter-count"' in document
+    assert 'role="status"' in filter_status
+    assert 'aria-live="polite"' in _element_start_tag(document, "span", "latest-filter-count")
+    assert 'aria-live="polite"' in _element_start_tag(document, "span", "history-filter-count")
+    _element_start_tag(document, "tbody", "latest-results-body")
+    _element_start_tag(document, "tbody", "history-results-body")
+    _element_start_tag(document, "summary", "history-filter-summary")
+
+
+def test_filter_rows_have_escaped_exact_match_data_and_print_markers() -> None:
+    row = _observation(
+        protocol=17,
+        source_ip='2001:db8::1" data-breakout="blocked',
+        destination_ip="203.0.113.81",
+        source_port=5353,
+        destination_port=53,
+    )
+    document = render_html_report(
+        _snapshot(
+            observations=(row,),
+            observation_history=(row,),
+            lifecycle_events=(),
+        )
+    )
+    rows = _report_rows(document)
+
+    assert len(rows) == 2
+    for rendered_row in rows:
+        assert 'data-source-ip="2001:db8::1&quot; data-breakout=&quot;blocked"' in rendered_row
+        assert 'data-destination-ip="203.0.113.81"' in rendered_row
+        assert 'data-source-port="5353"' in rendered_row
+        assert 'data-destination-port="53"' in rendered_row
+        assert 'data-protocol="UDP (17)"' in rendered_row
+        assert ' data-breakout="blocked"' not in rendered_row
+    assert 'id="print-filter-summary"' in document
+    assert ".print-filter-summary { display:none; }" in document
+    assert re.search(
+        r"@media print\s*\{.*?\.print-filter-summary\s*\{\s*display:block",
+        document,
+        flags=re.DOTALL,
+    )
+
+
+def test_filter_script_contains_bounded_ranked_suggestions_and_no_persistence() -> None:
+    script = _inline_scripts(render_html_report(_snapshot()))[0]
+
+    assert re.search(r"(?:const|let)\s+SUGGESTION_LIMIT\s*=\s*12\s*;", script)
+    assert ".startsWith(" in script
+    assert ".includes(" in script
+    assert "localeCompare(" in script or "Intl.Collator" in script
+    for label in ("출발지", "목적지", "양쪽", "추천 목록에서 값을 선택하세요"):
+        assert label in script
+    for key_name in ("ArrowDown", "ArrowUp", "Enter", "Escape"):
+        assert key_name in script
+    assert 'setAttribute("role", "option")' in script or "setAttribute('role', 'option')" in script
+    assert "aria-activedescendant" in script
+    assert "aria-selected" in script
+    assert 'list.addEventListener("pointerdown"' in script
+    assert 'list.addEventListener("click"' in script
+    assert 'event.pointerType === "mouse"' in script
+    assert "setTimeout(" in script
+    for forbidden in (
+        "localStorage",
+        "sessionStorage",
+        "indexedDB",
+        "fetch(",
+        "XMLHttpRequest",
+        "WebSocket",
+        "navigator.clipboard",
+        "eval(",
+    ):
+        assert forbidden not in script
+
+    candidate_values = re.search(
+        r"const candidateValues = \(kind\) => \{(?P<body>.*?)\n  \};",
+        script,
+        flags=re.DOTALL,
+    )
+    assert candidate_values is not None
+    assert "historyRecords" not in candidate_values.group("body")
+    assert "indexes[kind].values()" in candidate_values.group("body")
+    assert "historyRecords.forEach((record, rowId)" in script
+    assert "eligibleRowsForOtherFilters" in script
+    assert "touch-action:pan-y" in render_html_report(_snapshot())
+
+
+def test_public_html_report_interfaces_remain_compatible() -> None:
+    assert tuple(signature(render_html_report).parameters) == ("snapshot",)
+    assert tuple(signature(write_html_report_atomic).parameters) == ("destination", "snapshot")
+    assert "observation_history" in RunReportSnapshot.__dataclass_fields__
 
 
 def test_history_disclosure_keeps_screen_collapsed_but_prints_outside_details() -> None:
@@ -219,7 +407,7 @@ def test_history_disclosure_keeps_screen_collapsed_but_prints_outside_details() 
 
     assert re.search(
         r'<details class="history-toggle">\s*'
-        r'<summary aria-controls="observation-history-body">.*?</summary>\s*'
+        r'<summary\b[^>]*\baria-controls="observation-history-body"[^>]*>.*?</summary>\s*'
         r"</details>\s*"
         r'<div class="details-body" id="observation-history-body">',
         history,
@@ -535,8 +723,8 @@ def test_controller_move_is_one_logical_flow_and_latest_result_uses_last_device(
 
     latest_rows = _table_body(_section(document, "latest-sessions"))
     history_rows = _table_body(_section(document, "observation-history"))
-    assert latest_rows.count("<tr>") == 1
-    assert history_rows.count("<tr>") == 2
+    assert len(_report_rows(latest_rows)) == 1
+    assert len(_report_rows(history_rows)) == 2
     assert '<div class="label">고유 세션</div><span class="value">1개</span>' in document
     assert "MD-B" in latest_rows
     assert "MD-A" not in latest_rows
@@ -609,7 +797,7 @@ def test_zero_ports_keep_lifecycle_status_and_controller_move_in_one_flow() -> N
     )
 
     latest = _section(document, "latest-sessions")
-    assert _table_body(latest).count("<tr>") == 1
+    assert len(_report_rows(_table_body(latest))) == 1
     assert ">종료 확인<" in latest
     assert "MD-B" in latest
     assert "ICMP (1)" in latest
@@ -679,8 +867,8 @@ def test_only_latest_table_is_limited_to_fifty_logical_flows() -> None:
 
     latest = _section(document, "latest-sessions")
     history = _section(document, "observation-history")
-    assert _table_body(latest).count("<tr>") == 50
-    assert _table_body(history).count("<tr>") == 55
+    assert len(_report_rows(_table_body(latest))) == 50
+    assert len(_report_rows(_table_body(history))) == 55
     assert "고유 세션 55개 중 마지막 확인 시각을 기준으로 최근 50개" in latest
     assert "192.0.2.100:53000" not in _table_body(latest)
     assert "192.0.2.100:53000" in _table_body(history)
@@ -705,8 +893,8 @@ def test_full_history_preserves_all_2005_rows_beyond_ui_limit() -> None:
     )
     history_section = _section(document, "observation-history")
 
-    assert _table_body(history_section).count("<tr>") == 2_005
-    assert "전체 추적 이력 2,005건 보기" in history_section
+    assert len(_report_rows(_table_body(history_section))) == 2_005
+    assert "전체 추적 이력 2,005/2,005건 보기" in history_section
 
 
 def test_report_escapes_result_values_and_excludes_all_internal_evidence() -> None:
@@ -782,6 +970,54 @@ def test_empty_result_has_clear_rows_and_no_false_session_state() -> None:
     assert "저장된 관측 이력이 없습니다." in document
     assert "종료 확인" not in document
     assert "고유 세션 0개를 모두 표시합니다." in document
+    assert len(_report_rows(document)) == 0
+    assert document.count('class="filter-empty-row" hidden') == 2
+    assert document.count("선택한 필터와 일치하는 세션이 없습니다.") == 2
+
+
+def test_initial_filter_counts_distinguish_latest_limit_from_complete_history() -> None:
+    rows = tuple(
+        _observation(
+            observed_at=f"2026-08-28T08:{index:02d}:00.000Z",
+            source_ip=f"192.0.2.{index + 1}",
+            destination_ip="203.0.113.80",
+            source_port=53000 + index,
+            destination_port=443 if index % 2 == 0 else 8443,
+        )
+        for index in range(55)
+    )
+    document = render_html_report(
+        _snapshot(
+            observations=tuple(reversed(rows)),
+            observation_history=rows,
+            lifecycle_events=(),
+            observation_total=55,
+        )
+    )
+
+    latest_count = re.search(
+        r'<span\b[^>]*\bid="latest-filter-count"[^>]*>(?P<value>.*?)</span>',
+        document,
+        flags=re.DOTALL,
+    )
+    history_count = re.search(
+        r'<span\b[^>]*\bid="history-filter-count"[^>]*>(?P<value>.*?)</span>',
+        document,
+        flags=re.DOTALL,
+    )
+    assert latest_count is not None
+    assert history_count is not None
+    assert latest_count.group("value").strip() == "최신 50/50건"
+    assert history_count.group("value").strip() == "전체 55/55건"
+    assert "전체 추적 이력 55/55건 보기" in document
+    script = _inline_scripts(document)[0]
+    latest_visible = "${integerFormat.format(latestVisible)}"
+    latest_total = "${integerFormat.format(latestRecords.length)}"
+    history_visible = "${integerFormat.format(historyVisible)}"
+    history_total = "${integerFormat.format(historyRecords.length)}"
+    assert f"최신 {latest_visible}/{latest_total}건" in script
+    assert f"전체 {history_visible}/{history_total}건" in script
+    assert f"전체 추적 이력 {history_visible}/{history_total}건 보기" in script
 
 
 def test_render_and_atomic_writes_are_deterministic(tmp_path: Path) -> None:

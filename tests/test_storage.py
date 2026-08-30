@@ -2441,7 +2441,15 @@ def test_html_export_uses_database_id_order_for_equal_observation_and_lifecycle_
     assert latest is not None and history is not None
     latest_body = latest.group("body")
     history_body = history.group("body")
-    assert latest_body.count("<tbody><tr>") == 1
+    assert (
+        len(
+            re.findall(
+                r'<tbody\b[^>]*>\s*<tr\b(?=[^>]*\bclass="[^"]*\breport-row\b)',
+                latest_body,
+            )
+        )
+        == 1
+    )
     assert "MD-B" in latest_body
     assert ">확인됨<" in latest_body
     assert "session-changes" not in document
@@ -2615,10 +2623,22 @@ def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
     )
     assert history_section is not None
     history_body = history_section.group("body")
-    history_table_body = re.search(r"<tbody>(?P<body>.*?)</tbody>", history_body, re.DOTALL)
+    history_table_body = re.search(
+        r"<tbody\b[^>]*>(?P<body>.*?)</tbody>",
+        history_body,
+        re.DOTALL,
+    )
     assert history_table_body is not None
 
-    assert history_table_body.group("body").count("<tr>") == 2_005
+    assert (
+        len(
+            re.findall(
+                r'<tr\b(?=[^>]*\bclass="[^"]*\breport-row\b)',
+                history_table_body.group("body"),
+            )
+        )
+        == 2_005
+    )
     assert "OLDEST-OBSERVATION-CONTROLLER" in history_body
     assert "OLDEST-LIFECYCLE-INSTANCE" not in document
     assert "OLDEST-CONTROLLER-REASON" not in document
@@ -2627,7 +2647,8 @@ def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
     assert "capture-0000.txt" not in document
     assert "private-raw-body-0" not in document
     assert (
-        '<summary aria-controls="observation-history-body">전체 추적 이력 2,005건 보기</summary>'
+        '<summary id="history-filter-summary" aria-controls="observation-history-body">'
+        "전체 추적 이력 2,005/2,005건 보기</summary>"
     ) in document
     assert "세션별 수치 변화" not in document
     assert "패킷" not in document

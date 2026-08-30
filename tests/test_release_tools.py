@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import zipfile
 from dataclasses import replace
@@ -84,13 +85,22 @@ def test_packaged_smoke_environment_excludes_development_python(
 
 
 def test_packaged_report_verifier_requires_printable_history_structure() -> None:
-    report = """<!doctype html>
+    script = "document.documentElement.dataset.filterReady = 'true';"
+    digest = base64.b64encode(hashlib.sha256(script.encode("utf-8")).digest()).decode("ascii")
+    csp = f"default-src 'none'; script-src 'sha256-{digest}'"
+    report = f"""<!doctype html>
+    <meta http-equiv="Content-Security-Policy" content="{csp}">
     세션 추적 결과 KST 한국어-MD
+    결과 필터
+    <section id="result-filter"></section>
+    <input id="filter-ip"><select id="filter-protocol"></select><input id="filter-port">
     최신 세션 결과
+    <tr class="report-row"></tr>
     전체 추적 이력
     <details class="history-toggle"></details>
     <div class="details-body" id="observation-history-body"></div>
-    <style>.history-toggle + .details-body { display:block !important; }</style>
+    <style>.history-toggle + .details-body {{ display:block !important; }}</style>
+    <script>{script}</script>
     """
 
     _verify_packaged_report_text(report)
@@ -99,6 +109,12 @@ def test_packaged_report_verifier_requires_printable_history_structure() -> None
         _verify_packaged_report_text(
             report.replace('<details class="history-toggle">', "<details>")
         )
+    with pytest.raises(ReleaseVerificationError, match="standalone and complete"):
+        _verify_packaged_report_text(
+            report.replace("script-src 'sha256-", "script-src 'sha256-broken-", 1)
+        )
+    with pytest.raises(ReleaseVerificationError, match="standalone and complete"):
+        _verify_packaged_report_text(f"{report}<script>extra</script>")
 
 
 def test_secret_check_detects_sqlite_magic_without_database_suffix(tmp_path: Path) -> None:
