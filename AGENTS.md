@@ -45,6 +45,13 @@ datapath session rows from the relevant 7240XM managed device.
   shutdown work off the Qt GUI thread. Every new lifecycle worker must have a
   bounded wait, cancellation boundary, sanitized failure result and recovery
   behavior that is safe after process interruption.
+- Bind deferred Qt callbacks to their owning `QObject` lifetime. Daemon workers
+  must tolerate their signal sender being deleted during final Qt teardown;
+  never leave an unowned callback that can call a deleted window later.
+- Treat SQLite WAL disappearance during a read-only size snapshot as a normal
+  zero-byte transient. Keep a single `lstat` snapshot for file type, reparse and
+  size checks instead of weakening the managed-path boundary or serializing the
+  complete background storage scan behind the store lock.
 - Run `powershell -ExecutionPolicy Bypass -File .\tools\validate.ps1` before
   packaging.
 - Keep global line coverage at or above 83 percent and branch coverage for the
@@ -54,6 +61,12 @@ datapath session rows from the relevant 7240XM managed device.
 - Run the fixture-only 20,000-poll release soak with
   `$env:ARUBA_SOAK_POLLS='20000'; .\.venv\Scripts\python.exe -m pytest -m soak -q`
   before a versioned tag. This is not live-device evidence.
+- Keep synthetic soak inputs between 1 and 20,000 polls. Each child-process
+  timeout must remain between 500 and 3,200 seconds so the two sequential
+  nightly soaks stay inside the outer 120-minute workflow watchdog.
+- Deadline watchdogs must recheck the shared monotonic deadline after an OS
+  timer wait returns. Never treat one early Windows timer wakeup as expiry, and
+  keep the connection-manager and owned-socket guards on the same policy.
 - Keep real device addresses, logs, raw output, SQLite files, exports, and
   known-host files out of Git and release assets.
 - Preserve CSV export as an independent manual path. HTML is a result-only
@@ -102,6 +115,8 @@ datapath session rows from the relevant 7240XM managed device.
 - Every public release must contain exactly one uploaded Windows x64 ZIP. Keep
   the verified SHA-256 in the release body and the CycloneDX SBOM inside the ZIP.
   Local build inputs still include the sidecar and external SBOM for verification.
+- Install the pinned runtime lock and require `pip check` in a publish runner
+  before invoking package or remote-release verification tools.
 - Verify release assets while draft, compare GitHub-reported SHA-256 digests,
   re-download authenticated bytes before publish, and re-download public bytes
   after publish. A published versioned release must never be repaired in place.

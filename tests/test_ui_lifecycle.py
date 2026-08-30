@@ -10,12 +10,14 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication
+from shiboken6 import delete as delete_qt_object
 
 from aruba_session_tracker.collectors.ssh import CollectorError
 from aruba_session_tracker.config import ConfigRepository
 from aruba_session_tracker.models import ErrorCode
 from aruba_session_tracker.services import QueryOutcome
-from aruba_session_tracker.ui.main_window import MainWindow
+from aruba_session_tracker.ui.main_window import MainWindow, _StorageTask
 from aruba_session_tracker.ui.runtime_environment import RuntimeEnvironmentMonitor
 from aruba_session_tracker.ui.shutdown import ShutdownCoordinator
 from aruba_session_tracker.ui.startup import StartupCoordinator, StartupWindow
@@ -118,6 +120,32 @@ def test_shutdown_grace_timeout_settles_once_without_killing_transaction(qtbot: 
     release.set()
     qtbot.wait(100)  # type: ignore[attr-defined]
     assert settled == [(False, "ShutdownGraceTimeout")]
+
+
+def test_deferred_close_callback_is_bound_to_window_lifetime(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        _EmptyStore(),  # type: ignore[arg-type]
+        _EnvironmentExecutor(),  # type: ignore[arg-type]
+    )
+    qtbot.waitUntil(lambda: not window._history_task_running, timeout=3_000)  # type: ignore[attr-defined]
+    window._close_when_idle = True
+
+    window._close_if_idle()
+    delete_qt_object(window)
+    application = QApplication.instance()
+    assert application is not None
+    application.processEvents()
+
+
+def test_storage_worker_ignores_late_signal_after_qt_teardown() -> None:
+    task = _StorageTask(1, "fixture", lambda _cancel, _progress: object())
+    delete_qt_object(task.signals)
+
+    task.run()
 
 
 def test_stop_timeout_blocks_new_monitoring_until_restart(qtbot: object, tmp_path: Path) -> None:

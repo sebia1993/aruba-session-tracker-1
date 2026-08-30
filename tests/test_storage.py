@@ -2928,6 +2928,33 @@ def test_storage_health_reports_managed_usage_and_thresholds(
     assert hard_stop.hard_stop is True
 
 
+def test_storage_health_tolerates_sqlite_wal_disappearing_after_presence_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    wal_path = Path(f"{store.db_path}-wal")
+    original_lexists = os.path.lexists
+    original_lstat = os.lstat
+
+    def stale_presence(path: os.PathLike[str] | str) -> bool:
+        if Path(path) == wal_path:
+            return True
+        return original_lexists(path)
+
+    def vanished_wal(path: os.PathLike[str] | str) -> os.stat_result:
+        if Path(path) == wal_path:
+            raise FileNotFoundError(path)
+        return original_lstat(path)
+
+    monkeypatch.setattr(session_store_module.os.path, "lexists", stale_presence)
+    monkeypatch.setattr(session_store_module.os, "lstat", vanished_wal)
+
+    health = store.storage_health()
+
+    assert health.wal_bytes == 0
+
+
 def test_first_storage_health_is_incremental_until_explicit_reconciliation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
