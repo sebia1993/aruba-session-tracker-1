@@ -34,7 +34,12 @@ from tools.continuous_release_state import (
     verify_rollback,
 )
 from tools.release_notes import build_release_notes
-from tools.verify_release import ReleaseVerificationError, _packaged_environment, _safe_member
+from tools.verify_release import (
+    ReleaseVerificationError,
+    _packaged_environment,
+    _safe_member,
+    _verify_packaged_report_text,
+)
 
 
 def test_secret_check_scans_extensionless_private_key(tmp_path: Path) -> None:
@@ -76,6 +81,24 @@ def test_packaged_smoke_environment_excludes_development_python(
     assert environment["PATH"] == r"C:\Windows\System32;C:\Windows"
     assert "PYTHONHOME" not in environment
     assert "VIRTUAL_ENV" not in environment
+
+
+def test_packaged_report_verifier_requires_printable_history_structure() -> None:
+    report = """<!doctype html>
+    세션 추적 결과 KST 한국어-MD
+    최신 세션 결과
+    전체 추적 이력
+    <details class="history-toggle"></details>
+    <div class="details-body" id="observation-history-body"></div>
+    <style>.history-toggle + .details-body { display:block !important; }</style>
+    """
+
+    _verify_packaged_report_text(report)
+
+    with pytest.raises(ReleaseVerificationError, match="standalone and complete"):
+        _verify_packaged_report_text(
+            report.replace('<details class="history-toggle">', "<details>")
+        )
 
 
 def test_secret_check_detects_sqlite_magic_without_database_suffix(tmp_path: Path) -> None:

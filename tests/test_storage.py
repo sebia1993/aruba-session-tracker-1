@@ -2626,7 +2626,9 @@ def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
     assert "oldest-raw-kind" not in document
     assert "capture-0000.txt" not in document
     assert "private-raw-body-0" not in document
-    assert "<summary>전체 추적 이력 2,005건 보기</summary>" in document
+    assert (
+        '<summary aria-controls="observation-history-body">전체 추적 이력 2,005건 보기</summary>'
+    ) in document
     assert "세션별 수치 변화" not in document
     assert "패킷" not in document
     assert "바이트" not in document
@@ -3903,6 +3905,164 @@ def test_missing_external_export_target_is_deferred_without_blocking_startup(
     assert destination.read_bytes() == expected_bytes
     assert not tuple(reopened._manifests_root.glob("*.json"))
     assert not tuple(reopened._export_owners_root.glob("*.json"))
+
+
+@pytest.mark.parametrize(
+    "winerror",
+    (
+        2,
+        3,
+        21,
+        53,
+        55,
+        59,
+        64,
+        67,
+        121,
+        1201,
+        1203,
+        1222,
+        1229,
+        1231,
+        1232,
+        1233,
+        1235,
+        1236,
+        1237,
+        2250,
+    ),
+)
+def test_external_recovery_target_unavailable_accepts_only_disconnect_winerrors(
+    winerror: int,
+) -> None:
+    error = OSError("synthetic external target disconnect")
+    error.winerror = winerror
+
+    assert session_store_module._external_recovery_target_unavailable(error)
+
+
+@pytest.mark.parametrize("winerror", (5, 65, 1219, 267))
+def test_external_recovery_target_unavailable_rejects_security_and_config_winerrors(
+    winerror: int,
+) -> None:
+    error = OSError("synthetic external target policy failure")
+    error.winerror = winerror
+
+    assert not session_store_module._external_recovery_target_unavailable(error)
+
+
+def test_external_recovery_target_unavailable_rejects_non_directory_path() -> None:
+    assert not session_store_module._external_recovery_target_unavailable(
+        NotADirectoryError("synthetic external target parent is not a directory")
+    )
+
+
+@pytest.mark.parametrize("winerror", (59, 1222, 2250))
+def test_disconnected_external_recovery_is_deferred_and_local_history_remains_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    winerror: int,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.finish_run(run_id)
+    operation_id = "a" * 32
+    manifest = store._write_manifest(
+        operation_id,
+        {
+            "version": 1,
+            "kind": "external_export",
+            "operation_id": operation_id,
+        },
+    )
+    store.close()
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+
+    def raise_disconnected_target(_path: Path, _payload: dict[str, object]) -> None:
+        error = OSError("synthetic external target disconnect")
+        error.winerror = winerror
+        raise error
+
+    monkeypatch.setattr(
+        reopened,
+        "_recover_external_export_manifest",
+        raise_disconnected_target,
+    )
+
+    reopened.initialize()
+
+    assert reopened.pending_external_recovery_count == 1
+    assert reopened.list_runs()[0]["id"] == run_id
+    assert manifest.exists()
+
+
+@pytest.mark.parametrize("winerror", (5, 65, 1219, 267))
+def test_external_recovery_security_and_config_errors_fail_startup_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    winerror: int,
+) -> None:
+    store = _store(tmp_path)
+    operation_id = "b" * 32
+    manifest = store._write_manifest(
+        operation_id,
+        {
+            "version": 1,
+            "kind": "external_export",
+            "operation_id": operation_id,
+        },
+    )
+    store.close()
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+
+    def raise_policy_failure(_path: Path, _payload: dict[str, object]) -> None:
+        error = OSError("synthetic external target policy failure")
+        error.winerror = winerror
+        raise error
+
+    monkeypatch.setattr(
+        reopened,
+        "_recover_external_export_manifest",
+        raise_policy_failure,
+    )
+
+    with pytest.raises(StorageError, match="데이터베이스를 초기화할 수 없습니다"):
+        reopened.initialize()
+
+    assert reopened.pending_external_recovery_count == 0
+    assert manifest.exists()
+
+
+def test_external_recovery_parent_replaced_by_regular_file_fails_startup_closed(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()])
+    store.finish_run(run_id)
+    destination = tmp_path / "removable-drive" / "report.csv"
+
+    completed = _run_export_crash(store, run_id, destination, "PREPARED")
+    assert completed.returncode == 91, (completed.stdout, completed.stderr)
+    manifest = next(store._manifests_root.glob("*.json"))
+    owner = next(store._export_owners_root.glob("*.json"))
+
+    detached_parent = tmp_path / "detached-removable-drive"
+    destination.parent.rename(detached_parent)
+    replacement_bytes = b"must-not-be-treated-as-a-detached-directory"
+    destination.parent.write_bytes(replacement_bytes)
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    with pytest.raises(StorageError, match="데이터베이스를 초기화할 수 없습니다"):
+        reopened.initialize()
+
+    assert reopened.pending_external_recovery_count == 0
+    assert destination.parent.read_bytes() == replacement_bytes
+    assert detached_parent.is_dir()
+    assert manifest.exists()
+    assert owner.exists()
 
 
 def test_pending_external_recovery_does_not_hold_store_lock_against_poll_writes(

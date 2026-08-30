@@ -15,6 +15,7 @@ from .ssh import (
     SSHCollector,
     SSHConnectionFactory,
     StrictNetmikoFactory,
+    run_bounded_approval,
 )
 
 __all__ = [
@@ -32,4 +33,5 @@ __all__ = [
     "SSHCollector",
     "SSHConnectionFactory",
     "StrictNetmikoFactory",
+    "run_bounded_approval",
 ]

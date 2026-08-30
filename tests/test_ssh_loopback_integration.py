@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import base64
+import ctypes
+import gc
 import hashlib
+import json
+import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 from contextlib import AbstractContextManager, suppress
+from ctypes import wintypes
 from pathlib import Path
 from types import TracebackType
 from typing import Self
@@ -27,6 +34,8 @@ from aruba_session_tracker.models import Credentials, DeviceTarget, ErrorCode
 
 _LOOPBACK = "127.0.0.1"
 _PROMPT = "fixture-mm#"
+_RESOURCE_REPEAT_ENV = "ARUBA_SSH_LOOPBACK_REPEATS"
+_RESOURCE_RESULT_PREFIX = "ARUBA_SSH_LOOPBACK_RESOURCE_RESULT="
 
 
 class _PasswordServer(paramiko.ServerInterface):  # type: ignore[misc]
@@ -82,6 +91,7 @@ class _LoopbackSshServer(AbstractContextManager["_LoopbackSshServer"]):
         }
         self.auth_results: list[bool] = []
         self.commands: list[str] = []
+        self.accepted_connections = 0
         self.failures: list[BaseException] = []
         self.lock = threading.Lock()
         self._stop = threading.Event()
@@ -144,6 +154,7 @@ class _LoopbackSshServer(AbstractContextManager["_LoopbackSshServer"]):
                 client.close()
                 self.failures.append(RuntimeError("non-loopback SSH client rejected"))
                 continue
+            self.accepted_connections += 1
             worker = threading.Thread(
                 target=self._handle_client,
                 args=(client,),
@@ -258,6 +269,124 @@ def _configure_runtime_outputs(server: _LoopbackSshServer) -> str:
     return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
 
 
+def _windows_handle_count() -> int:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetProcessHandleCount.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetProcessHandleCount.restype = wintypes.BOOL
+    handle_count = wintypes.DWORD()
+    process = kernel32.GetCurrentProcess()
+    if not kernel32.GetProcessHandleCount(process, ctypes.byref(handle_count)):
+        raise OSError(ctypes.get_last_error(), "GetProcessHandleCount failed")
+    return int(handle_count.value)
+
+
+def _live_worker_names() -> tuple[str, ...]:
+    current = threading.current_thread()
+    return tuple(
+        thread.name
+        for thread in threading.enumerate()
+        if thread is not current and thread.is_alive()
+    )
+
+
+def _settled_resource_snapshot(*, timeout: float = 10.0) -> dict[str, object]:
+    """Wait for Paramiko, Netmiko and fixture workers to finish before sampling."""
+
+    deadline = time.monotonic() + timeout
+    previous_handles: int | None = None
+    stable_samples = 0
+    while time.monotonic() < deadline:
+        gc.collect()
+        worker_names = _live_worker_names()
+        handles = _windows_handle_count()
+        if not worker_names and handles == previous_handles:
+            stable_samples += 1
+            if stable_samples >= 3:
+                return {
+                    "handles": handles,
+                    "threads": len(threading.enumerate()),
+                    "workers": list(worker_names),
+                }
+        else:
+            stable_samples = 0
+        previous_handles = handles
+        time.sleep(0.05)
+    raise RuntimeError(f"loopback SSH workers did not settle: {_live_worker_names()!r}")
+
+
+def _run_repeated_loopback_connections(root: Path, repeats: int) -> dict[str, object]:
+    if os.name != "nt":
+        raise RuntimeError("Windows process resource counters are required")
+    if not 100 <= repeats <= 500:
+        raise ValueError("loopback SSH repeats must be between 100 and 500")
+
+    credentials: Credentials
+    target: DeviceTarget
+
+    # Warm cryptography, Paramiko and Netmiko once before the baseline so the
+    # comparison measures repeated-session cleanup rather than lazy imports.
+    with _LoopbackSshServer() as warmup_server:
+        credentials = Credentials(warmup_server.username, warmup_server.password)
+        target = DeviceTarget("loopback-warmup", _LOOPBACK, warmup_server.port)
+        _collector(warmup_server, root / "warmup" / "known_hosts").collect(
+            target,
+            credentials,
+            ("no paging",),
+            host_key_approval=lambda _target, _info: True,
+            deadline=PollDeadline.after(10),
+        )
+
+    baseline = _settled_resource_snapshot()
+    approvals: list[str] = []
+    accepted_connections = 0
+    authenticated_sessions = 0
+    collected_commands = 0
+
+    with _LoopbackSshServer() as server:
+        credentials = Credentials(server.username, server.password)
+        target = DeviceTarget("loopback-resource", _LOOPBACK, server.port)
+        collector = _collector(server, root / "repeated" / "known_hosts")
+        command = "show datapath session table 192.0.2.20"
+        for _iteration in range(repeats):
+            batch = collector.collect(
+                target,
+                credentials,
+                ("no paging", command),
+                host_key_approval=lambda _target, info: (
+                    approvals.append(info.sha256_fingerprint) or True
+                ),
+                deadline=PollDeadline.after(10),
+            )
+            if "fixture-session-row" not in batch.output_for(command):
+                raise AssertionError("loopback command output was incomplete")
+
+        accepted_connections = server.accepted_connections
+        authenticated_sessions = server.auth_results.count(True)
+        collected_commands = server.commands.count(command)
+
+    final = _settled_resource_snapshot()
+    return {
+        "repeats": repeats,
+        "accepted_connections": accepted_connections,
+        "authenticated_sessions": authenticated_sessions,
+        "collected_commands": collected_commands,
+        "approvals": len(approvals),
+        "baseline": baseline,
+        "final": final,
+    }
+
+
+def _resource_worker_main(arguments: list[str]) -> int:
+    if len(arguments) != 3 or arguments[0] != "--resource-cleanup-worker":
+        return 2
+    root = Path(arguments[1])
+    root.mkdir(parents=True, exist_ok=True)
+    result = _run_repeated_loopback_connections(root, int(arguments[2]))
+    print(_RESOURCE_RESULT_PREFIX + json.dumps(result, sort_keys=True))
+    return 0
+
+
 @pytest.mark.integration
 def test_loopback_paramiko_server_approves_host_key_and_collects_command(
     tmp_path: Path,
@@ -324,3 +453,62 @@ def test_loopback_runtime_smoke_covers_full_success_and_auth_failure(mode: str) 
             assert True in server.auth_results
         else:
             assert False in server.auth_results
+
+
+@pytest.mark.integration
+@pytest.mark.windows
+def test_repeated_loopback_ssh_connections_release_threads_and_handles(tmp_path: Path) -> None:
+    """Repeat the real local SSH boundary without retaining client resources."""
+
+    if os.name != "nt":
+        pytest.skip("Windows process resource counters are required")
+    repeats = int(os.environ.get(_RESOURCE_REPEAT_ENV, "100"))
+    if not 100 <= repeats <= 500:
+        raise ValueError(f"{_RESOURCE_REPEAT_ENV} must be between 100 and 500")
+
+    repository = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = str(repository / "src") + (
+        os.pathsep + existing_pythonpath if existing_pythonpath else ""
+    )
+    completed = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--resource-cleanup-worker",
+            str(tmp_path / "worker"),
+            str(repeats),
+        ],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=min(480, max(180, repeats * 2)),
+    )
+    assert completed.returncode == 0, completed.stderr[-4000:]
+    result_lines = tuple(
+        line.removeprefix(_RESOURCE_RESULT_PREFIX)
+        for line in completed.stdout.splitlines()
+        if line.startswith(_RESOURCE_RESULT_PREFIX)
+    )
+    assert len(result_lines) == 1, completed.stdout[-4000:]
+    result = json.loads(result_lines[0])
+    baseline = result["baseline"]
+    final = result["final"]
+
+    assert result["repeats"] == repeats
+    # Each collection has one Paramiko host-key probe and one authenticated
+    # Netmiko session. Hidden reconnects would indicate an unstable boundary.
+    assert result["accepted_connections"] == repeats * 2
+    assert result["authenticated_sessions"] == repeats
+    assert result["collected_commands"] == repeats
+    assert result["approvals"] == 1
+    assert final["workers"] == []
+    assert int(final["handles"]) - int(baseline["handles"]) <= 5, result
+    assert int(final["threads"]) - int(baseline["threads"]) <= 1, result
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by the subprocess test
+    raise SystemExit(_resource_worker_main(sys.argv[1:]))

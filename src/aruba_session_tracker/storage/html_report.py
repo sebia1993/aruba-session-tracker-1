@@ -156,6 +156,8 @@ def _report_chunks(
     .badge.observed {{ background:#edf2f7; color:#486581; }}
     details {{ border:0; }}
     summary {{ cursor:pointer; color:var(--blue); font-weight:700; padding:6px 0 13px; }}
+    .history-toggle:not([open]) + .details-body {{ display:none; }}
+    .history-toggle[open] + .details-body {{ display:block; }}
     .details-body {{ padding-top:2px; }}
     .muted {{ color:var(--muted); }}
     .sr-only {{ position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden;
@@ -172,7 +174,8 @@ def _report_chunks(
       body {{ background:#fff; color:#000; }} .header {{ background:#fff; color:#000; padding:0 0 10px; }}
       .subtitle {{ color:#333; }} .header-inner,.content,.footer {{ width:100%; }} .content {{ padding:0; }}
       section,.result-summary {{ box-shadow:none; border:1px solid #bbb; padding:10px; margin-bottom:8px; }}
-      details:not([open]) > .details-body {{ display:block !important; }} summary {{ color:#000; }}
+      section {{ border:0; border-radius:0; padding:0; }}
+      .history-toggle {{ display:none; }} .history-toggle + .details-body {{ display:block !important; }}
       .table-wrap {{ overflow:visible; border:0; }} table {{ min-width:0; font-size:7.5pt; }}
       thead {{ display:table-header-group; }} th {{ position:static; }} th,td {{ padding:4px; overflow-wrap:anywhere; }}
       .card,tr {{ break-inside:avoid; }}
@@ -212,9 +215,10 @@ def _report_chunks(
 
     <section id="observation-history">
       <h2>전체 추적 이력</h2>
-      <details>
-        <summary>전체 추적 이력 {_format_integer(snapshot.observation_total)}건 보기</summary>
-        <div class="details-body">
+      <details class="history-toggle">
+        <summary aria-controls="observation-history-body">전체 추적 이력 {_format_integer(snapshot.observation_total)}건 보기</summary>
+      </details>
+      <div class="details-body" id="observation-history-body">
           <p class="section-note">저장된 관측 결과를 시간순으로 모두 표시합니다.</p>
           <div class="table-wrap" role="region" aria-label="전체 추적 이력 표" tabindex="0"><table>
             <caption class="sr-only">전체 추적 이력</caption>
@@ -228,8 +232,7 @@ def _report_chunks(
         yield _empty_row(6, "저장된 관측 이력이 없습니다.")
     yield """</tbody>
           </table></div>
-        </div>
-      </details>
+      </div>
     </section>
   </main>
   <footer class="footer">Aruba Session Tracker 결과 보고서</footer>
@@ -331,6 +334,8 @@ def _lifecycle_statuses(
     session_statuses: dict[str, tuple[tuple[datetime, int], str]] = {}
     for index, row in enumerate(rows):
         status = _lifecycle_status(row.get("event_type"))
+        if status is None:
+            continue
         rank = (_datetime_sort_value(row.get("occurred_at")), -index)
         session_key = str(row.get("session_key") or "")
         if session_key:
@@ -360,7 +365,7 @@ def _status_for(
     return session_statuses.get(session_key, "관측됨")
 
 
-def _lifecycle_status(value: object) -> str:
+def _lifecycle_status(value: object) -> str | None:
     event_type = str(value or "").upper()
     if event_type == "CLOSED":
         return "종료 확인"
@@ -368,7 +373,7 @@ def _lifecycle_status(value: object) -> str:
         return "잠시 미확인"
     if event_type in _CONFIRMED_EVENTS:
         return "확인됨"
-    return "상태 확인 필요"
+    return None
 
 
 def _observation_row(row: ReportRow, status: str) -> str:
@@ -389,7 +394,6 @@ def _tracking_badge(status: str) -> str:
         "잠시 미확인": "missed",
         "종료 확인": "closed",
         "관측됨": "observed",
-        "상태 확인 필요": "missed",
     }.get(status, "")
     return f'<span class="badge {kind}">{_e(status)}</span>'
 

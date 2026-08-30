@@ -14,6 +14,7 @@ from aruba_session_tracker.collectors import (
     PollDeadline,
     SSHCollector,
     SSHConnectionFactory,
+    run_bounded_approval,
 )
 from aruba_session_tracker.commands import (
     NO_PAGING_COMMAND,
@@ -37,7 +38,10 @@ from aruba_session_tracker.parsers import (
     parse_global_user_table,
 )
 
-FullScanApproval = Callable[[QueryRequest, tuple[DeviceTarget, ...]], bool]
+FullScanApproval = (
+    Callable[[QueryRequest, tuple[DeviceTarget, ...]], bool]
+    | Callable[[QueryRequest, tuple[DeviceTarget, ...], PollDeadline], bool]
+)
 ProgressCallback = Callable[[str, str], None]
 MAX_POLL_RAW_BYTES = 32 * 1024 * 1024
 MAX_POLL_OBSERVATIONS = 20_000
@@ -175,6 +179,7 @@ class TrackerService:
         refresh_locations: bool = True,
         allow_full_scan: bool = True,
         fallback_devices: tuple[DeviceTarget, ...] = (),
+        required_controller_hosts: tuple[str, ...] = (),
         poll_budget: PollBudget | None = None,
         deadline: PollDeadline | None = None,
     ) -> QueryOutcome:
@@ -208,6 +213,31 @@ class TrackerService:
         source_location = locations.source
         destination_location = locations.destination
         enabled_devices = tuple(device for device in self.config.managed_devices if device.enabled)
+        required_devices: list[DeviceTarget] = []
+        for host in dict.fromkeys(required_controller_hosts):
+            matches = tuple(device for device in enabled_devices if device.host == host)
+            if len(matches) != 1:
+                diagnostics.append(
+                    DiagnosticEvent(
+                        stage="MD_ROUTE",
+                        code=(
+                            ErrorCode.CURRENT_SWITCH_AMBIGUOUS
+                            if len(matches) > 1
+                            else ErrorCode.CURRENT_SWITCH_UNMAPPED
+                        ),
+                        message="활성 세션을 관측한 MD를 현재 설정에 안전하게 매핑하지 못했습니다.",
+                    )
+                )
+                return QueryOutcome(
+                    diagnostics=tuple(diagnostics),
+                    used_mm=locations.used_mm,
+                    raw_snapshots=tuple(raw_snapshots),
+                    source_location=source_location,
+                    destination_location=destination_location,
+                    full_scan_eligible=locations.full_scan_eligible,
+                    authoritative=False,
+                )
+            required_devices.append(matches[0])
         device_candidates: list[tuple[DeviceTarget, str]] = []
 
         source_device = self._device_for_location(source_location, diagnostics)
@@ -235,8 +265,9 @@ class TrackerService:
         # permission to scan every MD.
         full_scan = locations.full_scan_eligible
         if full_scan and fallback_devices:
-            fallback = tuple(device for device in fallback_devices if device in enabled_devices)
-            if len(fallback) != len(fallback_devices):
+            requested_fallback = tuple(dict.fromkeys((*fallback_devices, *required_devices)))
+            fallback = tuple(device for device in requested_fallback if device in enabled_devices)
+            if len(fallback) != len(requested_fallback):
                 diagnostics.append(
                     DiagnosticEvent(
                         stage="MD_ROUTE",
@@ -258,17 +289,25 @@ class TrackerService:
             ]
         elif full_scan and allow_full_scan:
             approval = full_scan_approval or self._callbacks.full_scan_approval
-            approved = (
-                not token.is_cancelled
-                and approval is not None
-                and approval(request, enabled_devices)
-            )
-            if token.is_cancelled:
+            try:
+                token.raise_if_cancelled()
+                poll_deadline.raise_if_expired()
+                approved = approval is not None and run_bounded_approval(
+                    approval,
+                    request,
+                    enabled_devices,
+                    cancel_token=token,
+                    deadline=poll_deadline,
+                )
+                token.raise_if_cancelled()
+                poll_deadline.raise_if_expired()
+            except CollectorError as exc:
                 diagnostics.append(
                     DiagnosticEvent(
                         stage="MD_SCAN",
-                        code=ErrorCode.CANCELLED,
-                        message="작업이 취소되었습니다.",
+                        code=exc.code,
+                        message=str(exc),
+                        transient=exc.retryable_network,
                     )
                 )
                 return QueryOutcome(
@@ -321,6 +360,13 @@ class TrackerService:
                 authoritative=False,
             )
 
+        if not full_scan:
+            candidate_devices = {device for device, _filter_ip in device_candidates}
+            for device in required_devices:
+                if device not in candidate_devices:
+                    device_candidates.append((device, request.source_ip))
+                    candidate_devices.add(device)
+
         if not device_candidates:
             diagnostics.append(
                 DiagnosticEvent(
@@ -341,16 +387,13 @@ class TrackerService:
 
         observations: dict[str, SessionObservation] = {}
         for index, (device, filter_ip) in enumerate(device_candidates):
-            # In normal mode the destination MD is queried only if the source MD had no match.
-            if not full_scan and index > 0 and observations:
-                break
             self._progress("MD_QUERY", device.name)
             device_deadline = (
                 _fair_device_deadline(
                     poll_deadline,
                     remaining_devices=len(device_candidates) - index,
                 )
-                if full_scan and len(device_candidates) > 1
+                if len(device_candidates) > 1
                 else poll_deadline
             )
             try:

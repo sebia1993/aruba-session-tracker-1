@@ -22,6 +22,7 @@ from aruba_session_tracker.collectors import (
     PollDeadline,
     SSHCollector,
     StrictNetmikoFactory,
+    run_bounded_approval,
 )
 from aruba_session_tracker.collectors.ssh import (
     _abort_netmiko_connection,
@@ -945,6 +946,101 @@ def test_host_key_approval_cancellation_never_saves_or_connects(tmp_path: Path) 
     assert connector_called is False
 
 
+def test_host_key_approval_deadline_never_saves_or_connects_after_late_yes(
+    tmp_path: Path,
+) -> None:
+    key = paramiko.RSAKey.generate(1024)
+    release_approval = Event()
+    approval_finished = Event()
+    connector_called = False
+
+    def connector(**_kwargs: object) -> FakeNetmiko:
+        nonlocal connector_called
+        connector_called = True
+        return FakeNetmiko()
+
+    def blocking_approval(
+        _target: DeviceTarget,
+        _info: HostKeyInfo,
+        _deadline: PollDeadline,
+    ) -> bool:
+        release_approval.wait(timeout=3)
+        approval_finished.set()
+        return True
+
+    known_hosts = tmp_path / "known_hosts"
+    factory = StrictNetmikoFactory(
+        known_hosts,
+        key_probe=lambda *_args: key,
+        connector=connector,
+    )
+    started_at = time.monotonic()
+    try:
+        with pytest.raises(CollectorError) as caught:
+            factory.connect(
+                TARGET,
+                CREDENTIALS,
+                host_key_approval=blocking_approval,
+                cancel_token=CancellationToken(),
+                deadline=PollDeadline.after(0.05),
+            )
+        elapsed = time.monotonic() - started_at
+        assert caught.value.code is ErrorCode.POLL_DEADLINE_EXCEEDED
+        assert elapsed < 0.5
+        assert not known_hosts.exists()
+        assert connector_called is False
+    finally:
+        release_approval.set()
+        assert approval_finished.wait(timeout=3)
+
+    # The daemon callback's late approval cannot resume the completed poll.
+    assert not known_hosts.exists()
+    assert connector_called is False
+
+
+def test_bounded_approval_supports_legacy_and_deadline_aware_callbacks() -> None:
+    token = CancellationToken()
+    deadline = PollDeadline.after(1)
+    received_deadlines: list[PollDeadline] = []
+
+    def legacy(first: object, second: object) -> bool:
+        return (first, second) == ("first", "second")
+
+    def deadline_aware(first: object, second: object, current: PollDeadline) -> bool:
+        received_deadlines.append(current)
+        return (first, second) == ("first", "second")
+
+    assert run_bounded_approval(
+        legacy,
+        "first",
+        "second",
+        cancel_token=token,
+        deadline=deadline,
+    )
+    assert run_bounded_approval(
+        deadline_aware,
+        "first",
+        "second",
+        cancel_token=token,
+        deadline=deadline,
+    )
+    assert received_deadlines == [deadline]
+
+
+def test_bounded_approval_does_not_reinterpret_callback_type_error() -> None:
+    def broken_callback(_first: object, _second: object) -> bool:
+        raise TypeError("callback body failed")
+
+    with pytest.raises(TypeError, match="callback body failed"):
+        run_bounded_approval(
+            broken_callback,
+            "first",
+            "second",
+            cancel_token=CancellationToken(),
+            deadline=PollDeadline.after(1),
+        )
+
+
 def test_factories_for_same_path_do_not_hold_trust_lock_during_approval(tmp_path: Path) -> None:
     known_hosts = tmp_path / "known_hosts"
     first_target = DeviceTarget("MM-1", "192.0.2.10")
@@ -989,6 +1085,177 @@ def test_factories_for_same_path_do_not_hold_trust_lock_during_approval(tmp_path
     saved = paramiko.HostKeys(str(known_hosts))
     assert saved.lookup(first_target.host) is not None
     assert saved.lookup(second_target.host) is not None
+
+
+def test_known_hosts_process_lock_respects_poll_deadline_without_side_effects(
+    tmp_path: Path,
+) -> None:
+    known_hosts = tmp_path / "known_hosts"
+    key = paramiko.RSAKey.generate(1024)
+    connector_called = False
+    approval_called = False
+
+    def connector(**_kwargs: object) -> FakeNetmiko:
+        nonlocal connector_called
+        connector_called = True
+        return FakeNetmiko()
+
+    def approval(_target: DeviceTarget, _info: HostKeyInfo) -> bool:
+        nonlocal approval_called
+        approval_called = True
+        return True
+
+    lock_owner = StrictNetmikoFactory(
+        known_hosts,
+        key_probe=lambda *_args: key,
+        connector=connector,
+    )
+    contender = StrictNetmikoFactory(
+        known_hosts,
+        key_probe=lambda *_args: key,
+        connector=connector,
+    )
+    assert lock_owner._host_keys_lock is contender._host_keys_lock
+
+    started_at = time.monotonic()
+    with lock_owner._host_keys_lock, pytest.raises(CollectorError) as caught:
+        contender.connect(
+            TARGET,
+            CREDENTIALS,
+            host_key_approval=approval,
+            cancel_token=CancellationToken(),
+            deadline=PollDeadline.after(0.05),
+        )
+    elapsed = time.monotonic() - started_at
+
+    assert caught.value.code is ErrorCode.POLL_DEADLINE_EXCEEDED
+    assert elapsed < 0.5
+    assert not known_hosts.exists()
+    assert approval_called is False
+    assert connector_called is False
+
+
+def test_known_hosts_process_lock_respects_cancellation_without_side_effects(
+    tmp_path: Path,
+) -> None:
+    known_hosts = tmp_path / "known_hosts"
+    key = paramiko.RSAKey.generate(1024)
+    token = CancellationToken()
+    connector_called = False
+
+    def connector(**_kwargs: object) -> FakeNetmiko:
+        nonlocal connector_called
+        connector_called = True
+        return FakeNetmiko()
+
+    factory = StrictNetmikoFactory(
+        known_hosts,
+        key_probe=lambda *_args: key,
+        connector=connector,
+    )
+
+    def cancel_soon() -> None:
+        time.sleep(0.05)
+        token.cancel()
+
+    canceller = Thread(target=cancel_soon)
+    started_at = time.monotonic()
+    with factory._host_keys_lock:
+        canceller.start()
+        with pytest.raises(CollectorError) as caught:
+            factory.connect(
+                TARGET,
+                CREDENTIALS,
+                host_key_approval=lambda *_args: True,
+                cancel_token=token,
+                deadline=PollDeadline.after(1),
+            )
+    elapsed = time.monotonic() - started_at
+    canceller.join(timeout=1)
+
+    assert not canceller.is_alive()
+    assert caught.value.code is ErrorCode.CANCELLED
+    assert elapsed < 0.5
+    assert not known_hosts.exists()
+    assert connector_called is False
+
+
+def test_known_hosts_file_lock_respects_poll_deadline_without_side_effects(
+    tmp_path: Path,
+) -> None:
+    known_hosts = tmp_path / "known_hosts"
+    key = paramiko.RSAKey.generate(1024)
+    connector_called = False
+    approval_called = False
+
+    def connector(**_kwargs: object) -> FakeNetmiko:
+        nonlocal connector_called
+        connector_called = True
+        return FakeNetmiko()
+
+    def approval(_target: DeviceTarget, _info: HostKeyInfo) -> bool:
+        nonlocal approval_called
+        approval_called = True
+        return True
+
+    factory = StrictNetmikoFactory(
+        known_hosts,
+        key_probe=lambda *_args: key,
+        connector=connector,
+    )
+    started_at = time.monotonic()
+    with (
+        _known_hosts_file_lock(
+            known_hosts,
+            CancellationToken(),
+            deadline=PollDeadline.after(1),
+        ),
+        pytest.raises(CollectorError) as caught,
+    ):
+        factory.connect(
+            TARGET,
+            CREDENTIALS,
+            host_key_approval=approval,
+            cancel_token=CancellationToken(),
+            deadline=PollDeadline.after(0.05),
+        )
+    elapsed = time.monotonic() - started_at
+
+    assert caught.value.code is ErrorCode.POLL_DEADLINE_EXCEEDED
+    assert elapsed < 0.5
+    assert not known_hosts.exists()
+    assert approval_called is False
+    assert connector_called is False
+
+
+def test_known_hosts_file_lock_respects_cancellation(tmp_path: Path) -> None:
+    known_hosts = tmp_path / "known_hosts"
+    token = CancellationToken()
+
+    def cancel_soon() -> None:
+        time.sleep(0.05)
+        token.cancel()
+
+    canceller = Thread(target=cancel_soon)
+    started_at = time.monotonic()
+    with _known_hosts_file_lock(known_hosts, CancellationToken()):
+        canceller.start()
+        with (
+            pytest.raises(CollectorError) as caught,
+            _known_hosts_file_lock(
+                known_hosts,
+                token,
+                deadline=PollDeadline.after(1),
+            ),
+        ):
+            pytest.fail("an already-held known_hosts lock was acquired")
+    elapsed = time.monotonic() - started_at
+    canceller.join(timeout=1)
+
+    assert not canceller.is_alive()
+    assert caught.value.code is ErrorCode.CANCELLED
+    assert elapsed < 0.5
+    assert not known_hosts.exists()
 
 
 def test_known_hosts_cross_process_lock_fails_closed_at_bound(tmp_path: Path) -> None:

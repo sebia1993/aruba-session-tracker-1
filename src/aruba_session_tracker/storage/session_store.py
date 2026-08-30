@@ -79,6 +79,33 @@ _CREDENTIAL_TEXT = re.compile(
 _RAW_BUNDLE_MAGIC = b"ARUBA_SESSION_TRACKER_RAW_BUNDLE_V1\n"
 _RAW_BUNDLE_CONTROLLER = "POLL_BUNDLE"
 _RAW_BUNDLE_KIND = "poll-bundle"
+# Windows errors that mean a removable device or network target is absent,
+# disconnected, or temporarily unreachable. Access, credential, and
+# configuration failures are deliberately excluded so recovery fails closed.
+_EXTERNAL_RECOVERY_UNAVAILABLE_WINERRORS = frozenset(
+    {
+        2,  # ERROR_FILE_NOT_FOUND
+        3,  # ERROR_PATH_NOT_FOUND
+        21,  # ERROR_NOT_READY
+        53,  # ERROR_BAD_NETPATH
+        55,  # ERROR_DEV_NOT_EXIST
+        59,  # ERROR_UNEXP_NET_ERR
+        64,  # ERROR_NETNAME_DELETED
+        67,  # ERROR_BAD_NET_NAME
+        121,  # ERROR_SEM_TIMEOUT
+        1201,  # ERROR_CONNECTION_UNAVAIL
+        1203,  # ERROR_NO_NET_OR_BAD_PATH
+        1222,  # ERROR_NO_NETWORK
+        1229,  # ERROR_CONNECTION_INVALID
+        1231,  # ERROR_NETWORK_UNREACHABLE
+        1232,  # ERROR_HOST_UNREACHABLE
+        1233,  # ERROR_PROTOCOL_UNREACHABLE
+        1235,  # ERROR_REQUEST_ABORTED
+        1236,  # ERROR_CONNECTION_ABORTED
+        1237,  # ERROR_RETRY
+        2250,  # ERROR_NOT_CONNECTED
+    }
+)
 
 CancelCheck = Callable[[], bool]
 ProgressCallback = Callable[[str, int, int | None], None]
@@ -4829,9 +4856,9 @@ def _external_export_target_key(
 
 
 def _external_recovery_target_unavailable(error: OSError) -> bool:
-    if isinstance(error, (FileNotFoundError, NotADirectoryError)):
+    if isinstance(error, FileNotFoundError):
         return True
-    return getattr(error, "winerror", None) in {2, 3, 21, 53, 64, 67, 121, 1231}
+    return getattr(error, "winerror", None) in _EXTERNAL_RECOVERY_UNAVAILABLE_WINERRORS
 
 
 def _validate_external_export_aliases(path: Path) -> None:

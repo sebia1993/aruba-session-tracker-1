@@ -344,12 +344,17 @@ def _report_smoke_test(destination: Path) -> int:
         "바이트",
     )
     section_positions = tuple(text.find(marker) for marker in ("최신 세션 결과", "전체 추적 이력"))
+    history_markers = (
+        '<details class="history-toggle">',
+        '<div class="details-body" id="observation-history-body">',
+        ".history-toggle + .details-body { display:block !important; }",
+    )
     if (
         "<!doctype html>" not in text.casefold()
         or any(marker not in text for marker in required)
         or any(marker in text for marker in forbidden)
         or section_positions != tuple(sorted(section_positions))
-        or "<details>" not in text
+        or any(marker not in text for marker in history_markers)
         or "<details open" in text
         or "https://" in text.casefold()
         or "http://" in text.casefold()

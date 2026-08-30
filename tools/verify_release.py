@@ -700,39 +700,7 @@ def smoke_executable(zip_path: Path) -> None:
                 "packaged HTML report smoke failed in a Korean output path "
                 f"with exit code {report_result.returncode}"
             )
-        report_text = report_path.read_text(encoding="utf-8")
-        required_report_markers = (
-            "세션 추적 결과",
-            "최신 세션 결과",
-            "전체 추적 이력",
-            "KST",
-            "한국어-MD",
-        )
-        forbidden_report_markers = (
-            "PACKAGE-RAW-CANARY",
-            "PACKAGE-DIAGNOSTIC-CANARY",
-            "PARSE_PARTIAL",
-            "report-smoke",
-            "Troubleshooting",
-            "CLI와 Quick Reference",
-            "세션별 수치 변화",
-            "패킷",
-            "바이트",
-        )
-        section_positions = tuple(
-            report_text.find(marker) for marker in ("최신 세션 결과", "전체 추적 이력")
-        )
-        if (
-            "<!doctype html>" not in report_text.casefold()
-            or any(marker not in report_text for marker in required_report_markers)
-            or any(marker in report_text for marker in forbidden_report_markers)
-            or section_positions != tuple(sorted(section_positions))
-            or "<details>" not in report_text
-            or "<details open" in report_text
-            or "https://" in report_text.casefold()
-            or "http://" in report_text.casefold()
-        ):
-            raise ReleaseVerificationError("packaged HTML report is not standalone and complete")
+        _verify_packaged_report_text(report_path.read_text(encoding="utf-8"))
 
         gui_environment = _packaged_environment()
         gui_environment.pop("QT_QPA_PLATFORM", None)
@@ -752,6 +720,43 @@ def smoke_executable(zip_path: Path) -> None:
                 "packaged native Qt GUI smoke failed in a Korean LocalAppData path "
                 f"with exit code {gui_result.returncode}"
             )
+
+
+def _verify_packaged_report_text(report_text: str) -> None:
+    required_report_markers = (
+        "세션 추적 결과",
+        "최신 세션 결과",
+        "전체 추적 이력",
+        "KST",
+        "한국어-MD",
+        '<details class="history-toggle">',
+        '<div class="details-body" id="observation-history-body">',
+        ".history-toggle + .details-body { display:block !important; }",
+    )
+    forbidden_report_markers = (
+        "PACKAGE-RAW-CANARY",
+        "PACKAGE-DIAGNOSTIC-CANARY",
+        "PARSE_PARTIAL",
+        "report-smoke",
+        "Troubleshooting",
+        "CLI와 Quick Reference",
+        "세션별 수치 변화",
+        "패킷",
+        "바이트",
+    )
+    section_positions = tuple(
+        report_text.find(marker) for marker in ("최신 세션 결과", "전체 추적 이력")
+    )
+    if (
+        "<!doctype html>" not in report_text.casefold()
+        or any(marker not in report_text for marker in required_report_markers)
+        or any(marker in report_text for marker in forbidden_report_markers)
+        or section_positions != tuple(sorted(section_positions))
+        or "<details open" in report_text
+        or "https://" in report_text.casefold()
+        or "http://" in report_text.casefold()
+    ):
+        raise ReleaseVerificationError("packaged HTML report is not standalone and complete")
 
 
 def _packaged_environment() -> dict[str, str]:

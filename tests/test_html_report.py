@@ -204,11 +204,42 @@ def test_report_is_concise_standalone_result_only_html5() -> None:
         "목적지 IP:포트",
         "추적 상태",
     ]
-    assert "<summary>전체 추적 이력 1건 보기</summary>" in document
+    assert (
+        '<summary aria-controls="observation-history-body">전체 추적 이력 1건 보기</summary>'
+    ) in document
     assert "<details open" not in document
     assert 'role="region" aria-label="최신 세션 결과 표" tabindex="0"' in document
     assert 'role="region" aria-label="전체 추적 이력 표" tabindex="0"' in document
     assert document.count('<th scope="col">') == 12
+
+
+def test_history_disclosure_keeps_screen_collapsed_but_prints_outside_details() -> None:
+    document = render_html_report(_snapshot())
+    history = _section(document, "observation-history")
+
+    assert re.search(
+        r'<details class="history-toggle">\s*'
+        r'<summary aria-controls="observation-history-body">.*?</summary>\s*'
+        r"</details>\s*"
+        r'<div class="details-body" id="observation-history-body">',
+        history,
+        flags=re.DOTALL,
+    )
+    details = re.search(
+        r'<details class="history-toggle">(?P<body>.*?)</details>',
+        history,
+        flags=re.DOTALL,
+    )
+    assert details is not None
+    assert '<div class="details-body" id="observation-history-body">' not in details.group("body")
+    assert ".history-toggle:not([open]) + .details-body { display:none; }" in document
+    assert ".history-toggle[open] + .details-body { display:block; }" in document
+    assert (
+        ".history-toggle { display:none; } "
+        ".history-toggle + .details-body { display:block !important; }"
+    ) in document
+    assert "section { border:0; border-radius:0; padding:0; }" in document
+    assert "details:not([open]) > .details-body" not in document
 
     for removed_text in (
         "Executive Summary",
@@ -309,6 +340,12 @@ def test_lifecycle_statuses_are_korean_and_diagnostics_do_not_change_status() ->
     assert latest.count(">잠시 미확인<") == 1
     assert latest.count(">확인됨<") == 1
     assert latest.count(">관측됨<") == 1
+    assert set(re.findall(r'<span class="badge[^">]*">([^<]+)</span>', latest)) == {
+        "확인됨",
+        "잠시 미확인",
+        "종료 확인",
+        "관측됨",
+    }
     history = _section(document, "observation-history")
     assert history.count(">관측됨<") == 4
     assert ">종료 확인<" not in history
@@ -377,7 +414,7 @@ def test_latest_lifecycle_event_wins_and_equal_times_keep_database_order() -> No
     assert ">확인됨<" not in tied_latest
 
 
-def test_unknown_lifecycle_event_is_not_presented_as_an_observation() -> None:
+def test_unknown_lifecycle_event_falls_back_to_observed() -> None:
     observation = _observation()
     document = render_html_report(
         _snapshot(
@@ -392,8 +429,43 @@ def test_unknown_lifecycle_event_is_not_presented_as_an_observation() -> None:
     )
 
     latest = _section(document, "latest-sessions")
-    assert ">상태 확인 필요<" in latest
-    assert ">관측됨<" not in latest
+    assert ">관측됨<" in latest
+    assert ">상태 확인 필요<" not in latest
+
+
+@pytest.mark.parametrize(
+    ("recognized_event", "expected_status"),
+    (
+        ("CLOSED", "종료 확인"),
+        ("MISSED", "잠시 미확인"),
+        ("STARTED", "확인됨"),
+    ),
+)
+def test_newer_unknown_event_does_not_override_recognized_lifecycle_status(
+    recognized_event: str,
+    expected_status: str,
+) -> None:
+    observation = _observation()
+    document = render_html_report(
+        _snapshot(
+            lifecycle_events=(
+                {
+                    "occurred_at": "2026-08-28T08:04:00.000Z",
+                    "session_key": observation["session_key"],
+                    "event_type": "FUTURE_EVENT",
+                },
+                {
+                    "occurred_at": "2026-08-28T08:03:00.000Z",
+                    "session_key": observation["session_key"],
+                    "event_type": recognized_event,
+                },
+            )
+        )
+    )
+
+    latest = _section(document, "latest-sessions")
+    assert f">{expected_status}<" in latest
+    assert ">상태 확인 필요<" not in latest
 
 
 @pytest.mark.parametrize(
