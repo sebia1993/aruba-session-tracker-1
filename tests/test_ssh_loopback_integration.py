@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import socket
 import threading
 import time
@@ -20,6 +22,7 @@ from aruba_session_tracker.collectors import (
     SSHCollector,
     StrictNetmikoFactory,
 )
+from aruba_session_tracker.main import _loopback_runtime_smoke
 from aruba_session_tracker.models import Credentials, DeviceTarget, ErrorCode
 
 _LOOPBACK = "127.0.0.1"
@@ -225,6 +228,36 @@ def _collector(server: _LoopbackSshServer, known_hosts: Path) -> SSHCollector:
     return SSHCollector(factory, command_timeout=3.0)
 
 
+def _configure_runtime_outputs(server: _LoopbackSshServer) -> str:
+    fixtures = Path(__file__).parent / "fixtures"
+    source = (
+        (fixtures / "global_user_one.txt")
+        .read_text(encoding="utf-8")
+        .replace(
+            "198.51.100.11",
+            "127.0.0.1    ",
+        )
+    )
+    destination = (
+        (fixtures / "global_user_empty.txt")
+        .read_text(encoding="utf-8")
+        .replace(
+            "192.0.2.99",
+            "203.0.113.20",
+        )
+    )
+    datapath = (fixtures / "datapath_sessions.txt").read_text(encoding="utf-8")
+    server.command_outputs.update(
+        {
+            'show global-user-table list ip "192.0.2.10"': source,
+            'show global-user-table list ip "203.0.113.20"': destination,
+            "show datapath session table 192.0.2.10": datapath,
+        }
+    )
+    digest = hashlib.sha256(server.host_key.asbytes()).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
 @pytest.mark.integration
 def test_loopback_paramiko_server_approves_host_key_and_collects_command(
     tmp_path: Path,
@@ -273,3 +306,21 @@ def test_loopback_paramiko_server_maps_password_rejection_to_fatal_auth_failure(
         assert caught.value.code is ErrorCode.AUTH_FAILED
         assert caught.value.retryable_network is False
         assert False in server.auth_results
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("mode", ("success", "auth-failure"))
+def test_loopback_runtime_smoke_covers_full_success_and_auth_failure(mode: str) -> None:
+    with _LoopbackSshServer() as server:
+        fingerprint = _configure_runtime_outputs(server)
+
+        result = _loopback_runtime_smoke(server.port, fingerprint, mode)
+
+        assert result == 0
+        if mode == "success":
+            assert 'show global-user-table list ip "192.0.2.10"' in server.commands
+            assert 'show global-user-table list ip "203.0.113.20"' in server.commands
+            assert "show datapath session table 192.0.2.10" in server.commands
+            assert True in server.auth_results
+        else:
+            assert False in server.auth_results

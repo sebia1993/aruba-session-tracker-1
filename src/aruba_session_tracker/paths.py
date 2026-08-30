@@ -60,13 +60,15 @@ def verify_managed_directory(path: Path, expected: DirectoryIdentity) -> None:
 
 
 def reject_managed_file_link(path: Path) -> None:
-    """Reject an existing managed file unless it is a regular non-reparse file."""
+    """Reject an existing managed file unless it is regular, single-link and non-reparse."""
 
     if not os.path.lexists(path):
         return
     info = reject_link_or_reparse(path)
     if not stat.S_ISREG(info.st_mode):
         raise UnsafeManagedPath("관리 파일 경로가 일반 파일이 아닙니다.")
+    if int(getattr(info, "st_nlink", 1)) != 1:
+        raise UnsafeManagedPath("관리 파일 경로에 hard link를 사용할 수 없습니다.")
 
 
 @dataclass(frozen=True, slots=True)

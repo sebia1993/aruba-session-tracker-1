@@ -182,10 +182,10 @@ def test_report_is_concise_standalone_result_only_html5() -> None:
     assert not re.search(r"\b(?:src|href)=[\"'](?:https?:)?//", lowered)
     assert "<nav" not in lowered
 
-    headings = ("최신 세션 결과", "세션별 수치 변화", "전체 추적 이력")
+    headings = ("최신 세션 결과", "전체 추적 이력")
     positions = [document.index(f"<h2>{heading}</h2>") for heading in headings]
     assert positions == sorted(positions)
-    assert document.count("<h2>") == 3
+    assert document.count("<h2>") == 2
     assert re.findall(r'<th scope="col">([^<]+)</th>', _section(document, "latest-sessions")) == [
         "마지막 확인 시각",
         "장비명",
@@ -204,20 +204,11 @@ def test_report_is_concise_standalone_result_only_html5() -> None:
         "목적지 IP:포트",
         "추적 상태",
     ]
-    assert re.findall(r'<th scope="col">([^<]+)</th>', _section(document, "session-changes")) == [
-        "세션",
-        "처음 확인",
-        "마지막 확인",
-        "패킷",
-        "바이트",
-        "장비 변화",
-    ]
     assert "<summary>전체 추적 이력 1건 보기</summary>" in document
     assert "<details open" not in document
     assert 'role="region" aria-label="최신 세션 결과 표" tabindex="0"' in document
-    assert 'role="region" aria-label="세션별 수치 변화 표" tabindex="0"' in document
     assert 'role="region" aria-label="전체 추적 이력 표" tabindex="0"' in document
-    assert document.count('<th scope="col">') == 18
+    assert document.count('<th scope="col">') == 12
 
     for removed_text in (
         "Executive Summary",
@@ -233,6 +224,9 @@ def test_report_is_concise_standalone_result_only_html5() -> None:
         "MM-주장비",
         "DB ID",
         "show datapath session table",
+        "세션별 수치 변화",
+        "패킷",
+        "바이트",
     ):
         assert removed_text not in document
 
@@ -321,6 +315,23 @@ def test_lifecycle_statuses_are_korean_and_diagnostics_do_not_change_status() ->
     assert ">잠시 미확인<" not in history
     assert "MD_UNREACHABLE" not in document
     assert "transient communication failure" not in document
+
+
+def test_report_uses_static_protocol_labels_without_guessing_unknown_values() -> None:
+    gre = _observation(protocol=47, source_port=0, destination_port=0)
+    unknown = _observation(protocol=253, source_port=1, destination_port=1)
+
+    document = render_html_report(
+        _snapshot(
+            observations=(gre, unknown),
+            observation_history=(gre, unknown),
+            lifecycle_events=(),
+            observation_total=2,
+        )
+    )
+
+    assert "GRE (47)" in document
+    assert "Protocol 253" in document
 
 
 def test_latest_lifecycle_event_wins_and_equal_times_keep_database_order() -> None:
@@ -414,7 +425,7 @@ def test_positive_lifecycle_events_are_presented_as_confirmed(event_type: str) -
     assert ">확인됨<" in latest
 
 
-def test_controller_move_is_one_logical_flow_with_first_to_last_values() -> None:
+def test_controller_move_is_one_logical_flow_and_latest_result_uses_last_device() -> None:
     first = _observation(
         observed_at="2026-08-28T08:01:00.000Z",
         controller_name="MD-A",
@@ -451,70 +462,22 @@ def test_controller_move_is_one_logical_flow_with_first_to_last_values() -> None
     )
 
     latest_rows = _table_body(_section(document, "latest-sessions"))
-    change_rows = _table_body(_section(document, "session-changes"))
     history_rows = _table_body(_section(document, "observation-history"))
     assert latest_rows.count("<tr>") == 1
-    assert change_rows.count("<tr>") == 1
     assert history_rows.count("<tr>") == 2
     assert '<div class="label">고유 세션</div><span class="value">1개</span>' in document
-    assert "MD-A → MD-B" in change_rows
-    assert "1,000 → 1,250" in change_rows
-    assert "변화 +250" in change_rows
-    assert "2,048 B (2.0 KiB) → 4,096 B (4.0 KiB)" in change_rows
-    assert "변화 +2,048 B (+2.0 KiB)" in change_rows
+    assert "MD-B" in latest_rows
+    assert "MD-A" not in latest_rows
+    assert "MD-A" in history_rows
+    assert "MD-B" in history_rows
 
 
-def test_changes_show_zero_and_negative_deltas_without_guessing_a_cause() -> None:
-    unchanged_first = _observation(destination_port=443, packets=100, bytes_count=2048)
-    unchanged_last = _observation(
-        observed_at="2026-08-28T08:02:00.000Z",
-        destination_port=443,
-        packets=100,
-        bytes_count=2048,
-    )
-    decreased_first = _observation(
-        destination_port=8443,
-        source_port=54000,
-        packets=900,
-        bytes_count=8192,
-    )
-    decreased_last = _observation(
-        observed_at="2026-08-28T08:03:00.000Z",
-        destination_port=8443,
-        source_port=54000,
-        packets=700,
-        bytes_count=4096,
-    )
-    document = render_html_report(
-        _snapshot(
-            observations=(decreased_last, unchanged_last),
-            observation_history=(
-                unchanged_first,
-                decreased_first,
-                unchanged_last,
-                decreased_last,
-            ),
-            lifecycle_events=(),
-        )
-    )
-    changes = _section(document, "session-changes")
-
-    assert "100 → 100" in changes
-    assert "변화 0" in changes
-    assert "900 → 700" in changes
-    assert "변화 -200" in changes
-    assert "8,192 B (8.0 KiB) → 4,096 B (4.0 KiB)" in changes
-    assert "변화 -4,096 B (-4.0 KiB)" in changes
-    assert "초기화" not in changes
-    assert "오류" not in changes
-
-
-def test_partial_counter_values_are_preserved_and_only_delta_is_unavailable() -> None:
-    first = _observation(packets=None, bytes_count=2048)
+def test_packet_and_byte_values_are_intentionally_omitted_from_html() -> None:
+    first = _observation(packets=987_654_321, bytes_count=123_456_789)
     last = _observation(
         observed_at="2026-08-28T08:02:00.000Z",
-        packets=50,
-        bytes_count=None,
+        packets=987_654_322,
+        bytes_count=123_456_790,
     )
     document = render_html_report(
         _snapshot(
@@ -523,11 +486,24 @@ def test_partial_counter_values_are_preserved_and_only_delta_is_unavailable() ->
             lifecycle_events=(),
         )
     )
-    changes = _section(document, "session-changes")
 
-    assert ">- → 50</span>" in changes
-    assert ">2,048 B (2.0 KiB) → -</span>" in changes
-    assert changes.count("변화 계산 불가") == 2
+    assert "192.0.2.100:53000" in document
+    assert "TCP (6)" in document
+    assert "203.0.113.80:443" in document
+    for omitted in (
+        "세션별 수치 변화",
+        "패킷",
+        "바이트",
+        "987,654,321",
+        "987,654,322",
+        "123,456,789",
+        "123,456,790",
+        "987654321",
+        "987654322",
+        "123456789",
+        "123456790",
+    ):
+        assert omitted not in document
 
 
 def test_zero_ports_keep_lifecycle_status_and_controller_move_in_one_flow() -> None:
@@ -563,7 +539,10 @@ def test_zero_ports_keep_lifecycle_status_and_controller_move_in_one_flow() -> N
     latest = _section(document, "latest-sessions")
     assert _table_body(latest).count("<tr>") == 1
     assert ">종료 확인<" in latest
-    assert "MD-A → MD-B" in _section(document, "session-changes")
+    assert "MD-B" in latest
+    assert "ICMP (1)" in latest
+    assert "192.0.2.100:0" in latest
+    assert "203.0.113.80:0" in latest
 
 
 @pytest.mark.parametrize(
@@ -627,10 +606,8 @@ def test_only_latest_table_is_limited_to_fifty_logical_flows() -> None:
     )
 
     latest = _section(document, "latest-sessions")
-    changes = _section(document, "session-changes")
     history = _section(document, "observation-history")
     assert _table_body(latest).count("<tr>") == 50
-    assert _table_body(changes).count("<tr>") == 55
     assert _table_body(history).count("<tr>") == 55
     assert "고유 세션 55개 중 마지막 확인 시각을 기준으로 최근 50개" in latest
     assert "192.0.2.100:53000" not in _table_body(latest)
@@ -730,7 +707,6 @@ def test_empty_result_has_clear_rows_and_no_false_session_state() -> None:
     )
 
     assert "관측된 세션이 없습니다." in document
-    assert "비교할 세션이 없습니다." in document
     assert "저장된 관측 이력이 없습니다." in document
     assert "종료 확인" not in document
     assert "고유 세션 0개를 모두 표시합니다." in document

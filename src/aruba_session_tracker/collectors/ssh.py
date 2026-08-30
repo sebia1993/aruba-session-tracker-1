@@ -29,6 +29,7 @@ from typing import Any, Protocol, Self
 import paramiko
 from netmiko.aruba.aruba_os import ArubaOsSSH
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko.session_log import SessionLog
 from paramiko.hostkeys import HostKeyEntry, InvalidHostKey
 
 from aruba_session_tracker.models import Credentials, DeviceTarget, ErrorCode
@@ -263,7 +264,16 @@ class SSHCollector:
                     for command in requested:
                         token.raise_if_cancelled()
                         read_timeout = poll_deadline.bounded_timeout(self._command_timeout)
-                        output = connection.send_command(command, read_timeout=read_timeout)
+                        bounded_sender = getattr(connection, "send_command_bounded", None)
+                        if callable(bounded_sender):
+                            output = bounded_sender(
+                                command,
+                                read_timeout=read_timeout,
+                                max_output_bytes=self._max_output_bytes,
+                                max_output_lines=self._max_output_lines,
+                            )
+                        else:
+                            output = connection.send_command(command, read_timeout=read_timeout)
                         token.raise_if_cancelled()
                         poll_deadline.raise_if_expired()
                         _check_output_limits(
@@ -293,6 +303,11 @@ class SSHCollector:
         except CollectorError as exc:
             if token.is_cancelled and exc.retryable_network:
                 token.raise_if_cancelled()
+            if exc.retryable_network:
+                try:
+                    poll_deadline.raise_if_expired()
+                except CollectorError as deadline_exc:
+                    raise deadline_exc from exc
             raise
         except (NetmikoAuthenticationException, paramiko.AuthenticationException) as exc:
             raise CollectorError(ErrorCode.AUTH_FAILED, "SSH 인증에 실패했습니다.") from exc
@@ -309,6 +324,10 @@ class SSHCollector:
             ) from exc
         except (OSError, paramiko.SSHException) as exc:
             token.raise_if_cancelled()
+            try:
+                poll_deadline.raise_if_expired()
+            except CollectorError as deadline_exc:
+                raise deadline_exc from exc
             raise CollectorError(
                 ErrorCode.MM_UNREACHABLE,
                 "SSH 네트워크 연결에 실패했습니다.",
@@ -318,10 +337,34 @@ class SSHCollector:
 
 
 class _NetmikoConnectionManager(AbstractContextManager[CommandConnection]):
-    def __init__(self, connection: Any) -> None:
+    def __init__(
+        self,
+        connection: Any,
+        *,
+        deadline: PollDeadline | None = None,
+        bounded_session_log: _BoundedSessionLog | None = None,
+    ) -> None:
         self._connection: Any | None = connection
         self._closing_connection: Any | None = None
         self._lock = threading.Lock()
+        self._bounded_session_log = bounded_session_log
+        self._deadline = deadline
+        self._deadline_stop = threading.Event()
+        self._deadline_thread: threading.Thread | None = None
+        if deadline is not None:
+            try:
+                deadline.raise_if_expired()
+            except CollectorError:
+                _abort_netmiko_connection(connection)
+                self._connection = None
+                raise
+            deadline_thread = threading.Thread(
+                target=self._watch_deadline,
+                name="aruba-ssh-deadline-watchdog",
+                daemon=True,
+            )
+            self._deadline_thread = deadline_thread
+            deadline_thread.start()
 
     def __enter__(self) -> Self:
         return self
@@ -351,35 +394,53 @@ class _NetmikoConnectionManager(AbstractContextManager[CommandConnection]):
         )
         return str(result)
 
+    def send_command_bounded(
+        self,
+        command: str,
+        *,
+        read_timeout: float,
+        max_output_bytes: int,
+        max_output_lines: int,
+    ) -> str:
+        """Use Netmiko normally while rejecting oversized channel reads immediately."""
+
+        session_log = self._bounded_session_log
+        if session_log is None:
+            result = self.send_command(command, read_timeout=read_timeout)
+            _check_output_limits(
+                result,
+                max_bytes=max_output_bytes,
+                max_lines=max_output_lines,
+            )
+            return result
+        session_log.begin_command(
+            max_bytes=max_output_bytes,
+            max_lines=max_output_lines,
+        )
+        try:
+            return self.send_command(command, read_timeout=read_timeout)
+        except CollectorError as exc:
+            if exc.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED:
+                self.abort()
+            raise
+        finally:
+            session_log.end_command()
+
     def close(self) -> None:
         with self._lock:
-            connection = self._connection
+            connection = self._connection or self._closing_connection
             self._connection = None
-            if connection is not None:
-                self._closing_connection = connection
+            self._closing_connection = None
         if connection is None:
+            self._stop_deadline_watchdog()
             return
         try:
-            connection.disconnect()
-        except CollectorError:
-            raise
-        except (NetmikoTimeoutException, TimeoutError, OSError, paramiko.SSHException) as exc:
-            _abort_netmiko_connection(connection)
-            raise CollectorError(
-                ErrorCode.MM_UNREACHABLE,
-                "SSH 연결 정리에 실패했습니다.",
-                retryable_network=True,
-            ) from exc
-        except Exception as exc:
-            _abort_netmiko_connection(connection)
-            raise CollectorError(
-                ErrorCode.PROMPT_PARSE_FAILED,
-                "SSH 연결을 안전하게 정리하지 못했습니다.",
-            ) from exc
+            # Netmiko's graceful CLI logout can block independently of its
+            # configured read timeout. A read-only collector does not require
+            # a logout command, so close the owned channel/transport directly.
+            _abort_netmiko_connection(connection, cleanup=True)
         finally:
-            with self._lock:
-                if self._closing_connection is connection:
-                    self._closing_connection = None
+            self._stop_deadline_watchdog()
 
     def abort(self) -> None:
         """Force-close the active transport without waiting for CLI logout."""
@@ -387,22 +448,179 @@ class _NetmikoConnectionManager(AbstractContextManager[CommandConnection]):
         with self._lock:
             connection = self._connection or self._closing_connection
             self._connection = None
+            if connection is not None:
+                self._closing_connection = connection
         if connection is not None:
             _abort_netmiko_connection(connection)
 
+    def _watch_deadline(self) -> None:
+        deadline = self._deadline
+        if deadline is None:
+            return
+        if self._deadline_stop.wait(deadline.remaining_seconds):
+            return
+        self.abort()
 
-def _abort_netmiko_connection(connection: Any) -> None:
+    def _stop_deadline_watchdog(self) -> None:
+        self._deadline_stop.set()
+        deadline_thread = self._deadline_thread
+        if deadline_thread is not None and deadline_thread is not threading.current_thread():
+            deadline_thread.join(timeout=1.0)
+        self._deadline_thread = None
+
+
+class _BoundedSessionLog(SessionLog):  # type: ignore[misc]
+    """Discard session data while bounding setup, enable and command receives."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._guard_lock = threading.Lock()
+        # Netmiko writes banner, prompt-discovery and enable traffic before the
+        # first audited command.  Keep the hard safety cap armed from object
+        # creation so a malformed peer cannot stream unbounded setup output.
+        self._active = True
+        self._max_bytes = MAX_OUTPUT_BYTES
+        self._max_lines = MAX_OUTPUT_LINES
+        self._bytes = 0
+        self._line_breaks = 0
+        self._has_data = False
+        self._ends_with_break = False
+        self._previous_was_cr = False
+
+    def open(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def flush(self) -> None:
+        return None
+
+    def begin_command(self, *, max_bytes: int, max_lines: int) -> None:
+        with self._guard_lock:
+            self._active = True
+            self._max_bytes = max_bytes
+            self._max_lines = max_lines
+            self._bytes = 0
+            self._line_breaks = 0
+            self._has_data = False
+            self._ends_with_break = False
+            self._previous_was_cr = False
+
+    def end_command(self) -> None:
+        with self._guard_lock:
+            self._active = False
+
+    def write(self, data: str) -> None:
+        if not data:
+            return
+        with self._guard_lock:
+            if not self._active:
+                return
+            self._bytes += len(data.encode("utf-8", errors="replace"))
+            if self._bytes > self._max_bytes:
+                raise CollectorError(
+                    ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+                    "명령 출력 크기 한도를 초과했습니다.",
+                )
+            for character in data:
+                self._has_data = True
+                if character == "\r":
+                    self._line_breaks += 1
+                    self._ends_with_break = True
+                    self._previous_was_cr = True
+                elif character == "\n":
+                    if not self._previous_was_cr:
+                        self._line_breaks += 1
+                    self._ends_with_break = True
+                    self._previous_was_cr = False
+                else:
+                    self._ends_with_break = False
+                    self._previous_was_cr = False
+            line_count = self._line_breaks + int(self._has_data and not self._ends_with_break)
+            if line_count > self._max_lines:
+                raise CollectorError(
+                    ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+                    "명령 출력 행 수 한도를 초과했습니다.",
+                )
+
+
+class _SocketDeadlineGuard:
+    """Close a factory-owned TCP socket when connector setup exceeds the poll deadline."""
+
+    def __init__(self, sock: socket.socket, deadline: PollDeadline) -> None:
+        self._socket = sock
+        self._deadline = deadline
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._watch,
+            name="aruba-ssh-connect-watchdog",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=1.0)
+
+    def close_socket(self) -> None:
+        with suppress(OSError):
+            self._socket.shutdown(socket.SHUT_RDWR)
+        with suppress(OSError):
+            self._socket.close()
+
+    def _watch(self) -> None:
+        if not self._stop.wait(self._deadline.remaining_seconds):
+            self.close_socket()
+
+
+def _abort_netmiko_connection(connection: Any, *, cleanup: bool = False) -> None:
     """Best-effort close of Netmiko/Paramiko transports used to wake blocked reads."""
 
     remote_channel = getattr(connection, "remote_conn", None)
     remote_client = getattr(connection, "remote_conn_pre", None)
-    transport = None
-    if remote_client is not None:
+    transport = getattr(remote_channel, "transport", None)
+    if transport is None and remote_client is not None:
+        transport = getattr(remote_client, "_transport", None)
+    if transport is None and remote_client is not None:
         get_transport = getattr(remote_client, "get_transport", None)
         if callable(get_transport):
             with suppress(Exception):
                 transport = get_transport()
-    for resource in (remote_channel, transport, remote_client):
+
+    # Wake the blocking Paramiko read before invoking any higher-level cleanup.
+    # Channel.close() is user-extensible and has been observed to block forever;
+    # calling it first would disable the deadline watchdog itself.  A factory-
+    # owned production connection always exposes the underlying transport socket.
+    raw_sockets: list[Any] = []
+    for candidate in (
+        getattr(connection, "sock", None),
+        getattr(transport, "sock", None),
+    ):
+        if candidate is not None and all(candidate is not item for item in raw_sockets):
+            raw_sockets.append(candidate)
+    for raw_socket in raw_sockets:
+        shutdown = getattr(raw_socket, "shutdown", None)
+        if callable(shutdown):
+            with suppress(Exception):
+                shutdown(socket.SHUT_RDWR)
+        close = getattr(raw_socket, "close", None)
+        if callable(close):
+            with suppress(Exception):
+                close()
+
+    if raw_sockets and not cleanup:
+        return
+
+    # Injected test/custom connectors may not expose a socket.  Prefer the
+    # transport/client cleanup path, but deliberately never call Channel.close()
+    # from the watchdog because that method can block before reaching transport.
+    resources: list[Any] = []
+    for resource in (transport, remote_client):
+        if resource is not None and all(resource is not item for item in resources):
+            resources.append(resource)
+    for resource in resources:
         close = getattr(resource, "close", None)
         if callable(close):
             with suppress(Exception):
@@ -449,6 +667,7 @@ class StrictNetmikoFactory:
         self._connect_timeout = connect_timeout
         self._key_probe = key_probe or _probe_server_key
         self._connector = connector or _connect_read_only_aruba
+        self._connector_uses_owned_socket = connector is None
         self._host_keys_lock = _known_hosts_thread_lock(self._known_hosts_path)
         try:
             parent, self._known_hosts_parent_identity = ensure_managed_directory(
@@ -506,22 +725,50 @@ class StrictNetmikoFactory:
 
         try:
             connection_timeout = poll_deadline.bounded_timeout(self._connect_timeout)
-            connection = self._connector(
-                device_type="aruba_os",
-                host=target.host,
-                port=target.port,
-                username=credentials.username,
-                password=credentials.password,
-                secret=credentials.enable_secret,
-                timeout=connection_timeout,
-                conn_timeout=connection_timeout,
-                auth_timeout=connection_timeout,
-                banner_timeout=connection_timeout,
-                ssh_strict=True,
-                system_host_keys=False,
-                alt_host_keys=True,
-                alt_key_file=str(self._known_hosts_path),
-            )
+            bounded_session_log = _BoundedSessionLog()
+            connector_kwargs: dict[str, Any] = {
+                "device_type": "aruba_os",
+                "host": target.host,
+                "port": target.port,
+                "username": credentials.username,
+                "password": credentials.password,
+                "secret": credentials.enable_secret,
+                "timeout": connection_timeout,
+                "conn_timeout": connection_timeout,
+                "auth_timeout": connection_timeout,
+                "banner_timeout": connection_timeout,
+                "ssh_strict": True,
+                "system_host_keys": False,
+                "alt_host_keys": True,
+                "alt_key_file": str(self._known_hosts_path),
+                "session_log": bounded_session_log,
+            }
+            connector_socket: socket.socket | None = None
+            connector_guard: _SocketDeadlineGuard | None = None
+            if self._connector_uses_owned_socket:
+                connector_socket = socket.create_connection(
+                    (target.host, target.port),
+                    timeout=connection_timeout,
+                )
+                connector_socket.settimeout(connection_timeout)
+                connector_guard = _SocketDeadlineGuard(connector_socket, poll_deadline)
+                connector_kwargs["sock"] = connector_socket
+            try:
+                if connector_guard is None:
+                    connection = self._connector(**connector_kwargs)
+                else:
+                    with cancel_token.abort_on_cancel(connector_guard.close_socket):
+                        connection = self._connector(**connector_kwargs)
+            except BaseException:
+                if connector_guard is not None:
+                    connector_guard.close_socket()
+                elif connector_socket is not None:
+                    with suppress(OSError):
+                        connector_socket.close()
+                raise
+            finally:
+                if connector_guard is not None:
+                    connector_guard.stop()
         except (NetmikoAuthenticationException, paramiko.AuthenticationException) as exc:
             raise CollectorError(ErrorCode.AUTH_FAILED, "SSH 인증에 실패했습니다.") from exc
         except paramiko.BadHostKeyException as exc:
@@ -563,7 +810,11 @@ class StrictNetmikoFactory:
                 retryable_network=True,
             ) from exc
 
-        manager = _NetmikoConnectionManager(connection)
+        manager = _NetmikoConnectionManager(
+            connection,
+            deadline=poll_deadline,
+            bounded_session_log=bounded_session_log,
+        )
         if cancel_token.is_cancelled:
             with suppress(Exception):
                 manager.close()

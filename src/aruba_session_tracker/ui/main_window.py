@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 from typing import Protocol
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThread, QThreadPool, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QRunnable, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -36,6 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from aruba_session_tracker import __version__
+from aruba_session_tracker.analysis import protocol_label, service_definition
 from aruba_session_tracker.collectors.ssh import CancellationToken, CollectorError, HostKeyInfo
 from aruba_session_tracker.config import ConfigError, ConfigRepository
 from aruba_session_tracker.models import (
@@ -52,12 +54,37 @@ from aruba_session_tracker.ui.developer_inspector import (
     DeveloperInspectorController,
     UiElementMetadata,
 )
+from aruba_session_tracker.ui.runtime_environment import RuntimeEnvironmentMonitor
+from aruba_session_tracker.ui.shutdown import ShutdownCoordinator
 
 _UI_SOURCE_PATH = "src/aruba_session_tracker/ui/main_window.py"
 _MAX_VISIBLE_RESULT_ROWS = 2_000
 _DETAIL_COLUMN_INDEXES = range(5, 12)
 _STORAGE_HEALTH_INTERVAL_SECONDS = 60.0
 _OPERATOR_STATES = frozenset({"대기", "조회 중", "정상", "재시도 중", "확인 필요"})
+_RESULT_RENDER_CHUNK_SIZE = 200
+
+
+@dataclass(frozen=True, slots=True)
+class _DisplayRow:
+    observation: SessionObservation
+    packet_delta: str
+    byte_delta: str
+    lifecycle_status: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedDisplayOutcome:
+    outcome: object
+    visible_rows: tuple[_DisplayRow, ...]
+    total_rows: int
+    next_counters: dict[str, tuple[int | None, int | None]]
+
+
+@dataclass(frozen=True, slots=True)
+class _HistoryReadResult:
+    runs: tuple[object, ...]
+    pending_external_recoveries: int
 
 
 class QueryExecutor(Protocol):
@@ -97,6 +124,8 @@ class _QueryTask(QRunnable):
         generation: int,
         query_capacity_check: Callable[[], None] | None = None,
         storage_health_check: Callable[[], object] | None = None,
+        previous_counters: dict[str, tuple[int | None, int | None]] | None = None,
+        close_after_misses: int = 3,
     ) -> None:
         super().__init__()
         self.signals = _TaskSignals()
@@ -111,6 +140,8 @@ class _QueryTask(QRunnable):
         self._full_scan_approval = full_scan_approval
         self._query_capacity_check = query_capacity_check
         self._storage_health_check = storage_health_check
+        self._previous_counters = dict(previous_counters or {})
+        self._close_after_misses = close_after_misses
 
     @Slot()
     def run(self) -> None:
@@ -139,10 +170,16 @@ class _QueryTask(QRunnable):
                 host_key_approval=self._host_key_approval,
                 full_scan_approval=self._full_scan_approval,
             )
+            prepared = _prepare_display_outcome(
+                outcome,
+                previous_counters=self._previous_counters,
+                close_after_misses=self._close_after_misses,
+                monitoring=self._monitoring,
+            )
         except Exception as exc:
             self.signals.failed.emit(self.generation, exc)
         else:
-            self.signals.succeeded.emit(self.generation, outcome)
+            self.signals.succeeded.emit(self.generation, prepared)
         finally:
             self.signals.finished.emit(self.generation)
 
@@ -151,6 +188,7 @@ class _StorageTaskSignals(QObject):
     succeeded = Signal(int, str, object)
     failed = Signal(int, str, object)
     finished = Signal(int, str)
+    progress = Signal(int, str, str, int, int)
 
 
 class _StorageTask(QRunnable):
@@ -158,7 +196,10 @@ class _StorageTask(QRunnable):
         self,
         generation: int,
         kind: str,
-        operation: Callable[[], object],
+        operation: Callable[
+            [Callable[[], bool], Callable[[str, int, int | None], None]],
+            object,
+        ],
         context: object | None = None,
     ) -> None:
         super().__init__()
@@ -167,11 +208,27 @@ class _StorageTask(QRunnable):
         self.kind = kind
         self.context = context
         self._operation = operation
+        self._cancel_requested = threading.Event()
+
+    def request_cancel(self) -> None:
+        self._cancel_requested.set()
+
+    def cancelled(self) -> bool:
+        return self._cancel_requested.is_set()
+
+    def _report_progress(self, phase: str, completed: int, total: int | None) -> None:
+        self.signals.progress.emit(
+            self.generation,
+            self.kind,
+            phase,
+            completed,
+            -1 if total is None else total,
+        )
 
     @Slot()
     def run(self) -> None:
         try:
-            result = self._operation()
+            result = self._operation(self.cancelled, self._report_progress)
         except Exception as exc:
             self.signals.failed.emit(self.generation, self.kind, exc)
         else:
@@ -367,25 +424,34 @@ class MainWindow(QMainWindow):
         store: SessionStore,
         executor: QueryExecutor,
         developer_inspector: DeveloperInspectorController | None = None,
+        *,
+        shutdown_grace_milliseconds: int = 15_000,
+        close_grace_milliseconds: int | None = None,
     ) -> None:
         super().__init__()
+        close_grace = (
+            shutdown_grace_milliseconds
+            if close_grace_milliseconds is None
+            else close_grace_milliseconds
+        )
+        if type(close_grace) is not int or close_grace < 1:
+            raise ValueError("close_grace_milliseconds must be a positive integer")
         self._config_repository = config_repository
         self._store = store
         self._executor = executor
         self._developer_inspector = developer_inspector
-        self._thread_pool = QThreadPool(self)
-        self._thread_pool.setMaxThreadCount(1)
-        self._history_thread_pool = QThreadPool(self)
-        self._history_thread_pool.setMaxThreadCount(1)
         self._approval = ApprovalBridge(self)
         self._cancel_token: CancellationToken | None = None
         self._current_task: _QueryTask | None = None
         self._task_generation = 0
         self._user_cancel_generation: int | None = None
+        self._environment_cancel_generation: int | None = None
         self._query_running = False
         self._monitoring = False
         self._closing_requested = False
         self._close_when_idle = False
+        self._close_recovery_deferred = False
+        self._shutdown_finalization_succeeded: bool | None = None
         self._storage_task_running = False
         self._storage_task_generation = 0
         self._current_storage_task: _StorageTask | None = None
@@ -395,12 +461,33 @@ class MainWindow(QMainWindow):
         self._current_history_task: _StorageTask | None = None
         self._history_dirty = False
         self._history_revision = 0
+        self._storage_reconciliation_pending = True
         self._next_monitor_delay_seconds = 0.0
         self._next_storage_health_check_at = 0.0
         self._last_counters: dict[str, tuple[int | None, int | None]] = {}
         self._monitor_timer = QTimer(self)
         self._monitor_timer.setSingleShot(True)
         self._monitor_timer.timeout.connect(self._start_query)
+        self._close_grace_timer = QTimer(self)
+        self._close_grace_timer.setSingleShot(True)
+        self._close_grace_timer.setInterval(close_grace)
+        self._close_grace_timer.timeout.connect(self._close_grace_expired)
+        self._result_render_timer = QTimer(self)
+        self._result_render_timer.setSingleShot(True)
+        self._result_render_timer.timeout.connect(self._render_next_result_chunk)
+        self._result_render_generation = 0
+        self._pending_result_rows: tuple[_DisplayRow, ...] = ()
+        self._pending_result_index = 0
+        self._pending_result_total_rows = 0
+        self._shutdown = ShutdownCoordinator(
+            self._executor.stop_monitor,
+            self,
+            grace_milliseconds=shutdown_grace_milliseconds,
+        )
+        self._shutdown.stage_changed.connect(self._shutdown_stage_changed)
+        self._shutdown.settled.connect(self._shutdown_settled)
+        self._runtime_environment = RuntimeEnvironmentMonitor(self)
+        self._runtime_environment.discontinuity.connect(self._runtime_discontinuity)
 
         self.setWindowTitle(f"Aruba Session Tracker {__version__}")
         self.resize(1320, 820)
@@ -410,6 +497,10 @@ class MainWindow(QMainWindow):
         self._load_config()
         self._update_setup_guide()
         self._refresh_history()
+
+    @property
+    def clean_shutdown_completed(self) -> bool:
+        return self._shutdown_finalization_succeeded is True and not self._close_recovery_deferred
 
     def _build_ui(self) -> None:
         self.central_root = QWidget()
@@ -1389,7 +1480,13 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _start_query(self) -> None:
-        if self._query_running or self._storage_task_running or self._closing_requested:
+        if (
+            self._query_running
+            or self._storage_task_running
+            or self._closing_requested
+            or self._shutdown.active
+            or self._shutdown.restart_required
+        ):
             return
         if not self._monitoring:
             self._last_counters.clear()
@@ -1401,6 +1498,8 @@ class MainWindow(QMainWindow):
             self._set_state("확인 필요")
             self.statusBar().showMessage("입력값을 확인한 뒤 다시 시도해 주세요.", 5000)
             return
+        self._shutdown.reset()
+        self._shutdown_finalization_succeeded = None
         self._query_running = True
         self._task_generation += 1
         generation = self._task_generation
@@ -1452,17 +1551,24 @@ class MainWindow(QMainWindow):
             generation,
             query_capacity_check,
             storage_health_check,
+            dict(self._last_counters),
+            self.close_misses.value(),
         )
         self._current_task = task
         task.signals.succeeded.connect(self._task_succeeded)
         task.signals.failed.connect(self._task_failed)
         task.signals.finished.connect(self._query_finished)
         task.signals.storage_warning.connect(self._show_storage_warning)
-        self._thread_pool.start(task)
+        _start_daemon_task(task.run, f"aruba-session-query-{generation}")
 
     @Slot()
     def _start_monitoring(self) -> None:
-        if self._monitoring or self._closing_requested:
+        if (
+            self._monitoring
+            or self._closing_requested
+            or self._shutdown.active
+            or self._shutdown.restart_required
+        ):
             return
         self._last_counters.clear()
         self._monitoring = True
@@ -1497,12 +1603,8 @@ class MainWindow(QMainWindow):
         if user_requested and current_generation is not None:
             self._user_cancel_generation = current_generation
         self._approval.cancel_pending(current_generation)
-        try:
-            self._executor.stop_monitor()
-        except Exception:
-            self.diagnostics_list.addItem(
-                "[UNEXPECTED] 모니터링 중지 정리 중 내부 오류가 발생했습니다."
-            )
+        if was_active or self._closing_requested:
+            self._shutdown.request()
         if status is not None and was_active:
             self._set_state(status)
         self._set_monitor_inputs_enabled(True)
@@ -1514,13 +1616,18 @@ class MainWindow(QMainWindow):
             not self._owns_task(generation)
             or self._closing_requested
             or self._user_cancel_generation == generation
+            or self._environment_cancel_generation == generation
         ):
             return
         self._display_outcome(outcome)
 
     @Slot(int, object)
     def _task_failed(self, generation: int, exc: object) -> None:
-        if not self._owns_task(generation) or self._closing_requested:
+        if (
+            not self._owns_task(generation)
+            or self._closing_requested
+            or self._environment_cancel_generation == generation
+        ):
             return
         failure = exc if isinstance(exc, Exception) else RuntimeError("invalid task failure")
         self._display_failure(failure)
@@ -1534,120 +1641,33 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _display_outcome(self, outcome: object) -> None:
+        prepared = (
+            outcome
+            if isinstance(outcome, _PreparedDisplayOutcome)
+            else _prepare_display_outcome(
+                outcome,
+                previous_counters=self._last_counters,
+                close_after_misses=self.close_misses.value(),
+                monitoring=self._monitoring,
+            )
+        )
+        outcome = prepared.outcome
         observations = tuple(getattr(outcome, "observations", ()))
-        active_sessions = tuple(getattr(outcome, "active_sessions", ()))
-        lifecycle_events = tuple(getattr(outcome, "events", ()))
         authoritative = bool(getattr(outcome, "authoritative", False))
-        observed_by_flow = {
-            _flow_key(item): item for item in observations if isinstance(item, SessionObservation)
-        }
-        event_types_by_flow: dict[str, set[str]] = {}
-        closed_observations: dict[str, SessionObservation] = {}
-        for event in lifecycle_events:
-            event_observation = getattr(event, "observation", None)
-            event_type = getattr(getattr(event, "event_type", None), "value", "")
-            if not isinstance(event_observation, SessionObservation):
-                continue
-            flow_key = _flow_key(event_observation)
-            event_types_by_flow.setdefault(flow_key, set()).add(str(event_type))
-            if event_type == "CLOSED":
-                closed_observations[flow_key] = event_observation
-
-        rows: list[tuple[SessionObservation, str, str, str | None]] = []
-        next_counters: dict[str, tuple[int | None, int | None]] = {}
-        if active_sessions:
-            for session in active_sessions:
-                observation = getattr(session, "observation", None)
-                if not isinstance(observation, SessionObservation):
-                    continue
-                flow_key = _flow_key(observation)
-                is_observed = flow_key in observed_by_flow
-                previous = self._last_counters.get(flow_key)
-                packet_delta = (
-                    _counter_delta(
-                        observation.packets,
-                        None if previous is None else previous[0],
-                    )
-                    if is_observed
-                    else "-"
-                )
-                byte_delta = (
-                    _counter_delta(
-                        observation.bytes_count,
-                        None if previous is None else previous[1],
-                    )
-                    if is_observed
-                    else "-"
-                )
-                rows.append(
-                    (
-                        observation,
-                        packet_delta,
-                        byte_delta,
-                        _lifecycle_status(
-                            event_types_by_flow.get(flow_key, set()),
-                            miss_count=int(getattr(session, "miss_count", 0)),
-                            close_after_misses=self.close_misses.value(),
-                            is_observed=is_observed,
-                            authoritative=authoritative,
-                        ),
-                    )
-                )
-                next_counters[flow_key] = (observation.packets, observation.bytes_count)
-            for flow_key, observation in closed_observations.items():
-                if flow_key not in next_counters:
-                    rows.append(
-                        (
-                            observation,
-                            "-",
-                            "-",
-                            f"종료 확인 ({self.close_misses.value()}회 연속 MISS)",
-                        )
-                    )
-        else:
-            for observation in observations:
-                if not isinstance(observation, SessionObservation):
-                    continue
-                flow_key = _flow_key(observation)
-                previous = self._last_counters.get(flow_key)
-                rows.append(
-                    (
-                        observation,
-                        _counter_delta(
-                            observation.packets,
-                            None if previous is None else previous[0],
-                        ),
-                        _counter_delta(
-                            observation.bytes_count,
-                            None if previous is None else previous[1],
-                        ),
-                        None,
-                    ),
-                )
-                next_counters[flow_key] = (observation.packets, observation.bytes_count)
-
-        self.result_table.setUpdatesEnabled(False)
-        try:
-            self.result_table.setRowCount(0)
-            for observation, packet_delta, byte_delta, lifecycle_status in rows[
-                :_MAX_VISIBLE_RESULT_ROWS
-            ]:
-                self._append_observation(
-                    observation,
-                    packet_delta=packet_delta,
-                    byte_delta=byte_delta,
-                    lifecycle_status=lifecycle_status,
-                )
-        finally:
-            self.result_table.setUpdatesEnabled(True)
-            self.result_table.viewport().update()
-        self._last_counters = next_counters if self._monitoring else {}
+        self._result_render_timer.stop()
+        self._result_render_generation += 1
+        self._pending_result_rows = prepared.visible_rows
+        self._pending_result_index = 0
+        self._pending_result_total_rows = prepared.total_rows
+        self.result_table.setRowCount(0)
+        self._render_next_result_chunk()
+        self._last_counters = prepared.next_counters if self._monitoring else {}
         used_mm = getattr(outcome, "used_mm", None) or "-"
         controllers = ", ".join(getattr(outcome, "controllers", ())) or "-"
         self.context_label.setText(
             f"MM: {used_mm}   |   조회 MD: {controllers}   |   "
             f"현재 일치: {len(observations)}   |   "
-            f"화면 표시: {self.result_table.rowCount()}/{len(rows)}"
+            f"화면 표시: {len(prepared.visible_rows)}/{prepared.total_rows}"
         )
         self.diagnostics_list.clear()
         for event in getattr(outcome, "diagnostics", ()):
@@ -1656,7 +1676,7 @@ class MainWindow(QMainWindow):
             self.diagnostics_list.addItem(
                 f"[{getattr(event, 'stage', '-')}] {code_text}: {getattr(event, 'message', '')}"
             )
-        if len(rows) > _MAX_VISIBLE_RESULT_ROWS:
+        if prepared.total_rows > _MAX_VISIBLE_RESULT_ROWS:
             self.diagnostics_list.addItem(
                 "[UI] DISPLAY_LIMIT: 화면에는 처음 2,000행만 표시했습니다. "
                 "전체 결과는 저장된 기록 또는 내보내기에서 확인하십시오."
@@ -1702,6 +1722,34 @@ class MainWindow(QMainWindow):
             self._set_state("확인 필요")
         self._mark_history_dirty()
 
+    @Slot()
+    def _render_next_result_chunk(self) -> None:
+        start = self._pending_result_index
+        if start >= len(self._pending_result_rows):
+            self._pending_result_rows = ()
+            self._pending_result_index = 0
+            self.result_table.viewport().update()
+            return
+        stop = min(start + _RESULT_RENDER_CHUNK_SIZE, len(self._pending_result_rows))
+        self.result_table.setUpdatesEnabled(False)
+        try:
+            for row in self._pending_result_rows[start:stop]:
+                self._append_observation(
+                    row.observation,
+                    packet_delta=row.packet_delta,
+                    byte_delta=row.byte_delta,
+                    lifecycle_status=row.lifecycle_status,
+                )
+        finally:
+            self.result_table.setUpdatesEnabled(True)
+        self._pending_result_index = stop
+        self.result_table.viewport().update()
+        if stop < len(self._pending_result_rows):
+            self._result_render_timer.start(0)
+        else:
+            self._pending_result_rows = ()
+            self._pending_result_index = 0
+
     def _append_observation(
         self,
         observation: SessionObservation,
@@ -1720,7 +1768,7 @@ class MainWindow(QMainWindow):
         )
         values = (
             observation.controller_name,
-            str(observation.protocol),
+            _safe_protocol_label(observation.protocol),
             observation.source_ip,
             str(observation.source_port),
             observation.destination_ip,
@@ -1739,6 +1787,16 @@ class MainWindow(QMainWindow):
             item = QTableWidgetItem(value)
             if column == 0:
                 item.setData(_raw_data_role(), observation.raw_line)
+            if column in (3, 5):
+                port = observation.source_port if column == 3 else observation.destination_port
+                try:
+                    service = service_definition(observation.protocol, port)
+                except (TypeError, ValueError):
+                    service = None
+                if service is not None:
+                    item.setToolTip(
+                        f"포트 번호 기준 대표 서비스 후보: {service.label} ({service.port})"
+                    )
             if column in (13, 14):
                 item.setForeground(_severity_color(severity.name))
             self.result_table.setItem(row, column, item)
@@ -1770,13 +1828,18 @@ class MainWindow(QMainWindow):
             return
         self._approval.cancel_pending(generation)
         user_cancelled = self._user_cancel_generation == generation
+        environment_cancelled = self._environment_cancel_generation == generation
         self._query_running = False
         self._current_task = None
         self._user_cancel_generation = None
+        self._environment_cancel_generation = None
         self._set_busy(False)
         self._cancel_token = None
         if user_cancelled and not self._closing_requested:
             self._set_state("대기")
+        elif environment_cancelled and self._monitoring and not self._closing_requested:
+            self._set_state("재시도 중")
+            self._next_monitor_delay_seconds = 1.0
         if self._monitoring and not self._closing_requested:
             interval_ms = max(1_000, round(self._next_monitor_delay_seconds * 1_000))
             self._monitor_timer.start(interval_ms)
@@ -1784,9 +1847,63 @@ class MainWindow(QMainWindow):
         if self._close_when_idle:
             self._close_if_idle()
 
+    @Slot(str)
+    def _runtime_discontinuity(self, reason: str) -> None:
+        invalidate = getattr(self._executor, "invalidate_monitor_location", None)
+        if callable(invalidate):
+            try:
+                invalidate()
+            except Exception:
+                self.diagnostics_list.addItem(
+                    "[RUNTIME_ENVIRONMENT] 위치 캐시를 초기화하지 못했습니다."
+                )
+        if not self._monitoring or self._closing_requested:
+            return
+        self._monitor_timer.stop()
+        self._next_monitor_delay_seconds = 1.0
+        self._set_state("재시도 중")
+        reason_label = "절전 복귀" if reason == "SYSTEM_RESUMED" else "네트워크 변경"
+        self.statusBar().showMessage(
+            f"{reason_label}을 감지했습니다. 다음 조회에서 MM 위치를 다시 확인합니다.",
+            10_000,
+        )
+        if self._query_running and self._current_task is not None:
+            self._environment_cancel_generation = self._current_task.generation
+            if self._cancel_token is not None:
+                self._cancel_token.cancel()
+            self._approval.cancel_pending(self._current_task.generation)
+            return
+        self._monitor_timer.start(1_000)
+
+    @Slot(str)
+    def _shutdown_stage_changed(self, stage: str) -> None:
+        self.statusBar().showMessage(stage)
+        self._set_busy(self._query_running)
+
+    @Slot(bool, str)
+    def _shutdown_settled(self, succeeded: bool, exception_type: str) -> None:
+        if not self._close_recovery_deferred:
+            self._shutdown_finalization_succeeded = succeeded
+        if not succeeded:
+            message = (
+                "[SHUTDOWN_DEFERRED] 종료 기록은 다음 실행에서 안전하게 복구합니다."
+                if exception_type == "ShutdownGraceTimeout"
+                else "[SHUTDOWN_FINALIZE_FAILED] 종료 기록 정리를 완료하지 못했습니다."
+            )
+            self.diagnostics_list.addItem(message)
+            if not self._closing_requested:
+                self._set_state("확인 필요")
+        self._set_busy(self._query_running)
+        self._close_if_idle()
+
     def _set_busy(self, busy: bool) -> None:
         interactive = not self._closing_requested
-        available = interactive and not self._storage_task_running
+        available = (
+            interactive
+            and not self._storage_task_running
+            and not self._shutdown.active
+            and not self._shutdown.restart_required
+        )
         self.query_button.setEnabled(available and not busy and not self._monitoring)
         self.stop_button.setEnabled(available and (busy or self._monitoring))
         if not self._monitoring:
@@ -1822,15 +1939,27 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _refresh_history(self) -> None:
-        if self._closing_requested or self._history_task_running or self._storage_task_running:
+        if (
+            self._closing_requested
+            or self._history_task_running
+            or self._storage_task_running
+            or self._shutdown.active
+            or self._shutdown.restart_required
+        ):
             return
         self._history_task_generation += 1
         generation = self._history_task_generation
-        context = (self._selected_run_id(), self._history_revision)
+        reconcile_storage = self._storage_reconciliation_pending
+        context = (self._selected_run_id(), self._history_revision, reconcile_storage)
         task = _StorageTask(
             generation,
             "history-list",
-            lambda: tuple(self._store.list_runs(limit=100)),
+            lambda cancel_check, progress: _read_history_task(
+                self._store,
+                cancel_check,
+                progress,
+                reconcile_storage=reconcile_storage,
+            ),
             context,
         )
         self._history_task_running = True
@@ -1838,7 +1967,7 @@ class MainWindow(QMainWindow):
         task.signals.succeeded.connect(self._history_task_succeeded)
         task.signals.failed.connect(self._history_task_failed)
         self._set_busy(self._query_running)
-        self._history_thread_pool.start(task)
+        _start_daemon_task(task.run, f"aruba-session-history-{generation}")
 
     def _mark_history_dirty(self) -> None:
         self._history_revision += 1
@@ -1862,7 +1991,7 @@ class MainWindow(QMainWindow):
             self._drain_preview_discard_queue()
             self._close_if_idle()
             return
-        if not isinstance(result, tuple):
+        if not isinstance(result, _HistoryReadResult):
             self._history_dirty = True
             self.statusBar().showMessage(
                 "기록 읽기 실패: 로컬 기록을 안전하게 읽지 못했습니다.", 5000
@@ -1872,14 +2001,25 @@ class MainWindow(QMainWindow):
             return
         selected_run_id: str | None = None
         requested_revision = -1
-        if isinstance(task.context, tuple) and len(task.context) == 2:
-            selected_value, revision_value = task.context
+        requested_reconciliation = False
+        if isinstance(task.context, tuple) and len(task.context) == 3:
+            selected_value, revision_value, reconciliation_value = task.context
             if isinstance(selected_value, str):
                 selected_run_id = selected_value
             if isinstance(revision_value, int):
                 requested_revision = revision_value
-        self._render_history(result, selected_run_id)
+            requested_reconciliation = reconciliation_value is True
+        if requested_reconciliation:
+            self._storage_reconciliation_pending = False
+        self._render_history(result.runs, selected_run_id)
         self._history_dirty = requested_revision != self._history_revision
+        if result.pending_external_recoveries > 0:
+            self.statusBar().showMessage(
+                "외부 보고서 복구 "
+                f"{result.pending_external_recoveries}건 대기 중입니다. "
+                "대상 드라이브를 연결한 뒤 새로 고침을 누르십시오.",
+                15_000,
+            )
         self._drain_preview_discard_queue()
         self._close_if_idle()
 
@@ -1946,7 +2086,12 @@ class MainWindow(QMainWindow):
         output_path = Path(destination)
         self._start_storage_task(
             "export-csv",
-            lambda: self._store.export_run_csv(run_id, output_path),
+            lambda cancel_check, progress: self._store.export_run_csv(
+                run_id,
+                output_path,
+                cancel_check=cancel_check,
+                progress=progress,
+            ),
             status="CSV 내보내기 중",
         )
 
@@ -1968,7 +2113,12 @@ class MainWindow(QMainWindow):
         output_path = Path(destination)
         self._start_storage_task(
             "export-html",
-            lambda: self._store.export_run_html(run_id, output_path),
+            lambda cancel_check, progress: self._store.export_run_html(
+                run_id,
+                output_path,
+                cancel_check=cancel_check,
+                progress=progress,
+            ),
             status="HTML 보고서 만드는 중",
         )
 
@@ -1979,14 +2129,21 @@ class MainWindow(QMainWindow):
             return
         self._start_storage_task(
             "delete-preview",
-            lambda: self._store.preview_delete(run_id),
+            lambda cancel_check, progress: self._store.preview_delete(
+                run_id,
+                cancel_check=cancel_check,
+                progress=progress,
+            ),
             status="삭제 대상 확인 중",
         )
 
     def _start_storage_task(
         self,
         kind: str,
-        operation: Callable[[], object],
+        operation: Callable[
+            [Callable[[], bool], Callable[[str, int, int | None], None]],
+            object,
+        ],
         *,
         status: str,
         context: object | None = None,
@@ -1997,6 +2154,8 @@ class MainWindow(QMainWindow):
             or self._history_task_running
             or self._query_running
             or self._monitoring
+            or (self._shutdown.active and not allow_while_closing)
+            or (self._shutdown.restart_required and not allow_while_closing)
         ):
             return False
         if self._closing_requested and not allow_while_closing:
@@ -2008,9 +2167,10 @@ class MainWindow(QMainWindow):
         self._current_storage_task = task
         task.signals.succeeded.connect(self._storage_task_succeeded)
         task.signals.failed.connect(self._storage_task_failed)
+        task.signals.progress.connect(self._storage_task_progress)
         self._set_busy(self._query_running)
         self.statusBar().showMessage(status)
-        self._thread_pool.start(task)
+        _start_daemon_task(task.run, f"aruba-session-storage-{generation}-{kind}")
         return True
 
     @Slot(int, bool)
@@ -2023,6 +2183,33 @@ class MainWindow(QMainWindow):
             else "저장 공간이 부족해지고 있습니다. 오래된 기록을 정리해 주세요."
         )
         self.statusBar().showMessage(message, 15000)
+
+    @Slot(int, str, str, int, int)
+    def _storage_task_progress(
+        self,
+        generation: int,
+        kind: str,
+        phase: str,
+        completed: int,
+        total: int,
+    ) -> None:
+        task = self._current_storage_task
+        if task is None or task.generation != generation or task.kind != kind:
+            return
+        label = {
+            "export-csv": "CSV 내보내기",
+            "export-html": "HTML 보고서 만들기",
+            "delete-preview": "삭제 대상 확인",
+        }.get(kind, "로컬 기록 작업")
+        safe_phase = {
+            "READ": "기록 읽는 중",
+            "RENDER": "문서 만드는 중",
+            "HASH": "무결성 확인 중",
+            "INSTALL": "파일 저장 중",
+            "SCAN": "대상 확인 중",
+        }.get(phase.upper(), "안전하게 처리 중")
+        amount = f" ({completed}/{total})" if total >= 0 else ""
+        self.statusBar().showMessage(f"{label}: {safe_phase}{amount}")
 
     def _finish_storage_task(self, generation: int, kind: str) -> _StorageTask | None:
         task = self._current_storage_task
@@ -2043,7 +2230,7 @@ class MainWindow(QMainWindow):
         preview = self._pending_preview_discards[0]
         started = self._start_storage_task(
             "delete-discard",
-            lambda: self._store.discard_delete_preview(preview),
+            lambda _cancel_check, _progress: self._store.discard_delete_preview(preview),
             status="삭제 확인 정리 중",
             context=preview,
             allow_while_closing=True,
@@ -2104,9 +2291,11 @@ class MainWindow(QMainWindow):
         if answer == QMessageBox.StandardButton.Yes:
             started = self._start_storage_task(
                 "delete-commit",
-                lambda: self._store.delete(
+                lambda cancel_check, progress: self._store.delete(
                     preview,
                     confirmation_token=preview.confirmation_token,
+                    cancel_check=cancel_check,
+                    progress=progress,
                 ),
                 status="기록 삭제 중",
                 context=preview,
@@ -2169,22 +2358,72 @@ class MainWindow(QMainWindow):
             application.setFont(font)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._close_recovery_deferred:
+            event.accept()
+            return
         self._closing_requested = True
         self._close_when_idle = True
+        self._result_render_timer.stop()
+        self._pending_result_rows = ()
+        self._pending_result_index = 0
         self._cancel_active_work(user_requested=True)
+        if self._current_storage_task is not None:
+            self._current_storage_task.request_cancel()
+        if self._current_history_task is not None:
+            self._current_history_task.request_cancel()
         self._approval.shutdown()
         self._drain_preview_discard_queue()
         if (
             self._query_running
             or self._storage_task_running
             or self._history_task_running
+            or self._shutdown.active
             or self._pending_preview_discards
         ):
+            if not self._close_grace_timer.isActive():
+                self._close_grace_timer.start()
             self._set_state("확인 필요")
             self.statusBar().showMessage("진행 중인 작업을 안전하게 정리한 뒤 종료합니다.")
             event.ignore()
             return
+        self._close_grace_timer.stop()
         event.accept()
+
+    @Slot()
+    def _close_grace_expired(self) -> None:
+        if not self._closing_requested:
+            return
+        if not (
+            self._query_running
+            or self._storage_task_running
+            or self._history_task_running
+            or self._shutdown.active
+            or self._pending_preview_discards
+        ):
+            self._close_if_idle()
+            return
+        self._close_recovery_deferred = True
+        self._shutdown_finalization_succeeded = False
+        self._monitoring = False
+        self._monitor_timer.stop()
+        if self._cancel_token is not None:
+            self._cancel_token.cancel()
+        if self._current_storage_task is not None:
+            self._current_storage_task.request_cancel()
+        if self._current_history_task is not None:
+            self._current_history_task.request_cancel()
+        self._task_generation += 1
+        self._storage_task_generation += 1
+        self._history_task_generation += 1
+        self._query_running = False
+        self._storage_task_running = False
+        self._history_task_running = False
+        self._current_task = None
+        self._current_storage_task = None
+        self._current_history_task = None
+        self._pending_preview_discards.clear()
+        self.statusBar().showMessage("완료되지 않은 로컬 작업은 다음 실행에서 안전하게 복구합니다.")
+        QTimer.singleShot(0, self.close)
 
     def _close_if_idle(self) -> None:
         if not self._close_when_idle:
@@ -2195,6 +2434,7 @@ class MainWindow(QMainWindow):
             self._query_running
             or self._storage_task_running
             or self._history_task_running
+            or self._shutdown.active
             or self._pending_preview_discards
         ):
             return
@@ -2211,6 +2451,45 @@ def _optional_port(text: str, label: str) -> int | None:
     if not 0 <= value <= 65535:
         raise ValueError(f"{label}는 0~65535 범위여야 합니다.")
     return value
+
+
+def _start_daemon_task(operation: Callable[[], None], name: str) -> threading.Thread:
+    worker = threading.Thread(target=operation, name=name, daemon=True)
+    worker.start()
+    return worker
+
+
+def _read_history_task(
+    store: SessionStore,
+    cancel_check: Callable[[], bool],
+    progress: Callable[[str, int, int | None], None],
+    *,
+    reconcile_storage: bool = False,
+) -> _HistoryReadResult:
+    if cancel_check():
+        raise StorageError("기록 읽기가 취소되었습니다.", code=ErrorCode.CANCELLED)
+    reconcile = getattr(store, "reconcile_storage_health", None)
+    if reconcile_storage and callable(reconcile):
+        progress("SCAN", 0, None)
+        reconcile(cancel_check=cancel_check, progress=progress)
+        if cancel_check():
+            raise StorageError("기록 읽기가 취소되었습니다.", code=ErrorCode.CANCELLED)
+        progress("SCAN", 1, 1)
+    pending_recoveries = store.pending_external_recovery_count
+    if pending_recoveries > 0:
+        progress("RECOVER", 0, pending_recoveries)
+        if cancel_check():
+            raise StorageError("기록 읽기가 취소되었습니다.", code=ErrorCode.CANCELLED)
+        pending_recoveries = store.retry_pending_external_recoveries()
+        if cancel_check():
+            raise StorageError("기록 읽기가 취소되었습니다.", code=ErrorCode.CANCELLED)
+        progress("RECOVER", 1, 1)
+    progress("READ", 0, None)
+    result = tuple(store.list_runs(limit=100))
+    if cancel_check():
+        raise StorageError("기록 읽기가 취소되었습니다.", code=ErrorCode.CANCELLED)
+    progress("READ", len(result), len(result))
+    return _HistoryReadResult(result, pending_recoveries)
 
 
 def _safe_query_failure(exc: Exception) -> tuple[str, str]:
@@ -2247,6 +2526,12 @@ def _display_number(value: int | None) -> str:
     return "-" if value is None else f"{value:,}"
 
 
+def _safe_protocol_label(value: object) -> str:
+    if type(value) is not int or not 0 <= value <= 255:
+        return str(value)
+    return protocol_label(value)
+
+
 def _display_observed_at(observation: SessionObservation) -> str:
     return observation.observed_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2260,6 +2545,112 @@ def _flow_key(observation: SessionObservation) -> str:
             str(observation.source_port),
             str(observation.destination_port),
         )
+    )
+
+
+def _prepare_display_outcome(
+    outcome: object,
+    *,
+    previous_counters: dict[str, tuple[int | None, int | None]],
+    close_after_misses: int,
+    monitoring: bool,
+) -> _PreparedDisplayOutcome:
+    observations = tuple(getattr(outcome, "observations", ()))
+    active_sessions = tuple(getattr(outcome, "active_sessions", ()))
+    lifecycle_events = tuple(getattr(outcome, "events", ()))
+    authoritative = bool(getattr(outcome, "authoritative", False))
+    observed_by_flow = {
+        _flow_key(item): item for item in observations if isinstance(item, SessionObservation)
+    }
+    event_types_by_flow: dict[str, set[str]] = {}
+    closed_observations: dict[str, SessionObservation] = {}
+    for event in lifecycle_events:
+        event_observation = getattr(event, "observation", None)
+        event_type = getattr(getattr(event, "event_type", None), "value", "")
+        if not isinstance(event_observation, SessionObservation):
+            continue
+        flow_key = _flow_key(event_observation)
+        event_types_by_flow.setdefault(flow_key, set()).add(str(event_type))
+        if event_type == "CLOSED":
+            closed_observations[flow_key] = event_observation
+
+    rows: list[_DisplayRow] = []
+    next_counters: dict[str, tuple[int | None, int | None]] = {}
+    if active_sessions:
+        for session in active_sessions:
+            observation = getattr(session, "observation", None)
+            if not isinstance(observation, SessionObservation):
+                continue
+            flow_key = _flow_key(observation)
+            is_observed = flow_key in observed_by_flow
+            previous = previous_counters.get(flow_key)
+            packet_delta = (
+                _counter_delta(
+                    observation.packets,
+                    None if previous is None else previous[0],
+                )
+                if is_observed
+                else "-"
+            )
+            byte_delta = (
+                _counter_delta(
+                    observation.bytes_count,
+                    None if previous is None else previous[1],
+                )
+                if is_observed
+                else "-"
+            )
+            rows.append(
+                _DisplayRow(
+                    observation,
+                    packet_delta,
+                    byte_delta,
+                    _lifecycle_status(
+                        event_types_by_flow.get(flow_key, set()),
+                        miss_count=int(getattr(session, "miss_count", 0)),
+                        close_after_misses=close_after_misses,
+                        is_observed=is_observed,
+                        authoritative=authoritative,
+                    ),
+                )
+            )
+            next_counters[flow_key] = (observation.packets, observation.bytes_count)
+        for flow_key, observation in closed_observations.items():
+            if flow_key not in next_counters:
+                rows.append(
+                    _DisplayRow(
+                        observation,
+                        "-",
+                        "-",
+                        f"종료 확인 ({close_after_misses}회 연속 MISS)",
+                    )
+                )
+    else:
+        for observation in observations:
+            if not isinstance(observation, SessionObservation):
+                continue
+            flow_key = _flow_key(observation)
+            previous = previous_counters.get(flow_key)
+            rows.append(
+                _DisplayRow(
+                    observation,
+                    _counter_delta(
+                        observation.packets,
+                        None if previous is None else previous[0],
+                    ),
+                    _counter_delta(
+                        observation.bytes_count,
+                        None if previous is None else previous[1],
+                    ),
+                    None,
+                )
+            )
+            next_counters[flow_key] = (observation.packets, observation.bytes_count)
+    return _PreparedDisplayOutcome(
+        outcome=outcome,
+        visible_rows=tuple(rows[:_MAX_VISIBLE_RESULT_ROWS]),
+        total_rows=len(rows),
+        next_counters=next_counters if monitoring else {},
     )
 
 

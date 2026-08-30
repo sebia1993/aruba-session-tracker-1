@@ -3,12 +3,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
+
+from aruba_session_tracker.analysis import protocol_label
+from aruba_session_tracker.storage.durable_io import replace_with_retry
 
 ReportRow = dict[str, object]
 FlowKey = tuple[str, str, str, str, str]
@@ -62,9 +67,31 @@ class RunReportSnapshot:
 def render_html_report(snapshot: RunReportSnapshot) -> str:
     """Return a concise standalone HTML5 report containing tracked results only."""
 
+    return "".join(_report_chunks(snapshot))
+
+
+def _report_chunks(
+    snapshot: RunReportSnapshot,
+    *,
+    observation_history: Iterable[ReportRow] | None = None,
+    logical_session_total: int | None = None,
+) -> Iterator[str]:
+    """Yield one report in bounded chunks.
+
+    ``observation_history`` is used by :class:`SessionStore` to stream a stable
+    SQLite cursor directly to the atomic destination.  The public renderer
+    keeps its historical behavior by deriving both the latest results and the
+    complete history from the supplied snapshot.
+    """
+
     run = snapshot.run
-    history = snapshot.observation_history or snapshot.observations
-    flow_groups = _group_observations(history)
+    if observation_history is None:
+        history: Iterable[ReportRow] = snapshot.observation_history or snapshot.observations
+        latest_source = snapshot.observation_history or snapshot.observations
+    else:
+        history = observation_history
+        latest_source = snapshot.observations
+    flow_groups = _group_observations(latest_source)
     flow_statuses, session_statuses = _lifecycle_statuses(snapshot.lifecycle_events)
     latest_groups = flow_groups[:_LATEST_SESSION_LIMIT]
 
@@ -75,23 +102,20 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
         )
         for _flow, rows in latest_groups
     )
-    change_rows = "".join(_change_row(rows) for _flow, rows in flow_groups)
-    history_rows = "".join(_observation_row(row, "관측됨") for row in history)
-
-    logical_session_total = len(flow_groups)
+    total_sessions = len(flow_groups) if logical_session_total is None else logical_session_total
     displayed_latest = len(latest_groups)
     latest_note = (
-        f"고유 세션 {_format_integer(logical_session_total)}개를 모두 표시합니다."
-        if displayed_latest >= logical_session_total
+        f"고유 세션 {_format_integer(total_sessions)}개를 모두 표시합니다."
+        if displayed_latest >= total_sessions
         else (
-            f"고유 세션 {_format_integer(logical_session_total)}개 중 마지막 확인 시각을 기준으로 "
+            f"고유 세션 {_format_integer(total_sessions)}개 중 마지막 확인 시각을 기준으로 "
             f"최근 {_format_integer(displayed_latest)}개를 표시합니다."
         )
     )
     query_direction = "양방향" if bool(run.get("bidirectional")) else "단방향"
     run_status = _RUN_STATUS_KO.get(str(run.get("status") or "").upper(), "상태 확인 필요")
 
-    return f"""<!doctype html>
+    yield f"""<!doctype html>
 <html lang="ko">
 <head>
   <meta charset="utf-8">
@@ -122,7 +146,6 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
     .table-wrap {{ overflow-x:auto; border:1px solid var(--line); border-radius:9px; }}
     .table-wrap:focus-visible,summary:focus-visible {{ outline:3px solid #63b3ed; outline-offset:2px; }}
     table {{ width:100%; min-width:800px; border-collapse:collapse; font-size:.88rem; }}
-    .changes table {{ min-width:1050px; }}
     th,td {{ padding:9px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }}
     th {{ background:#f0f4f8; color:var(--navy); position:sticky; top:0; white-space:nowrap; }}
     tr:last-child td {{ border-bottom:0; }}
@@ -131,7 +154,6 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
     .badge.missed {{ background:#fffaf0; color:var(--warn); }}
     .badge.closed {{ background:#fff5f5; color:var(--closed); }}
     .badge.observed {{ background:#edf2f7; color:#486581; }}
-    .delta {{ color:var(--muted); font-size:.82rem; white-space:nowrap; }}
     details {{ border:0; }}
     summary {{ cursor:pointer; color:var(--blue); font-weight:700; padding:6px 0 13px; }}
     .details-body {{ padding-top:2px; }}
@@ -151,7 +173,7 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
       .subtitle {{ color:#333; }} .header-inner,.content,.footer {{ width:100%; }} .content {{ padding:0; }}
       section,.result-summary {{ box-shadow:none; border:1px solid #bbb; padding:10px; margin-bottom:8px; }}
       details:not([open]) > .details-body {{ display:block !important; }} summary {{ color:#000; }}
-      .table-wrap {{ overflow:visible; border:0; }} table,.changes table {{ min-width:0; font-size:7.5pt; }}
+      .table-wrap {{ overflow:visible; border:0; }} table {{ min-width:0; font-size:7.5pt; }}
       thead {{ display:table-header-group; }} th {{ position:static; }} th,td {{ padding:4px; overflow-wrap:anywhere; }}
       .card,tr {{ break-inside:avoid; }}
     }}
@@ -173,7 +195,7 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
         {_card("목적지 포트", run.get("destination_port"))}
         {_card("검색 방향", query_direction)}
         {_card("전체 관측", f"{_format_integer(snapshot.observation_total)}건")}
-        {_card("고유 세션", f"{_format_integer(logical_session_total)}개")}
+        {_card("고유 세션", f"{_format_integer(total_sessions)}개")}
         {_card("수집 상태", run_status)}
       </div>
     </div>
@@ -188,16 +210,6 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
       </table></div>
     </section>
 
-    <section id="session-changes" class="changes">
-      <h2>세션별 수치 변화</h2>
-      <p class="section-note">각 세션의 처음 값과 마지막 값을 그대로 비교합니다.</p>
-      <div class="table-wrap" role="region" aria-label="세션별 수치 변화 표" tabindex="0"><table>
-        <caption class="sr-only">세션별 수치 변화</caption>
-        <thead><tr><th scope="col">세션</th><th scope="col">처음 확인</th><th scope="col">마지막 확인</th><th scope="col">패킷</th><th scope="col">바이트</th><th scope="col">장비 변화</th></tr></thead>
-        <tbody>{change_rows or _empty_row(6, "비교할 세션이 없습니다.")}</tbody>
-      </table></div>
-    </section>
-
     <section id="observation-history">
       <h2>전체 추적 이력</h2>
       <details>
@@ -207,7 +219,14 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
           <div class="table-wrap" role="region" aria-label="전체 추적 이력 표" tabindex="0"><table>
             <caption class="sr-only">전체 추적 이력</caption>
             <thead><tr><th scope="col">확인 시각</th><th scope="col">장비명</th><th scope="col">프로토콜</th><th scope="col">출발지 IP:포트</th><th scope="col">목적지 IP:포트</th><th scope="col">추적 상태</th></tr></thead>
-            <tbody>{history_rows or _empty_row(6, "저장된 관측 이력이 없습니다.")}</tbody>
+            <tbody>"""
+    history_count = 0
+    for row in history:
+        history_count += 1
+        yield _observation_row(row, "관측됨")
+    if history_count == 0:
+        yield _empty_row(6, "저장된 관측 이력이 없습니다.")
+    yield """</tbody>
           </table></div>
         </div>
       </details>
@@ -222,6 +241,29 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
 def write_html_report_atomic(destination: Path | str, snapshot: RunReportSnapshot) -> Path:
     """Atomically write one deterministic UTF-8 report."""
 
+    return _write_html_chunks_atomic(destination, _report_chunks(snapshot))
+
+
+def write_html_report_stream_atomic(
+    destination: Path | str,
+    snapshot: RunReportSnapshot,
+    observation_history: Iterable[ReportRow],
+    *,
+    logical_session_total: int,
+) -> Path:
+    """Atomically write a report while consuming history rows incrementally."""
+
+    return _write_html_chunks_atomic(
+        destination,
+        _report_chunks(
+            snapshot,
+            observation_history=observation_history,
+            logical_session_total=logical_session_total,
+        ),
+    )
+
+
+def _write_html_chunks_atomic(destination: Path | str, chunks: Iterable[str]) -> Path:
     path = Path(destination)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -229,11 +271,23 @@ def write_html_report_atomic(destination: Path | str, snapshot: RunReportSnapsho
     )
     temporary_path = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(render_html_report(snapshot))
+        digest = hashlib.sha256()
+        byte_size = 0
+        with os.fdopen(descriptor, "wb") as stream:
+            for chunk in chunks:
+                encoded = chunk.encode("utf-8")
+                stream.write(encoded)
+                digest.update(encoded)
+                byte_size += len(encoded)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_path, path)
+        replace_with_retry(
+            temporary_path,
+            path,
+            replace=os.replace,
+            expected_sha256=digest.hexdigest(),
+            expected_size=byte_size,
+        )
     finally:
         temporary_path.unlink(missing_ok=True)
     return path
@@ -330,43 +384,6 @@ def _observation_row(row: ReportRow, status: str) -> str:
     )
 
 
-def _change_row(rows: tuple[ReportRow, ...]) -> str:
-    first = rows[0]
-    last = rows[-1]
-    first_packets = _optional_int(first.get("packets"))
-    last_packets = _optional_int(last.get("packets"))
-    first_bytes = _optional_int(first.get("bytes_count"))
-    last_bytes = _optional_int(last.get("bytes_count"))
-    return (
-        "<tr>"
-        f"<td>{_e(_flow_label(first))}</td>"
-        f"<td>{_e(_format_kst(first.get('observed_at')))}</td>"
-        f"<td>{_e(_format_kst(last.get('observed_at')))}</td>"
-        f"<td>{_change_cell(first_packets, last_packets, byte_count=False)}</td>"
-        f"<td>{_change_cell(first_bytes, last_bytes, byte_count=True)}</td>"
-        f"<td>{_e(_controller_change(first, last))}</td>"
-        "</tr>"
-    )
-
-
-def _change_cell(first: int | None, last: int | None, *, byte_count: bool) -> str:
-    if byte_count:
-        first_text = "-" if first is None else _format_byte_value(first)
-        last_text = "-" if last is None else _format_byte_value(last)
-    else:
-        first_text = "-" if first is None else _format_integer(first)
-        last_text = "-" if last is None else _format_integer(last)
-    if first is None or last is None:
-        delta_text = "계산 불가"
-    else:
-        delta = last - first
-        delta_text = _format_byte_delta(delta) if byte_count else _format_signed_integer(delta)
-    return (
-        f'<span class="value">{_e(first_text)} → {_e(last_text)}</span>'
-        f'<span class="delta">변화 {_e(delta_text)}</span>'
-    )
-
-
 def _tracking_badge(status: str) -> str:
     kind = {
         "잠시 미확인": "missed",
@@ -394,22 +411,6 @@ def _flow_key_from_session_key(value: str) -> FlowKey | None:
     return (parts[1], parts[2], parts[3], parts[4], parts[5])
 
 
-def _flow_label(row: ReportRow) -> str:
-    return (
-        f"{_protocol(row.get('protocol'))} · "
-        f"{_endpoint(row.get('source_ip'), row.get('source_port'))} → "
-        f"{_endpoint(row.get('destination_ip'), row.get('destination_port'))}"
-    )
-
-
-def _controller_change(first: ReportRow, last: ReportRow) -> str:
-    first_name = _plain(first.get("controller_name"))
-    last_name = _plain(last.get("controller_name"))
-    if first_name == last_name:
-        return f"{first_name} (변화 없음)"
-    return f"{first_name} → {last_name}"
-
-
 def _endpoint(address: object, port: object) -> str:
     address_text = _plain(address)
     if address_text == "-":
@@ -422,7 +423,9 @@ def _protocol(value: object) -> str:
     number = _optional_int(value)
     if number is None:
         return _plain(value)
-    return {1: "ICMP (1)", 6: "TCP (6)", 17: "UDP (17)"}.get(number, str(number))
+    if not 0 <= number <= 255:
+        return str(number)
+    return protocol_label(number)
 
 
 def _format_kst(value: object) -> str:
@@ -453,40 +456,6 @@ def _datetime_sort_value(value: object) -> datetime:
 
 def _format_integer(value: int) -> str:
     return f"{value:,}"
-
-
-def _format_signed_integer(value: int) -> str:
-    if value > 0:
-        return f"+{value:,}"
-    return f"{value:,}"
-
-
-def _format_byte_value(value: int) -> str:
-    exact = f"{value:,} B"
-    scaled = _scaled_bytes(value)
-    return exact if scaled is None else f"{exact} ({scaled})"
-
-
-def _format_byte_delta(value: int) -> str:
-    sign = "+" if value > 0 else ""
-    exact = f"{sign}{value:,} B"
-    scaled = _scaled_bytes(value, signed=True)
-    return exact if scaled is None else f"{exact} ({scaled})"
-
-
-def _scaled_bytes(value: int, *, signed: bool = False) -> str | None:
-    magnitude = abs(value)
-    if magnitude < 1024:
-        return None
-    size = float(magnitude)
-    unit = "B"
-    for candidate in ("KiB", "MiB", "GiB", "TiB"):
-        size /= 1024
-        unit = candidate
-        if size < 1024 or candidate == "TiB":
-            break
-    prefix = "-" if value < 0 else ("+" if signed and value > 0 else "")
-    return f"{prefix}{size:.1f} {unit}"
 
 
 def _optional_int(value: object) -> int | None:

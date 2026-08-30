@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from tools.check_coverage_policy import CoveragePolicyError, check_coverage_policy
+from tools.check_coverage_policy import (
+    CRITICAL_BRANCH_FLOORS,
+    CoveragePolicyError,
+    check_coverage_policy,
+)
 from tools.check_no_secrets import check
 from tools.check_remote_release import ExpectedAsset, RemoteReleaseError, verify_release
 from tools.check_version import VersionError
@@ -95,16 +99,7 @@ def _write_coverage_xml(
 ) -> None:
     classes = "".join(
         f'<class filename="{filename}" branch-rate="{branch_rate}" />'
-        for filename in (
-            "src/aruba_session_tracker/main.py",
-            "src/aruba_session_tracker/runtime.py",
-            "src/aruba_session_tracker/collectors/ssh.py",
-            "src/aruba_session_tracker/services/monitoring.py",
-            "src/aruba_session_tracker/services/tracker.py",
-            "src/aruba_session_tracker/storage/html_report.py",
-            "src/aruba_session_tracker/storage/session_store.py",
-            "src/aruba_session_tracker/ui/main_window.py",
-        )
+        for filename in CRITICAL_BRANCH_FLOORS
     )
     destination.write_text(
         f'<coverage line-rate="{global_line_rate}"><packages><package><classes>'

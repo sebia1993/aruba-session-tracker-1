@@ -39,6 +39,16 @@ _LOGGER = logging.getLogger(__name__)
 _TRANSIENT_BACKOFF_SECONDS = (5, 10, 20, 40, 80, 160, 300)
 
 
+class MonitorDaemonError(RuntimeError):
+    """Sanitized terminal failure retained by the optional daemon runner."""
+
+    def __init__(self, exception_type: str, code: str | None = None) -> None:
+        self.exception_type = exception_type
+        self.code = code
+        detail = f" ({code})" if code is not None else ""
+        super().__init__(f"Monitor daemon stopped: {exception_type}{detail}")
+
+
 class LifecycleEventType(StrEnum):
     STARTED = "STARTED"
     OBSERVED = "OBSERVED"
@@ -109,6 +119,7 @@ class MonitorPollResult:
 
 
 LifecycleCallback = Callable[[LifecycleEvent], None]
+MonitorFailureCallback = Callable[[Exception], None]
 MonotonicClock = Callable[[], float]
 WallClock = Callable[[], datetime]
 
@@ -137,6 +148,7 @@ class _ActiveSession:
 class _PreparedMonitorPoll:
     owner_id: int
     generation: int
+    location_epoch: int
     result: MonitorPollResult
     location_snapshot: LocationSnapshot | None
     last_location_refresh: float | None
@@ -156,6 +168,7 @@ class MonitorEngine:
         credentials: Credentials,
         callbacks: LifecycleCallback | None = None,
         *,
+        failure_callback: MonitorFailureCallback | None = None,
         full_scan_approval: FullScanApproval | None = None,
         monotonic_clock: MonotonicClock = time.monotonic,
         wall_clock: WallClock | None = None,
@@ -164,11 +177,13 @@ class MonitorEngine:
         self._request = request
         self._credentials = credentials
         self._callback = callbacks
+        self._failure_callback = failure_callback
         self._full_scan_approval = full_scan_approval
         self._monotonic_clock = monotonic_clock
         self._wall_clock = wall_clock or (lambda: datetime.now(UTC))
         self._location_snapshot: LocationSnapshot | None = None
         self._last_location_refresh: float | None = None
+        self._location_epoch = 0
         self._consecutive_misses = 0
         self._consecutive_transient_failures = 0
         self._active: dict[str, _ActiveSession] = {}
@@ -177,6 +192,7 @@ class MonitorEngine:
         self._cancel_token: CancellationToken | None = None
         self._lock = threading.RLock()
         self._last_result: MonitorPollResult | None = None
+        self._last_error: MonitorDaemonError | None = None
         self._prepare_generation = 0
         self._prepared_generation: int | None = None
 
@@ -189,6 +205,20 @@ class MonitorEngine:
     def last_result(self) -> MonitorPollResult | None:
         with self._lock:
             return self._last_result
+
+    @property
+    def last_error(self) -> MonitorDaemonError | None:
+        with self._lock:
+            return self._last_error
+
+    def invalidate_location(self) -> None:
+        """Discard cached MM routing without racing an in-flight prepared poll."""
+
+        with self._lock:
+            self._location_epoch += 1
+            self._location_snapshot = None
+            self._last_location_refresh = None
+            self._fallback_devices = ()
 
     def poll_once(self, *, cancel_token: CancellationToken | None = None) -> MonitorPollResult:
         prepared = self._prepare_for_persistence(cancel_token=cancel_token)
@@ -211,6 +241,7 @@ class MonitorEngine:
             self._prepare_generation += 1
             generation = self._prepare_generation
             self._prepared_generation = generation
+            location_epoch = self._location_epoch
             location_snapshot = self._location_snapshot
             last_location_refresh = self._last_location_refresh
             consecutive_misses = self._consecutive_misses
@@ -222,6 +253,7 @@ class MonitorEngine:
             return self._calculate_prepared_poll(
                 token,
                 generation=generation,
+                location_epoch=location_epoch,
                 location_snapshot=location_snapshot,
                 last_location_refresh=last_location_refresh,
                 consecutive_misses=consecutive_misses,
@@ -240,6 +272,7 @@ class MonitorEngine:
         token: CancellationToken,
         *,
         generation: int,
+        location_epoch: int,
         location_snapshot: LocationSnapshot | None,
         last_location_refresh: float | None,
         consecutive_misses: int,
@@ -296,8 +329,8 @@ class MonitorEngine:
                     fallback_devices = self._matched_fallback_devices(refreshed)
 
         events: list[LifecycleEvent] = []
-        prospective_flows = set(active)
-        prospective_flows.update(_flow_key(item) for item in outcome.observations)
+        observed_flows = {_flow_key(item) for item in outcome.observations}
+        prospective_flows = set(active) | observed_flows
         if len(prospective_flows) > MAX_POLL_OBSERVATIONS:
             outcome = replace(
                 outcome,
@@ -306,11 +339,29 @@ class MonitorEngine:
                     DiagnosticEvent(
                         stage="MONITOR_STATE",
                         code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
-                        message="모니터링에서 유지할 수 있는 활성 세션 수를 초과했습니다.",
+                        message=(
+                            "모니터링 활성 상태 한도를 초과하여 미관측 상태를 종료 판정 없이 "
+                            "폐기하고 현재 관측 상태로 복구했습니다."
+                        ),
                     ),
                 ),
                 authoritative=False,
             )
+            # Current positive observations remain useful. Reconcile to those
+            # bounded flows while dropping stale state without emitting a
+            # potentially false MISS/CLOSED event.
+            events.extend(
+                self._apply_observations(
+                    active,
+                    outcome.observations,
+                    absence_is_authoritative=False,
+                )
+            )
+            for flow_key in tuple(active):
+                if flow_key not in observed_flows:
+                    del active[flow_key]
+            if outcome.observations:
+                consecutive_misses = 0
         else:
             if outcome.observations:
                 consecutive_misses = 0
@@ -347,6 +398,7 @@ class MonitorEngine:
         return _PreparedMonitorPoll(
             owner_id=id(self),
             generation=generation,
+            location_epoch=location_epoch,
             result=result,
             location_snapshot=location_snapshot,
             last_location_refresh=last_location_refresh,
@@ -360,13 +412,15 @@ class MonitorEngine:
         """Commit exactly the poll prepared by this engine and emit its callbacks."""
         with self._lock:
             self._validate_prepared_locked(prepared)
-            self._location_snapshot = prepared.location_snapshot
-            self._last_location_refresh = prepared.last_location_refresh
+            if prepared.location_epoch == self._location_epoch:
+                self._location_snapshot = prepared.location_snapshot
+                self._last_location_refresh = prepared.last_location_refresh
+                self._fallback_devices = prepared.fallback_devices
             self._consecutive_misses = prepared.consecutive_misses
             self._consecutive_transient_failures = prepared.consecutive_transient_failures
             self._active = prepared.active
-            self._fallback_devices = prepared.fallback_devices
             self._last_result = prepared.result
+            self._last_error = None
         try:
             for event in prepared.result.events:
                 if self._callback is not None:
@@ -411,6 +465,18 @@ class MonitorEngine:
                 )
                 if token.wait(wait_seconds):
                     break
+        except Exception as exc:
+            failure = _sanitize_daemon_failure(exc)
+            with self._lock:
+                self._last_error = failure
+            if self._failure_callback is not None:
+                try:
+                    self._failure_callback(failure)
+                except Exception as callback_exc:
+                    _LOGGER.warning(
+                        "Monitor failure callback failed (%s).",
+                        type(callback_exc).__name__,
+                    )
         finally:
             with self._lock:
                 if self._thread is current_thread and self._cancel_token is token:
@@ -422,6 +488,7 @@ class MonitorEngine:
             if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError("모니터링이 이미 실행 중입니다.")
             token = CancellationToken()
+            self._last_error = None
             thread = threading.Thread(
                 target=self.run,
                 args=(token,),
@@ -514,18 +581,20 @@ class MonitorEngine:
                 continue
 
             previous = active.observation
+            previous_miss_count = active.miss_count
             active.observation = observation
             active.last_seen = now
             active.miss_count = 0
-            events.append(
-                LifecycleEvent(
-                    LifecycleEventType.OBSERVED,
-                    active.instance_id,
-                    observation,
-                    previous_observation=previous,
-                    occurred_at=now,
+            if previous_miss_count > 0:
+                events.append(
+                    LifecycleEvent(
+                        LifecycleEventType.OBSERVED,
+                        active.instance_id,
+                        observation,
+                        previous_observation=previous,
+                        occurred_at=now,
+                    )
                 )
-            )
             if previous.controller_host != observation.controller_host:
                 events.append(
                     LifecycleEvent(
@@ -546,11 +615,7 @@ class MonitorEngine:
                         occurred_at=now,
                     )
                 )
-            if (previous.packets, previous.bytes_count, previous.counter) != (
-                observation.packets,
-                observation.bytes_count,
-                observation.counter,
-            ):
+            if _counter_reset_or_identity_changed(previous, observation):
                 events.append(
                     LifecycleEvent(
                         LifecycleEventType.COUNTERS_CHANGED,
@@ -586,6 +651,12 @@ class MonitorEngine:
         return events
 
 
+def _sanitize_daemon_failure(exc: Exception) -> MonitorDaemonError:
+    raw_code = getattr(exc, "code", None)
+    code = raw_code.value if isinstance(raw_code, ErrorCode) else None
+    return MonitorDaemonError(type(exc).__name__, code)
+
+
 def _clone_active(active: dict[str, _ActiveSession]) -> dict[str, _ActiveSession]:
     return {
         flow_key: _ActiveSession(
@@ -598,6 +669,23 @@ def _clone_active(active: dict[str, _ActiveSession]) -> dict[str, _ActiveSession
         )
         for flow_key, item in active.items()
     }
+
+
+def _counter_reset_or_identity_changed(
+    previous: SessionObservation,
+    current: SessionObservation,
+) -> bool:
+    """Keep lifecycle counter events for resets, not routine monotonic increments."""
+
+    if previous.counter != current.counter:
+        return True
+    return any(
+        prior is not None and latest is not None and latest < prior
+        for prior, latest in (
+            (previous.packets, current.packets),
+            (previous.bytes_count, current.bytes_count),
+        )
+    )
 
 
 def _flow_key(observation: SessionObservation) -> str:

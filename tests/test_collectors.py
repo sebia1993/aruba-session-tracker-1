@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 from contextlib import AbstractContextManager
 from pathlib import Path
 from threading import Barrier, Event, Thread
@@ -22,6 +24,8 @@ from aruba_session_tracker.collectors import (
     StrictNetmikoFactory,
 )
 from aruba_session_tracker.collectors.ssh import (
+    _abort_netmiko_connection,
+    _BoundedSessionLog,
     _known_hosts_file_lock,
     _NetmikoConnectionManager,
 )
@@ -202,6 +206,7 @@ def test_cancellation_callback_aborts_a_blocked_netmiko_transport() -> None:
 
         def __init__(self) -> None:
             self.remote_conn = self
+            self.remote_conn_pre = self
 
         def send_command(self, *_args: object, **_kwargs: object) -> str:
             entered.set()
@@ -246,8 +251,7 @@ def test_cancellation_callback_aborts_a_blocked_netmiko_transport() -> None:
     assert [failure.code for failure in failures] == [ErrorCode.CANCELLED]
 
 
-def test_cancellation_callback_remains_active_during_ssh_teardown() -> None:
-    disconnect_started = Event()
+def test_ssh_teardown_bypasses_unbounded_graceful_disconnect() -> None:
     channel_closed = Event()
 
     class BlockingDisconnect:
@@ -256,13 +260,13 @@ def test_cancellation_callback_remains_active_during_ssh_teardown() -> None:
 
         def __init__(self) -> None:
             self.remote_conn = self
+            self.remote_conn_pre = self
 
         def send_command(self, *_args: object, **_kwargs: object) -> str:
             return ""
 
         def disconnect(self) -> None:
-            disconnect_started.set()
-            assert channel_closed.wait(timeout=5)
+            raise AssertionError("collector teardown must not call an unbounded CLI logout")
 
         def close(self) -> None:
             channel_closed.set()
@@ -273,29 +277,146 @@ def test_cancellation_callback_remains_active_during_ssh_teardown() -> None:
         def connect(self, *_args: object, **_kwargs: object) -> _NetmikoConnectionManager:
             return manager
 
-    token = CancellationToken()
-    failures: list[CollectorError] = []
+    SSHCollector(ManagerFactory()).collect(
+        TARGET,
+        CREDENTIALS,
+        ("no paging",),
+    )
 
-    def collect() -> None:
-        try:
-            SSHCollector(ManagerFactory()).collect(
-                TARGET,
-                CREDENTIALS,
-                ("no paging",),
-                cancel_token=token,
-            )
-        except CollectorError as exc:
-            failures.append(exc)
+    assert channel_closed.is_set()
 
-    worker = Thread(target=collect)
+
+def test_deadline_watchdog_aborts_blocked_command() -> None:
+    operation_started = Event()
+    transport_closed = Event()
+
+    class BlockingNetmiko:
+        remote_conn = None
+        remote_conn_pre = None
+
+        def __init__(self) -> None:
+            self.remote_conn = self
+            self.remote_conn_pre = self
+
+        def send_command(self, *_args: object, **_kwargs: object) -> str:
+            operation_started.set()
+            assert transport_closed.wait(timeout=2)
+            raise OSError("fixture watchdog abort")
+
+        def disconnect(self) -> None:
+            raise AssertionError("collector teardown must not call graceful disconnect")
+
+        def close(self) -> None:
+            transport_closed.set()
+
+    deadline = PollDeadline.after(0.1)
+    manager = _NetmikoConnectionManager(
+        BlockingNetmiko(),
+        deadline=deadline,
+    )
+
+    class ManagerFactory:
+        def connect(self, *_args: object, **_kwargs: object) -> _NetmikoConnectionManager:
+            return manager
+
+    with pytest.raises(CollectorError) as caught:
+        SSHCollector(ManagerFactory()).collect(
+            TARGET,
+            CREDENTIALS,
+            ("no paging",),
+            deadline=deadline,
+        )
+
+    assert operation_started.is_set()
+    assert transport_closed.is_set()
+    assert caught.value.code is ErrorCode.POLL_DEADLINE_EXCEEDED
+    assert manager._deadline_thread is None
+
+
+def test_deadline_watchdog_never_calls_blocking_channel_close() -> None:
+    transport_closed = Event()
+    channel_close_called = Event()
+
+    class BlockingChannel:
+        def close(self) -> None:
+            channel_close_called.set()
+            Event().wait()
+
+    class Transport:
+        def close(self) -> None:
+            transport_closed.set()
+
+    class Connection:
+        def __init__(self) -> None:
+            self.remote_conn = BlockingChannel()
+            self.remote_conn_pre = self
+            self.transport = Transport()
+
+        def get_transport(self) -> object:
+            return self.transport
+
+    connection = Connection()
+
+    worker = threading.Thread(target=_abort_netmiko_connection, args=(connection,), daemon=True)
     worker.start()
-    assert disconnect_started.wait(timeout=5)
-    token.cancel()
-    worker.join(timeout=5)
+    worker.join(timeout=0.5)
 
     assert not worker.is_alive()
-    assert channel_closed.is_set()
-    assert [failure.code for failure in failures] == [ErrorCode.CANCELLED]
+    assert transport_closed.is_set()
+    assert not channel_close_called.is_set()
+
+
+def test_netmiko_session_log_rejects_oversized_output_during_receive() -> None:
+    session_log = _BoundedSessionLog()
+    transport_closed = Event()
+
+    class StreamingNetmiko:
+        remote_conn = None
+        remote_conn_pre = None
+
+        def __init__(self) -> None:
+            self.remote_conn = self
+            self.remote_conn_pre = self
+
+        def send_command(self, *_args: object, **_kwargs: object) -> str:
+            session_log.write("12345")
+            session_log.write("67890")
+            session_log.write("X")
+            raise AssertionError("receive limit should abort before a full result is built")
+
+        def disconnect(self) -> None:
+            return None
+
+        def close(self) -> None:
+            transport_closed.set()
+
+    manager = _NetmikoConnectionManager(
+        StreamingNetmiko(),
+        bounded_session_log=session_log,
+    )
+
+    class ManagerFactory:
+        def connect(self, *_args: object, **_kwargs: object) -> _NetmikoConnectionManager:
+            return manager
+
+    with pytest.raises(CollectorError) as caught:
+        SSHCollector(ManagerFactory(), max_output_bytes=10).collect(
+            TARGET,
+            CREDENTIALS,
+            ("no paging",),
+        )
+
+    assert caught.value.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
+    assert transport_closed.is_set()
+
+
+def test_netmiko_session_log_bounds_setup_before_first_command() -> None:
+    session_log = _BoundedSessionLog()
+
+    with pytest.raises(CollectorError) as caught:
+        session_log.write("X" * (ssh_module.MAX_OUTPUT_BYTES + 1))
+
+    assert caught.value.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
 
 
 def test_cancellation_does_not_hide_an_authentication_failure() -> None:
@@ -371,6 +492,171 @@ def test_factory_cancellation_does_not_hide_connector_authentication_failure(
         )
 
     assert caught.value.code is ErrorCode.AUTH_FAILED
+
+
+def test_factory_deadline_watchdog_aborts_blocked_enable(tmp_path: Path) -> None:
+    key = paramiko.RSAKey.generate(1024)
+    enable_started = Event()
+    transport_closed = Event()
+
+    class BlockingEnableNetmiko(FakeNetmiko):
+        remote_conn = None
+        remote_conn_pre = None
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.remote_conn = self
+            self.remote_conn_pre = self
+
+        def enable(self) -> None:
+            enable_started.set()
+            assert transport_closed.wait(timeout=2)
+
+        def close(self) -> None:
+            transport_closed.set()
+
+    factory = StrictNetmikoFactory(
+        tmp_path / "known_hosts",
+        key_probe=lambda *_args: key,
+        connector=lambda **_kwargs: BlockingEnableNetmiko(),
+    )
+
+    with pytest.raises(CollectorError) as caught:
+        factory.connect(
+            TARGET,
+            Credentials("operator", "secret", "enable-secret"),
+            host_key_approval=lambda *_args: True,
+            cancel_token=CancellationToken(),
+            deadline=PollDeadline.after(0.1),
+        )
+
+    assert enable_started.is_set()
+    assert transport_closed.is_set()
+    assert caught.value.code is ErrorCode.POLL_DEADLINE_EXCEEDED
+
+
+def test_factory_deadline_watchdog_closes_owned_socket_during_blocked_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    key = paramiko.RSAKey.generate(1024)
+    connector_started = Event()
+    socket_closed = Event()
+
+    class FakeSocket:
+        def settimeout(self, _timeout: float) -> None:
+            return None
+
+        def shutdown(self, _how: int) -> None:
+            socket_closed.set()
+
+        def close(self) -> None:
+            socket_closed.set()
+
+    fake_socket = FakeSocket()
+    monkeypatch.setattr(
+        ssh_module.socket,
+        "create_connection",
+        lambda *_args, **_kwargs: fake_socket,
+    )
+    factory = StrictNetmikoFactory(
+        tmp_path / "known_hosts",
+        key_probe=lambda *_args: key,
+    )
+
+    def blocked_connector(**kwargs: object) -> object:
+        connector_started.set()
+        assert kwargs["sock"] is fake_socket
+        assert socket_closed.wait(timeout=2)
+        raise OSError("fixture connector released by owned socket close")
+
+    # Preserve the production owned-socket path while substituting a connector
+    # that cannot return until that socket is force-closed.
+    factory._connector = blocked_connector
+    started_at = time.monotonic()
+
+    with pytest.raises(CollectorError) as caught:
+        factory.connect(
+            TARGET,
+            CREDENTIALS,
+            host_key_approval=lambda *_args: True,
+            cancel_token=CancellationToken(),
+            deadline=PollDeadline.after(0.1),
+        )
+
+    assert connector_started.is_set()
+    assert socket_closed.is_set()
+    assert time.monotonic() - started_at < 1.0
+    assert caught.value.code is ErrorCode.POLL_DEADLINE_EXCEEDED
+    assert not any(
+        thread.name == "aruba-ssh-connect-watchdog" and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+
+
+def test_factory_cancellation_closes_owned_socket_during_blocked_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    key = paramiko.RSAKey.generate(1024)
+    connector_started = Event()
+    socket_closed = Event()
+    token = CancellationToken()
+    failures: list[CollectorError] = []
+
+    class FakeSocket:
+        def settimeout(self, _timeout: float) -> None:
+            return None
+
+        def shutdown(self, _how: int) -> None:
+            socket_closed.set()
+
+        def close(self) -> None:
+            socket_closed.set()
+
+    fake_socket = FakeSocket()
+    monkeypatch.setattr(
+        ssh_module.socket,
+        "create_connection",
+        lambda *_args, **_kwargs: fake_socket,
+    )
+    factory = StrictNetmikoFactory(
+        tmp_path / "known_hosts",
+        key_probe=lambda *_args: key,
+    )
+
+    def blocked_connector(**_kwargs: object) -> object:
+        connector_started.set()
+        assert socket_closed.wait(timeout=2)
+        raise OSError("fixture connector released by cancellation")
+
+    factory._connector = blocked_connector
+
+    def connect() -> None:
+        try:
+            factory.connect(
+                TARGET,
+                CREDENTIALS,
+                host_key_approval=lambda *_args: True,
+                cancel_token=token,
+                deadline=PollDeadline.after(5),
+            )
+        except CollectorError as exc:
+            failures.append(exc)
+
+    worker = Thread(target=connect)
+    worker.start()
+    assert connector_started.wait(timeout=1)
+    token.cancel()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert socket_closed.is_set()
+    assert [failure.code for failure in failures] == [ErrorCode.CANCELLED]
+    assert not any(
+        thread.name == "aruba-ssh-connect-watchdog" and thread.is_alive()
+        for thread in threading.enumerate()
+    )
 
 
 def test_probe_closes_socket_when_transport_construction_fails(
@@ -698,7 +984,7 @@ def test_known_hosts_cross_process_lock_fails_closed_at_bound(tmp_path: Path) ->
     assert caught.value.retryable_network is False
 
 
-def test_connection_manager_close_is_idempotent_and_cleanup_error_is_sanitized(
+def test_connection_manager_close_is_idempotent_and_skips_unbounded_disconnect(
     tmp_path: Path,
 ) -> None:
     key = paramiko.RSAKey.generate(1024)
@@ -725,10 +1011,7 @@ def test_connection_manager_close_is_idempotent_and_cleanup_error_is_sanitized(
         cancel_token=CancellationToken(),
     )
 
-    with pytest.raises(CollectorError) as caught:
-        manager.close()  # type: ignore[attr-defined]
+    manager.close()  # type: ignore[attr-defined]
     manager.close()  # type: ignore[attr-defined]
 
-    assert caught.value.code is ErrorCode.MM_UNREACHABLE
-    assert "sensitive" not in str(caught.value)
-    assert connection.disconnect_calls == 1
+    assert connection.disconnect_calls == 0

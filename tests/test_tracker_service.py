@@ -11,6 +11,7 @@ from typing import Self
 
 import pytest
 
+import aruba_session_tracker.services.monitoring as monitoring_module
 from aruba_session_tracker.collectors import (
     CancellationToken,
     CollectorError,
@@ -32,7 +33,11 @@ from aruba_session_tracker.models import (
     SessionObservation,
 )
 from aruba_session_tracker.services import (
+    MAX_POLL_OBSERVATIONS,
+    MAX_POLL_RAW_BYTES,
     LifecycleEventType,
+    LocationSnapshot,
+    MonitorDaemonError,
     MonitorEngine,
     PollBudget,
     QueryOutcome,
@@ -412,6 +417,129 @@ def test_monitor_empty_full_scan_is_not_repeated_before_the_next_mm_refresh() ->
     assert ErrorCode.CLIENT_NOT_FOUND_ON_MM in {event.code for event in deferred.diagnostics}
 
 
+def test_repeated_full_scans_rotate_the_first_managed_device() -> None:
+    outputs = {
+        "MM-Primary": _mm_outputs(None, None),
+        "MM-Standby": _mm_outputs(None, None),
+        **{
+            f"MD-{index}": {
+                NO_PAGING_COMMAND: "",
+                build_datapath_session_command(REQUEST.source_ip): DATAPATH_EMPTY,
+            }
+            for index in range(1, 5)
+        },
+    }
+    factory = FakeFactory(outputs)
+    service = TrackerService(_config(), factory)
+
+    service.query_once(REQUEST, CREDENTIALS, full_scan_approval=lambda *_args: True)
+    first_calls = tuple(factory.calls)
+    factory.calls.clear()
+    service.query_once(REQUEST, CREDENTIALS, full_scan_approval=lambda *_args: True)
+    second_calls = tuple(factory.calls)
+
+    assert first_calls == ("MM-Primary", "MD-1", "MD-2", "MD-3", "MD-4")
+    assert second_calls == ("MM-Primary", "MD-2", "MD-3", "MD-4", "MD-1")
+
+
+def test_repeated_fallback_full_scans_also_rotate_the_first_managed_device() -> None:
+    outputs = {
+        f"MD-{index}": {
+            NO_PAGING_COMMAND: "",
+            build_datapath_session_command(REQUEST.source_ip): DATAPATH_EMPTY,
+        }
+        for index in range(1, 5)
+    }
+    factory = FakeFactory(outputs)
+    service = TrackerService(_config(), factory)
+    fallback = _config().managed_devices
+    location_snapshot = LocationSnapshot(
+        source=None,
+        destination=None,
+        used_mm="MM-Primary",
+        full_scan_eligible=True,
+    )
+
+    service.query_once(
+        REQUEST,
+        CREDENTIALS,
+        location_snapshot=location_snapshot,
+        refresh_locations=False,
+        fallback_devices=fallback,
+    )
+    first_calls = tuple(factory.calls)
+    factory.calls.clear()
+    service.query_once(
+        REQUEST,
+        CREDENTIALS,
+        location_snapshot=location_snapshot,
+        refresh_locations=False,
+        fallback_devices=fallback,
+    )
+    second_calls = tuple(factory.calls)
+
+    assert first_calls == ("MD-1", "MD-2", "MD-3", "MD-4")
+    assert second_calls == ("MD-2", "MD-3", "MD-4", "MD-1")
+
+
+def test_full_scan_deadline_slice_failure_does_not_starve_later_devices() -> None:
+    outputs = {
+        "MM-Primary": _mm_outputs(None, None),
+        "MM-Standby": _mm_outputs(None, None),
+        **{
+            f"MD-{index}": {
+                NO_PAGING_COMMAND: "",
+                build_datapath_session_command(REQUEST.source_ip): DATAPATH_EMPTY,
+            }
+            for index in range(1, 5)
+        },
+    }
+
+    class DeadlineFactory(FakeFactory):
+        def __init__(self) -> None:
+            super().__init__(outputs)
+            self.md_deadlines: list[float] = []
+
+        def connect(
+            self,
+            target: DeviceTarget,
+            credentials: Credentials,
+            *,
+            host_key_approval: object,
+            cancel_token: CancellationToken,
+            deadline: object,
+        ) -> FakeConnection:
+            if target.name.startswith("MD-"):
+                assert isinstance(deadline, PollDeadline)
+                self.md_deadlines.append(deadline.expires_at)
+                if target.name == "MD-1":
+                    self.calls.append(target.name)
+                    raise CollectorError(
+                        ErrorCode.POLL_DEADLINE_EXCEEDED,
+                        "fixture device slice expired",
+                        retryable_network=True,
+                    )
+            return super().connect(
+                target,
+                credentials,
+                host_key_approval=host_key_approval,
+                cancel_token=cancel_token,
+                deadline=deadline,
+            )
+
+    factory = DeadlineFactory()
+    outcome = TrackerService(_config(), factory).query_once(
+        REQUEST,
+        CREDENTIALS,
+        full_scan_approval=lambda *_args: True,
+        deadline=PollDeadline(100.0, lambda: 0.0),
+    )
+
+    assert factory.calls == ["MM-Primary", "MD-1", "MD-2", "MD-3", "MD-4"]
+    assert factory.md_deadlines == pytest.approx([25.0, 100.0 / 3.0, 50.0, 100.0])
+    assert outcome.authoritative is False
+
+
 def test_query_raw_budget_exhaustion_is_non_authoritative() -> None:
     factory = FakeFactory({"MM-Primary": _mm_outputs("192.0.2.101", None)})
 
@@ -423,6 +551,31 @@ def test_query_raw_budget_exhaustion_is_non_authoritative() -> None:
 
     assert outcome.authoritative is False
     assert ErrorCode.OUTPUT_LIMIT_EXCEEDED in {event.code for event in outcome.diagnostics}
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected_exception",
+    [
+        ({"max_raw_bytes": MAX_POLL_RAW_BYTES + 1}, ValueError),
+        ({"max_observations": MAX_POLL_OBSERVATIONS + 1}, ValueError),
+        ({"max_observations": True}, TypeError),
+        ({"raw_bytes": -1}, ValueError),
+        ({"observations": 20_001}, ValueError),
+    ],
+)
+def test_poll_budget_rejects_unsafe_initial_state(
+    kwargs: dict[str, object],
+    expected_exception: type[Exception],
+) -> None:
+    with pytest.raises(expected_exception):
+        PollBudget(**kwargs)  # type: ignore[arg-type]
+
+
+def test_poll_budget_rejects_non_integer_consumption() -> None:
+    budget = PollBudget()
+
+    with pytest.raises(TypeError):
+        budget.consume_observations(1.5)  # type: ignore[arg-type]
 
 
 def test_rejected_filtered_command_never_falls_back_to_unfiltered_table() -> None:
@@ -810,10 +963,8 @@ def test_failed_second_miss_refresh_retains_positive_first_pass_evidence() -> No
     assert result.authoritative is False
     assert result.observations == (first_latest,)
     assert sorted(item.miss_count for item in result.active_sessions) == [0, 1]
-    assert any(
-        event.event_type is LifecycleEventType.OBSERVED and event.observation.packets == 3
-        for event in result.events
-    )
+    assert result.active_sessions[0].observation.packets == 3
+    assert not any(event.event_type is LifecycleEventType.OBSERVED for event in result.events)
 
 
 def test_discarded_prepared_poll_does_not_advance_monitor_state() -> None:
@@ -875,7 +1026,7 @@ def test_monitor_callback_observes_committed_result_and_thread_can_restart() -> 
     observed = QueryOutcome(
         observations=(_observation(),), used_mm="MM-Primary", authoritative=True
     )
-    service = StubService([observed, observed])
+    service = StubService([observed, QueryOutcome(used_mm="MM-Primary", authoritative=True)])
     callback_seen = Event()
     holder: list[MonitorEngine] = []
 
@@ -924,6 +1075,179 @@ def test_monitor_callback_failure_does_not_reclassify_committed_poll() -> None:
     assert callback_events == list(result.events)
     assert monitor.last_result is result
     assert monitor._prepared_generation is None
+
+
+def test_monitor_events_focus_on_state_transitions_not_routine_counter_growth() -> None:
+    first = _observation(packets=10)
+    growing = replace(first, packets=11, bytes_count=1001)
+    reset = replace(first, packets=1, bytes_count=10)
+    missing = QueryOutcome(used_mm="MM-Primary", authoritative=True)
+    service = StubService(
+        [
+            QueryOutcome(observations=(first,), used_mm="MM-Primary", authoritative=True),
+            QueryOutcome(observations=(growing,), used_mm="MM-Primary", authoritative=True),
+            missing,
+            QueryOutcome(observations=(reset,), used_mm="MM-Primary", authoritative=True),
+        ]
+    )
+    monitor = MonitorEngine(service, REQUEST, CREDENTIALS)  # type: ignore[arg-type]
+
+    started = monitor.poll_once()
+    routine = monitor.poll_once()
+    missed = monitor.poll_once()
+    recovered = monitor.poll_once()
+
+    assert [event.event_type for event in started.events] == [LifecycleEventType.STARTED]
+    assert routine.events == ()
+    assert [event.event_type for event in missed.events] == [LifecycleEventType.MISSED]
+    assert [event.event_type for event in recovered.events] == [
+        LifecycleEventType.OBSERVED,
+        LifecycleEventType.COUNTERS_CHANGED,
+    ]
+    assert routine.observations == (growing,)
+    assert recovered.observations == (reset,)
+
+
+def test_one_recovered_observation_can_emit_four_lifecycle_events() -> None:
+    first = _observation(packets=10)
+    changed = replace(
+        first,
+        controller_name="MD-02",
+        controller_host="198.51.100.22",
+        flags="D",
+        packets=1,
+        bytes_count=10,
+    )
+    service = StubService(
+        [
+            QueryOutcome(observations=(first,), authoritative=True),
+            QueryOutcome(authoritative=True),
+            QueryOutcome(observations=(changed,), authoritative=True),
+        ]
+    )
+    monitor = MonitorEngine(service, REQUEST, CREDENTIALS)  # type: ignore[arg-type]
+
+    monitor.poll_once()
+    monitor.poll_once()
+    recovered = monitor.poll_once()
+
+    assert [event.event_type for event in recovered.events] == [
+        LifecycleEventType.OBSERVED,
+        LifecycleEventType.CONTROLLER_CHANGED,
+        LifecycleEventType.FLAGS_CHANGED,
+        LifecycleEventType.COUNTERS_CHANGED,
+    ]
+
+
+def test_monitor_capacity_overflow_recovers_to_current_positive_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(monitoring_module, "MAX_POLL_OBSERVATIONS", 2)
+    first = replace(_observation(), source_port=10001)
+    second = replace(_observation(), source_port=10002)
+    third = replace(_observation(), source_port=10003)
+    fourth = replace(_observation(), source_port=10004)
+    initial = QueryOutcome(observations=(first, second), authoritative=True)
+    churn = QueryOutcome(observations=(third, fourth), authoritative=True)
+    service = StubService([initial, churn, churn])
+    monitor = MonitorEngine(service, REQUEST, CREDENTIALS)  # type: ignore[arg-type]
+
+    monitor.poll_once()
+    overflowed = monitor.poll_once()
+    healed = monitor.poll_once()
+
+    assert overflowed.authoritative is False
+    assert {item.flow_key for item in overflowed.active_sessions} == {
+        monitoring_module._flow_key(third),
+        monitoring_module._flow_key(fourth),
+    }
+    assert not {
+        LifecycleEventType.MISSED,
+        LifecycleEventType.CLOSED,
+    }.intersection(event.event_type for event in overflowed.events)
+    assert healed.authoritative is True
+    assert len(healed.active_sessions) == 2
+
+
+def test_monitor_location_invalidation_forces_refresh() -> None:
+    observed = QueryOutcome(observations=(_observation(),), authoritative=True)
+    service = StubService([observed, observed])
+    monitor = MonitorEngine(service, REQUEST, CREDENTIALS)  # type: ignore[arg-type]
+
+    monitor.poll_once()
+    monitor.invalidate_location()
+    monitor.poll_once()
+
+    assert service.refresh_calls == [True, True]
+
+
+def test_monitor_location_invalidation_during_poll_cannot_recommit_stale_location() -> None:
+    observed = QueryOutcome(observations=(_observation(),), used_mm="MM-Primary")
+    service = StubService([observed, observed])
+    monitor = MonitorEngine(service, REQUEST, CREDENTIALS)  # type: ignore[arg-type]
+
+    prepared = monitor._prepare_for_persistence()
+    monitor.invalidate_location()
+    monitor._commit_prepared(prepared)
+    monitor.poll_once()
+
+    assert monitor._location_snapshot is not None
+    assert service.refresh_calls == [True, True]
+
+
+def test_monitor_daemon_exposes_unexpected_failure() -> None:
+    service = StubService([])
+    failure_seen = Event()
+    failures: list[Exception] = []
+
+    def failure_callback(exc: Exception) -> None:
+        failures.append(exc)
+        failure_seen.set()
+
+    monitor = MonitorEngine(
+        service,  # type: ignore[arg-type]
+        REQUEST,
+        CREDENTIALS,
+        failure_callback=failure_callback,
+    )
+    monitor.start()
+
+    assert failure_seen.wait(timeout=5)
+    monitor.stop(timeout=1)
+    assert isinstance(monitor.last_error, MonitorDaemonError)
+    assert monitor.last_error.exception_type == "IndexError"
+    assert monitor.last_error.__traceback__ is None
+    assert len(failures) == 1
+    assert failures[0] is monitor.last_error
+    assert "fixture" not in repr(failures[0])
+    assert monitor.is_running is False
+
+
+def test_monitor_daemon_does_not_retain_failure_message_or_traceback_secret() -> None:
+    canary = "MONITOR_SECRET_CANARY_7f4a"
+    failure_seen = Event()
+
+    class SecretFailureService:
+        config = _config()
+
+        def query_once(self, *_args: object, **_kwargs: object) -> QueryOutcome:
+            runtime_secret = canary
+            raise RuntimeError(runtime_secret)
+
+    monitor = MonitorEngine(
+        SecretFailureService(),  # type: ignore[arg-type]
+        REQUEST,
+        CREDENTIALS,
+        failure_callback=lambda _failure: failure_seen.set(),
+    )
+    monitor.start()
+
+    assert failure_seen.wait(timeout=5)
+    monitor.stop(timeout=1)
+    assert monitor.last_error is not None
+    assert monitor.last_error.exception_type == "RuntimeError"
+    assert monitor.last_error.__traceback__ is None
+    assert canary not in repr(monitor.last_error)
 
 
 @pytest.mark.soak

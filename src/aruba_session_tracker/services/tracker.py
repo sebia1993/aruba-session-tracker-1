@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -51,6 +52,26 @@ class PollBudget:
     raw_bytes: int = 0
     observations: int = 0
 
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("max_raw_bytes", self.max_raw_bytes),
+            ("max_observations", self.max_observations),
+            ("raw_bytes", self.raw_bytes),
+            ("observations", self.observations),
+        ):
+            if type(value) is not int:
+                raise TypeError(f"{name} must be an integer.")
+        if self.max_raw_bytes < 1 or self.max_observations < 1:
+            raise ValueError("Poll budget limits must be positive.")
+        if self.max_raw_bytes > MAX_POLL_RAW_BYTES:
+            raise ValueError("max_raw_bytes exceeds the tracker safety boundary.")
+        if self.max_observations > MAX_POLL_OBSERVATIONS:
+            raise ValueError("max_observations exceeds the tracker safety boundary.")
+        if not 0 <= self.raw_bytes <= self.max_raw_bytes:
+            raise ValueError("raw_bytes is outside the configured poll budget.")
+        if not 0 <= self.observations <= self.max_observations:
+            raise ValueError("observations is outside the configured poll budget.")
+
     @property
     def remaining_observations(self) -> int:
         return max(0, self.max_observations - self.observations)
@@ -63,6 +84,8 @@ class PollBudget:
         return True
 
     def consume_observations(self, count: int) -> bool:
+        if type(count) is not int:
+            raise TypeError("count must be an integer.")
         if count < 0 or self.observations + count > self.max_observations:
             return False
         self.observations += count
@@ -138,6 +161,8 @@ class TrackerService:
         self.config = config
         self._callbacks = callbacks or TrackerCallbacks()
         self._collector = collector or SSHCollector(ssh_factory)
+        self._full_scan_cursor = 0
+        self._full_scan_cursor_lock = threading.Lock()
 
     def query_once(
         self,
@@ -228,7 +253,9 @@ class TrackerService:
                     full_scan_eligible=True,
                     authoritative=False,
                 )
-            device_candidates = [(device, request.source_ip) for device in fallback]
+            device_candidates = [
+                (device, request.source_ip) for device in self._rotated_full_scan_devices(fallback)
+            ]
         elif full_scan and allow_full_scan:
             approval = full_scan_approval or self._callbacks.full_scan_approval
             approved = (
@@ -272,7 +299,10 @@ class TrackerService:
                     full_scan_eligible=locations.full_scan_eligible,
                     authoritative=False,
                 )
-            device_candidates = [(device, request.source_ip) for device in enabled_devices]
+            device_candidates = [
+                (device, request.source_ip)
+                for device in self._rotated_full_scan_devices(enabled_devices)
+            ]
         elif full_scan:
             diagnostics.append(
                 DiagnosticEvent(
@@ -315,6 +345,14 @@ class TrackerService:
             if not full_scan and index > 0 and observations:
                 break
             self._progress("MD_QUERY", device.name)
+            device_deadline = (
+                _fair_device_deadline(
+                    poll_deadline,
+                    remaining_devices=len(device_candidates) - index,
+                )
+                if full_scan and len(device_candidates) > 1
+                else poll_deadline
+            )
             try:
                 poll_deadline.raise_if_expired()
                 batch = self._collector.collect(
@@ -326,7 +364,7 @@ class TrackerService:
                     ),
                     host_key_approval=self._callbacks.host_key_approval,
                     cancel_token=token,
-                    deadline=poll_deadline,
+                    deadline=device_deadline,
                 )
             except CollectorError as exc:
                 diagnostics.append(
@@ -343,9 +381,13 @@ class TrackerService:
                     ErrorCode.CANCELLED,
                     ErrorCode.HOST_KEY_CHANGED,
                     ErrorCode.HOST_KEY_UNKNOWN,
-                    ErrorCode.POLL_DEADLINE_EXCEEDED,
                 }:
                     break
+                if exc.code is ErrorCode.POLL_DEADLINE_EXCEEDED:
+                    try:
+                        poll_deadline.raise_if_expired()
+                    except CollectorError:
+                        break
                 continue
 
             controllers.append(device.name)
@@ -593,6 +635,17 @@ class TrackerService:
         )
         return None
 
+    def _rotated_full_scan_devices(
+        self,
+        devices: tuple[DeviceTarget, ...],
+    ) -> tuple[DeviceTarget, ...]:
+        if len(devices) < 2:
+            return devices
+        with self._full_scan_cursor_lock:
+            start = self._full_scan_cursor % len(devices)
+            self._full_scan_cursor = (start + 1) % len(devices)
+        return devices[start:] + devices[:start]
+
     def _progress(self, stage: str, device_name: str) -> None:
         if self._callbacks.progress is not None:
             self._callbacks.progress(stage, device_name)
@@ -600,6 +653,21 @@ class TrackerService:
 
 def _normalize_switch(value: str) -> str:
     return value.strip().rstrip(".").casefold()
+
+
+def _fair_device_deadline(
+    parent: PollDeadline,
+    *,
+    remaining_devices: int,
+) -> PollDeadline:
+    if remaining_devices < 1:
+        raise ValueError("remaining_devices must be positive")
+    remaining = parent.remaining_seconds
+    if remaining <= 0:
+        parent.raise_if_expired()
+    now = parent.expires_at - remaining
+    fair_share = remaining / remaining_devices
+    return PollDeadline(min(parent.expires_at, now + max(0.001, fair_share)), parent.clock)
 
 
 def _md_error_code(exc: CollectorError) -> ErrorCode:

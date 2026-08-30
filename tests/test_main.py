@@ -9,7 +9,7 @@ import aruba_session_tracker.main as main_module
 from aruba_session_tracker.config import ConfigError
 from aruba_session_tracker.main import main
 from aruba_session_tracker.paths import AppPaths, UnsafeManagedPath
-from aruba_session_tracker.storage import StorageError
+from aruba_session_tracker.storage import SessionStore, StorageError
 
 
 @pytest.mark.parametrize(
@@ -26,6 +26,63 @@ def test_cli_metadata_modes_exit_without_starting_gui(
 ) -> None:
     assert main([argument]) == 0
     assert capsys.readouterr().out.startswith(output_prefix)
+
+
+def test_loopback_smoke_requires_all_private_fixture_arguments() -> None:
+    with pytest.raises(SystemExit) as caught:
+        main(["--loopback-ssh-smoke", "success"])
+
+    assert caught.value.code == 2
+
+
+@pytest.mark.parametrize("guard_mode", ("already-running", "guard-error"))
+def test_single_instance_guard_failures_are_bounded_and_sanitized(
+    qtbot: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    guard_mode: str,
+) -> None:
+    del qtbot
+    root = tmp_path / "app"
+    paths = AppPaths(
+        root=root,
+        config=root / "config.json",
+        known_hosts=root / "known_hosts",
+        database=root / "tracker.db",
+        raw=root / "raw",
+        exports=root / "exports",
+    )
+    shown: list[tuple[str, str]] = []
+
+    class _Guard:
+        def __init__(self, _identity: str) -> None:
+            pass
+
+        def acquire(self) -> bool:
+            if guard_mode == "guard-error":
+                raise OSError("GUARD_SECRET_CANARY")
+            return False
+
+        def release(self) -> None:
+            raise AssertionError("unacquired guard must not be released")
+
+    monkeypatch.setattr(main_module.AppPaths, "default", lambda: paths)
+    monkeypatch.setattr(main_module, "SingleInstanceGuard", _Guard)
+    monkeypatch.setattr(
+        main_module.QMessageBox,
+        "information",
+        lambda _parent, title, message: shown.append((title, message)),
+    )
+    monkeypatch.setattr(
+        main_module.QMessageBox,
+        "critical",
+        lambda _parent, title, message: shown.append((title, message)),
+    )
+
+    expected = 1 if guard_mode == "guard-error" else 0
+    assert main([]) == expected
+    assert shown
+    assert "GUARD_SECRET_CANARY" not in repr(shown)
 
 
 class _SmokeApplication:
@@ -114,19 +171,66 @@ def test_report_smoke_writes_standalone_html_to_korean_path(tmp_path: Path) -> N
     assert "<!doctype html>" in text.casefold()
     assert "한국어-MD" in text
     assert "최신 세션 결과" in text
-    assert "세션별 수치 변화" in text
     assert "전체 추적 이력" in text
     assert "KST" in text
     assert "PACKAGE-RAW-CANARY" not in text
     assert "PACKAGE-DIAGNOSTIC-CANARY" not in text
     assert "PARSE_PARTIAL" not in text
     assert "report-smoke" not in text
-    assert text.index("최신 세션 결과") < text.index("세션별 수치 변화")
-    assert text.index("세션별 수치 변화") < text.index("전체 추적 이력")
+    assert "세션별 수치 변화" not in text
+    assert "패킷" not in text
+    assert "바이트" not in text
+    assert text.index("최신 세션 결과") < text.index("전체 추적 이력")
     assert "<details>" in text
     assert "<details open" not in text
     assert "https://" not in text.casefold()
     assert "http://" not in text.casefold()
+
+
+def test_report_smoke_releases_run_lease_after_storage_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statuses: list[str] = []
+    original_finish = SessionStore.finish_run
+
+    def fail_record_query(self: SessionStore, *_args: object, **_kwargs: object) -> object:
+        raise StorageError("fixture storage failure")
+
+    def record_finish(
+        self: SessionStore,
+        run_id: str,
+        *,
+        status: str = "COMPLETED",
+        ended_at: object = None,
+    ) -> None:
+        statuses.append(status)
+        original_finish(self, run_id, status=status, ended_at=ended_at)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(SessionStore, "record_query", fail_record_query)
+    monkeypatch.setattr(SessionStore, "finish_run", record_finish)
+
+    with pytest.raises(StorageError, match="fixture storage failure"):
+        main_module._report_smoke_test(tmp_path / "failure.html")
+
+    assert statuses == ["FAILED"]
+
+
+def test_report_smoke_closes_run_lease_when_finish_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_record_query(self: SessionStore, *_args: object, **_kwargs: object) -> object:
+        raise StorageError("original record failure")
+
+    def fail_finish(self: SessionStore, *_args: object, **_kwargs: object) -> None:
+        raise StorageError("finish failure")
+
+    monkeypatch.setattr(SessionStore, "record_query", fail_record_query)
+    monkeypatch.setattr(SessionStore, "finish_run", fail_finish)
+
+    with pytest.raises(StorageError, match="original record failure"):
+        main_module._report_smoke_test(tmp_path / "failure.html")
 
 
 @pytest.mark.parametrize(
@@ -166,3 +270,55 @@ def test_startup_storage_failure_is_visible_and_returns_nonzero(
     assert main([]) == 1
     assert shown and "시작 실패" in shown[0][0]
     assert str(error) not in shown[0][1]
+
+
+def test_main_window_failure_is_sanitized_and_journaled_before_hook_restore(
+    qtbot: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del qtbot
+    root = tmp_path / "app"
+    paths = AppPaths(
+        root=root,
+        config=root / "config.json",
+        known_hosts=root / "known_hosts",
+        database=root / "tracker.db",
+        raw=root / "raw",
+        exports=root / "exports",
+    )
+    records: list[tuple[str, str, str]] = []
+
+    class _Journal:
+        def start_session(self) -> bool:
+            return False
+
+        def record(self, event: str, exception_type: object, *, stage: str) -> str:
+            records.append((event, str(exception_type), stage))
+            return "sanitized-incident"
+
+        def mark_clean_exit(self) -> None:
+            raise AssertionError("failed startup must not be marked clean")
+
+    def fail_main_window(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("MAIN_WINDOW_SECRET_CANARY")
+
+    monkeypatch.setattr(main_module.AppPaths, "default", lambda: paths)
+    monkeypatch.setattr(main_module, "CrashJournal", lambda *_args, **_kwargs: _Journal())
+    monkeypatch.setattr(main_module, "MainWindow", fail_main_window)
+    monkeypatch.setattr(
+        main_module.SessionStore,
+        "close",
+        lambda _self: (_ for _ in ()).throw(
+            AssertionError("incomplete UI shutdown must not wait on the store lock")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="MAIN_WINDOW_SECRET_CANARY"):
+        main([])
+
+    assert records == [
+        ("UNHANDLED_EXCEPTION", "RuntimeError", "MAIN_THREAD"),
+        ("CONTROLLED_SHUTDOWN_INCOMPLETE", "RecoveryRequired", "SHUTDOWN"),
+    ]
+    assert "MAIN_WINDOW_SECRET_CANARY" not in repr(records)

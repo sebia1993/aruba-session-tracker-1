@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from contextlib import AbstractContextManager
+import hashlib
+import json
+import sqlite3
+from contextlib import AbstractContextManager, closing
 from pathlib import Path
 from threading import Event, Thread
 from types import TracebackType
@@ -74,6 +77,32 @@ class _Factory:
                 build_datapath_session_command("192.0.2.10"): self._sessions,
             }
         return _Connection(responses)
+
+
+class _RecordingFactory(_Factory):
+    def __init__(self) -> None:
+        super().__init__()
+        self.targets: list[str] = []
+        self.passwords: list[str] = []
+
+    def connect(
+        self,
+        target: DeviceTarget,
+        credentials: Credentials,
+        *,
+        host_key_approval: object,
+        cancel_token: CancellationToken,
+        deadline: object,
+    ) -> AbstractContextManager[CommandConnection]:
+        self.targets.append(target.name)
+        self.passwords.append(credentials.password)
+        return super().connect(
+            target,
+            credentials,
+            host_key_approval=host_key_approval,
+            cancel_token=cancel_token,
+            deadline=deadline,
+        )
 
 
 class _BlockingConnection(_Connection):
@@ -167,7 +196,27 @@ def test_runtime_query_persists_observations_raw_and_diagnostics(tmp_path: Path)
     assert len(runs) == 1
     assert runs[0]["status"] == "COMPLETED"
     assert runs[0]["observation_count"] == 2
-    assert len(tuple(paths.raw.rglob("*.txt"))) == 3
+    raw_paths = tuple(paths.raw.rglob("*.txt"))
+    assert len(raw_paths) == 1
+    with closing(sqlite3.connect(paths.database)) as connection:
+        raw_row = connection.execute(
+            "SELECT kind, controller_name, sha256, byte_size FROM raw_files"
+        ).fetchone()
+    bundle = raw_paths[0].read_bytes()
+    assert raw_row == (
+        "poll-bundle",
+        "POLL_BUNDLE",
+        hashlib.sha256(bundle).hexdigest(),
+        len(bundle),
+    )
+    lines = bundle.splitlines()
+    assert lines[0] == b"ARUBA_SESSION_TRACKER_RAW_BUNDLE_V1"
+    assert json.loads(lines[1]) == {"snapshot_count": 3}
+    metadata_rows = [json.loads(line) for line in lines if line.startswith(b'{"command"')]
+    assert len(metadata_rows) == 3
+    assert [row["index"] for row in metadata_rows] == [1, 2, 3]
+    assert all(len(row["output_sha256"]) == 64 for row in metadata_rows)
+    assert all(row["output_utf8_bytes"] > 0 for row in metadata_rows)
     exported = store.export_run_csv(str(runs[0]["id"]))
     assert exported.read_bytes().startswith(b"\xef\xbb\xbf")
 
@@ -271,6 +320,7 @@ def test_runtime_monitor_reuses_one_run_and_finishes_on_stop(tmp_path: Path) -> 
     assert len(runs) == 1
     assert runs[0]["status"] == "STOPPED"
     assert runs[0]["observation_count"] == 4
+    assert runs[0]["lifecycle_count"] == 2
 
 
 def test_runtime_restarts_monitor_when_its_identity_changes(tmp_path: Path) -> None:
@@ -553,3 +603,69 @@ def test_runtime_cancelled_monitor_failure_finishes_stopped_and_releases_ownersh
     assert [run["status"] for run in runs] == ["STOPPED", "STOPPED"]
     assert runs[0]["lifecycle_count"] > 0
     assert runs[1]["lifecycle_count"] == 0
+
+
+def test_runtime_restarts_monitor_when_in_memory_credentials_change(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    store = SessionStore(paths.database, paths.raw, paths.exports)
+    store.initialize()
+    factory = _RecordingFactory()
+    executor = RuntimeExecutor(paths, store, ssh_factory=factory)
+    request = QueryRequest("192.0.2.10", "203.0.113.20", 54321, 443)
+    common = {
+        "monitoring": True,
+        "host_key_approval": lambda _target, _info: True,
+        "full_scan_approval": lambda _request, _devices: False,
+    }
+
+    executor.execute(
+        _config(),
+        request,
+        Credentials("operator", "first-session-secret"),
+        cancel_token=CancellationToken(),
+        **common,  # type: ignore[arg-type]
+    )
+    executor.execute(
+        _config(),
+        request,
+        Credentials("operator", "second-session-secret"),
+        cancel_token=CancellationToken(),
+        **common,  # type: ignore[arg-type]
+    )
+
+    assert factory.passwords[:2] == ["first-session-secret", "first-session-secret"]
+    assert factory.passwords[-2:] == ["second-session-secret", "second-session-secret"]
+    assert "second-session-secret" not in str(executor._monitor_signature)
+    assert [run["status"] for run in store.list_runs()] == ["RUNNING", "RESTARTED"]
+    executor.stop_monitor()
+
+
+def test_runtime_can_invalidate_cached_monitor_location(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    store = SessionStore(paths.database, paths.raw, paths.exports)
+    store.initialize()
+    factory = _RecordingFactory()
+    executor = RuntimeExecutor(paths, store, ssh_factory=factory)
+    request = QueryRequest("192.0.2.10", "203.0.113.20", 54321, 443)
+
+    def poll() -> None:
+        executor.execute(
+            _config(),
+            request,
+            Credentials("operator", "session-only"),
+            monitoring=True,
+            cancel_token=CancellationToken(),
+            host_key_approval=lambda _target, _info: True,
+            full_scan_approval=lambda _request, _devices: False,
+        )
+
+    poll()
+    factory.targets.clear()
+    poll()
+    assert factory.targets == ["MD-1"]
+
+    executor.invalidate_monitor_location()
+    factory.targets.clear()
+    poll()
+    assert factory.targets == ["MM-1", "MD-1"]
+    executor.stop_monitor()
