@@ -88,7 +88,9 @@ if (
     --sha256 $sha `
     --sbom $sbom `
     --runtime-lock requirements-runtime.lock `
+    --build-lock requirements-build.lock `
     --pyproject pyproject.toml `
+    --component-manifest third_party_components.toml `
     --version $Version `
     --expected-commit $ExpectedCommit
 if ($LASTEXITCODE -ne 0) {

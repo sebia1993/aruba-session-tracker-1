@@ -70,7 +70,11 @@ def build_stylesheet() -> str:
         selection-color: #08243B;
     }
 
-    /* Primary navigation: quiet tabs with a strong active-state underline. */
+    /* Primary navigation: compact NOC console bar with explicit active state. */
+    QTabWidget#mainTabs {
+        background-color: #102F49;
+    }
+
     QTabWidget#mainTabs::pane {
         background-color: #EEF3F8;
         border: 0;
@@ -78,34 +82,34 @@ def build_stylesheet() -> str:
     }
 
     QTabWidget#mainTabs QTabBar {
-        background-color: #E4EBF2;
+        background-color: #102F49;
     }
 
     QTabWidget#mainTabs QTabBar::tab {
-        min-height: 36px;
-        padding: 0 14px;
+        min-height: 38px;
+        padding: 0 16px;
         margin: 0;
-        color: #52667A;
-        background-color: #E4EBF2;
+        color: #C8D7E5;
+        background-color: #102F49;
         border: 0;
         border-bottom: 3px solid transparent;
     }
 
     QTabWidget#mainTabs QTabBar::tab:selected {
-        color: #0B4F82;
-        background-color: #F7FAFC;
-        border-bottom: 3px solid #1976B9;
+        color: #FFFFFF;
+        background-color: #173E5E;
+        border-bottom: 3px solid #4EB3F2;
         font-weight: 700;
     }
 
     QTabWidget#mainTabs QTabBar::tab:hover:!selected {
-        color: #173A57;
-        background-color: #EDF3F8;
+        color: #FFFFFF;
+        background-color: #173E5E;
     }
 
     QTabWidget#mainTabs QTabBar::tab:focus {
-        border: 2px solid #1976B9;
-        border-bottom: 3px solid #1976B9;
+        border: 2px solid #FFC857;
+        border-bottom: 3px solid #FFC857;
     }
 
     /* Progressive detail panel remains visually subordinate to the main table. */
@@ -200,10 +204,42 @@ def build_stylesheet() -> str:
     QLabel#stateLabel {
         min-height: 28px;
         padding: 2px 13px;
+        color: #425A70;
+        background-color: #E7EDF3;
+        border: 1px solid #B7C5D1;
+        border-radius: 14px;
+        font-weight: 700;
+    }
+
+    QLabel#stateLabel[stateRole="active"] {
         color: #0A527E;
         background-color: #DDF0FC;
-        border: 1px solid #8FC2E2;
-        border-radius: 14px;
+        border-color: #8FC2E2;
+    }
+
+    QLabel#stateLabel[stateRole="success"] {
+        color: #0B5D46;
+        background-color: #DFF5EC;
+        border-color: #80C9B4;
+    }
+
+    QLabel#stateLabel[stateRole="warning"] {
+        color: #765000;
+        background-color: #FFF3D2;
+        border-color: #DEB853;
+    }
+
+    QLabel#stateLabel[stateRole="danger"] {
+        color: #981B1B;
+        background-color: #FDE8E8;
+        border-color: #E2A2A2;
+    }
+
+    QLabel#toolbarSectionLabel {
+        min-height: 28px;
+        padding: 0 3px 0 9px;
+        color: #60758A;
+        font-size: 9pt;
         font-weight: 700;
     }
 
@@ -458,7 +494,7 @@ def build_stylesheet() -> str:
         border: 1px solid #A7B8C8;
     }
 
-    QPlainTextEdit#rawConsole {
+    QMainWindow#mainWindow QPlainTextEdit#rawConsole {
         color: #DDE8F2;
         background-color: #0F1C29;
         border: 0;
@@ -469,7 +505,7 @@ def build_stylesheet() -> str:
         selection-color: #FFFFFF;
     }
 
-    QListWidget#diagnosticsList {
+    QMainWindow#mainWindow QListWidget#diagnosticsList {
         color: #1E3347;
         background-color: #FFFFFF;
         border: 0;
@@ -542,6 +578,10 @@ def build_stylesheet() -> str:
         color: palette(window-text);
         background-color: palette(window);
         border-color: palette(mid);
+    }
+
+    QMainWindow#mainWindow[themeContrast="high"] QTabWidget#mainTabs {
+        background-color: palette(window);
     }
 
     QMainWindow#mainWindow[themeContrast="high"] QLineEdit,

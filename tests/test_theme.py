@@ -78,6 +78,9 @@ def test_theme_assigns_operational_roles_without_replacing_widgets(
     assert window.md_group.property("panelRole") == "controller"
     assert window.timing_group.property("panelRole") == "timing"
     assert window.context_label.objectName() == "contextSummary"
+    assert window.state_label.property("stateRole") == "neutral"
+    assert window.history_export_label.objectName() == "toolbarSectionLabel"
+    assert window.history_delete_label.objectName() == "toolbarSectionLabel"
     assert window.raw_view.objectName() == "rawConsole"
     assert window.result_table.alternatingRowColors()
     assert window.result_table.verticalHeader().isHidden()
@@ -101,6 +104,11 @@ def test_theme_stylesheet_keeps_focus_and_semantic_action_states() -> None:
     assert 'QPushButton[buttonRole="primary"]' in stylesheet
     assert 'QPushButton[buttonRole="tertiary"]' in stylesheet
     assert 'QPushButton[buttonRole="dangerStrong"]' in stylesheet
+    assert 'QLabel#stateLabel[stateRole="success"]' in stylesheet
+    assert 'QLabel#stateLabel[stateRole="warning"]' in stylesheet
+    assert 'QLabel#stateLabel[stateRole="danger"]' in stylesheet
+    assert "QTabWidget#mainTabs QTabBar::tab:selected" in stylesheet
+    assert "background-color: #102F49;" in stylesheet
     assert 'QMainWindow#mainWindow[themeContrast="high"]' in stylesheet
     assert "QLineEdit:focus" in stylesheet
     assert "QTableWidget::item:selected" in stylesheet
@@ -185,3 +193,20 @@ def test_theme_uses_native_palette_roles_for_injected_high_contrast(
         if window is not None:
             window.close()
         application.setPalette(original_palette)
+
+
+def test_raw_console_keeps_terminal_contrast_after_widget_is_shown(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = _build_window(qtbot, tmp_path)
+    apply_main_window_theme(window)
+    window.raw_diagnostics_toggle.setChecked(True)
+    window.show()
+    qtbot.waitUntil(lambda: window.raw_view.isVisible(), timeout=3000)  # type: ignore[attr-defined]
+
+    palette = window.raw_view.palette()
+    text = palette.color(QPalette.ColorRole.Text).name()
+    base = palette.color(QPalette.ColorRole.Base).name()
+    assert _contrast_ratio(text, base) >= 4.5
+    window.close()

@@ -2,12 +2,13 @@ Aruba Session Tracker - Third-Party Notices
 ============================================
 
 This distribution contains third-party software. The bundled CycloneDX file
-"sbom.cdx.json" is the exact package/version/wheel-hash inventory for the
-locked Python runtime dependencies. It does not claim to inventory Windows
-system components, the embedded CPython runtime, or the PyInstaller bootloader.
-Copyright notices and license texts supplied inside packaged libraries remain
-applicable. The portable bundle's "licenses" directory contains per-component
-wheel license evidence and metadata. It also contains the full
+"sbom.cdx.json" records the locked Python runtime dependencies and the native
+runtime components declared by this build. "THIRD_PARTY_COMPONENTS.json" binds
+the latter components to the exact files and SHA-256 values in this ZIP.
+Windows system components remain outside that inventory. Copyright notices and
+license texts supplied inside packaged libraries remain applicable. The
+portable bundle's "licenses" directory contains per-component wheel evidence,
+the CPython distribution license, the OpenSSL notice and license, and the full
 LGPL-3.0-only/GPL-3.0 text used for the PySide6/Qt redistribution choice.
 
 Direct runtime components
@@ -20,9 +21,10 @@ PySide6-Essentials / Qt for Python 6.11.0
   the GNU General Public License, or commercial terms. This project uses the
   LGPL option for redistribution. The portable onedir package keeps Qt DLLs as
   separate files so a recipient can replace/relink compatible LGPL-covered
-  libraries. Qt source and license information is available from:
+  libraries. Exact source-request and rebuilding information is included in
+  OPEN_SOURCE_SOURCE_OFFER.txt. General Qt licensing information is available
+  from:
   https://www.qt.io/licensing/open-source-lgpl-obligations
-  https://code.qt.io/
 
 Netmiko 4.6.0
   Copyright (C) Kirk Byers and contributors.
@@ -32,25 +34,113 @@ Netmiko 4.6.0
 Paramiko 5.0.0
   Copyright (C) Jeff Forcier and contributors.
   License: GNU Lesser General Public License version 2.1.
+  Exact source-request and rebuilding information is included in
+  OPEN_SOURCE_SOURCE_OFFER.txt.
   https://github.com/paramiko/paramiko
 
-Build-only component
---------------------
+Native runtime and bootloader components
+----------------------------------------
+
+CPython 3.13.x
+  Copyright Python Software Foundation and contributors.
+  License: Python Software Foundation License Version 2 and the incorporated
+  component licenses reproduced in licenses/cpython/LICENSE.txt. The exact
+  patch version is recorded in BUILD_INFO.json, THIRD_PARTY_COMPONENTS.json,
+  and sbom.cdx.json.
+  https://www.python.org/
+
+OpenSSL 3.x used by CPython
+  Copyright The OpenSSL Project Authors. All Rights Reserved.
+  License: Apache License 2.0. The exact version and DLL hashes are recorded in
+  THIRD_PARTY_COMPONENTS.json and sbom.cdx.json. The optional Qt OpenSSL TLS
+  backend is not shipped; Qt uses the Windows Schannel backend in this bundle.
+  https://www.openssl.org/
+
+OpenSSL statically linked into cryptography
+  The cryptography native extension contains its own OpenSSL implementation,
+  separate from CPython's shared OpenSSL DLLs. Its exact OpenSSL version,
+  containing-extension hash, source reference, Apache-2.0 text, and notice are
+  recorded in BUILD_INFO.json, THIRD_PARTY_COMPONENTS.json, sbom.cdx.json, and
+  licenses/openssl.
+  https://github.com/pyca/cryptography
+
+libffi bundled by CPython
+  License: permissive libffi license. CPython's distribution license reproduces
+  the full libffi permission and disclaimer text in
+  licenses/cpython/LICENSE.txt. The packaged DLL hash is recorded in
+  THIRD_PARTY_COMPONENTS.json and sbom.cdx.json.
+  https://github.com/libffi/libffi
+
+SQLite bundled by CPython
+  SQLite is dedicated to the public domain. The exact runtime version and DLL
+  hash are recorded in BUILD_INFO.json, THIRD_PARTY_COMPONENTS.json, and
+  sbom.cdx.json. Official public-domain and exact-version source references are
+  recorded with the SQLite native component in sbom.cdx.json.
+  https://www.sqlite.org/copyright.html
+
+Microsoft Visual C++ runtime files
+  The portable bundle carries the Visual C++ runtime files required by CPython,
+  PySide6, and Shiboken. CPython's distribution license reproduces the relevant
+  Microsoft Distributable Code terms in licenses/cpython/LICENSE.txt. Every
+  packaged runtime file and SHA-256 value is recorded as the separate
+  microsoft-vc-runtime component in THIRD_PARTY_COMPONENTS.json and
+  sbom.cdx.json.
+  https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist
+
+PyNaCl native extension and bundled libsodium
+  PyNaCl is licensed under Apache-2.0. Its native extension bundles libsodium,
+  whose ISC license text is supplied by the locked wheel under
+  licenses/pynacl. The containing file hash and both source references are
+  recorded in THIRD_PARTY_COMPONENTS.json and sbom.cdx.json. The locked PyNaCl
+  1.6.2 source declares libsodium 1.0.20-stable; the Python binding does not
+  expose sodium_version_string(), so the build binds that source declaration
+  to the exact locked wheel and containing-file hash instead of claiming an
+  independent runtime version probe.
+
+PyYAML native extension and bundled LibYAML
+  PyYAML and the bundled LibYAML implementation use the MIT license reproduced
+  by the locked wheel under licenses/pyyaml. BUILD_INFO.json records the
+  LibYAML runtime version reported by the extension; the exact source reference
+  and containing file hash are recorded in THIRD_PARTY_COMPONENTS.json and
+  sbom.cdx.json.
+
+bcrypt Rust native extension
+  The bcrypt wheel supplies its Apache-2.0 license under licenses/bcrypt. The
+  exact wheel version, source reference, and native extension hash are recorded
+  in THIRD_PARTY_COMPONENTS.json and sbom.cdx.json. Automated package checks do
+  not reconstruct a separate Cargo dependency-license inventory from the
+  compiled wheel.
 
 PyInstaller 6.22.2
   Copyright (C) PyInstaller Development Team.
   License: GNU General Public License version 2 with the special exception that
   permits distribution of executables produced by PyInstaller under the
-  application's license.
+  application's license. The build-only package is not a runtime dependency,
+  but its bootloader is embedded in ArubaSessionTracker.exe and is therefore
+  represented in the native component inventory.
   https://pyinstaller.org/
+
+pyserial 3.5
+  Copyright (c) 2001-2020 Chris Liechti.
+  License: BSD-3-Clause. The locked wheel does not carry a license text, so
+  the portable bundle includes the byte-verified upstream v3.5 LICENSE.txt as
+  an explicit supplemental fallback under licenses/pyserial.
+  https://github.com/pyserial/pyserial/tree/v3.5
 
 Transitive dependencies
 -----------------------
 
 Netmiko, Paramiko, PySide6 and the build tools bring additional transitive
-components. Review the exact CycloneDX SBOM included with the release before
-deployment. This notice is informational and does not replace any license text
-distributed by a component.
+components. Review both the CycloneDX SBOM and THIRD_PARTY_COMPONENTS.json
+included with the release before deployment. This notice is informational and
+does not replace any license text distributed by a component. It is not legal
+advice and does not assert suitability for a particular distribution model.
+
+The inventory and SBOM bind the files produced by one build. They do not
+claim that separate ZIP builds are byte-for-byte reproducible. The CPython
+patch version is recorded from the build interpreter rather than pinned as a
+repository dependency; BUILD_INFO.json and the native inventory record the
+version and hashes actually packaged.
 
 Aruba, ArubaOS and HPE are trademarks of their respective owners. This project
 is independent and is not endorsed by Hewlett Packard Enterprise.

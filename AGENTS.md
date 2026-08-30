@@ -107,10 +107,10 @@ datapath session rows from the relevant 7240XM managed device.
   presentation, never remove an observation row from the document, are never
   persisted, and must reset whenever the report is reopened.
 - Keep the report summary ordered as query source IP:port, direction, query
-  destination IP:port, run status, and four core cards: start, end, total
-  observations, and unique sessions. Protocol and device distributions may use
-  only the same latest logical flows shown in the latest-results table, are
-  limited to five values each, and must be hidden from filtered print output.
+  destination IP:port, run status, and four compact values: start, end, total
+  observations, and unique sessions. Do not add protocol/device distributions,
+  event timelines, or controller cards; the report is intentionally focused on
+  protocol and source/destination IP and port results.
 - Build autocomplete candidates from one full-history reverse index. Partial
   keystrokes may search only the cached unique candidate set, must discard any
   stale active option immediately, and must not rescan the report DOM. Touch
@@ -157,6 +157,9 @@ datapath session rows from the relevant 7240XM managed device.
 - Desktop presentation changes must not replace Qt widgets or Inspector IDs.
   Keep role-aware keyboard focus visible, retain clickable scrollbar line
   controls, and use native palette roles for high-contrast scrollbars.
+- Keep the query flow and session-only credentials in one compact two-column
+  work area, with the source/destination flow first. Stored history status codes
+  remain unchanged even when the table presents their Korean display labels.
 
 ## Release
 
@@ -171,7 +174,19 @@ datapath session rows from the relevant 7240XM managed device.
   draft and resume it instead of republishing an older workflow target.
 - Every public release must contain exactly one uploaded Windows x64 ZIP. Keep
   the verified SHA-256 in the release body and the CycloneDX SBOM inside the ZIP.
-  Local build inputs still include the sidecar and external SBOM for verification.
+  Also include `THIRD_PARTY_COMPONENTS.json`, the declared license evidence, and
+  `OPEN_SOURCE_SOURCE_OFFER.txt` inside that ZIP. Local build inputs still include
+  the sidecar and external SBOM for verification.
+- Isolate the PyInstaller PATH. Require Qt's Schannel TLS backend and reject the
+  Qt OpenSSL backend plus host-derived `libcrypto-3-x64.dll` and
+  `libssl-3-x64.dll`; inventory the CPython OpenSSL pair that is intentionally
+  shipped.
+- Keep every packaged EXE, DLL, and PYD on a case-insensitive exact component
+  allowlist. Any unassigned native file, casefold collision, API-set/UCRT copy,
+  or renamed forbidden backend must fail package creation and verification.
+- Package tests may prove that reviewed license/source-offer evidence and hashes
+  are present. They must not claim to prove future source retention or request
+  fulfillment; those remain distributor operations for the stated period.
 - Install the pinned runtime lock and require `pip check` in a publish runner
   before invoking package or remote-release verification tools.
 - Verify release assets while draft, compare GitHub-reported SHA-256 digests,

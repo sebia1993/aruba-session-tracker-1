@@ -120,6 +120,17 @@ def test_main_window_registers_exact_static_ui_catalog(qtbot: object, tmp_path: 
         metadata.source_path == "src/aruba_session_tracker/ui/main_window.py"
         for metadata in catalog
     )
+    catalog_by_id = {metadata.stable_id: metadata for metadata in catalog}
+    assert catalog_by_id["MAIN-QUERY-CONDITIONS-SOURCE-IP"].name_ko == "출발지 IP 입력"
+    assert catalog_by_id["MAIN-QUERY-CONDITIONS-DESTINATION-IP"].name_ko == "목적지 IP 입력"
+    assert catalog_by_id["MAIN-QUERY-CONDITIONS-SOURCE-PORT"].name_ko == "출발지 포트 입력"
+    assert catalog_by_id["MAIN-QUERY-CONDITIONS-DESTINATION-PORT"].name_ko == "목적지 포트 입력"
+    assert catalog_by_id["MAIN-SETTINGS-MONITOR-SESSION-INTERVAL"].name_ko == "세션 조회 주기"
+    assert (
+        catalog_by_id["MAIN-SETTINGS-MONITOR-LOCATION-INTERVAL"].name_ko
+        == "클라이언트 위치 재확인 주기"
+    )
+    assert catalog_by_id["MAIN-SETTINGS-MONITOR-CLOSE-MISSES"].name_ko == "세션 종료 확인 횟수"
     assert not inspector.enabled
     assert window.centralWidget() is window.central_root
     assert window.central_layout.indexOf(window.tabs) >= 0

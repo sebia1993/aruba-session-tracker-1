@@ -245,27 +245,27 @@ def test_report_is_concise_standalone_result_only_html5() -> None:
     assert not re.search(r"\b(?:src|href)=[\"'](?:https?:)?//", lowered)
     assert "<nav" not in lowered
 
-    headings = ("결과 필터", "최신 세션 결과", "전체 추적 이력")
+    headings = ("조회 요약", "결과 찾기", "최신 세션 결과", "전체 추적 이력")
     positions = [document.index(heading) for heading in headings]
     assert positions == sorted(positions)
-    assert document.count("<h2") == 2
+    assert document.count("<h2") == 4
     assert re.findall(r'<th scope="col">([^<]+)</th>', _section(document, "latest-sessions")) == [
-        "마지막 확인 시각",
-        "장비명",
         "프로토콜",
-        "출발지 IP:포트",
-        "목적지 IP:포트",
+        "출발지 IP·포트",
+        "목적지 IP·포트",
         "추적 상태",
+        "마지막 확인",
+        "장비",
     ]
     assert re.findall(
         r'<th scope="col">([^<]+)</th>', _section(document, "observation-history")
     ) == [
-        "확인 시각",
-        "장비명",
         "프로토콜",
-        "출발지 IP:포트",
-        "목적지 IP:포트",
+        "출발지 IP·포트",
+        "목적지 IP·포트",
         "추적 상태",
+        "확인 시각",
+        "장비",
     ]
     assert "전체 추적 이력 1/1건 보기</summary>" in document
     assert "<details open" not in document
@@ -464,7 +464,7 @@ def test_history_disclosure_keeps_screen_collapsed_but_prints_outside_details() 
         ".history-toggle { display:none; } "
         ".history-toggle + .details-body { display:block !important; }"
     ) in document
-    assert "section { border:0; border-radius:0; padding:0; }" in document
+    assert "section { border:0; border-radius:0; padding:0; margin-bottom:8px; }" in document
     assert "details:not([open]) > .details-body" not in document
 
     for removed_text in (
@@ -513,40 +513,89 @@ def test_report_renders_kst_with_utc_date_rollover_and_missing_values_as_dash() 
     assert "2026-08-29 01:05:00 KST" in document
     assert "2026-08-28T16:00:00.000Z" not in document
     assert "2026-08-28T16:05:00+00:00" not in document
-    assert '<div class="run-state">일부 수집</div>' in document
+    assert '<div class="run-state attention">일부 수집</div>' in document
     assert '<span class="endpoint-label">조회 출발지</span>' in document
     assert '<span class="endpoint-label">조회 목적지</span>' in document
     assert document.count('<span class="endpoint-value">-</span>') == 2
     assert "PARTIAL" not in document
 
 
-def test_summary_prioritizes_query_flow_and_keeps_only_four_core_cards() -> None:
+def test_summary_prioritizes_query_flow_and_keeps_only_four_core_stats() -> None:
     document = render_html_report(_snapshot())
 
     assert '<span class="endpoint-value">192.0.2.100:53000</span>' in document
     assert '<span class="endpoint-value">203.0.113.80:443</span>' in document
     assert '<div class="direction" aria-label="양방향 검색">' in document
     assert '<span class="direction-arrow" aria-hidden="true">↔</span>' in document
-    assert '<div class="run-state">수집 완료</div>' in document
-    assert document.count('<div class="card">') == 4
+    assert '<div class="run-state completed">수집 완료</div>' in document
+    assert document.count('<div class="summary-stat">') == 4
     for label in ("출발지 IP", "출발지 포트", "목적지 IP", "목적지 포트", "검색 방향", "수집 상태"):
-        assert f'<div class="label">{label}</div>' not in document
+        assert f"<dt>{label}</dt>" not in document
     for label in ("추적 시작", "추적 종료", "전체 관측", "고유 세션"):
-        assert f'<div class="label">{label}</div>' in document
-    assert "프로토콜별 최신 세션" in document
-    assert "장비별 최신 세션" in document
-    assert ".insights,.insights-note { display:none !important; }" in document
+        assert f"<dt>{label}</dt>" in document
+    assert "프로토콜별 최신 세션" not in document
+    assert "장비별 최신 세션" not in document
+    assert 'class="insights"' not in document
     assert ".direction-arrow { transform:none; margin-left:0; }" in document
+
+
+@pytest.mark.parametrize(
+    ("status", "label", "style_class"),
+    (
+        ("RUNNING", "수집 중", "running"),
+        ("COMPLETED", "수집 완료", "completed"),
+        ("PARTIAL", "일부 수집", "attention"),
+        ("FAILED", "수집 실패", "failed"),
+        ("CANCELLED", "사용자 취소", "neutral"),
+    ),
+)
+def test_run_status_keeps_korean_text_and_uses_semantic_style_class(
+    status: str,
+    label: str,
+    style_class: str,
+) -> None:
+    run = dict(_snapshot().run)
+    run["status"] = status
+
+    document = render_html_report(_snapshot(run=run))
+
+    assert f'<div class="run-state {style_class}">{label}</div>' in document
+
+
+def test_report_includes_forced_color_boundaries_and_focus_styles() -> None:
+    document = render_html_report(_snapshot())
+
+    assert "@media (forced-colors:active)" in document
+    assert "border:1px solid CanvasText" in document
+    assert "outline-color:Highlight" in document
 
 
 def test_muted_report_text_meets_normal_text_contrast_on_used_backgrounds() -> None:
     document = render_html_report(_snapshot())
-    match = re.search(r"--muted:(#[0-9a-f]{6})", document)
+    match = re.search(r"--text-muted:(#[0-9a-f]{6})", document)
 
     assert match is not None
     muted = match.group(1)
-    for background in ("#ffffff", "#f7fafc", "#f2f7fb", "#edf3f7"):
+    for background in ("#ffffff", "#f8fafc", "#e8eef4", "#f3f6f9"):
         assert _html_contrast_ratio(muted, background) >= 4.5
+
+
+def test_ipv6_endpoints_are_bracketed_without_changing_filter_values() -> None:
+    row = _observation(
+        source_ip="2001:db8::10",
+        destination_ip="fe80::20",
+        source_port=5353,
+        destination_port=53,
+    )
+
+    document = render_html_report(
+        _snapshot(observations=(row,), observation_history=(row,), lifecycle_events=())
+    )
+
+    assert "[2001:db8::10]:5353" in document
+    assert "[fe80::20]:53" in document
+    assert 'data-source-ip="2001:db8::10"' in document
+    assert 'data-destination-ip="fe80::20"' in document
 
 
 def test_single_direction_flow_uses_right_arrow_and_accessible_korean_label() -> None:
@@ -560,7 +609,7 @@ def test_single_direction_flow_uses_right_arrow_and_accessible_korean_label() ->
     assert '<span class="direction-pill">단방향</span>' in document
 
 
-def test_latest_distributions_are_bounded_sorted_and_use_latest_fifty_flows() -> None:
+def test_summary_omits_distributions_and_latest_table_still_uses_fifty_flows() -> None:
     rows = tuple(
         _observation(
             observed_at=f"2026-08-28T08:{index:02d}:00.000Z",
@@ -582,24 +631,12 @@ def test_latest_distributions_are_bounded_sorted_and_use_latest_fifty_flows() ->
         )
     )
 
-    assert 'aria-label="RECENT-MD-A 25건"' in document
-    assert 'aria-label="RECENT-MD-B 25건"' in document
-    assert 'aria-label="OLD-MD 5건"' not in document
-    assert 'aria-label="TCP (6) 33건"' in document
-    assert 'aria-label="UDP (17) 17건"' in document
-    assert "아래 분포는 필터 적용 전 최신 50개 세션 기준입니다." in document
-
-
-def test_distribution_helper_limits_to_five_and_uses_deterministic_tie_order() -> None:
-    values = ("z", "b", "a", "m", "q", "c", "a", "b")
-
-    assert html_report._distribution(values) == (
-        ("a", 2, 25),
-        ("b", 2, 25),
-        ("c", 1, 12),
-        ("m", 1, 12),
-        ("q", 1, 12),
-    )
+    latest = _section(document, "latest-sessions")
+    assert len(_report_rows(_table_body(latest))) == 50
+    assert "프로토콜별 최신 세션" not in document
+    assert "장비별 최신 세션" not in document
+    assert "아래 분포는 필터 적용 전" not in document
+    assert 'class="distribution"' not in document
 
 
 def test_lifecycle_statuses_are_korean_and_diagnostics_do_not_change_status() -> None:
@@ -846,7 +883,7 @@ def test_controller_move_is_one_logical_flow_and_latest_result_uses_last_device(
     history_rows = _table_body(_section(document, "observation-history"))
     assert len(_report_rows(latest_rows)) == 1
     assert len(_report_rows(history_rows)) == 2
-    assert '<div class="label">고유 세션</div><span class="value">1개</span>' in document
+    assert '<div class="summary-stat"><dt>고유 세션</dt><dd>1개</dd></div>' in document
     assert "MD-B" in latest_rows
     assert "MD-A" not in latest_rows
     assert "MD-A" in history_rows
@@ -964,7 +1001,7 @@ def test_naive_or_invalid_times_are_not_assumed_to_be_utc() -> None:
         )
     )
 
-    assert document.count('<span class="value">-</span>') >= 2
+    assert document.count("<dd>-</dd>") >= 2
     assert "2026-08-28 17:00:00 KST" not in document
 
 

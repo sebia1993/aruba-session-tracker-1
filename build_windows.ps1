@@ -100,6 +100,24 @@ function Get-GitStatusSnapshot {
     return [string]::Join("`n", $lines)
 }
 
+$packagingInjectionNames = @(
+    "CONDA_PREFIX",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "QML2_IMPORT_PATH",
+    "QT_PLUGIN_PATH",
+    "QT_QPA_PLATFORM_PLUGIN_PATH",
+    "VIRTUAL_ENV"
+)
+$packagingEnvironmentBefore = @{}
+foreach ($environmentName in $packagingInjectionNames) {
+    $environmentPath = "Env:$environmentName"
+    if (Test-Path -LiteralPath $environmentPath) {
+        $packagingEnvironmentBefore[$environmentName] = (Get-Item -LiteralPath $environmentPath).Value
+    }
+    Remove-Item -LiteralPath $environmentPath -ErrorAction SilentlyContinue
+}
+
 Push-Location $repoRoot
 try {
     $env:PYTHONUTF8 = "1"
@@ -174,15 +192,37 @@ try {
         "--no-deps", "--no-build-isolation", "--check-build-dependencies", "-e", "."
     )
 
-    Invoke-Checked $packagePython @(
-        "-m", "PyInstaller", "--clean", "--noconfirm", "--windowed", "--onedir",
-        "--name", $productName,
-        "--paths", (Join-Path $repoRoot "src"),
-        "--workpath", (Join-Path $buildRoot "pyinstaller"),
-        "--distpath", $distRoot,
-        "--specpath", $buildRoot,
-        (Join-Path $repoRoot "src\aruba_session_tracker\__main__.py")
-    )
+    # PyInstaller's Qt hook scans PATH for optional native dependencies. Keep
+    # build-host tools (Poppler, Git, VPN clients, and similar programs) out of
+    # that search so their OpenSSL/ICU DLLs cannot silently enter the bundle.
+    $packagingPathBefore = $env:PATH
+    $packageScripts = Split-Path -Parent $packagePython
+    $packagingPath = @(
+        $packageScripts,
+        [Environment]::SystemDirectory,
+        $env:SystemRoot
+    ) | Select-Object -Unique
+    try {
+        $env:PATH = [string]::Join([IO.Path]::PathSeparator, $packagingPath)
+        Invoke-Checked $packagePython @(
+            "tools/check_packaging_environment.py",
+            "--allowed-path", $packageScripts,
+            "--allowed-path", [Environment]::SystemDirectory,
+            "--allowed-path", $env:SystemRoot
+        )
+        Invoke-Checked $packagePython @(
+            "-m", "PyInstaller", "--clean", "--noconfirm", "--windowed", "--onedir",
+            "--name", $productName,
+            "--paths", (Join-Path $repoRoot "src"),
+            "--workpath", (Join-Path $buildRoot "pyinstaller"),
+            "--distpath", $distRoot,
+            "--specpath", $buildRoot,
+            (Join-Path $repoRoot "src\aruba_session_tracker\__main__.py")
+        )
+    }
+    finally {
+        $env:PATH = $packagingPathBefore
+    }
 
     if ($gitStateAvailable -and (Get-GitStatusSnapshot) -ne $gitStateBefore) {
         throw "The source tree changed while the package was being built."
@@ -206,9 +246,37 @@ try {
         Remove-Item -LiteralPath $safeIcuPath -Force
     }
 
+    # The application does not use Qt's OpenSSL TLS backend. Windows Schannel
+    # remains bundled, while qopensslbackend and host-PATH OpenSSL variants are
+    # excluded to isolate optional dependency search from the build host.
+    # CPython's own un-suffixed OpenSSL DLL pair remains and is inventoried.
+    $qtOpenSslBackend = Join-Path $internalRoot "PySide6\plugins\tls\qopensslbackend.dll"
+    if (Test-Path -LiteralPath $qtOpenSslBackend -PathType Leaf) {
+        Remove-Item -LiteralPath (Assert-RepoChild $qtOpenSslBackend) -Force
+    }
+    $qtSoftwareOpenGl = Join-Path $internalRoot "PySide6\opengl32sw.dll"
+    if (Test-Path -LiteralPath $qtSoftwareOpenGl -PathType Leaf) {
+        Remove-Item -LiteralPath (Assert-RepoChild $qtSoftwareOpenGl) -Force
+    }
+    foreach ($forbiddenOpenSslName in @("libcrypto-3-x64.dll", "libssl-3-x64.dll")) {
+        $forbiddenOpenSslPath = Join-Path $internalRoot $forbiddenOpenSslName
+        if (Test-Path -LiteralPath $forbiddenOpenSslPath) {
+            throw "Build-host OpenSSL contamination detected: $forbiddenOpenSslName"
+        }
+    }
+    foreach ($requiredNativePath in @(
+        (Join-Path $internalRoot "libcrypto-3.dll"),
+        (Join-Path $internalRoot "libssl-3.dll"),
+        (Join-Path $internalRoot "PySide6\plugins\tls\qschannelbackend.dll")
+    )) {
+        if (-not (Test-Path -LiteralPath $requiredNativePath -PathType Leaf)) {
+            throw "Required native runtime file is missing: $requiredNativePath"
+        }
+    }
+
     foreach ($document in @(
         "README.md", "LICENSE", "CHANGELOG.md", "SECURITY.md", "THIRD_PARTY_NOTICES.txt",
-        "requirements-runtime.lock"
+        "OPEN_SOURCE_SOURCE_OFFER.txt", "requirements-runtime.lock"
     )) {
         Copy-Item -LiteralPath (Join-Path $repoRoot $document) -Destination $bundleRoot
     }
@@ -216,11 +284,54 @@ try {
         "tools/copy_runtime_licenses.py",
         "--lock", (Join-Path $repoRoot "requirements-runtime.lock"),
         "--destination", (Join-Path $bundleRoot "licenses"),
+        "--component-manifest", (Join-Path $repoRoot "third_party_components.toml"),
         "--extra-package", "PyInstaller==6.22.2"
     )
     Copy-Item `
         -LiteralPath (Join-Path $repoRoot "licenses\LGPL-3.0-only.txt") `
         -Destination (Join-Path $bundleRoot "licenses\LGPL-3.0-only.txt")
+    $pythonBasePrefix = (& $packagePython -c "import sys; print(sys.base_prefix)").Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($pythonBasePrefix)) {
+        throw "Could not resolve the packaged CPython base prefix."
+    }
+    $cpythonLicenseSource = Join-Path $pythonBasePrefix "LICENSE.txt"
+    if (-not (Test-Path -LiteralPath $cpythonLicenseSource -PathType Leaf)) {
+        throw "The packaged CPython license file is missing: $cpythonLicenseSource"
+    }
+    $cpythonLicenseRoot = Join-Path $bundleRoot "licenses\cpython"
+    $opensslLicenseRoot = Join-Path $bundleRoot "licenses\openssl"
+    New-Item -ItemType Directory -Path $cpythonLicenseRoot, $opensslLicenseRoot | Out-Null
+    Copy-Item -LiteralPath $cpythonLicenseSource `
+        -Destination (Join-Path $cpythonLicenseRoot "LICENSE.txt")
+    Copy-Item -LiteralPath (Join-Path $repoRoot "licenses\Apache-2.0.txt") `
+        -Destination (Join-Path $opensslLicenseRoot "LICENSE.txt")
+    Copy-Item -LiteralPath (Join-Path $repoRoot "licenses\OpenSSL-NOTICE.txt") `
+        -Destination (Join-Path $opensslLicenseRoot "NOTICE.txt")
+
+    $pythonVersion = (& $packagePython -c "import platform; print(platform.python_version())").Trim()
+    $opensslVersion = (& $packagePython -c "import ssl; print(ssl.OPENSSL_VERSION.split()[1])").Trim()
+    $cryptographyOpenSslVersion = (& $packagePython -c "from cryptography.hazmat.bindings.openssl.binding import Binding; b=Binding(); print(b.ffi.string(b.lib.OpenSSL_version(0)).decode().split()[1])").Trim()
+    $libyamlVersion = (& $packagePython -c "import _yaml; print(_yaml.get_version_string())").Trim()
+    $sqliteVersion = (& $packagePython -c "import sqlite3; print(sqlite3.sqlite_version)").Trim()
+    $pyinstallerVersion = (& $packagePython -c "import PyInstaller; print(PyInstaller.__version__)").Trim()
+    $qtVersionRows = @(& $packagePython -c "import importlib.metadata as m; print(m.version('PySide6-Essentials')); print(m.version('shiboken6'))")
+    if ($LASTEXITCODE -ne 0 -or $qtVersionRows.Count -ne 2) {
+        throw "Could not read installed PySide6/Shiboken versions."
+    }
+    $qtVersion = ([string]$qtVersionRows[0]).Trim()
+    $shibokenVersion = ([string]$qtVersionRows[1]).Trim()
+    if (
+        $pythonVersion -notmatch '^3\.13\.\d+$' -or
+        $opensslVersion -notmatch '^3\.\d+\.\d+$' -or
+        $cryptographyOpenSslVersion -notmatch '^\d+\.\d+\.\d+$' -or
+        $libyamlVersion -notmatch '^\d+\.\d+\.\d+$' -or
+        $sqliteVersion -notmatch '^3\.\d+\.\d+$' -or
+        $pyinstallerVersion -ne "6.22.2" -or
+        $qtVersion -notmatch '^\d+\.\d+\.\d+$' -or
+        $qtVersion -ne $shibokenVersion
+    ) {
+        throw "Could not bind native component versions to the pinned package environment."
+    }
 
     $buildInfo = [ordered]@{
         product = $productName
@@ -228,7 +339,13 @@ try {
         architecture = "windows-x64"
         commit = $gitCommit
         dirtyTree = $gitDirty
-        python = (& $packagePython -c "import platform; print(platform.python_version())").Trim()
+        python = $pythonVersion
+        openssl = $opensslVersion
+        cryptographyOpenssl = $cryptographyOpenSslVersion
+        libyaml = $libyamlVersion
+        pyinstaller = $pyinstallerVersion
+        qt = $qtVersion
+        sqlite = $sqliteVersion
         packagedAtUtc = [DateTime]::UtcNow.ToString("o")
         authenticodeSigned = $false
         liveDeviceValidated = $false
@@ -246,9 +363,20 @@ try {
         "--pyproject", "pyproject.toml", "--mc-type", "application",
         "--output-reproducible", "--sv", "1.6", "--of", "JSON", "-o", $sbomPath
     )
-    Invoke-Checked $toolPython @(
+    Invoke-Checked $packagePython @(
         "tools/finalize_sbom.py", "--sbom", $sbomPath,
-        "--pyproject", (Join-Path $repoRoot "pyproject.toml")
+        "--pyproject", (Join-Path $repoRoot "pyproject.toml"),
+        "--runtime-lock", (Join-Path $repoRoot "requirements-runtime.lock"),
+        "--component-manifest", (Join-Path $repoRoot "third_party_components.toml"),
+        "--bundle-root", $bundleRoot,
+        "--resolved-manifest", (Join-Path $bundleRoot "THIRD_PARTY_COMPONENTS.json"),
+        "--python-version", $pythonVersion,
+        "--openssl-version", $opensslVersion,
+        "--cryptography-openssl-version", $cryptographyOpenSslVersion,
+        "--libyaml-version", $libyamlVersion,
+        "--pyinstaller-version", $pyinstallerVersion,
+        "--qt-version", $qtVersion,
+        "--sqlite-version", $sqliteVersion
     )
     Copy-Item -LiteralPath $sbomPath -Destination (Join-Path $bundleRoot "sbom.cdx.json")
 
@@ -267,7 +395,9 @@ try {
         "tools/verify_release.py", "--zip", $zipPath,
         "--sha256", $sidecarPath, "--sbom", $sbomPath,
         "--runtime-lock", (Join-Path $repoRoot "requirements-runtime.lock"),
+        "--build-lock", (Join-Path $repoRoot "requirements-build.lock"),
         "--pyproject", (Join-Path $repoRoot "pyproject.toml"),
+        "--component-manifest", (Join-Path $repoRoot "third_party_components.toml"),
         "--version", $Version, "--smoke"
     )
     if ($gitCommit -match '^[0-9a-fA-F]{40}$') {
@@ -291,5 +421,13 @@ try {
     Get-ChildItem -LiteralPath $releaseRoot | Select-Object Name, Length
 }
 finally {
+    foreach ($environmentName in $packagingInjectionNames) {
+        $environmentPath = "Env:$environmentName"
+        Remove-Item -LiteralPath $environmentPath -ErrorAction SilentlyContinue
+        if ($packagingEnvironmentBefore.ContainsKey($environmentName)) {
+            Set-Item -LiteralPath $environmentPath `
+                -Value $packagingEnvironmentBefore[$environmentName]
+        }
+    }
     Pop-Location
 }

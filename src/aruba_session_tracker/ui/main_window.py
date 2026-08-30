@@ -71,6 +71,23 @@ _STORAGE_HEALTH_INTERVAL_SECONDS = 60.0
 # full week without changing the existing free-space hard stop.
 _RAW_FILE_COUNT_WARNING = 100_000
 _OPERATOR_STATES = frozenset({"대기", "조회 중", "정상", "재시도 중", "확인 필요"})
+_OPERATOR_STATE_ROLES = {
+    "대기": "neutral",
+    "조회 중": "active",
+    "정상": "success",
+    "재시도 중": "warning",
+    "확인 필요": "danger",
+}
+_HISTORY_STATUS_LABELS = {
+    "RUNNING": "진행 중",
+    "COMPLETED": "완료",
+    "STOPPED": "중지",
+    "PARTIAL": "일부 결과",
+    "FAILED": "실패",
+    "INTERRUPTED": "수집 중단",
+    "RESTARTED": "조건 변경 종료",
+    "CANCELLED": "취소",
+}
 _RESULT_RENDER_CHUNK_SIZE = 200
 
 
@@ -641,7 +658,7 @@ class MainWindow(QMainWindow):
         guide_layout.addWidget(self.open_settings_button)
         layout.addWidget(self.setup_guide)
 
-        self.connection_group = QGroupBox("실행 세션 자격증명 (저장하지 않음)")
+        self.connection_group = QGroupBox("로그인 정보 · 이번 실행에만 사용")
         connection_layout = QGridLayout(self.connection_group)
         self.username_edit = QLineEdit()
         self.username_edit.setAccessibleName("사용자 이름")
@@ -654,22 +671,22 @@ class MainWindow(QMainWindow):
         self.password_edit.setAccessibleDescription(
             "현재 실행에만 사용하는 장비 로그인 암호이며 저장되지 않습니다."
         )
-        connection_layout.addWidget(QLabel("사용자 이름"), 0, 0)
+        connection_layout.addWidget(QLabel("SSH 사용자 이름"), 0, 0)
         connection_layout.addWidget(self.username_edit, 0, 1)
-        connection_layout.addWidget(QLabel("암호"), 0, 2)
+        connection_layout.addWidget(QLabel("SSH 암호"), 0, 2)
         connection_layout.addWidget(self.password_edit, 0, 3)
 
-        self.query_group = QGroupBox("세션 조건")
+        self.query_group = QGroupBox("조회할 세션 흐름")
         query_layout = QGridLayout(self.query_group)
         self.source_ip_edit = QLineEdit()
-        self.source_ip_edit.setAccessibleName("Source IP")
+        self.source_ip_edit.setAccessibleName("출발지 IP")
         self.source_ip_edit.setAccessibleDescription("조회할 출발지 IP 주소입니다.")
         self.destination_ip_edit = QLineEdit()
-        self.destination_ip_edit.setAccessibleName("Destination IP")
+        self.destination_ip_edit.setAccessibleName("목적지 IP")
         self.destination_ip_edit.setAccessibleDescription("조회할 목적지 IP 주소입니다.")
-        query_layout.addWidget(QLabel("Source IP"), 0, 0)
+        query_layout.addWidget(QLabel("출발지 IP"), 0, 0)
         query_layout.addWidget(self.source_ip_edit, 0, 1)
-        query_layout.addWidget(QLabel("Destination IP"), 0, 2)
+        query_layout.addWidget(QLabel("목적지 IP"), 0, 2)
         query_layout.addWidget(self.destination_ip_edit, 0, 3)
 
         self.advanced_toggle_button = QPushButton("고급 조건 보기")
@@ -688,26 +705,26 @@ class MainWindow(QMainWindow):
             "필요한 장비에서만 현재 실행에 사용할 Enable 암호입니다."
         )
         self.source_port_edit = QLineEdit()
-        self.source_port_edit.setAccessibleName("Source 포트")
+        self.source_port_edit.setAccessibleName("출발지 포트")
         self.source_port_edit.setAccessibleDescription(
             "선택 사항인 출발지 포트 번호입니다. 비우면 모든 포트를 조회합니다."
         )
         self.destination_port_edit = QLineEdit()
-        self.destination_port_edit.setAccessibleName("Destination 포트")
+        self.destination_port_edit.setAccessibleName("목적지 포트")
         self.destination_port_edit.setAccessibleDescription(
             "선택 사항인 목적지 포트 번호입니다. 비우면 모든 포트를 조회합니다."
         )
         self.bidirectional_check = QCheckBox("양방향 검색 (IP와 포트를 함께 교환)")
         self.bidirectional_check.setAccessibleName("양방향 검색")
         self.bidirectional_check.setAccessibleDescription(
-            "Source와 Destination IP 및 포트를 서로 바꾼 방향도 함께 검색합니다."
+            "출발지와 목적지 IP 및 포트를 서로 바꾼 방향도 함께 검색합니다."
         )
         self.bidirectional_check.setChecked(True)
-        advanced_layout.addWidget(QLabel("Enable 암호(선택)"), 0, 0)
+        advanced_layout.addWidget(QLabel("Enable 암호 (선택)"), 0, 0)
         advanced_layout.addWidget(self.enable_edit, 0, 1)
-        advanced_layout.addWidget(QLabel("SPort (선택)"), 0, 2)
+        advanced_layout.addWidget(QLabel("출발지 포트 (선택)"), 0, 2)
         advanced_layout.addWidget(self.source_port_edit, 0, 3)
-        advanced_layout.addWidget(QLabel("DPort (선택)"), 0, 4)
+        advanced_layout.addWidget(QLabel("목적지 포트 (선택)"), 0, 4)
         advanced_layout.addWidget(self.destination_port_edit, 0, 5)
         advanced_layout.addWidget(self.bidirectional_check, 0, 6)
         for column in (1, 3, 5):
@@ -739,10 +756,14 @@ class MainWindow(QMainWindow):
         actions.addStretch(1)
         self.state_label = QLabel("대기")
         self.state_label.setObjectName("stateLabel")
+        self.state_label.setProperty("stateRole", _OPERATOR_STATE_ROLES["대기"])
         actions.addWidget(self.state_label)
 
-        layout.addWidget(self.connection_group)
-        layout.addWidget(self.query_group)
+        primary_inputs = QHBoxLayout()
+        primary_inputs.setSpacing(10)
+        primary_inputs.addWidget(self.query_group, 1)
+        primary_inputs.addWidget(self.connection_group, 1)
+        layout.addLayout(primary_inputs)
         layout.addWidget(self.advanced_toggle_button, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(self.advanced_panel)
         layout.addLayout(actions)
@@ -755,7 +776,7 @@ class MainWindow(QMainWindow):
         self.detail_columns_toggle = QCheckBox("상세 열 보기")
         self.detail_columns_toggle.setAccessibleName("상세 결과 열 보기")
         self.detail_columns_toggle.setAccessibleDescription(
-            "DPort, 패킷, 바이트, 변화량, Age, CPU 열을 표시하거나 숨깁니다."
+            "목적지 포트, 패킷, 바이트, 변화량, 세션 경과, CPU ID 열을 표시하거나 숨깁니다."
         )
         self.raw_diagnostics_toggle = QCheckBox("상세 정보 보기")
         self.raw_diagnostics_toggle.setAccessibleName("Raw 및 진단 패널 보기")
@@ -768,20 +789,20 @@ class MainWindow(QMainWindow):
         self.result_table = QTableWidget(0, 15)
         self.result_table.setHorizontalHeaderLabels(
             [
-                "Controller",
-                "Protocol",
-                "Source",
-                "SPort",
-                "Destination",
-                "DPort",
-                "Packets",
-                "Bytes",
-                "ΔPackets",
-                "ΔBytes",
-                "Age",
-                "CPU",
-                "마지막 관측(로컬)",
-                "Flags",
+                "장비",
+                "프로토콜",
+                "출발지 IP",
+                "출발지 포트",
+                "목적지 IP",
+                "목적지 포트",
+                "패킷",
+                "바이트",
+                "패킷 변화",
+                "바이트 변화",
+                "세션 경과",
+                "CPU ID",
+                "마지막 확인 시각",
+                "장비 Flags",
                 "상태",
             ]
         )
@@ -790,7 +811,7 @@ class MainWindow(QMainWindow):
         header = self.result_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(True)
-        widths = (110, 70, 125, 70, 125, 70, 85, 95, 85, 85, 70, 55, 150, 80)
+        widths = (120, 82, 140, 96, 140, 96, 85, 95, 96, 96, 88, 70, 150, 90)
         for column, width in enumerate(widths):
             header.resizeSection(column, width)
         for column in _DETAIL_COLUMN_INDEXES:
@@ -815,10 +836,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter, 1)
         focus_order = (
             self.open_settings_button,
-            self.username_edit,
-            self.password_edit,
             self.source_ip_edit,
             self.destination_ip_edit,
+            self.username_edit,
+            self.password_edit,
             self.advanced_toggle_button,
             self.enable_edit,
             self.source_port_edit,
@@ -858,22 +879,28 @@ class MainWindow(QMainWindow):
         if state not in _OPERATOR_STATES:
             raise ValueError("invalid operator state")
         self.state_label.setText(state)
+        self.state_label.setProperty("stateRole", _OPERATOR_STATE_ROLES[state])
+        self.state_label.style().unpolish(self.state_label)
+        self.state_label.style().polish(self.state_label)
+        self.state_label.update()
 
     def _build_settings_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        self.mm_group = QGroupBox("Mobility Conductor")
+        self.mm_group = QGroupBox("Mobility Conductor (MM)")
         mm_layout = QGridLayout(self.mm_group)
         self.mm_primary_name = QLineEdit("MM-Conductor")
         self.mm_primary_host = QLineEdit()
         self.mm_primary_port = self._port_spin()
         self.mm_primary_enabled = QCheckBox()
         self.mm_primary_enabled.setChecked(True)
+        self.mm_primary_enabled.setAccessibleName("Primary MM 사용")
         self.mm_standby_name = QLineEdit("MM-Standby")
         self.mm_standby_host = QLineEdit()
         self.mm_standby_port = self._port_spin()
         self.mm_standby_enabled = QCheckBox()
         self.mm_standby_enabled.setChecked(True)
+        self.mm_standby_enabled.setAccessibleName("Standby MM 사용")
         mm_layout.addWidget(QLabel("구분"), 0, 0)
         mm_layout.addWidget(QLabel("표시 이름"), 0, 1)
         mm_layout.addWidget(QLabel("IPv4"), 0, 2)
@@ -890,7 +917,7 @@ class MainWindow(QMainWindow):
         mm_layout.addWidget(self.mm_standby_port, 2, 3)
         mm_layout.addWidget(self.mm_standby_enabled, 2, 4)
 
-        self.md_group = QGroupBox("Managed Devices (7240XM)")
+        self.md_group = QGroupBox("Managed Device (MD, 7240XM)")
         md_layout = QVBoxLayout(self.md_group)
         self.md_table = QTableWidget(4, 4)
         self.md_table.setHorizontalHeaderLabels(["사용", "표시 이름", "IPv4", "SSH 포트"])
@@ -904,7 +931,7 @@ class MainWindow(QMainWindow):
             self.md_table.setItem(row, 3, QTableWidgetItem("22"))
         md_layout.addWidget(self.md_table)
 
-        self.timing_group = QGroupBox("모니터링")
+        self.timing_group = QGroupBox("모니터링 판정 기준")
         timing_layout = QFormLayout(self.timing_group)
         self.session_interval = QSpinBox()
         self.session_interval.setRange(3, 300)
@@ -915,9 +942,16 @@ class MainWindow(QMainWindow):
         self.close_misses = QSpinBox()
         self.close_misses.setRange(2, 10)
         self.close_misses.setValue(3)
-        timing_layout.addRow("MD 세션 조회(초)", self.session_interval)
-        timing_layout.addRow("MM 위치 재확인(초)", self.location_interval)
-        timing_layout.addRow("종료 판정 MISS", self.close_misses)
+        self.session_interval.setAccessibleName("세션 조회 주기")
+        self.location_interval.setAccessibleName("클라이언트 위치 재확인 주기")
+        self.close_misses.setAccessibleName("세션 종료 확인 횟수")
+        self.close_misses.setAccessibleDescription(
+            "세션이 연속으로 보이지 않는 횟수가 이 값에 도달하면 종료로 확정합니다."
+        )
+        self.close_misses.setToolTip("세션이 연속으로 N회 보이지 않을 때 종료로 확정합니다.")
+        timing_layout.addRow("세션 조회 주기 (초)", self.session_interval)
+        timing_layout.addRow("클라이언트 위치 재확인 주기 (초)", self.location_interval)
+        timing_layout.addRow("세션 종료 확인 횟수 (회)", self.close_misses)
 
         save_row = QHBoxLayout()
         self.save_config_button = QPushButton("장비 설정 저장")
@@ -942,9 +976,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         toolbar = QHBoxLayout()
         self.refresh_history_button = QPushButton("새로고침")
-        self.export_button = QPushButton("선택 실행 CSV 내보내기")
-        self.html_export_button = QPushButton("선택 실행 HTML 보고서")
-        self.delete_button = QPushButton("선택 실행 삭제")
+        self.export_button = QPushButton("CSV 내보내기")
+        self.html_export_button = QPushButton("HTML 보고서")
+        self.delete_button = QPushButton("선택 삭제")
         self.delete_all_button = QPushButton("전체 기록 삭제")
         self.refresh_history_button.clicked.connect(self._refresh_history)
         self.export_button.clicked.connect(self._export_selected_run)
@@ -952,18 +986,26 @@ class MainWindow(QMainWindow):
         self.delete_button.clicked.connect(lambda: self._delete_history(all_runs=False))
         self.delete_all_button.clicked.connect(lambda: self._delete_history(all_runs=True))
         toolbar.addWidget(self.refresh_history_button)
+        self.history_export_label = QLabel("내보내기")
+        self.history_export_label.setObjectName("toolbarSectionLabel")
+        toolbar.addWidget(self.history_export_label)
         toolbar.addWidget(self.export_button)
         toolbar.addWidget(self.html_export_button)
+        toolbar.addStretch(1)
+        self.history_delete_label = QLabel("기록 정리")
+        self.history_delete_label.setObjectName("toolbarSectionLabel")
+        toolbar.addWidget(self.history_delete_label)
         toolbar.addWidget(self.delete_button)
         toolbar.addWidget(self.delete_all_button)
-        toolbar.addStretch(1)
         layout.addLayout(toolbar)
         self.storage_status_label = QLabel("저장소 현황을 확인하는 중입니다.")
         self.storage_status_label.setAccessibleName("저장소 사용 현황")
         self.storage_status_label.setWordWrap(True)
         layout.addWidget(self.storage_status_label)
         self.history_table = QTableWidget(0, 5)
-        self.history_table.setHorizontalHeaderLabels(["Run ID", "시작", "종료", "상태", "관측 행"])
+        self.history_table.setHorizontalHeaderLabels(
+            ["실행 ID", "시작 시각", "종료 시각", "상태", "관측 결과"]
+        )
         self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
@@ -1084,13 +1126,13 @@ class MainWindow(QMainWindow):
             (
                 self.source_ip_edit,
                 _ui_metadata(
-                    "Source IP 입력", "MAIN-QUERY-CONDITIONS-SOURCE-IP", query, "출발지 IPv4 입력"
+                    "출발지 IP 입력", "MAIN-QUERY-CONDITIONS-SOURCE-IP", query, "출발지 IPv4 입력"
                 ),
             ),
             (
                 self.destination_ip_edit,
                 _ui_metadata(
-                    "Destination IP 입력",
+                    "목적지 IP 입력",
                     "MAIN-QUERY-CONDITIONS-DESTINATION-IP",
                     query,
                     "목적지 IPv4 입력",
@@ -1099,7 +1141,7 @@ class MainWindow(QMainWindow):
             (
                 self.source_port_edit,
                 _ui_metadata(
-                    "Source 포트 입력",
+                    "출발지 포트 입력",
                     "MAIN-QUERY-CONDITIONS-SOURCE-PORT",
                     query,
                     "선택적 출발지 포트 입력",
@@ -1108,7 +1150,7 @@ class MainWindow(QMainWindow):
             (
                 self.destination_port_edit,
                 _ui_metadata(
-                    "Destination 포트 입력",
+                    "목적지 포트 입력",
                     "MAIN-QUERY-CONDITIONS-DESTINATION-PORT",
                     query,
                     "선택적 목적지 포트 입력",
@@ -1323,28 +1365,28 @@ class MainWindow(QMainWindow):
             (
                 self.session_interval,
                 _ui_metadata(
-                    "MD 세션 조회 주기",
+                    "세션 조회 주기",
                     "MAIN-SETTINGS-MONITOR-SESSION-INTERVAL",
                     settings,
-                    "MD 세션 조회 주기 입력",
+                    "세션 조회 주기 입력",
                 ),
             ),
             (
                 self.location_interval,
                 _ui_metadata(
-                    "MM 위치 재확인 주기",
+                    "클라이언트 위치 재확인 주기",
                     "MAIN-SETTINGS-MONITOR-LOCATION-INTERVAL",
                     settings,
-                    "MM 위치 재확인 주기 입력",
+                    "클라이언트 위치 재확인 주기 입력",
                 ),
             ),
             (
                 self.close_misses,
                 _ui_metadata(
-                    "종료 판정 MISS",
+                    "세션 종료 확인 횟수",
                     "MAIN-SETTINGS-MONITOR-CLOSE-MISSES",
                     settings,
-                    "세션 종료 판정 MISS 횟수 입력",
+                    "세션이 보이지 않을 때 종료로 확정하기 위한 연속 미확인 횟수 입력",
                 ),
             ),
             (
@@ -1561,8 +1603,8 @@ class MainWindow(QMainWindow):
 
     def _read_query(self) -> tuple[AppConfig, QueryRequest, Credentials]:
         config = self._read_config_from_ui()
-        source_port = _optional_port(self.source_port_edit.text(), "SPort")
-        destination_port = _optional_port(self.destination_port_edit.text(), "DPort")
+        source_port = _optional_port(self.source_port_edit.text(), "출발지 포트")
+        destination_port = _optional_port(self.destination_port_edit.text(), "목적지 포트")
         request = QueryRequest(
             self.source_ip_edit.text().strip(),
             self.destination_ip_edit.text().strip(),
@@ -1906,6 +1948,8 @@ class MainWindow(QMainWindow):
                     )
             if column in (13, 14):
                 item.setForeground(_severity_color(severity.name))
+            if column == 14:
+                item.setToolTip(status)
             self.result_table.setItem(row, column, item)
 
     @Slot()
@@ -2171,7 +2215,11 @@ class MainWindow(QMainWindow):
                     str(getattr(run, "observation_count", 0)),
                 )
             for column, value in enumerate(values):
-                self.history_table.setItem(row, column, QTableWidgetItem(value))
+                display_value = _history_status_label(value) if column == 3 else value
+                item = QTableWidgetItem(display_value)
+                if column == 3 and display_value != value:
+                    item.setToolTip(f"저장 상태 코드: {value}")
+                self.history_table.setItem(row, column, item)
             if values[0] == selected_run_id:
                 selected_row = row
         if selected_row >= 0:
@@ -2877,7 +2925,7 @@ def _storage_status_text(health: object) -> str:
     total_managed_bytes = _nonnegative_int(getattr(health, "total_managed_bytes", 0))
     free_bytes = _nonnegative_int(getattr(health, "free_bytes", 0))
     summary = (
-        f"저장소 현황 · Raw 파일 {raw_file_count:,}개 · Raw {_display_bytes(raw_bytes)} · "
+        f"저장소 · Raw 파일 {raw_file_count:,}개 · Raw 용량 {_display_bytes(raw_bytes)} · "
         f"전체 관리 데이터 {_display_bytes(total_managed_bytes)} · "
         f"여유 공간 {_display_bytes(free_bytes)}"
     )
@@ -2888,6 +2936,11 @@ def _storage_status_text(health: object) -> str:
             "보존 정책에 따라 오래된 기록을 수동으로 정리하십시오."
         )
     return summary
+
+
+def _history_status_label(value: str) -> str:
+    normalized = value.strip().upper()
+    return _HISTORY_STATUS_LABELS.get(normalized, value or "-")
 
 
 def _checked_state() -> Qt.CheckState:

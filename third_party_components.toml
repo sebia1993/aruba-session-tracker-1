@@ -1,0 +1,254 @@
+schema_version = 1
+resolved_manifest = "THIRD_PARTY_COMPONENTS.json"
+
+[policy]
+required_bundle_files = [
+  "_internal/PySide6/plugins/tls/qschannelbackend.dll",
+]
+forbidden_bundle_globs = [
+  "**/qopensslbackend.dll",
+  "**/libcrypto-3-x64.dll",
+  "**/libssl-3-x64.dll",
+  "**/api-ms-win-*.dll",
+  "**/ucrtbase.dll",
+  "**/opengl32sw.dll",
+]
+
+[[license_fallbacks]]
+package = "pyserial"
+version = "3.5"
+source_file = "licenses/pyserial-BSD-3-Clause.txt"
+source_url = "https://raw.githubusercontent.com/pyserial/pyserial/v3.5/LICENSE.txt"
+sha256 = "f91cb9813de6a5b142b8f7f2dede630b5134160aedaeaf55f4d6a7e2593ca3f3"
+
+[[components]]
+id = "cpython-runtime"
+name = "CPython runtime"
+type = "framework"
+version = "{python_version}"
+license_name = "Python Software Foundation License Version 2"
+license_files = ["licenses/cpython/LICENSE.txt"]
+source_urls = ["https://www.python.org/ftp/python/{python_version}/Python-{python_version}.tgz"]
+files = [
+  "_internal/base_library.zip",
+  "_internal/_asyncio.pyd",
+  "_internal/_bz2.pyd",
+  "_internal/_ctypes.pyd",
+  "_internal/_decimal.pyd",
+  "_internal/_hashlib.pyd",
+  "_internal/_lzma.pyd",
+  "_internal/_multiprocessing.pyd",
+  "_internal/_overlapped.pyd",
+  "_internal/_queue.pyd",
+  "_internal/_socket.pyd",
+  "_internal/_sqlite3.pyd",
+  "_internal/_ssl.pyd",
+  "_internal/_uuid.pyd",
+  "_internal/_wmi.pyd",
+  "_internal/pyexpat.pyd",
+  "_internal/python3.dll",
+  "_internal/python313.dll",
+  "_internal/select.pyd",
+  "_internal/unicodedata.pyd",
+]
+
+[[components]]
+id = "openssl-runtime"
+name = "OpenSSL runtime used by CPython"
+type = "library"
+version = "{openssl_version}"
+license_id = "Apache-2.0"
+license_files = [
+  "licenses/openssl/LICENSE.txt",
+  "licenses/openssl/NOTICE.txt",
+]
+source_urls = ["https://github.com/openssl/openssl/releases/tag/openssl-{openssl_version}"]
+files = [
+  "_internal/libcrypto-3.dll",
+  "_internal/libssl-3.dll",
+]
+
+[[components]]
+id = "libffi-runtime"
+name = "libffi runtime bundled by CPython"
+type = "library"
+version = "{python_version}-distribution"
+license_name = "libffi permissive license reproduced by CPython"
+license_files = ["licenses/cpython/LICENSE.txt"]
+source_urls = [
+  "https://github.com/libffi/libffi",
+  "https://www.python.org/ftp/python/{python_version}/Python-{python_version}.tgz",
+]
+files = ["_internal/libffi-8.dll"]
+
+[[components]]
+id = "sqlite-runtime"
+name = "SQLite runtime bundled by CPython"
+type = "library"
+version = "{sqlite_version}"
+license_name = "Public Domain"
+license_files = ["THIRD_PARTY_NOTICES.txt"]
+source_urls = [
+  "https://www.sqlite.org/src/tarball/sqlite.tar.gz?r=version-{sqlite_version}",
+  "https://www.sqlite.org/copyright.html",
+]
+files = ["_internal/sqlite3.dll"]
+
+[[components]]
+id = "microsoft-vc-runtime"
+name = "Microsoft Visual C++ runtime inventory"
+type = "framework"
+version = "redistributable-runtime"
+license_name = "Microsoft Distributable Code terms reproduced by CPython"
+license_files = ["licenses/cpython/LICENSE.txt"]
+source_urls = ["https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist"]
+files = [
+  "_internal/VCRUNTIME140.dll",
+  "_internal/VCRUNTIME140_1.dll",
+  "_internal/PySide6/MSVCP140.dll",
+  "_internal/PySide6/MSVCP140_1.dll",
+  "_internal/PySide6/MSVCP140_2.dll",
+  "_internal/PySide6/VCRUNTIME140.dll",
+  "_internal/PySide6/VCRUNTIME140_1.dll",
+  "_internal/shiboken6/MSVCP140.dll",
+  "_internal/shiboken6/VCRUNTIME140.dll",
+  "_internal/shiboken6/VCRUNTIME140_1.dll",
+]
+
+[[components]]
+id = "qt-for-python-runtime"
+name = "Qt for Python native runtime"
+type = "framework"
+version = "{qt_version}"
+license_id = "LGPL-3.0-only"
+license_files = [
+  "licenses/LGPL-3.0-only.txt",
+  "OPEN_SOURCE_SOURCE_OFFER.txt",
+]
+source_urls = [
+  "https://code.qt.io/cgit/qt/qt5.git/tag/?h=v{qt_version}",
+  "https://code.qt.io/cgit/pyside/pyside-setup.git/tag/?h=v{qt_version}",
+]
+files = [
+  "_internal/PySide6/pyside6.abi3.dll",
+  "_internal/PySide6/Qt6Core.dll",
+  "_internal/PySide6/Qt6Gui.dll",
+  "_internal/PySide6/Qt6Network.dll",
+  "_internal/PySide6/Qt6Svg.dll",
+  "_internal/PySide6/Qt6Widgets.dll",
+  "_internal/PySide6/QtCore.pyd",
+  "_internal/PySide6/QtGui.pyd",
+  "_internal/PySide6/QtNetwork.pyd",
+  "_internal/PySide6/QtWidgets.pyd",
+  "_internal/PySide6/plugins/generic/qtuiotouchplugin.dll",
+  "_internal/PySide6/plugins/iconengines/qsvgicon.dll",
+  "_internal/PySide6/plugins/imageformats/qgif.dll",
+  "_internal/PySide6/plugins/imageformats/qicns.dll",
+  "_internal/PySide6/plugins/imageformats/qico.dll",
+  "_internal/PySide6/plugins/imageformats/qjpeg.dll",
+  "_internal/PySide6/plugins/imageformats/qsvg.dll",
+  "_internal/PySide6/plugins/imageformats/qtga.dll",
+  "_internal/PySide6/plugins/imageformats/qtiff.dll",
+  "_internal/PySide6/plugins/imageformats/qwbmp.dll",
+  "_internal/PySide6/plugins/imageformats/qwebp.dll",
+  "_internal/PySide6/plugins/networkinformation/qnetworklistmanager.dll",
+  "_internal/PySide6/plugins/platforms/qdirect2d.dll",
+  "_internal/PySide6/plugins/platforms/qminimal.dll",
+  "_internal/PySide6/plugins/platforms/qoffscreen.dll",
+  "_internal/PySide6/plugins/platforms/qwindows.dll",
+  "_internal/PySide6/plugins/styles/qmodernwindowsstyle.dll",
+  "_internal/PySide6/plugins/tls/qcertonlybackend.dll",
+  "_internal/PySide6/plugins/tls/qschannelbackend.dll",
+  "_internal/shiboken6/Shiboken.pyd",
+  "_internal/shiboken6/shiboken6.abi3.dll",
+]
+globs = ["_internal/PySide6/translations/*.qm"]
+
+[[components]]
+id = "bcrypt-native-extension"
+name = "bcrypt native extension"
+type = "library"
+version = "{bcrypt_version}"
+license_id = "Apache-2.0"
+license_files = [
+  "licenses/bcrypt/bcrypt-{bcrypt_version}.dist-info__LICENSE",
+]
+source_urls = ["https://pypi.org/project/bcrypt/{bcrypt_version}/"]
+files = ["_internal/bcrypt/_bcrypt.pyd"]
+
+[[components]]
+id = "cffi-native-extension"
+name = "cffi native extension"
+type = "library"
+version = "{cffi_version}"
+license_id = "MIT-0"
+license_files = [
+  "licenses/cffi/cffi-{cffi_version}.dist-info__licenses__LICENSE",
+]
+source_urls = ["https://pypi.org/project/cffi/{cffi_version}/"]
+files = ["_internal/_cffi_backend.cp313-win_amd64.pyd"]
+
+[[components]]
+id = "cryptography-native-extension"
+name = "cryptography native extension with statically linked OpenSSL"
+type = "library"
+version = "{cryptography_version}+openssl.{cryptography_openssl_version}"
+license_name = "(Apache-2.0 OR BSD-3-Clause) AND Apache-2.0 for bundled OpenSSL"
+license_files = [
+  "licenses/cryptography/cryptography-{cryptography_version}.dist-info__licenses__LICENSE",
+  "licenses/cryptography/cryptography-{cryptography_version}.dist-info__licenses__LICENSE.APACHE",
+  "licenses/cryptography/cryptography-{cryptography_version}.dist-info__licenses__LICENSE.BSD",
+  "licenses/openssl/LICENSE.txt",
+  "licenses/openssl/NOTICE.txt",
+]
+source_urls = [
+  "https://pypi.org/project/cryptography/{cryptography_version}/",
+  "https://github.com/openssl/openssl/releases/tag/openssl-{cryptography_openssl_version}",
+]
+files = ["_internal/cryptography/hazmat/bindings/_rust.pyd"]
+
+[[components]]
+id = "pynacl-native-extension"
+name = "PyNaCl native extension with bundled libsodium"
+type = "library"
+version = "{pynacl_version}+libsodium.1.0.20-stable"
+license_name = "Apache-2.0 (PyNaCl) AND ISC (bundled libsodium)"
+license_files = [
+  "licenses/pynacl/pynacl-{pynacl_version}.dist-info__licenses__LICENSE",
+  "licenses/pynacl/licenses__licenses__LICENSE.libsodium.txt",
+]
+source_urls = [
+  "https://pypi.org/project/PyNaCl/{pynacl_version}/",
+  "https://github.com/pyca/pynacl/tree/{pynacl_version}",
+  "https://github.com/jedisct1/libsodium/tree/1.0.20-RELEASE",
+]
+files = ["_internal/nacl/_sodium.pyd"]
+
+[[components]]
+id = "pyyaml-native-extension"
+name = "PyYAML native extension with bundled LibYAML"
+type = "library"
+version = "{pyyaml_version}+libyaml.{libyaml_version}"
+license_id = "MIT"
+license_files = [
+  "licenses/pyyaml/pyyaml-{pyyaml_version}.dist-info__licenses__LICENSE",
+]
+source_urls = [
+  "https://pypi.org/project/PyYAML/{pyyaml_version}/",
+  "https://github.com/yaml/libyaml/archive/refs/tags/{libyaml_version}.tar.gz",
+]
+files = ["_internal/yaml/_yaml.cp313-win_amd64.pyd"]
+
+[[components]]
+id = "pyinstaller-bootloader"
+name = "PyInstaller bootloader embedded in ArubaSessionTracker.exe"
+type = "framework"
+version = "{pyinstaller_version}"
+license_name = "GPL-2.0-or-later with the PyInstaller bootloader exception"
+license_files = [
+  "licenses/pyinstaller/pyinstaller-{pyinstaller_version}.dist-info__licenses__COPYING.txt",
+]
+source_urls = [
+  "https://github.com/pyinstaller/pyinstaller/archive/refs/tags/v{pyinstaller_version}.tar.gz",
+]
+files = ["ArubaSessionTracker.exe"]

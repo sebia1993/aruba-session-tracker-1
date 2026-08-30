@@ -40,6 +40,7 @@ from aruba_session_tracker.ui.main_window import (
     _counter_delta,
     _display_bytes,
     _fatal_diagnostic_code,
+    _history_status_label,
     _lifecycle_status,
     _optional_port,
     _prepare_display_outcome,
@@ -163,6 +164,7 @@ def test_result_semantic_labels_fall_back_for_out_of_range_legacy_values(
     assert window.result_table.item(0, 1).text() == "999"
     assert window.result_table.item(0, 3).toolTip() == ""
     assert window.result_table.item(0, 5).toolTip() == ""
+    assert window.result_table.item(0, 14).toolTip() == window.result_table.item(0, 14).text()
     window.close()
 
 
@@ -174,6 +176,44 @@ def test_operator_state_vocabulary_is_fixed_to_five_plain_states() -> None:
         "재시도 중",
         "확인 필요",
     } == _OPERATOR_STATES
+
+
+def test_operator_states_keep_plain_text_and_assign_semantic_visual_roles(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        _EmptyStore(),  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+
+    for state, role in (
+        ("대기", "neutral"),
+        ("조회 중", "active"),
+        ("정상", "success"),
+        ("재시도 중", "warning"),
+        ("확인 필요", "danger"),
+    ):
+        window._set_state(state)
+        assert window.state_label.text() == state
+        assert window.state_label.property("stateRole") == role
+
+    window.close()
+
+
+def test_history_status_presenter_translates_known_codes_without_guessing_unknowns() -> None:
+    assert _history_status_label("COMPLETED") == "완료"
+    assert _history_status_label(" partial ") == "일부 결과"
+    assert _history_status_label("FAILED") == "실패"
+    assert _history_status_label("STOPPED") == "중지"
+    assert _history_status_label("INTERRUPTED") == "수집 중단"
+    assert _history_status_label("RESTARTED") == "조건 변경 종료"
+    assert _history_status_label("CANCELLED") == "취소"
+    assert _history_status_label("RUNNING") == "진행 중"
+    assert _history_status_label("RECOVERED_CUSTOM") == "RECOVERED_CUSTOM"
+    assert _history_status_label("") == "-"
 
 
 def test_optional_port_accepts_only_blank_or_ascii_port_range() -> None:
@@ -365,7 +405,7 @@ def test_storage_status_text_reports_usage_and_advises_at_raw_file_threshold() -
     advisory = _storage_status_text(at_threshold)
 
     assert "Raw 파일 99,999개" in normal
-    assert "Raw 2.0 GiB" in normal
+    assert "Raw 용량 2.0 GiB" in normal
     assert "전체 관리 데이터 3.0 GiB" in normal
     assert "여유 공간 20.0 GiB" in normal
     assert "주의:" not in normal
@@ -403,7 +443,7 @@ def test_history_tab_shows_read_only_storage_status_without_changing_default_tab
     status = window.storage_status_label.text()
     assert window.tabs.currentWidget() is window.query_page
     assert "Raw 파일 1개" in status
-    assert "Raw 10 B" in status
+    assert "Raw 용량 10 B" in status
     assert "전체 관리 데이터" in status
     assert "여유 공간" in status
     assert "주의:" not in status
@@ -460,8 +500,8 @@ def test_html_report_export_is_independent_from_csv(
         timeout=5000,
     )
 
-    assert window.export_button.text() == "선택 실행 CSV 내보내기"
-    assert window.html_export_button.text() == "선택 실행 HTML 보고서"
+    assert window.export_button.text() == "CSV 내보내기"
+    assert window.html_export_button.text() == "HTML 보고서"
     assert destination.is_file()
     assert messages == [("HTML 보고서 완료", str(destination))]
     window.close()
@@ -1056,6 +1096,8 @@ def test_query_screen_defaults_to_primary_monitoring_and_progressive_details(
 
     assert window.setup_guide.isVisible()
     assert window.monitor_button.isDefault()
+    assert window.query_group.title() == "조회할 세션 흐름"
+    assert window.connection_group.title() == "로그인 정보 · 이번 실행에만 사용"
     assert window.monitor_button.text() == "지속 모니터링 시작"
     assert window.query_button.text() == "현재 조회"
     assert window.advanced_toggle_button.text() == "고급 조건 보기"
@@ -1064,6 +1106,19 @@ def test_query_screen_defaults_to_primary_monitoring_and_progressive_details(
     assert not window.advanced_panel.isVisible()
     assert not window.details.isVisible()
     assert all(window.result_table.isColumnHidden(column) for column in range(5, 12))
+    assert [
+        window.result_table.horizontalHeaderItem(column).text()
+        for column in (0, 1, 2, 3, 4, 12, 13, 14)
+    ] == [
+        "장비",
+        "프로토콜",
+        "출발지 IP",
+        "출발지 포트",
+        "목적지 IP",
+        "마지막 확인 시각",
+        "장비 Flags",
+        "상태",
+    ]
 
     window.advanced_toggle_button.setChecked(True)
     window.detail_columns_toggle.setChecked(True)
@@ -1112,10 +1167,17 @@ def test_query_progressive_controls_are_keyboard_and_accessibility_ready(
     )
     assert all(control.accessibleName() for control in controls)
     assert all(control.accessibleDescription() for control in controls)
+    assert window.source_ip_edit.accessibleName() == "출발지 IP"
+    assert window.destination_ip_edit.accessibleName() == "목적지 IP"
+    assert window.source_port_edit.accessibleName() == "출발지 포트"
+    assert window.destination_port_edit.accessibleName() == "목적지 포트"
+    assert "Source" not in window.bidirectional_check.accessibleDescription()
+    assert "DPort" not in window.detail_columns_toggle.accessibleDescription()
 
+    assert _next_keyboard_focus(window.source_ip_edit) is window.destination_ip_edit
+    assert _next_keyboard_focus(window.destination_ip_edit) is window.username_edit
     assert _next_keyboard_focus(window.username_edit) is window.password_edit
-    assert _next_keyboard_focus(window.password_edit) is window.source_ip_edit
-    assert _next_keyboard_focus(window.destination_ip_edit) is window.advanced_toggle_button
+    assert _next_keyboard_focus(window.password_edit) is window.advanced_toggle_button
 
     qtbot.keyClick(window.advanced_toggle_button, Qt.Key.Key_Space)  # type: ignore[attr-defined]
     assert window.advanced_toggle_button.isChecked()
@@ -1127,6 +1189,30 @@ def test_query_progressive_controls_are_keyboard_and_accessibility_ready(
     qtbot.keyClick(window.raw_diagnostics_toggle, Qt.Key.Key_Space)  # type: ignore[attr-defined]
     assert window.raw_diagnostics_toggle.isChecked()
     assert window.details.isVisible()
+    window.close()
+
+
+def test_query_port_validation_uses_the_same_korean_labels_as_the_screen(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        _EmptyStore(),  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    _configure_valid_query(window)
+
+    window.source_port_edit.setText("invalid")
+    with pytest.raises(ValueError, match="출발지 포트"):
+        window._read_query()
+
+    window.source_port_edit.clear()
+    window.destination_port_edit.setText("65536")
+    with pytest.raises(ValueError, match="목적지 포트"):
+        window._read_query()
+
     window.close()
 
 
