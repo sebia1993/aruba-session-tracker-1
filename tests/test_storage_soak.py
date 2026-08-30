@@ -42,7 +42,10 @@ def test_storage_poll_soak(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
         check=False,
-        timeout=max(120, polls // 10),
+        # Durable writes intentionally fsync each poll. GitHub-hosted Windows
+        # disks can be substantially slower than a local NTFS volume, so use
+        # the same bounded budget as the full fixture-pipeline soak.
+        timeout=max(300, polls // 4),
     )
     assert completed.returncode == 0, completed.stderr[-4000:]
     output_lines = tuple(line for line in completed.stdout.splitlines() if line.strip())
