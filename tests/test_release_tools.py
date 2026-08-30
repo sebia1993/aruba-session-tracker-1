@@ -696,6 +696,13 @@ def test_versioned_workflow_verifies_draft_and_public_download_before_done() -> 
     assert "--state published `" in workflow
     assert "Invoke-WebRequest -Uri $remote[0].browser_download_url" in workflow
     assert "Versioned release is already published; this workflow will not mutate it." in workflow
+    publish_job = workflow[workflow.index("  publish:") :]
+    dependency_install = publish_job.index(
+        "python -m pip install --no-input -r requirements-runtime.lock"
+    )
+    package_verification = publish_job.index("./tools/verify_publish_assets.ps1")
+    assert dependency_install < package_verification
+    assert "Publish verification dependency check failed." in publish_job
     assert workflow.count("Assert-VersionedTagProvenance") == 4
     assert workflow.count("Assert-MainAtExpected") == 3
     assert "# Re-peel the annotated tag immediately before making the draft public." in workflow
