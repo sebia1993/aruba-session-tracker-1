@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import inspect
 import msvcrt
 import os
 import re
@@ -174,7 +175,10 @@ class HostKeyInfo:
     sha256_fingerprint: str
 
 
-HostKeyApproval = Callable[[DeviceTarget, HostKeyInfo], bool]
+HostKeyApproval = (
+    Callable[[DeviceTarget, HostKeyInfo], bool]
+    | Callable[[DeviceTarget, HostKeyInfo, PollDeadline], bool]
+)
 
 
 class CollectorError(RuntimeError):
@@ -184,6 +188,83 @@ class CollectorError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.retryable_network = retryable_network
+
+
+@dataclass(slots=True)
+class _ApprovalResult:
+    answer: bool = False
+    error: BaseException | None = None
+
+
+def run_bounded_approval(
+    approval: Callable[..., bool],
+    first_argument: object,
+    second_argument: object,
+    *,
+    cancel_token: CancellationToken,
+    deadline: PollDeadline,
+) -> bool:
+    """Run an operator approval without letting it exceed a poll boundary.
+
+    Legacy two-argument callbacks remain supported.  New callbacks may accept
+    the shared :class:`PollDeadline` as a third positional argument so a UI can
+    dismiss its own pending prompt.  Signature binding happens before the call,
+    therefore a ``TypeError`` raised *inside* the callback is never mistaken for
+    a legacy callback signature.
+
+    A callback that ignores cancellation or the deadline may leave its daemon
+    helper alive temporarily, but its late answer is never consumed by the poll.
+    """
+
+    arguments = (first_argument, second_argument)
+    try:
+        signature = inspect.signature(approval)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("approval callback signature cannot be inspected") from exc
+    try:
+        signature.bind(*arguments, deadline)
+    except TypeError:
+        # Validate the legacy signature separately.  Do not catch any error
+        # raised later by the callback itself.
+        signature.bind(*arguments)
+        deadline_aware = False
+    else:
+        deadline_aware = True
+
+    cancel_token.raise_if_cancelled()
+    deadline.raise_if_expired()
+    completed = threading.Event()
+    result = _ApprovalResult()
+
+    def invoke() -> None:
+        try:
+            if deadline_aware:
+                result.answer = bool(approval(*arguments, deadline))
+            else:
+                result.answer = bool(approval(*arguments))
+        except BaseException as exc:  # Re-raised on the polling thread below.
+            result.error = exc
+        finally:
+            completed.set()
+
+    threading.Thread(
+        target=invoke,
+        name="aruba-approval-callback",
+        daemon=True,
+    ).start()
+    while True:
+        cancel_token.raise_if_cancelled()
+        deadline.raise_if_expired()
+        wait_seconds = min(0.05, deadline.remaining_seconds)
+        if completed.wait(wait_seconds):
+            break
+
+    # Cancellation/deadline always wins a race with a callback completion.
+    cancel_token.raise_if_cancelled()
+    deadline.raise_if_expired()
+    if result.error is not None:
+        raise result.error
+    return result.answer
 
 
 class CommandConnection(Protocol):
@@ -730,7 +811,13 @@ class StrictNetmikoFactory:
             ) from exc
         cancel_token.raise_if_cancelled()
         poll_deadline.raise_if_expired()
-        self._verify_or_approve(target, offered_key, host_key_approval, cancel_token)
+        self._verify_or_approve(
+            target,
+            offered_key,
+            host_key_approval,
+            cancel_token,
+            poll_deadline,
+        )
         cancel_token.raise_if_cancelled()
         poll_deadline.raise_if_expired()
 
@@ -880,10 +967,11 @@ class StrictNetmikoFactory:
         offered_key: paramiko.PKey,
         approval: HostKeyApproval | None,
         cancel_token: CancellationToken,
+        deadline: PollDeadline,
     ) -> None:
         host_token = _known_hosts_token(target)
         cancel_token.raise_if_cancelled()
-        with self._locked_host_keys(cancel_token) as host_keys:
+        with self._locked_host_keys(cancel_token, deadline) as host_keys:
             if _known_key_matches(host_keys, host_token, offered_key):
                 return
 
@@ -891,8 +979,15 @@ class StrictNetmikoFactory:
             algorithm=offered_key.get_name(),
             sha256_fingerprint=_sha256_fingerprint(offered_key),
         )
-        approved = approval is not None and approval(target, info)
+        approved = approval is not None and run_bounded_approval(
+            approval,
+            target,
+            info,
+            cancel_token=cancel_token,
+            deadline=deadline,
+        )
         cancel_token.raise_if_cancelled()
+        deadline.raise_if_expired()
         if not approved:
             raise CollectorError(
                 ErrorCode.HOST_KEY_UNKNOWN,
@@ -901,10 +996,11 @@ class StrictNetmikoFactory:
 
         # Approval must not hold either the process-local or cross-process lock.
         # Reload after approval so another process cannot be overwritten.
-        with self._locked_host_keys(cancel_token) as host_keys:
+        with self._locked_host_keys(cancel_token, deadline) as host_keys:
             if _known_key_matches(host_keys, host_token, offered_key):
                 return
             cancel_token.raise_if_cancelled()
+            deadline.raise_if_expired()
             host_keys.add(host_token, offered_key.get_name(), offered_key)
             try:
                 self._save_host_keys(host_keys)
@@ -914,21 +1010,30 @@ class StrictNetmikoFactory:
                     "승인한 SSH 호스트 키를 known_hosts에 저장할 수 없습니다.",
                 ) from exc
         cancel_token.raise_if_cancelled()
+        deadline.raise_if_expired()
 
     @contextmanager
     def _locked_host_keys(
         self,
         cancel_token: CancellationToken,
+        deadline: PollDeadline,
     ) -> Iterator[paramiko.HostKeys]:
         try:
             with (
-                self._host_keys_lock,
+                _known_hosts_process_lock(
+                    self._host_keys_lock,
+                    cancel_token,
+                    deadline,
+                ),
                 _known_hosts_file_lock(
                     self._known_hosts_path,
                     cancel_token,
+                    deadline=deadline,
                     parent_identity=self._known_hosts_parent_identity,
                 ),
             ):
+                cancel_token.raise_if_cancelled()
+                deadline.raise_if_expired()
                 self._assert_known_hosts_path()
                 try:
                     host_keys = self._load_host_keys()
@@ -1020,13 +1125,41 @@ def _known_hosts_thread_lock(path: Path) -> threading.Lock:
 
 
 @contextmanager
+def _known_hosts_process_lock(
+    lock: threading.Lock,
+    cancel_token: CancellationToken,
+    deadline: PollDeadline,
+) -> Iterator[None]:
+    """Acquire one process-local trust lock within the shared poll budget."""
+
+    acquired = False
+    try:
+        while not acquired:
+            cancel_token.raise_if_cancelled()
+            deadline.raise_if_expired()
+            acquired = lock.acquire(timeout=min(0.05, deadline.remaining_seconds))
+        # A cancellation or deadline that races with acquisition must win
+        # before known_hosts is read or mutated.
+        cancel_token.raise_if_cancelled()
+        deadline.raise_if_expired()
+        yield
+    finally:
+        if acquired:
+            lock.release()
+
+
+@contextmanager
 def _known_hosts_file_lock(
     known_hosts_path: Path,
     cancel_token: CancellationToken,
     *,
     timeout: float = KNOWN_HOSTS_LOCK_TIMEOUT_SECONDS,
+    deadline: PollDeadline | None = None,
     parent_identity: DirectoryIdentity | None = None,
 ) -> Iterator[None]:
+    cancel_token.raise_if_cancelled()
+    if deadline is not None:
+        deadline.raise_if_expired()
     parent = known_hosts_path.parent
     if parent_identity is None:
         parent, parent_identity = ensure_managed_directory(parent)
@@ -1035,7 +1168,7 @@ def _known_hosts_file_lock(
         verify_managed_directory(parent, parent_identity)
     lock_path = known_hosts_path.with_name(f"{known_hosts_path.name}.lock")
     reject_managed_file_link(lock_path)
-    deadline = time.monotonic() + timeout
+    lock_expires_at = time.monotonic() + timeout
     with lock_path.open("a+b") as stream:
         verify_managed_directory(parent, parent_identity)
         lock_info = reject_link_or_reparse(lock_path)
@@ -1054,18 +1187,31 @@ def _known_hosts_file_lock(
         try:
             while not acquired:
                 cancel_token.raise_if_cancelled()
+                if deadline is not None:
+                    deadline.raise_if_expired()
                 stream.seek(0)
                 try:
                     msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
                     acquired = True
                 except OSError as exc:
-                    remaining = deadline - time.monotonic()
+                    remaining = lock_expires_at - time.monotonic()
                     if remaining <= 0:
+                        cancel_token.raise_if_cancelled()
+                        if deadline is not None:
+                            deadline.raise_if_expired()
                         raise CollectorError(
                             ErrorCode.HOST_KEY_UNKNOWN,
                             "known_hosts 잠금 시간이 초과되었습니다.",
                         ) from exc
-                    cancel_token.wait(min(0.05, remaining))
+                    wait_seconds = min(0.05, remaining)
+                    if deadline is not None:
+                        wait_seconds = min(wait_seconds, deadline.remaining_seconds)
+                    cancel_token.wait(wait_seconds)
+            # A cancellation or deadline that races with acquisition must win
+            # before known_hosts is read or mutated.
+            cancel_token.raise_if_cancelled()
+            if deadline is not None:
+                deadline.raise_if_expired()
             yield
         finally:
             if acquired:

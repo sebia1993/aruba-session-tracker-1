@@ -18,6 +18,14 @@ datapath session rows from the relevant 7240XM managed device.
   remain in memory only.
 - Treat parser, SSH, and collection failures as unknown/partial results, never
   as proof that a controller or client is down.
+- When Source and Destination resolve to different enabled MDs, query both.
+  Keep every controller that owns an active flow in the authoritative poll
+  scope; a positive result from one MD must never advance another MD's flow to
+  `MISSED` or `CLOSED`.
+- Host-key and full-MD-scan approvals share the poll cancellation and monotonic
+  deadline. Ignore every approval result that arrives after either boundary,
+  and never save a host key or start a scan from that late result. Process and
+  Windows file locks for known_hosts must share the same boundary.
 - Never fall back to an unfiltered datapath table query.
 - Treat managed files, operation manifests, leases, crash journals and their
   parent directories as local security boundaries. Reject symbolic links,
@@ -79,8 +87,8 @@ datapath session rows from the relevant 7240XM managed device.
   escaped database/device values.
 - Show KST as the primary display time and focus the latest 50 results and the
   collapsed full-history section on protocol, source IP:port, and destination
-  IP:port. HTML must include every stored observation row; the 2,000-row cap
-  applies only to the live Qt result table.
+  IP:port. HTML must include every stored observation row on screen and in
+  print; the 2,000-row cap applies only to the live Qt result table.
 - Omit packet, byte, and counter-delta values from HTML while preserving them
   in SQLite, CSV, and Raw data. Do not change those storage formats for this
   presentation-only simplification.
@@ -91,6 +99,10 @@ datapath session rows from the relevant 7240XM managed device.
 - Keep staged crash recovery for both managed and user-selected external CSV
   and HTML destinations. External recovery must independently validate owner,
   parent identity, destination and commit receipt before mutating user files.
+- A detached external USB or unreachable UNC destination may defer only its
+  owned recovery operation while the app starts in limited mode. Classify only
+  documented device/network-unavailable Windows errors this way; access,
+  credential and policy failures must fail closed.
 - Keep the crash journal bounded and sanitized: event, stage, exception class,
   version and incident ID only. It must never accept exception messages,
   tracebacks, runtime values or absolute paths.

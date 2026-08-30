@@ -38,7 +38,12 @@ from PySide6.QtWidgets import (
 
 from aruba_session_tracker import __version__
 from aruba_session_tracker.analysis import protocol_label, service_definition
-from aruba_session_tracker.collectors.ssh import CancellationToken, CollectorError, HostKeyInfo
+from aruba_session_tracker.collectors.ssh import (
+    CancellationToken,
+    CollectorError,
+    HostKeyInfo,
+    PollDeadline,
+)
 from aruba_session_tracker.config import ConfigError, ConfigRepository
 from aruba_session_tracker.models import (
     AppConfig,
@@ -285,6 +290,7 @@ class ApprovalBridge(QObject):
         self,
         target: DeviceTarget,
         info: HostKeyInfo,
+        deadline: PollDeadline | None = None,
         *,
         cancel_token: CancellationToken | None = None,
         generation: int | None = None,
@@ -296,12 +302,13 @@ class ApprovalBridge(QObject):
             "장비의 실제 지문과 일치하는지 확인한 뒤 승인하십시오.",
             generation,
         )
-        return self._request_answer(request, cancel_token)
+        return self._request_answer(request, cancel_token, deadline)
 
     def approve_full_scan(
         self,
         _request: QueryRequest,
         devices: tuple[DeviceTarget, ...],
+        deadline: PollDeadline | None = None,
         *,
         cancel_token: CancellationToken | None = None,
         generation: int | None = None,
@@ -314,7 +321,7 @@ class ApprovalBridge(QObject):
             f"{targets}\n\n장비 부하와 조회 권한을 확인한 뒤 진행하십시오.",
             generation,
         )
-        return self._request_answer(request, cancel_token)
+        return self._request_answer(request, cancel_token, deadline)
 
     def cancel_pending(self, generation: int | None = None) -> None:
         with self._lock:
@@ -335,8 +342,11 @@ class ApprovalBridge(QObject):
         self,
         request: _ApprovalRequest,
         cancel_token: CancellationToken | None,
+        deadline: PollDeadline | None,
     ) -> bool:
         if cancel_token is not None and cancel_token.is_cancelled:
+            return False
+        if deadline is not None and deadline.remaining_seconds <= 0:
             return False
         with self._lock:
             if self._shutting_down:
@@ -347,13 +357,27 @@ class ApprovalBridge(QObject):
             self._complete_request(request, False, dismiss=False)
             return False
         if QThread.currentThread() == self.thread():
-            self._show_request_blocking(request)
+            self._show_request_blocking(request, cancel_token, deadline)
         else:
             self.requested.emit(request)
 
-        while not request.event.wait(0.05):
+        while True:
+            wait_seconds = 0.05
+            if deadline is not None:
+                remaining = deadline.remaining_seconds
+                if remaining <= 0:
+                    self._complete_request(request, False, dismiss=True)
+                    return False
+                wait_seconds = min(wait_seconds, remaining)
+            if request.event.wait(wait_seconds):
+                break
             if cancel_token is not None and cancel_token.is_cancelled:
                 self._complete_request(request, False, dismiss=True)
+                return False
+        if cancel_token is not None and cancel_token.is_cancelled:
+            return False
+        if deadline is not None and deadline.remaining_seconds <= 0:
+            return False
         return request.answer
 
     def _complete_request(
@@ -373,22 +397,64 @@ class ApprovalBridge(QObject):
             self.dismiss_requested.emit(request)
         return True
 
-    def _show_request_blocking(self, request: _ApprovalRequest) -> None:
+    def _show_request_blocking(
+        self,
+        request: _ApprovalRequest,
+        cancel_token: CancellationToken | None,
+        deadline: PollDeadline | None,
+    ) -> None:
         with self._lock:
             if request not in self._pending:
                 return
-        answer = QMessageBox.question(
-            self._owner,
+        if cancel_token is None and deadline is None:
+            selected_button = QMessageBox.question(
+                self._owner,
+                request.title,
+                request.message,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            self._complete_request(
+                request,
+                selected_button == QMessageBox.StandardButton.Yes,
+                dismiss=False,
+            )
+            return
+
+        dialog = QMessageBox(
+            QMessageBox.Icon.Question,
             request.title,
             request.message,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+            self._owner,
         )
+        dialog.setDefaultButton(QMessageBox.StandardButton.No)
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self._dialogs[request] = dialog
+        expiry_timer = QTimer(dialog)
+        expiry_timer.setInterval(50)
+
+        def reject_if_stopped() -> None:
+            cancelled = cancel_token is not None and cancel_token.is_cancelled
+            expired = deadline is not None and deadline.remaining_seconds <= 0
+            if cancelled or expired:
+                self._complete_request(request, False, dismiss=False)
+                dialog.done(QMessageBox.StandardButton.No.value)
+
+        expiry_timer.timeout.connect(reject_if_stopped)
+        expiry_timer.start()
+        dialog.exec()
+        expiry_timer.stop()
+        clicked = dialog.clickedButton()
+        yes_button = QMessageBox.StandardButton.Yes
+        approved = clicked is not None and dialog.standardButton(clicked) == yes_button
+        self._dialogs.pop(request, None)
         self._complete_request(
             request,
-            answer == QMessageBox.StandardButton.Yes,
+            approved,
             dismiss=False,
         )
+        dialog.deleteLater()
 
     @Slot(object)
     def _show_request(self, request: _ApprovalRequest) -> None:
@@ -1524,23 +1590,30 @@ class MainWindow(QMainWindow):
         self._set_busy(True)
         self._set_state("조회 중")
 
-        def approve_host_key(target: DeviceTarget, info: HostKeyInfo) -> bool:
+        def approve_host_key(
+            target: DeviceTarget,
+            info: HostKeyInfo,
+            deadline: PollDeadline | None = None,
+        ) -> bool:
             return self._approval.approve_host_key(
                 target,
                 info,
                 cancel_token=token,
                 generation=generation,
+                deadline=deadline,
             )
 
         def approve_full_scan(
             current_request: QueryRequest,
             devices: tuple[DeviceTarget, ...],
+            deadline: PollDeadline | None = None,
         ) -> bool:
             return self._approval.approve_full_scan(
                 current_request,
                 devices,
                 cancel_token=token,
                 generation=generation,
+                deadline=deadline,
             )
 
         query_capacity_check = getattr(self._store, "ensure_query_capacity", None)

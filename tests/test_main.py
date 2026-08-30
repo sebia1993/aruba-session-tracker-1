@@ -181,7 +181,9 @@ def test_report_smoke_writes_standalone_html_to_korean_path(tmp_path: Path) -> N
     assert "패킷" not in text
     assert "바이트" not in text
     assert text.index("최신 세션 결과") < text.index("전체 추적 이력")
-    assert "<details>" in text
+    assert '<details class="history-toggle">' in text
+    assert '<div class="details-body" id="observation-history-body">' in text
+    assert ".history-toggle + .details-body { display:block !important; }" in text
     assert "<details open" not in text
     assert "https://" not in text.casefold()
     assert "http://" not in text.casefold()

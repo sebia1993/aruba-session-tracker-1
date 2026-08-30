@@ -16,7 +16,12 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QWidget
 
-from aruba_session_tracker.collectors.ssh import CancellationToken, CollectorError, HostKeyInfo
+from aruba_session_tracker.collectors.ssh import (
+    CancellationToken,
+    CollectorError,
+    HostKeyInfo,
+    PollDeadline,
+)
 from aruba_session_tracker.config import ConfigRepository
 from aruba_session_tracker.models import (
     AppConfig,
@@ -510,6 +515,63 @@ def test_approval_cancellation_dismisses_open_dialog_and_wakes_worker(qtbot: obj
 
     assert answers == [False]
     assert bridge.pending_count == 0
+
+
+def test_approval_deadline_dismisses_open_dialog_and_wakes_worker(qtbot: object) -> None:
+    owner = QWidget()
+    qtbot.addWidget(owner)  # type: ignore[attr-defined]
+    bridge = ApprovalBridge(owner)
+    answers: list[bool] = []
+    worker = threading.Thread(
+        target=lambda: answers.append(
+            bridge.approve_full_scan(
+                QueryRequest("192.0.2.1", "203.0.113.1"),
+                (DeviceTarget("MD-01", "198.51.100.21"),),
+                deadline=PollDeadline.after(1.0),
+                generation=12,
+            )
+        )
+    )
+
+    worker.start()
+    try:
+        qtbot.waitUntil(  # type: ignore[attr-defined]
+            lambda: bridge.pending_count == 1 and bool(owner.findChildren(QMessageBox)),
+            timeout=3000,
+        )
+        qtbot.waitUntil(lambda: not worker.is_alive(), timeout=3000)  # type: ignore[attr-defined]
+    finally:
+        bridge.shutdown()
+        worker.join(timeout=3)
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: not owner.findChildren(QMessageBox),
+        timeout=3000,
+    )
+
+    assert answers == [False]
+    assert bridge.pending_count == 0
+
+
+def test_approval_deadline_closes_direct_modal_request(qtbot: object) -> None:
+    owner = QWidget()
+    qtbot.addWidget(owner)  # type: ignore[attr-defined]
+    bridge = ApprovalBridge(owner)
+    started_at = time.monotonic()
+
+    answer = bridge.approve_host_key(
+        DeviceTarget("MD-01", "198.51.100.21"),
+        HostKeyInfo("ssh-ed25519", "SHA256:fixture"),
+        deadline=PollDeadline.after(0.1),
+        generation=13,
+    )
+
+    assert answer is False
+    assert time.monotonic() - started_at < 1.0
+    assert bridge.pending_count == 0
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: not owner.findChildren(QMessageBox),
+        timeout=3000,
+    )
 
 
 class _FailingExecutor(_Executor):

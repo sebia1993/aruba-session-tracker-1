@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from contextlib import AbstractContextManager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -87,11 +88,14 @@ def _datapath_output(
     source: str = "198.51.100.10",
     destination: str = "203.0.113.20",
     *,
+    source_port: int = 12345,
+    destination_port: int = 443,
     packets: int = 5,
     flags: str = "SY",
 ) -> str:
     return DATAPATH_HEADER + (
-        f"{source} {destination} 6 12345 443 0/0 0 0 10 0 0 {packets} 100 {flags} 0\nEntries: 1\n"
+        f"{source} {destination} 6 {source_port} {destination_port} "
+        f"0/0 0 0 10 0 0 {packets} 100 {flags} 0\nEntries: 1\n"
     )
 
 
@@ -230,7 +234,7 @@ def test_expired_poll_deadline_does_not_attempt_mm_failover() -> None:
     assert outcome.diagnostics[0].transient is True
 
 
-def test_destination_md_is_queried_only_after_source_md_has_no_match() -> None:
+def test_destination_md_is_queried_when_source_md_has_no_match() -> None:
     config = _config()
     outputs = {
         "MM-Primary": _mm_outputs("192.0.2.101", "192.0.2.102"),
@@ -255,6 +259,47 @@ def test_destination_md_is_queried_only_after_source_md_has_no_match() -> None:
         for commands in factory.commands_by_device.values()
         for command in commands
     )
+
+
+def test_distinct_source_and_destination_mds_are_both_queried() -> None:
+    request = QueryRequest(REQUEST.source_ip, REQUEST.destination_ip)
+    outputs = {
+        "MM-Primary": _mm_outputs("192.0.2.101", "192.0.2.102"),
+        "MD-1": {
+            NO_PAGING_COMMAND: "",
+            build_datapath_session_command(REQUEST.source_ip): _datapath_output(),
+        },
+        "MD-2": {
+            NO_PAGING_COMMAND: "",
+            build_datapath_session_command(REQUEST.destination_ip): _datapath_output(
+                source_port=23456
+            ),
+        },
+    }
+    factory = FakeFactory(outputs)
+
+    outcome = TrackerService(_config(), factory).query_once(request, CREDENTIALS)
+
+    assert len(outcome.observations) == 2
+    assert outcome.authoritative is True
+    assert factory.calls == ["MM-Primary", "MD-1", "MD-2"]
+
+
+def test_same_source_and_destination_md_is_queried_once() -> None:
+    outputs = {
+        "MM-Primary": _mm_outputs("192.0.2.101", "192.0.2.101"),
+        "MD-1": {
+            NO_PAGING_COMMAND: "",
+            build_datapath_session_command(REQUEST.source_ip): _datapath_output(),
+        },
+    }
+    factory = FakeFactory(outputs)
+
+    outcome = TrackerService(_config(), factory).query_once(REQUEST, CREDENTIALS)
+
+    assert len(outcome.observations) == 1
+    assert outcome.authoritative is True
+    assert factory.calls == ["MM-Primary", "MD-1"]
 
 
 def test_md_authentication_failure_stops_before_other_candidates() -> None:
@@ -344,6 +389,50 @@ def test_full_scan_approval_cancellation_takes_precedence_over_denial() -> None:
     assert [event.code for event in outcome.diagnostics][-1] is ErrorCode.CANCELLED
 
 
+def test_full_scan_approval_deadline_prevents_late_scan() -> None:
+    config = _config()
+    outputs: dict[str, dict[str, str]] = {"MM-Primary": _mm_outputs(None, None)}
+    for device in config.managed_devices:
+        outputs[device.name] = {
+            NO_PAGING_COMMAND: "",
+            build_datapath_session_command(REQUEST.source_ip): DATAPATH_EMPTY,
+        }
+    factory = FakeFactory(outputs)
+    release_approval = Event()
+    approval_finished = Event()
+
+    def blocking_approval(
+        _request: QueryRequest,
+        _devices: tuple[DeviceTarget, ...],
+        _deadline: PollDeadline,
+    ) -> bool:
+        release_approval.wait(timeout=3)
+        approval_finished.set()
+        return True
+
+    started_at = time.monotonic()
+    try:
+        outcome = TrackerService(config, factory).query_once(
+            REQUEST,
+            CREDENTIALS,
+            full_scan_approval=blocking_approval,
+            deadline=PollDeadline.after(0.05),
+        )
+        elapsed = time.monotonic() - started_at
+        assert elapsed < 0.5
+        assert factory.calls == ["MM-Primary"]
+        assert outcome.authoritative is False
+        assert [event.code for event in outcome.diagnostics][-1] is (
+            ErrorCode.POLL_DEADLINE_EXCEEDED
+        )
+    finally:
+        release_approval.set()
+        assert approval_finished.wait(timeout=3)
+
+    # A late yes is discarded, so no managed-device query can start afterward.
+    assert factory.calls == ["MM-Primary"]
+
+
 def test_monitor_full_scan_reuses_only_the_md_that_matched_until_mm_refresh() -> None:
     config = _config()
     outputs: dict[str, dict[str, str]] = {"MM-Primary": _mm_outputs(None, None)}
@@ -417,6 +506,64 @@ def test_monitor_empty_full_scan_is_not_repeated_before_the_next_mm_refresh() ->
     assert ErrorCode.CLIENT_NOT_FOUND_ON_MM in {event.code for event in deferred.diagnostics}
 
 
+def test_monitor_keeps_querying_the_md_of_each_active_split_flow() -> None:
+    split_request = QueryRequest(REQUEST.source_ip, REQUEST.destination_ip)
+    source_command = build_datapath_session_command(split_request.source_ip)
+    destination_command = build_datapath_session_command(split_request.destination_ip)
+    outputs = {
+        "MM-Primary": _mm_outputs("192.0.2.101", "192.0.2.102"),
+        "MD-1": {
+            NO_PAGING_COMMAND: "",
+            source_command: _datapath_output(source_port=12345),
+        },
+        "MD-2": {
+            NO_PAGING_COMMAND: "",
+            destination_command: _datapath_output(source_port=23456),
+        },
+    }
+    factory = FakeFactory(outputs)
+    monotonic_now = [0.0]
+    wall_start = datetime(2026, 8, 30, tzinfo=UTC)
+    wall_ticks = count()
+    monitor = MonitorEngine(
+        TrackerService(replace(_config(), close_after_misses=2), factory),
+        split_request,
+        CREDENTIALS,
+        monotonic_clock=lambda: monotonic_now[0],
+        wall_clock=lambda: wall_start + timedelta(seconds=next(wall_ticks)),
+    )
+
+    first = monitor.poll_once()
+    assert len(first.observations) == 2
+    split_flow = next(
+        item for item in first.active_sessions if item.observation.source_port == 23456
+    )
+    first_seen = split_flow.last_seen
+    calls_after_first = len(factory.calls)
+
+    later_results = []
+    for poll_number in range(1, 4):
+        monotonic_now[0] = float(poll_number * 5)
+        later_results.append(monitor.poll_once())
+
+    assert factory.calls[:calls_after_first] == ["MM-Primary", "MD-1", "MD-2"]
+    assert factory.calls[calls_after_first:] == ["MD-1", "MD-2"] * 3
+    assert all(len(result.observations) == 2 for result in later_results)
+    assert all(
+        not {
+            LifecycleEventType.MISSED,
+            LifecycleEventType.CLOSED,
+        }.intersection(event.event_type for event in result.events)
+        for result in later_results
+    )
+    final_split_flow = next(
+        item for item in later_results[-1].active_sessions if item.observation.source_port == 23456
+    )
+    assert final_split_flow.instance_id == split_flow.instance_id
+    assert final_split_flow.miss_count == 0
+    assert final_split_flow.last_seen > first_seen
+
+
 def test_repeated_full_scans_rotate_the_first_managed_device() -> None:
     outputs = {
         "MM-Primary": _mm_outputs(None, None),
@@ -480,6 +627,99 @@ def test_repeated_fallback_full_scans_also_rotate_the_first_managed_device() -> 
 
     assert first_calls == ("MD-1", "MD-2", "MD-3", "MD-4")
     assert second_calls == ("MD-2", "MD-3", "MD-4", "MD-1")
+
+
+def test_fallback_scan_also_queries_an_active_controller_missing_from_its_cache() -> None:
+    config = _config()
+    outputs = {
+        "MD-1": {
+            NO_PAGING_COMMAND: "",
+            build_datapath_session_command(REQUEST.source_ip): _datapath_output(),
+        },
+        "MD-2": {
+            NO_PAGING_COMMAND: "",
+            build_datapath_session_command(REQUEST.source_ip): _datapath_output(source_port=23456),
+        },
+    }
+    factory = FakeFactory(outputs)
+    service = TrackerService(config, factory)
+
+    outcome = service.query_once(
+        QueryRequest(REQUEST.source_ip, REQUEST.destination_ip),
+        CREDENTIALS,
+        location_snapshot=LocationSnapshot(
+            source=None,
+            destination=None,
+            used_mm="MM-Primary",
+            full_scan_eligible=True,
+        ),
+        refresh_locations=False,
+        fallback_devices=(config.managed_devices[0],),
+        required_controller_hosts=(config.managed_devices[1].host,),
+    )
+
+    assert outcome.authoritative is True
+    assert len(outcome.observations) == 2
+    assert factory.calls == ["MD-1", "MD-2"]
+
+
+def test_direct_multi_md_query_fairly_slices_deadline_and_reaches_later_device() -> None:
+    outputs = {
+        "MM-Primary": _mm_outputs("192.0.2.101", "192.0.2.102"),
+        "MD-1": {
+            NO_PAGING_COMMAND: "",
+            build_datapath_session_command(REQUEST.source_ip): DATAPATH_EMPTY,
+        },
+        "MD-2": {
+            NO_PAGING_COMMAND: "",
+            build_datapath_session_command(REQUEST.destination_ip): _datapath_output(),
+        },
+    }
+
+    class DirectDeadlineFactory(FakeFactory):
+        def __init__(self) -> None:
+            super().__init__(outputs)
+            self.md_deadlines: list[float] = []
+
+        def connect(
+            self,
+            target: DeviceTarget,
+            credentials: Credentials,
+            *,
+            host_key_approval: object,
+            cancel_token: CancellationToken,
+            deadline: object,
+        ) -> FakeConnection:
+            if target.name.startswith("MD-"):
+                assert isinstance(deadline, PollDeadline)
+                self.md_deadlines.append(deadline.expires_at)
+                if target.name == "MD-1":
+                    self.calls.append(target.name)
+                    raise CollectorError(
+                        ErrorCode.POLL_DEADLINE_EXCEEDED,
+                        "fixture direct-device slice expired",
+                        retryable_network=True,
+                    )
+            return super().connect(
+                target,
+                credentials,
+                host_key_approval=host_key_approval,
+                cancel_token=cancel_token,
+                deadline=deadline,
+            )
+
+    factory = DirectDeadlineFactory()
+
+    outcome = TrackerService(_config(), factory).query_once(
+        REQUEST,
+        CREDENTIALS,
+        deadline=PollDeadline(100.0, lambda: 0.0),
+    )
+
+    assert factory.calls == ["MM-Primary", "MD-1", "MD-2"]
+    assert factory.md_deadlines == pytest.approx([50.0, 100.0])
+    assert len(outcome.observations) == 1
+    assert outcome.authoritative is False
 
 
 def test_full_scan_deadline_slice_failure_does_not_starve_later_devices() -> None:

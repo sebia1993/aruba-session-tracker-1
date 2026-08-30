@@ -289,12 +289,16 @@ class MonitorEngine:
             or now_monotonic - last_location_refresh
             >= self._service.config.location_interval_seconds
         )
+        required_controller_hosts = tuple(
+            dict.fromkeys(item.observation.controller_host for item in active.values())
+        )
         outcome = self._query(
             token,
             refresh=refresh,
             location_snapshot=location_snapshot,
             allow_full_scan=refresh,
             fallback_devices=() if refresh else fallback_devices,
+            required_controller_hosts=required_controller_hosts,
             poll_budget=poll_budget,
             deadline=deadline,
         )
@@ -318,6 +322,7 @@ class MonitorEngine:
                     location_snapshot=location_snapshot,
                     allow_full_scan=True,
                     fallback_devices=(),
+                    required_controller_hosts=required_controller_hosts,
                     poll_budget=poll_budget,
                     deadline=deadline,
                 )
@@ -521,6 +526,7 @@ class MonitorEngine:
         location_snapshot: LocationSnapshot | None,
         allow_full_scan: bool,
         fallback_devices: tuple[DeviceTarget, ...],
+        required_controller_hosts: tuple[str, ...],
         poll_budget: PollBudget,
         deadline: PollDeadline,
     ) -> QueryOutcome:
@@ -533,6 +539,7 @@ class MonitorEngine:
             refresh_locations=refresh,
             allow_full_scan=allow_full_scan,
             fallback_devices=fallback_devices,
+            required_controller_hosts=required_controller_hosts,
             poll_budget=poll_budget,
             deadline=deadline,
         )

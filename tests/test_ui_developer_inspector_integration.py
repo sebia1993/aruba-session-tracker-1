@@ -165,6 +165,18 @@ def test_static_requests_never_copy_runtime_canaries(qtbot: object, tmp_path: Pa
     assert canary not in static_output
     assert "현재 현상:\n원하는 변경:" in static_output
 
+    window.show()
+    _send_plain_f12(application, window)
+    metadata = next(item for item in inspector.catalog if item.stable_id == "MAIN-QUERY-RUN")
+    dialog = inspector.show_element_detail(metadata, window)
+    assert dialog is not None
+    copied = dialog.copy_request()
+    assert copied == inspector.request_text(metadata)
+    assert QApplication.clipboard().text() == copied
+    assert canary not in copied
+    assert "자동 전송되지는 않습니다" in dialog.copy_status.text()
+
+    QApplication.clipboard().clear()
     inspector.close()
     window.close()
 
