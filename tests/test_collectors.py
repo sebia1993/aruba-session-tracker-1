@@ -535,6 +535,30 @@ def test_factory_deadline_watchdog_aborts_blocked_enable(tmp_path: Path) -> None
     assert caught.value.code is ErrorCode.POLL_DEADLINE_EXCEEDED
 
 
+def test_deadline_watchdog_rechecks_an_early_timer_wakeup() -> None:
+    now = [0.0]
+
+    class EarlyWakeStop:
+        def __init__(self) -> None:
+            self.wait_calls = 0
+
+        def wait(self, timeout: float) -> bool:
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                now[0] += timeout / 2
+            else:
+                now[0] += timeout + 0.01
+            return False
+
+    stop = EarlyWakeStop()
+
+    assert ssh_module._deadline_elapsed_before_stop(  # type: ignore[arg-type]
+        PollDeadline(0.1, lambda: now[0]),
+        stop,
+    )
+    assert stop.wait_calls == 2
+
+
 def test_factory_deadline_watchdog_closes_owned_socket_during_blocked_connect(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
