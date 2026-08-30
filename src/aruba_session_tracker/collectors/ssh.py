@@ -157,6 +157,17 @@ class PollDeadline:
             )
 
 
+def _deadline_elapsed_before_stop(deadline: PollDeadline, stop: threading.Event) -> bool:
+    """Wait until the monotonic deadline, tolerating early OS timer wakeups."""
+
+    while True:
+        remaining = deadline.remaining_seconds
+        if remaining <= 0:
+            return True
+        if stop.wait(remaining):
+            return False
+
+
 @dataclass(frozen=True, slots=True)
 class HostKeyInfo:
     algorithm: str
@@ -457,7 +468,7 @@ class _NetmikoConnectionManager(AbstractContextManager[CommandConnection]):
         deadline = self._deadline
         if deadline is None:
             return
-        if self._deadline_stop.wait(deadline.remaining_seconds):
+        if not _deadline_elapsed_before_stop(deadline, self._deadline_stop):
             return
         self.abort()
 
@@ -571,7 +582,7 @@ class _SocketDeadlineGuard:
             self._socket.close()
 
     def _watch(self) -> None:
-        if not self._stop.wait(self._deadline.remaining_seconds):
+        if _deadline_elapsed_before_stop(self._deadline, self._stop):
             self.close_socket()
 
 
