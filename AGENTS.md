@@ -22,10 +22,19 @@ datapath session rows from the relevant 7240XM managed device.
   Keep every controller that owns an active flow in the authoritative poll
   scope; a positive result from one MD must never advance another MD's flow to
   `MISSED` or `CLOSED`.
+- Keep one logical lifecycle instance for a controller-free five-tuple while
+  preserving every controller-specific observation and Raw link. An
+  authoritative controller overlap must not emit `CONTROLLER_CHANGED`; retain
+  all overlap controllers in the next required poll scope and confirm a move
+  only after an authoritative singleton resolves the overlap.
 - Host-key and full-MD-scan approvals share the poll cancellation and monotonic
   deadline. Ignore every approval result that arrives after either boundary,
   and never save a host key or start a scan from that late result. Process and
   Windows file locks for known_hosts must share the same boundary.
+- Probe an unknown SSH host before approval, but do not repeat the probe for a
+  safely loaded known-host token when the production connector performs the
+  strict authenticated check. A wrapped BadHostKey or missing known-host entry
+  remains non-retryable `HOST_KEY_CHANGED`; ordinary timeouts remain transient.
 - Never fall back to an unfiltered datapath table query.
 - Treat managed files, operation manifests, leases, crash journals and their
   parent directories as local security boundaries. Reject symbolic links,
@@ -53,6 +62,9 @@ datapath session rows from the relevant 7240XM managed device.
   shutdown work off the Qt GUI thread. Every new lifecycle worker must have a
   bounded wait, cancellation boundary, sanitized failure result and recovery
   behavior that is safe after process interruption.
+- Persist one-shot runs as `COMPLETED` for authoritative results, `PARTIAL` only
+  when a non-authoritative result retains positive observations, `FAILED` for
+  zero-observation non-authoritative failures, and `CANCELLED` for cancellation.
 - Bind deferred Qt callbacks to their owning `QObject` lifetime. Daemon workers
   must tolerate their signal sender being deleted during final Qt teardown;
   never leave an unowned callback that can call a deleted window later.
@@ -116,6 +128,9 @@ datapath session rows from the relevant 7240XM managed device.
 - Omit packet, byte, and counter-delta values from HTML while preserving them
   in SQLite, CSV, and Raw data. Do not change those storage formats for this
   presentation-only simplification.
+- The History and Export screen may show read-only Raw file count, Raw bytes,
+  total managed bytes and free space. A 100,000-file Raw warning is advisory
+  only: it must not stop polling, show repeated popups, compact, or delete data.
 - Exclude diagnostic events and codes, Raw bodies, paths and hashes, CLI and
   program-flow material, troubleshooting, developer information, credentials,
   and logs from HTML. Do not change the SQLite schema, CSV or Raw format for

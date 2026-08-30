@@ -35,13 +35,16 @@ from aruba_session_tracker.storage import DeletePreview, SessionStore, StorageEr
 from aruba_session_tracker.ui import MainWindow
 from aruba_session_tracker.ui.main_window import (
     _OPERATOR_STATES,
+    _RAW_FILE_COUNT_WARNING,
     ApprovalBridge,
     _counter_delta,
     _display_bytes,
     _fatal_diagnostic_code,
     _lifecycle_status,
     _optional_port,
+    _prepare_display_outcome,
     _safe_query_failure,
+    _storage_status_text,
 )
 
 
@@ -251,6 +254,60 @@ def test_lifecycle_status_distinguishes_uncertain_missing_and_active_changes() -
     )
 
 
+def test_display_preparation_keeps_same_flow_from_multiple_controllers_visible() -> None:
+    first = SessionObservation(
+        controller_name="MD-01",
+        controller_host="198.51.100.21",
+        protocol=6,
+        source_ip="192.0.2.10",
+        destination_ip="203.0.113.20",
+        source_port=54321,
+        destination_port=443,
+        packets=10,
+        bytes_count=100,
+    )
+    second = SessionObservation(
+        controller_name="MD-02",
+        controller_host="198.51.100.22",
+        protocol=6,
+        source_ip="192.0.2.10",
+        destination_ip="203.0.113.20",
+        source_port=54321,
+        destination_port=443,
+        packets=20,
+        bytes_count=200,
+    )
+    prepared = _prepare_display_outcome(
+        SimpleNamespace(
+            observations=(second, first),
+            active_sessions=(SimpleNamespace(observation=first, miss_count=0),),
+            events=(),
+            authoritative=True,
+        ),
+        previous_counters={
+            first.session_key: (5, 50),
+            second.session_key: (15, 150),
+        },
+        close_after_misses=3,
+        monitoring=True,
+    )
+
+    assert [row.observation.controller_name for row in prepared.visible_rows] == [
+        "MD-01",
+        "MD-02",
+    ]
+    assert [(row.packet_delta, row.byte_delta) for row in prepared.visible_rows] == [
+        ("+5", "+50"),
+        ("+5", "+50"),
+    ]
+    assert {row.lifecycle_status for row in prepared.visible_rows} == {"활성 · 여러 MD에서 관측"}
+    assert prepared.total_rows == 2
+    assert prepared.next_counters == {
+        first.session_key: (10, 100),
+        second.session_key: (20, 200),
+    }
+
+
 def test_fatal_diagnostic_code_and_file_size_display_cover_boundaries() -> None:
     nonfatal = SimpleNamespace(code=ErrorCode.PARSE_PARTIAL)
     fatal = SimpleNamespace(code=ErrorCode.AUTH_FAILED)
@@ -288,6 +345,69 @@ def test_fatal_diagnostic_code_and_file_size_display_cover_boundaries() -> None:
     assert _display_bytes(1024) == "1.0 KiB"
     assert _display_bytes(1024**2) == "1.0 MiB"
     assert _display_bytes(1024**3) == "1.0 GiB"
+
+
+def test_storage_status_text_reports_usage_and_advises_at_raw_file_threshold() -> None:
+    below_threshold = SimpleNamespace(
+        raw_file_count=_RAW_FILE_COUNT_WARNING - 1,
+        raw_bytes=2 * 1024**3,
+        total_managed_bytes=3 * 1024**3,
+        free_bytes=20 * 1024**3,
+    )
+    at_threshold = SimpleNamespace(
+        raw_file_count=_RAW_FILE_COUNT_WARNING,
+        raw_bytes=2 * 1024**3,
+        total_managed_bytes=3 * 1024**3,
+        free_bytes=20 * 1024**3,
+    )
+
+    normal = _storage_status_text(below_threshold)
+    advisory = _storage_status_text(at_threshold)
+
+    assert "Raw 파일 99,999개" in normal
+    assert "Raw 2.0 GiB" in normal
+    assert "전체 관리 데이터 3.0 GiB" in normal
+    assert "여유 공간 20.0 GiB" in normal
+    assert "주의:" not in normal
+    assert "Raw 파일 100,000개" in advisory
+    assert "주의:" in advisory
+    assert "자동 삭제되지 않으므로" in advisory
+
+
+def test_history_tab_shows_read_only_storage_status_without_changing_default_tab(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "tracker.db", tmp_path / "raw", tmp_path / "exports")
+    store.initialize()
+    run_id = store.start_run(QueryRequest("192.0.2.10", "203.0.113.20"))
+    store.record_query(
+        run_id,
+        (),
+        raw_text="raw-status",
+        controller_name="MD-01",
+        captured_at=datetime(2026, 8, 31, 1, 0, tzinfo=UTC),
+    )
+    store.finish_run(run_id)
+
+    window = MainWindow(ConfigRepository(tmp_path / "config.json"), store, _Executor())
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: (
+            not window._history_task_running
+            and window.storage_status_label.text() != "저장소 현황을 확인하는 중입니다."
+        ),
+        timeout=5000,
+    )
+
+    status = window.storage_status_label.text()
+    assert window.tabs.currentWidget() is window.query_page
+    assert "Raw 파일 1개" in status
+    assert "Raw 10 B" in status
+    assert "전체 관리 데이터" in status
+    assert "여유 공간" in status
+    assert "주의:" not in status
+    window.close()
 
 
 def test_html_report_export_is_independent_from_csv(
@@ -603,10 +723,18 @@ class _StorageHealthStore(_EmptyStore):
         warning: bool = False,
         hard_stop: bool = False,
         capacity_failure: StorageError | None = None,
+        raw_file_count: int = 0,
+        raw_bytes: int = 0,
+        total_managed_bytes: int = 0,
+        free_bytes: int = 10 * 1024**3,
     ) -> None:
         self.warning = warning
         self.hard_stop = hard_stop
         self.capacity_failure = capacity_failure
+        self.raw_file_count = raw_file_count
+        self.raw_bytes = raw_bytes
+        self.total_managed_bytes = total_managed_bytes
+        self.free_bytes = free_bytes
         self.capacity_calls = 0
         self.health_calls = 0
 
@@ -617,7 +745,14 @@ class _StorageHealthStore(_EmptyStore):
 
     def storage_health(self) -> object:
         self.health_calls += 1
-        return SimpleNamespace(warning=self.warning, hard_stop=self.hard_stop)
+        return SimpleNamespace(
+            warning=self.warning,
+            hard_stop=self.hard_stop,
+            raw_file_count=self.raw_file_count,
+            raw_bytes=self.raw_bytes,
+            total_managed_bytes=self.total_managed_bytes,
+            free_bytes=self.free_bytes,
+        )
 
 
 def _delete_preview_fixture() -> DeletePreview:
@@ -1543,9 +1678,22 @@ class _CountingExecutor(_Executor):
 def test_monitor_rechecks_storage_health_on_a_bounded_interval(
     qtbot: object,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = _StorageHealthStore(warning=True)
+    store = _StorageHealthStore(
+        warning=True,
+        raw_file_count=_RAW_FILE_COUNT_WARNING,
+        raw_bytes=2 * 1024**3,
+        total_managed_bytes=3 * 1024**3,
+        free_bytes=4 * 1024**3,
+    )
     executor = _CountingExecutor()
+    popup_warnings: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, _title, message, *_args: popup_warnings.append(str(message)),
+    )
     window = MainWindow(
         ConfigRepository(tmp_path / "config.json"),
         store,  # type: ignore[arg-type]
@@ -1563,6 +1711,9 @@ def test_monitor_rechecks_storage_health_on_a_bounded_interval(
     assert store.capacity_calls == 1
     assert store.health_calls == 1
     assert "저장 공간이 부족" in window.statusBar().currentMessage()
+    assert "Raw 파일 100,000개" in window.storage_status_label.text()
+    assert "주의:" in window.storage_status_label.text()
+    assert popup_warnings == []
 
     window._start_query()
     qtbot.waitUntil(  # type: ignore[attr-defined]

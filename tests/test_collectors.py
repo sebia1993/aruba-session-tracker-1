@@ -11,7 +11,7 @@ from typing import Self
 
 import paramiko
 import pytest
-from netmiko.exceptions import NetmikoAuthenticationException
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 
 import aruba_session_tracker.collectors.ssh as ssh_module
 from aruba_session_tracker.collectors import (
@@ -116,6 +116,27 @@ def test_collector_checks_cancellation_and_output_limits() -> None:
             TARGET, CREDENTIALS, ("no paging",)
         )
     assert caught.value.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
+
+
+def test_paging_validation_preserves_explicit_command_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = FakeConnection({"no paging": "authorization fixture"})
+
+    def reject_as_unauthorized(_output: str) -> None:
+        raise ssh_module.ParseError(
+            "fixture authorization rejection",
+            code=ErrorCode.COMMAND_REJECTED,
+        )
+
+    monkeypatch.setattr(ssh_module, "reject_command_errors", reject_as_unauthorized)
+
+    with pytest.raises(CollectorError) as caught:
+        SSHCollector(FakeFactory(connection)).collect(TARGET, CREDENTIALS, ("no paging",))
+
+    assert caught.value.code is ErrorCode.COMMAND_REJECTED
+    assert caught.value.retryable_network is False
+    assert connection.closed is True
 
 
 def test_cancellation_wins_over_timeout_and_cleanup_failure() -> None:
@@ -773,6 +794,170 @@ def test_unknown_host_key_requires_callback_and_changed_key_fails_closed(tmp_pat
         )
     assert caught.value.code is ErrorCode.HOST_KEY_CHANGED
     assert caught.value.retryable_network is False
+
+
+def test_default_connector_skips_probe_for_safely_loaded_known_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    key = paramiko.RSAKey.generate(1024)
+    known_hosts = tmp_path / "known_hosts"
+    host_keys = paramiko.HostKeys()
+    host_keys.add(TARGET.host, key.get_name(), key)
+    host_keys.save(str(known_hosts))
+    connector_calls: list[dict[str, object]] = []
+
+    class FakeSocket:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def settimeout(self, _timeout: float) -> None:
+            return None
+
+        def shutdown(self, _how: int) -> None:
+            self.closed = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    fake_socket = FakeSocket()
+    monkeypatch.setattr(
+        ssh_module.socket,
+        "create_connection",
+        lambda *_args, **_kwargs: fake_socket,
+    )
+    factory = StrictNetmikoFactory(
+        known_hosts,
+        key_probe=lambda *_args: pytest.fail("known host was probed"),
+    )
+
+    def connector(**kwargs: object) -> FakeNetmiko:
+        connector_calls.append(kwargs)
+        connection = FakeNetmiko()
+        connection.sock = kwargs["sock"]
+        return connection
+
+    factory._connector = connector
+    with factory.connect(
+        TARGET,
+        CREDENTIALS,
+        host_key_approval=lambda *_args: pytest.fail("known host requested approval"),
+        cancel_token=CancellationToken(),
+    ):
+        pass
+
+    assert len(connector_calls) == 1
+    assert connector_calls[0]["ssh_strict"] is True
+    assert connector_calls[0]["system_host_keys"] is False
+    assert connector_calls[0]["alt_host_keys"] is True
+    assert connector_calls[0]["alt_key_file"] == str(known_hosts)
+    snapshot = connector_calls[0]["host_keys_snapshot"]
+    assert isinstance(snapshot, paramiko.HostKeys)
+    assert snapshot.check(TARGET.host, key) is True
+    assert connector_calls[0]["sock"] is fake_socket
+    assert fake_socket.closed is True
+
+
+def test_default_connector_distinguishes_wrapped_host_key_rejections_from_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    trusted_key = paramiko.RSAKey.generate(1024)
+    changed_key = paramiko.RSAKey.generate(1024)
+    known_hosts = tmp_path / "known_hosts"
+    host_keys = paramiko.HostKeys()
+    host_keys.add(TARGET.host, trusted_key.get_name(), trusted_key)
+    host_keys.save(str(known_hosts))
+    sockets: list[object] = []
+
+    class FakeSocket:
+        def settimeout(self, _timeout: float) -> None:
+            return None
+
+        def shutdown(self, _how: int) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    def create_socket(*_args: object, **_kwargs: object) -> FakeSocket:
+        current = FakeSocket()
+        sockets.append(current)
+        return current
+
+    monkeypatch.setattr(ssh_module.socket, "create_connection", create_socket)
+
+    strict_failures = (
+        paramiko.BadHostKeyException(TARGET.host, changed_key, trusted_key),
+        paramiko.SSHException(f"Server {TARGET.host!r} not found in known_hosts"),
+    )
+    for strict_failure in strict_failures:
+        factory = StrictNetmikoFactory(
+            known_hosts,
+            key_probe=lambda *_args: pytest.fail("known host was probed"),
+        )
+
+        def reject_host_key(
+            *,
+            failure: paramiko.SSHException = strict_failure,
+            **_kwargs: object,
+        ) -> FakeNetmiko:
+            try:
+                raise failure
+            except paramiko.SSHException as exc:
+                raise NetmikoTimeoutException("wrapped strict connection failure") from exc
+
+        factory._connector = reject_host_key
+        with pytest.raises(CollectorError) as caught:
+            factory.connect(
+                TARGET,
+                CREDENTIALS,
+                host_key_approval=lambda *_args: pytest.fail("known host requested approval"),
+                cancel_token=CancellationToken(),
+            )
+        assert caught.value.code is ErrorCode.HOST_KEY_CHANGED
+        assert caught.value.retryable_network is False
+
+    timeout_factory = StrictNetmikoFactory(
+        known_hosts,
+        key_probe=lambda *_args: pytest.fail("known host was probed"),
+    )
+
+    def timeout_connector(**_kwargs: object) -> FakeNetmiko:
+        raise NetmikoTimeoutException("fixture host key lookup timed out")
+
+    timeout_factory._connector = timeout_connector
+    with pytest.raises(CollectorError) as caught:
+        timeout_factory.connect(
+            TARGET,
+            CREDENTIALS,
+            host_key_approval=lambda *_args: pytest.fail("known host requested approval"),
+            cancel_token=CancellationToken(),
+        )
+
+    assert caught.value.code is ErrorCode.MM_UNREACHABLE
+    assert caught.value.retryable_network is True
+
+    negotiation_factory = StrictNetmikoFactory(
+        known_hosts,
+        key_probe=lambda *_args: pytest.fail("known host was probed"),
+    )
+
+    def incompatible_host_key_algorithm(**_kwargs: object) -> FakeNetmiko:
+        raise paramiko.IncompatiblePeer("Incompatible ssh peer (no acceptable host key)")
+
+    negotiation_factory._connector = incompatible_host_key_algorithm
+    with pytest.raises(CollectorError) as caught:
+        negotiation_factory.connect(
+            TARGET,
+            CREDENTIALS,
+            host_key_approval=lambda *_args: pytest.fail("known host requested approval"),
+            cancel_token=CancellationToken(),
+        )
+
+    assert caught.value.code is ErrorCode.MM_UNREACHABLE
+    assert caught.value.retryable_network is True
+    assert len(sockets) == 4
 
 
 def test_known_hosts_parent_identity_change_fails_closed(tmp_path: Path) -> None:

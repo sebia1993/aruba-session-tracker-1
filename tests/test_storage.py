@@ -660,6 +660,65 @@ def test_record_poll_batch_uses_explicit_same_controller_raw_provenance(
     assert f'"observation_keys":["{observation.session_key}"]' in bundle
 
 
+def test_poll_batch_persists_cross_controller_overlap_without_schema_change(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    first = _observation(controller_name="MD-01", controller_host="198.51.100.21")
+    second = _observation(controller_name="MD-02", controller_host="198.51.100.22")
+    outcome = QueryOutcome(
+        observations=(first, second),
+        diagnostics=(
+            DiagnosticEvent(
+                stage="MONITOR_STATE",
+                code=ErrorCode.DUPLICATE_FLOW_ACROSS_CONTROLLERS,
+                message="fixture overlap",
+            ),
+        ),
+        raw_snapshots=(
+            RawSnapshot(
+                "MD-01",
+                "show datapath session table 192.0.2.100",
+                "first controller output",
+                observation_keys=(first.session_key,),
+            ),
+            RawSnapshot(
+                "MD-02",
+                "show datapath session table 192.0.2.100",
+                "second controller output",
+                observation_keys=(second.session_key,),
+            ),
+        ),
+        authoritative=True,
+    )
+
+    store.record_poll_batch(run_id, outcome)
+
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        observations = connection.execute(
+            """
+            SELECT controller_host, session_key, raw_file_id
+            FROM observations WHERE run_id = ? ORDER BY controller_host
+            """,
+            (run_id,),
+        ).fetchall()
+        diagnostic_code = connection.execute(
+            "SELECT code FROM diagnostic_events WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()[0]
+        schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+    assert [row[:2] for row in observations] == [
+        (first.controller_host, first.session_key),
+        (second.controller_host, second.session_key),
+    ]
+    assert observations[0][2] is not None
+    assert observations[1][2] == observations[0][2]
+    assert diagnostic_code == ErrorCode.DUPLICATE_FLOW_ACROSS_CONTROLLERS.value
+    assert schema_version == 2
+
+
 def test_poll_bundle_keeps_csv_references_and_deletes_as_one_file(tmp_path: Path) -> None:
     store = _store(tmp_path)
     run_id = _run(store)

@@ -66,6 +66,10 @@ _UI_SOURCE_PATH = "src/aruba_session_tracker/ui/main_window.py"
 _MAX_VISIBLE_RESULT_ROWS = 2_000
 _DETAIL_COLUMN_INDEXES = range(5, 12)
 _STORAGE_HEALTH_INTERVAL_SECONDS = 60.0
+# Advisory only: the supported five-second interval reaches 100,000 Raw files
+# in about 5.8 days.  Surface the filesystem-pressure risk before the first
+# full week without changing the existing free-space hard stop.
+_RAW_FILE_COUNT_WARNING = 100_000
 _OPERATOR_STATES = frozenset({"대기", "조회 중", "정상", "재시도 중", "확인 필요"})
 _RESULT_RENDER_CHUNK_SIZE = 200
 
@@ -90,6 +94,7 @@ class _PreparedDisplayOutcome:
 class _HistoryReadResult:
     runs: tuple[object, ...]
     pending_external_recoveries: int
+    storage_health: object | None
 
 
 class QueryExecutor(Protocol):
@@ -127,6 +132,7 @@ class _TaskSignals(QObject):
     failed = Signal(int, object)
     finished = Signal(int)
     storage_warning = Signal(int, bool)
+    storage_health_updated = Signal(int, object)
 
 
 class _QueryTask(QRunnable):
@@ -169,6 +175,11 @@ class _QueryTask(QRunnable):
                 self._query_capacity_check()
             if self._storage_health_check is not None:
                 health = self._storage_health_check()
+                _emit_if_alive(
+                    self.signals.storage_health_updated,
+                    self.generation,
+                    health,
+                )
                 if bool(getattr(health, "warning", False)):
                     hard_stop = bool(getattr(health, "hard_stop", False))
                     _emit_if_alive(
@@ -947,6 +958,10 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.delete_all_button)
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
+        self.storage_status_label = QLabel("저장소 현황을 확인하는 중입니다.")
+        self.storage_status_label.setAccessibleName("저장소 사용 현황")
+        self.storage_status_label.setWordWrap(True)
+        layout.addWidget(self.storage_status_label)
         self.history_table = QTableWidget(0, 5)
         self.history_table.setHorizontalHeaderLabels(["Run ID", "시작", "종료", "상태", "관측 행"])
         self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -1650,6 +1665,7 @@ class MainWindow(QMainWindow):
         task.signals.failed.connect(self._task_failed)
         task.signals.finished.connect(self._query_finished)
         task.signals.storage_warning.connect(self._show_storage_warning)
+        task.signals.storage_health_updated.connect(self._storage_health_updated)
         _start_daemon_task(task.run, f"aruba-session-query-{generation}")
 
     @Slot()
@@ -2102,6 +2118,8 @@ class MainWindow(QMainWindow):
             requested_reconciliation = reconciliation_value is True
         if requested_reconciliation:
             self._storage_reconciliation_pending = False
+        if result.storage_health is not None:
+            self._update_storage_status(result.storage_health)
         self._render_history(result.runs, selected_run_id)
         self._history_dirty = requested_revision != self._history_revision
         if result.pending_external_recoveries > 0:
@@ -2274,6 +2292,15 @@ class MainWindow(QMainWindow):
             else "저장 공간이 부족해지고 있습니다. 오래된 기록을 정리해 주세요."
         )
         self.statusBar().showMessage(message, 15000)
+
+    @Slot(int, object)
+    def _storage_health_updated(self, generation: int, health: object) -> None:
+        if not self._owns_task(generation) or self._closing_requested:
+            return
+        self._update_storage_status(health)
+
+    def _update_storage_status(self, health: object) -> None:
+        self.storage_status_label.setText(_storage_status_text(health))
 
     @Slot(int, str, str, int, int)
     def _storage_task_progress(
@@ -2560,9 +2587,10 @@ def _read_history_task(
     if cancel_check():
         raise StorageError("기록 읽기가 취소되었습니다.", code=ErrorCode.CANCELLED)
     reconcile = getattr(store, "reconcile_storage_health", None)
+    storage_health: object | None = None
     if reconcile_storage and callable(reconcile):
         progress("SCAN", 0, None)
-        reconcile(cancel_check=cancel_check, progress=progress)
+        storage_health = reconcile(cancel_check=cancel_check, progress=progress)
         if cancel_check():
             raise StorageError("기록 읽기가 취소되었습니다.", code=ErrorCode.CANCELLED)
         progress("SCAN", 1, 1)
@@ -2580,7 +2608,11 @@ def _read_history_task(
     if cancel_check():
         raise StorageError("기록 읽기가 취소되었습니다.", code=ErrorCode.CANCELLED)
     progress("READ", len(result), len(result))
-    return _HistoryReadResult(result, pending_recoveries)
+    if storage_health is None and not reconcile_storage:
+        health_check = getattr(store, "storage_health", None)
+        if callable(health_check):
+            storage_health = health_check()
+    return _HistoryReadResult(result, pending_recoveries, storage_health)
 
 
 def _safe_query_failure(exc: Exception) -> tuple[str, str]:
@@ -2650,9 +2682,10 @@ def _prepare_display_outcome(
     active_sessions = tuple(getattr(outcome, "active_sessions", ()))
     lifecycle_events = tuple(getattr(outcome, "events", ()))
     authoritative = bool(getattr(outcome, "authoritative", False))
-    observed_by_flow = {
-        _flow_key(item): item for item in observations if isinstance(item, SessionObservation)
-    }
+    observed_by_flow: dict[str, list[SessionObservation]] = {}
+    for item in observations:
+        if isinstance(item, SessionObservation):
+            observed_by_flow.setdefault(_flow_key(item), []).append(item)
     event_types_by_flow: dict[str, set[str]] = {}
     closed_observations: dict[str, SessionObservation] = {}
     for event in lifecycle_events:
@@ -2667,47 +2700,62 @@ def _prepare_display_outcome(
 
     rows: list[_DisplayRow] = []
     next_counters: dict[str, tuple[int | None, int | None]] = {}
+    displayed_active_flows: set[str] = set()
     if active_sessions:
         for session in active_sessions:
-            observation = getattr(session, "observation", None)
-            if not isinstance(observation, SessionObservation):
+            active_observation = getattr(session, "observation", None)
+            if not isinstance(active_observation, SessionObservation):
                 continue
-            flow_key = _flow_key(observation)
-            is_observed = flow_key in observed_by_flow
-            previous = previous_counters.get(flow_key)
-            packet_delta = (
-                _counter_delta(
+            flow_key = _flow_key(active_observation)
+            displayed_active_flows.add(flow_key)
+            current_observations = observed_by_flow.get(flow_key, [])
+            display_observations = current_observations or [active_observation]
+            event_types = set(event_types_by_flow.get(flow_key, set()))
+            if len(current_observations) > 1:
+                event_types.add("CONTROLLER_OVERLAP")
+            for observation in sorted(
+                display_observations,
+                key=lambda item: (item.controller_host, item.controller_name, item.session_key),
+            ):
+                is_observed = bool(current_observations)
+                counter_key = observation.session_key
+                previous = previous_counters.get(counter_key)
+                packet_delta = (
+                    _counter_delta(
+                        observation.packets,
+                        None if previous is None else previous[0],
+                    )
+                    if is_observed
+                    else "-"
+                )
+                byte_delta = (
+                    _counter_delta(
+                        observation.bytes_count,
+                        None if previous is None else previous[1],
+                    )
+                    if is_observed
+                    else "-"
+                )
+                rows.append(
+                    _DisplayRow(
+                        observation,
+                        packet_delta,
+                        byte_delta,
+                        _lifecycle_status(
+                            event_types,
+                            miss_count=int(getattr(session, "miss_count", 0)),
+                            close_after_misses=close_after_misses,
+                            is_observed=is_observed,
+                            authoritative=authoritative,
+                        ),
+                    )
+                )
+                next_counters[counter_key] = (
                     observation.packets,
-                    None if previous is None else previous[0],
-                )
-                if is_observed
-                else "-"
-            )
-            byte_delta = (
-                _counter_delta(
                     observation.bytes_count,
-                    None if previous is None else previous[1],
                 )
-                if is_observed
-                else "-"
-            )
-            rows.append(
-                _DisplayRow(
-                    observation,
-                    packet_delta,
-                    byte_delta,
-                    _lifecycle_status(
-                        event_types_by_flow.get(flow_key, set()),
-                        miss_count=int(getattr(session, "miss_count", 0)),
-                        close_after_misses=close_after_misses,
-                        is_observed=is_observed,
-                        authoritative=authoritative,
-                    ),
-                )
-            )
-            next_counters[flow_key] = (observation.packets, observation.bytes_count)
         for flow_key, observation in closed_observations.items():
-            if flow_key not in next_counters:
+            if flow_key not in displayed_active_flows:
                 rows.append(
                     _DisplayRow(
                         observation,
@@ -2720,8 +2768,8 @@ def _prepare_display_outcome(
         for observation in observations:
             if not isinstance(observation, SessionObservation):
                 continue
-            flow_key = _flow_key(observation)
-            previous = previous_counters.get(flow_key)
+            counter_key = observation.session_key
+            previous = previous_counters.get(counter_key)
             rows.append(
                 _DisplayRow(
                     observation,
@@ -2736,7 +2784,7 @@ def _prepare_display_outcome(
                     None,
                 )
             )
-            next_counters[flow_key] = (observation.packets, observation.bytes_count)
+            next_counters[counter_key] = (observation.packets, observation.bytes_count)
     return _PreparedDisplayOutcome(
         outcome=outcome,
         visible_rows=tuple(rows[:_MAX_VISIBLE_RESULT_ROWS]),
@@ -2768,6 +2816,8 @@ def _lifecycle_status(
         labels.append("새 세션")
     if "CONTROLLER_CHANGED" in event_types:
         labels.append("MD 변경")
+    if "CONTROLLER_OVERLAP" in event_types:
+        labels.append("여러 MD에서 관측")
     if "FLAGS_CHANGED" in event_types:
         labels.append("플래그 변경")
     return "활성" + (" · " + " · ".join(labels) if labels else "")
@@ -2819,6 +2869,25 @@ def _display_bytes(value: int) -> str:
             return f"{amount:.1f} {unit}" if unit != "B" else f"{int(amount)} B"
         amount /= 1024
     return f"{value} B"
+
+
+def _storage_status_text(health: object) -> str:
+    raw_file_count = _nonnegative_int(getattr(health, "raw_file_count", 0))
+    raw_bytes = _nonnegative_int(getattr(health, "raw_bytes", 0))
+    total_managed_bytes = _nonnegative_int(getattr(health, "total_managed_bytes", 0))
+    free_bytes = _nonnegative_int(getattr(health, "free_bytes", 0))
+    summary = (
+        f"저장소 현황 · Raw 파일 {raw_file_count:,}개 · Raw {_display_bytes(raw_bytes)} · "
+        f"전체 관리 데이터 {_display_bytes(total_managed_bytes)} · "
+        f"여유 공간 {_display_bytes(free_bytes)}"
+    )
+    if raw_file_count >= _RAW_FILE_COUNT_WARNING:
+        summary += (
+            "\n주의: Raw 파일이 "
+            f"{_RAW_FILE_COUNT_WARNING:,}개 이상입니다. 자동 삭제되지 않으므로 "
+            "보존 정책에 따라 오래된 기록을 수동으로 정리하십시오."
+        )
+    return summary
 
 
 def _checked_state() -> Qt.CheckState:

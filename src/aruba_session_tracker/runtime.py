@@ -10,7 +10,7 @@ from aruba_session_tracker.collectors import (
     SSHConnectionFactory,
     StrictNetmikoFactory,
 )
-from aruba_session_tracker.models import AppConfig, Credentials, ErrorCode, QueryRequest
+from aruba_session_tracker.models import AppConfig, Credentials, QueryRequest
 from aruba_session_tracker.paths import AppPaths
 from aruba_session_tracker.services import (
     FullScanApproval,
@@ -314,13 +314,6 @@ def _one_shot_status(outcome: QueryOutcome) -> str:
         return "CANCELLED"
     if outcome.authoritative:
         return "COMPLETED"
-    failed_codes = {
-        ErrorCode.AUTH_FAILED,
-        ErrorCode.HOST_KEY_CHANGED,
-        ErrorCode.HOST_KEY_UNKNOWN,
-        ErrorCode.MM_UNREACHABLE,
-        ErrorCode.PROMPT_PARSE_FAILED,
-    }
-    if any(diagnostic.code in failed_codes for diagnostic in outcome.diagnostics):
-        return "FAILED"
-    return "PARTIAL"
+    if outcome.observations:
+        return "PARTIAL"
+    return "FAILED"

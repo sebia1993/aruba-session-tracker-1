@@ -1,9 +1,9 @@
 """Strict, bounded and read-only SSH collection.
 
-The concrete factory performs a Paramiko host-key handshake first and then lets
-Netmiko establish the authenticated CLI session with strict known-host checking.
-This two-step design gives the GUI a chance to display an unknown fingerprint
-without ever weakening the authenticated connection's host-key policy.
+The concrete factory probes unknown hosts before approval, while already-known
+hosts rely on Netmiko's strict authenticated connection for host-key checking.
+This gives the GUI a chance to display a new fingerprint without adding a
+second handshake to every connection after trust has been established.
 """
 
 from __future__ import annotations
@@ -377,6 +377,11 @@ class SSHCollector:
                             try:
                                 reject_command_errors(output)
                             except ParseError as exc:
+                                if exc.code is ErrorCode.COMMAND_REJECTED:
+                                    raise CollectorError(
+                                        ErrorCode.COMMAND_REJECTED,
+                                        "장비가 세션 페이징 해제 명령의 실행 권한을 거부했습니다.",
+                                    ) from exc
                                 raise CollectorError(
                                     ErrorCode.COMMAND_VARIANT_UNVERIFIED,
                                     "장비가 세션 페이징 해제 명령을 거부했습니다.",
@@ -733,6 +738,35 @@ class _ReadOnlyArubaOsSSH(ArubaOsSSH):  # type: ignore[misc]
     the audited code paths below.
     """
 
+    def __init__(
+        self,
+        *args: Any,
+        host_keys_snapshot: paramiko.HostKeys | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # BaseConnection connects during __init__, so the immutable-by-convention
+        # trust snapshot must be available before the parent constructor runs.
+        self._host_keys_snapshot = host_keys_snapshot
+        super().__init__(*args, **kwargs)
+
+    def _build_ssh_client(self) -> paramiko.SSHClient:
+        snapshot = self._host_keys_snapshot
+        if snapshot is None:
+            return super()._build_ssh_client()
+
+        remote_conn_pre = paramiko.SSHClient()
+        if self.system_host_keys:
+            remote_conn_pre.load_system_host_keys()
+        destination = remote_conn_pre.get_host_keys()
+        for hostname in snapshot:
+            entries = snapshot.lookup(hostname)
+            if entries is None:
+                continue
+            for key_type in entries:
+                destination.add(hostname, key_type, entries[key_type])
+        remote_conn_pre.set_missing_host_key_policy(self.key_policy)
+        return remote_conn_pre
+
     def session_preparation(self) -> None:
         self.ansi_escape_codes = True
         self._test_channel_read(pattern=r"[>#]")
@@ -760,6 +794,7 @@ class StrictNetmikoFactory:
         self._key_probe = key_probe or _probe_server_key
         self._connector = connector or _connect_read_only_aruba
         self._connector_uses_owned_socket = connector is None
+        self._connector_enforces_strict_host_keys = connector is None
         self._host_keys_lock = _known_hosts_thread_lock(self._known_hosts_path)
         try:
             parent, self._known_hosts_parent_identity = ensure_managed_directory(
@@ -785,41 +820,28 @@ class StrictNetmikoFactory:
         poll_deadline = deadline or PollDeadline.after()
         cancel_token.raise_if_cancelled()
         poll_deadline.raise_if_expired()
-        try:
-            offered_key = self._key_probe(
-                target,
-                poll_deadline.bounded_timeout(self._connect_timeout),
-            )
-        except CollectorError as exc:
-            if exc.retryable_network:
-                cancel_token.raise_if_cancelled()
-                try:
-                    poll_deadline.raise_if_expired()
-                except CollectorError as deadline_exc:
-                    raise deadline_exc from exc
-            raise
-        except (TimeoutError, OSError, paramiko.SSHException) as exc:
-            cancel_token.raise_if_cancelled()
-            try:
-                poll_deadline.raise_if_expired()
-            except CollectorError as deadline_exc:
-                raise deadline_exc from exc
-            raise CollectorError(
-                ErrorCode.MM_UNREACHABLE,
-                "SSH 호스트 키 확인 연결에 실패했습니다.",
-                retryable_network=True,
-            ) from exc
-        cancel_token.raise_if_cancelled()
-        poll_deadline.raise_if_expired()
-        self._verify_or_approve(
-            target,
-            offered_key,
-            host_key_approval,
-            cancel_token,
-            poll_deadline,
+        host_keys_snapshot = (
+            self._known_host_keys_snapshot(target, cancel_token, poll_deadline)
+            if self._connector_enforces_strict_host_keys
+            else None
         )
+        if host_keys_snapshot is None:
+            verified_host_keys = self._probe_and_verify(
+                target,
+                host_key_approval,
+                cancel_token,
+                poll_deadline,
+            )
+            if self._connector_enforces_strict_host_keys:
+                host_keys_snapshot = verified_host_keys
         cancel_token.raise_if_cancelled()
         poll_deadline.raise_if_expired()
+
+        if self._connector_enforces_strict_host_keys and host_keys_snapshot is None:
+            raise CollectorError(
+                ErrorCode.HOST_KEY_UNKNOWN,
+                "SSH 호스트 키 신뢰 정보를 안전하게 준비하지 못했습니다.",
+            )
 
         try:
             connection_timeout = poll_deadline.bounded_timeout(self._connect_timeout)
@@ -841,6 +863,8 @@ class StrictNetmikoFactory:
                 "alt_key_file": str(self._known_hosts_path),
                 "session_log": bounded_session_log,
             }
+            if self._connector_enforces_strict_host_keys:
+                connector_kwargs["host_keys_snapshot"] = host_keys_snapshot
             connector_socket: socket.socket | None = None
             connector_guard: _SocketDeadlineGuard | None = None
             if self._connector_uses_owned_socket:
@@ -874,7 +898,23 @@ class StrictNetmikoFactory:
                 ErrorCode.HOST_KEY_CHANGED,
                 "SSH 호스트 키가 변경되었습니다.",
             ) from exc
-        except (NetmikoTimeoutException, TimeoutError, OSError) as exc:
+        except NetmikoTimeoutException as exc:
+            if _is_strict_host_key_rejection(exc):
+                raise CollectorError(
+                    ErrorCode.HOST_KEY_CHANGED,
+                    "SSH 호스트 키 검증에 실패했습니다.",
+                ) from exc
+            cancel_token.raise_if_cancelled()
+            try:
+                poll_deadline.raise_if_expired()
+            except CollectorError as deadline_exc:
+                raise deadline_exc from exc
+            raise CollectorError(
+                ErrorCode.MM_UNREACHABLE,
+                "SSH 연결 시간이 초과되었거나 장비에 연결할 수 없습니다.",
+                retryable_network=True,
+            ) from exc
+        except (TimeoutError, OSError) as exc:
             cancel_token.raise_if_cancelled()
             try:
                 poll_deadline.raise_if_expired()
@@ -892,7 +932,7 @@ class StrictNetmikoFactory:
             ) from exc
         except paramiko.SSHException as exc:
             # A strict-policy rejection is never eligible for MM failover.
-            if "host key" in str(exc).lower():
+            if _is_strict_host_key_rejection(exc):
                 raise CollectorError(
                     ErrorCode.HOST_KEY_CHANGED,
                     "SSH 호스트 키 검증에 실패했습니다.",
@@ -961,6 +1001,59 @@ class StrictNetmikoFactory:
                 cancel_token.raise_if_cancelled()
         return manager
 
+    def _known_host_keys_snapshot(
+        self,
+        target: DeviceTarget,
+        cancel_token: CancellationToken,
+        deadline: PollDeadline,
+    ) -> paramiko.HostKeys | None:
+        host_token = _known_hosts_token(target)
+        with self._locked_host_keys(cancel_token, deadline) as host_keys:
+            if host_keys.lookup(host_token) is None:
+                return None
+            return host_keys
+
+    def _probe_and_verify(
+        self,
+        target: DeviceTarget,
+        host_key_approval: HostKeyApproval | None,
+        cancel_token: CancellationToken,
+        deadline: PollDeadline,
+    ) -> paramiko.HostKeys:
+        try:
+            offered_key = self._key_probe(
+                target,
+                deadline.bounded_timeout(self._connect_timeout),
+            )
+        except CollectorError as exc:
+            if exc.retryable_network:
+                cancel_token.raise_if_cancelled()
+                try:
+                    deadline.raise_if_expired()
+                except CollectorError as deadline_exc:
+                    raise deadline_exc from exc
+            raise
+        except (TimeoutError, OSError, paramiko.SSHException) as exc:
+            cancel_token.raise_if_cancelled()
+            try:
+                deadline.raise_if_expired()
+            except CollectorError as deadline_exc:
+                raise deadline_exc from exc
+            raise CollectorError(
+                ErrorCode.MM_UNREACHABLE,
+                "SSH 호스트 키 확인 연결에 실패했습니다.",
+                retryable_network=True,
+            ) from exc
+        cancel_token.raise_if_cancelled()
+        deadline.raise_if_expired()
+        return self._verify_or_approve(
+            target,
+            offered_key,
+            host_key_approval,
+            cancel_token,
+            deadline,
+        )
+
     def _verify_or_approve(
         self,
         target: DeviceTarget,
@@ -968,12 +1061,12 @@ class StrictNetmikoFactory:
         approval: HostKeyApproval | None,
         cancel_token: CancellationToken,
         deadline: PollDeadline,
-    ) -> None:
+    ) -> paramiko.HostKeys:
         host_token = _known_hosts_token(target)
         cancel_token.raise_if_cancelled()
         with self._locked_host_keys(cancel_token, deadline) as host_keys:
             if _known_key_matches(host_keys, host_token, offered_key):
-                return
+                return host_keys
 
         info = HostKeyInfo(
             algorithm=offered_key.get_name(),
@@ -998,7 +1091,7 @@ class StrictNetmikoFactory:
         # Reload after approval so another process cannot be overwritten.
         with self._locked_host_keys(cancel_token, deadline) as host_keys:
             if _known_key_matches(host_keys, host_token, offered_key):
-                return
+                return host_keys
             cancel_token.raise_if_cancelled()
             deadline.raise_if_expired()
             host_keys.add(host_token, offered_key.get_name(), offered_key)
@@ -1011,6 +1104,7 @@ class StrictNetmikoFactory:
                 ) from exc
         cancel_token.raise_if_cancelled()
         deadline.raise_if_expired()
+        return host_keys
 
     @contextmanager
     def _locked_host_keys(
@@ -1232,6 +1326,27 @@ def _known_key_matches(
     if expected is not None and expected == offered_key:
         return True
     raise CollectorError(ErrorCode.HOST_KEY_CHANGED, "SSH 호스트 키가 변경되었습니다.")
+
+
+def _is_strict_host_key_rejection(exc: BaseException) -> bool:
+    pending = [exc]
+    visited: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        identity = id(candidate)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        if isinstance(candidate, paramiko.BadHostKeyException):
+            return True
+        if isinstance(candidate, paramiko.SSHException):
+            message = str(candidate).casefold()
+            if "not found in known_hosts" in message:
+                return True
+        for linked in (candidate.__cause__, candidate.__context__):
+            if linked is not None:
+                pending.append(linked)
+    return False
 
 
 def _known_hosts_token(target: DeviceTarget) -> str:

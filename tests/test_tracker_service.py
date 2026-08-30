@@ -336,6 +336,23 @@ def test_md_host_key_failure_stops_before_other_candidates() -> None:
     assert ErrorCode.HOST_KEY_CHANGED in {event.code for event in outcome.diagnostics}
 
 
+def test_md_command_permission_failure_stops_before_other_candidates() -> None:
+    config = _config()
+    outputs = {
+        "MM-Primary": _mm_outputs("192.0.2.101", "192.0.2.102"),
+        "MD-1": {NO_PAGING_COMMAND: ""},
+        "MD-2": {NO_PAGING_COMMAND: ""},
+    }
+    factory = FakeFactory(outputs)
+    factory.errors["MD-1"] = CollectorError(ErrorCode.COMMAND_REJECTED, "permission")
+
+    outcome = TrackerService(config, factory).query_once(REQUEST, CREDENTIALS)
+
+    assert outcome.authoritative is False
+    assert factory.calls == ["MM-Primary", "MD-1"]
+    assert ErrorCode.COMMAND_REJECTED in {event.code for event in outcome.diagnostics}
+
+
 def test_full_scan_requires_explicit_approval_and_queries_all_enabled_mds() -> None:
     config = _config()
     outputs: dict[str, dict[str, str]] = {"MM-Primary": _mm_outputs(None, None)}
@@ -663,6 +680,38 @@ def test_fallback_scan_also_queries_an_active_controller_missing_from_its_cache(
     assert factory.calls == ["MD-1", "MD-2"]
 
 
+def test_tracker_preserves_same_flow_from_two_direct_managed_devices() -> None:
+    outputs = {
+        "MM-Primary": _mm_outputs("192.0.2.101", "192.0.2.102"),
+        "MD-1": {
+            NO_PAGING_COMMAND: "",
+            build_datapath_session_command(REQUEST.source_ip): _datapath_output(),
+        },
+        "MD-2": {
+            NO_PAGING_COMMAND: "",
+            build_datapath_session_command(REQUEST.destination_ip): _datapath_output(),
+        },
+    }
+
+    outcome = TrackerService(_config(), FakeFactory(outputs)).query_once(REQUEST, CREDENTIALS)
+
+    assert outcome.authoritative is True
+    assert [item.controller_host for item in outcome.observations] == [
+        "192.0.2.101",
+        "192.0.2.102",
+    ]
+    assert len({_flow_key_without_controller(item) for item in outcome.observations}) == 1
+    raw_links = {
+        snapshot.device_name: snapshot.observation_keys
+        for snapshot in outcome.raw_snapshots
+        if snapshot.command.startswith("show datapath session table")
+    }
+    assert raw_links == {
+        "MD-1": (outcome.observations[0].session_key,),
+        "MD-2": (outcome.observations[1].session_key,),
+    }
+
+
 def test_direct_multi_md_query_fairly_slices_deadline_and_reaches_later_device() -> None:
     outputs = {
         "MM-Primary": _mm_outputs("192.0.2.101", "192.0.2.102"),
@@ -835,6 +884,28 @@ def test_rejected_filtered_command_never_falls_back_to_unfiltered_table() -> Non
     assert factory.commands_by_device["MD-1"] == [NO_PAGING_COMMAND, filtered]
 
 
+def test_parsed_permission_rejection_stops_before_later_managed_device() -> None:
+    filtered_source = build_datapath_session_command(REQUEST.source_ip)
+    outputs = {
+        "MM-Primary": _mm_outputs("192.0.2.101", "192.0.2.102"),
+        "MD-1": {
+            NO_PAGING_COMMAND: "",
+            filtered_source: "Permission denied",
+        },
+        "MD-2": {
+            NO_PAGING_COMMAND: "",
+            build_datapath_session_command(REQUEST.destination_ip): _datapath_output(),
+        },
+    }
+    factory = FakeFactory(outputs)
+
+    outcome = TrackerService(_config(), factory).query_once(REQUEST, CREDENTIALS)
+
+    assert outcome.authoritative is False
+    assert factory.calls == ["MM-Primary", "MD-1"]
+    assert ErrorCode.COMMAND_REJECTED in {event.code for event in outcome.diagnostics}
+
+
 def test_ambiguous_mm_location_never_grants_full_scan_eligibility() -> None:
     config = _config()
     mm = _mm_outputs(None, None)
@@ -890,6 +961,16 @@ def _observation(*, packets: int = 1, controller: str = "192.0.2.101") -> Sessio
         packets=packets,
         bytes_count=packets * 100,
         flags="SY",
+    )
+
+
+def _flow_key_without_controller(observation: SessionObservation) -> tuple[object, ...]:
+    return (
+        observation.protocol,
+        observation.source_ip,
+        observation.destination_ip,
+        observation.source_port,
+        observation.destination_port,
     )
 
 
@@ -1205,6 +1286,221 @@ def test_failed_second_miss_refresh_retains_positive_first_pass_evidence() -> No
     assert sorted(item.miss_count for item in result.active_sessions) == [0, 1]
     assert result.active_sessions[0].observation.packets == 3
     assert not any(event.event_type is LifecycleEventType.OBSERVED for event in result.events)
+
+
+def test_monitor_defers_controller_change_across_authoritative_overlap() -> None:
+    first = _observation(controller="192.0.2.101")
+    second = replace(
+        first,
+        controller_name="MD-2",
+        controller_host="192.0.2.102",
+    )
+
+    class RecordingService(StubService):
+        def __init__(self) -> None:
+            super().__init__(
+                [
+                    QueryOutcome(observations=(first,), authoritative=True),
+                    QueryOutcome(observations=(second, first), authoritative=True),
+                    QueryOutcome(observations=(second,), authoritative=True),
+                ]
+            )
+            self.required_hosts: list[tuple[str, ...]] = []
+
+        def query_once(self, *args: object, **kwargs: object) -> QueryOutcome:
+            self.required_hosts.append(tuple(kwargs["required_controller_hosts"]))
+            return super().query_once(*args, **kwargs)
+
+    service = RecordingService()
+    monitor = MonitorEngine(service, REQUEST, CREDENTIALS)  # type: ignore[arg-type]
+
+    started = monitor.poll_once()
+    overlap = monitor.poll_once()
+    moved = monitor.poll_once()
+
+    assert len(overlap.observations) == 2
+    assert len(overlap.active_sessions) == 1
+    assert overlap.active_sessions[0].instance_id == started.active_sessions[0].instance_id
+    assert overlap.events == ()
+    assert ErrorCode.DUPLICATE_FLOW_ACROSS_CONTROLLERS in {
+        item.code for item in overlap.diagnostics
+    }
+    assert service.required_hosts[:2] == [(), ("192.0.2.101",)]
+    assert set(service.required_hosts[2]) == {"192.0.2.101", "192.0.2.102"}
+    assert [item.event_type for item in moved.events] == [LifecycleEventType.CONTROLLER_CHANGED]
+    assert moved.events[0].previous_observation == first
+    assert moved.events[0].observation == second
+    assert moved.active_sessions[0].instance_id == started.active_sessions[0].instance_id
+
+
+def test_monitor_initial_overlap_resolves_without_false_controller_change() -> None:
+    first = _observation(controller="192.0.2.101")
+    second = replace(
+        first,
+        controller_name="MD-2",
+        controller_host="192.0.2.102",
+    )
+
+    class RecordingService(StubService):
+        def __init__(self) -> None:
+            super().__init__(
+                [
+                    QueryOutcome(observations=(second, first), authoritative=True),
+                    QueryOutcome(observations=(second,), authoritative=True),
+                ]
+            )
+            self.required_hosts: list[tuple[str, ...]] = []
+
+        def query_once(self, *args: object, **kwargs: object) -> QueryOutcome:
+            self.required_hosts.append(tuple(kwargs["required_controller_hosts"]))
+            return super().query_once(*args, **kwargs)
+
+    service = RecordingService()
+    monitor = MonitorEngine(service, REQUEST, CREDENTIALS)  # type: ignore[arg-type]
+
+    overlap = monitor.poll_once()
+    resolved = monitor.poll_once()
+
+    assert [item.event_type for item in overlap.events] == [LifecycleEventType.STARTED]
+    assert resolved.events == ()
+    assert resolved.active_sessions[0].instance_id == overlap.active_sessions[0].instance_id
+    assert set(service.required_hosts[1]) == {"192.0.2.101", "192.0.2.102"}
+
+
+def test_non_authoritative_positive_poll_retains_controller_scope_and_defers_change() -> None:
+    first = _observation(controller="192.0.2.101")
+    second = replace(
+        first,
+        controller_name="MD-2",
+        controller_host="192.0.2.102",
+    )
+
+    class RecordingService(StubService):
+        def __init__(self) -> None:
+            super().__init__(
+                [
+                    QueryOutcome(observations=(first,), authoritative=True),
+                    QueryOutcome(observations=(second,), authoritative=False),
+                    QueryOutcome(observations=(second,), authoritative=True),
+                ]
+            )
+            self.required_hosts: list[tuple[str, ...]] = []
+
+        def query_once(self, *args: object, **kwargs: object) -> QueryOutcome:
+            self.required_hosts.append(tuple(kwargs["required_controller_hosts"]))
+            return super().query_once(*args, **kwargs)
+
+    service = RecordingService()
+    monitor = MonitorEngine(service, REQUEST, CREDENTIALS)  # type: ignore[arg-type]
+
+    monitor.poll_once()
+    partial = monitor.poll_once()
+    resolved = monitor.poll_once()
+
+    assert partial.authoritative is False
+    assert partial.events == ()
+    assert partial.consecutive_misses == 0
+    assert set(service.required_hosts[2]) == {"192.0.2.101", "192.0.2.102"}
+    assert [item.event_type for item in resolved.events] == [LifecycleEventType.CONTROLLER_CHANGED]
+
+
+def test_merge_outcomes_supersedes_every_first_pass_controller_for_refreshed_flow() -> None:
+    first = _observation(controller="192.0.2.101")
+    second = replace(
+        first,
+        controller_name="MD-2",
+        controller_host="192.0.2.102",
+    )
+    refreshed_second = replace(second, packets=2)
+    merged = monitoring_module._merge_outcomes(
+        QueryOutcome(
+            observations=(first, second),
+            raw_snapshots=(
+                RawSnapshot(
+                    "MD-1",
+                    "show datapath session table 198.51.100.10",
+                    "first-pass",
+                    observation_keys=(first.session_key,),
+                ),
+                RawSnapshot(
+                    "MD-2",
+                    "show datapath session table 198.51.100.10",
+                    "first-pass-overlap",
+                    observation_keys=(second.session_key,),
+                ),
+            ),
+            authoritative=True,
+        ),
+        QueryOutcome(
+            observations=(refreshed_second,),
+            raw_snapshots=(
+                RawSnapshot(
+                    "MD-2",
+                    "show datapath session table 198.51.100.10",
+                    "refreshed-pass",
+                    observation_keys=(refreshed_second.session_key,),
+                ),
+            ),
+            authoritative=True,
+        ),
+    )
+
+    assert merged.observations == (refreshed_second,)
+    assert [snapshot.observation_keys for snapshot in merged.raw_snapshots] == [
+        (),
+        (),
+        (refreshed_second.session_key,),
+    ]
+
+
+def test_merge_outcomes_preserves_all_controllers_within_refreshed_pass() -> None:
+    first = _observation(controller="192.0.2.101")
+    refreshed_first = replace(first, packets=2)
+    refreshed_second = replace(
+        first,
+        controller_name="MD-2",
+        controller_host="192.0.2.102",
+        packets=3,
+    )
+    merged = monitoring_module._merge_outcomes(
+        QueryOutcome(
+            observations=(first,),
+            raw_snapshots=(
+                RawSnapshot(
+                    "MD-1",
+                    "show datapath session table 198.51.100.10",
+                    "first-pass",
+                    observation_keys=(first.session_key,),
+                ),
+            ),
+            authoritative=True,
+        ),
+        QueryOutcome(
+            observations=(refreshed_first, refreshed_second),
+            raw_snapshots=(
+                RawSnapshot(
+                    "MD-1",
+                    "show datapath session table 198.51.100.10",
+                    "refreshed-first-controller",
+                    observation_keys=(refreshed_first.session_key,),
+                ),
+                RawSnapshot(
+                    "MD-2",
+                    "show datapath session table 198.51.100.10",
+                    "refreshed-second-controller",
+                    observation_keys=(refreshed_second.session_key,),
+                ),
+            ),
+            authoritative=True,
+        ),
+    )
+
+    assert merged.observations == (refreshed_first, refreshed_second)
+    assert [snapshot.observation_keys for snapshot in merged.raw_snapshots] == [
+        (),
+        (refreshed_first.session_key,),
+        (refreshed_second.session_key,),
+    ]
 
 
 def test_discarded_prepared_poll_does_not_advance_monitor_state() -> None:

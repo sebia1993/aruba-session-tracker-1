@@ -89,6 +89,10 @@ Raw에만 보존합니다.
 - Source와 Destination이 서로 다른 MD에 있으면 두 MD의 결과를 모두 확인하고,
   기존 활성 세션의 MD도 계속 조회합니다. 일부 MD 결과만으로 다른 MD의
   세션을 `잠시 미확인` 또는 `종료 확인`으로 바꾸지 않습니다.
+- 같은 Protocol·Source·Destination·SPort·DPort가 여러 MD에서 동시에
+  관측되면 Controller별 행과 Raw 연결을 모두 보존하고 `여러 MD에서 관측`으로
+  표시합니다. 중첩 상태에서는 MD 변경을 확정하지 않으며 권위 있는 단일 MD로
+  해소된 경우에만 실제 변경을 기록합니다.
 - 호스트 키 승인 대기, 전체 MD 검색 승인 대기와 `known_hosts` 잠금도
   300초의 조회 제한 시간과 취소 처리를 따릅니다. 제한을 넘긴 뒤 도착한
   승인은 호스트 키 저장이나 MD 조회에 사용하지 않습니다.
@@ -104,7 +108,9 @@ Raw에만 보존합니다.
   화면을 사용할 수 있는 상태입니다.
 - 매 poll의 SSH 실행 전에 빠른 여유 공간 검사를 수행해 1 GiB 미만이면
   조회 자체를 중단합니다. DB·WAL·Raw·내보내기 전체 통계는 최대 60초
-  간격으로 계산하고 5 GiB 미만이면 경고합니다.
+  간격으로 계산하고 5 GiB 미만이면 경고합니다. `기록 및 내보내기`에서는
+  Raw 파일 수·용량, 전체 관리 데이터와 여유 공간을 읽기 전용으로 확인할 수
+  있으며 Raw 100,000개부터 정리 검토를 비차단 안내합니다.
 - 새 Raw는 실행 ID 아래 날짜·시간 폴더로 분산하고 기존 평면 경로도 계속
   지원합니다. 기록은 자동 삭제하지 않습니다.
 - 조회 전체에 300초 deadline을 적용하고 SSH 취소 시 underlying socket을
@@ -198,7 +204,8 @@ RFC 5737 문서용 주소로만 제공됩니다.
 
 첫 SSH 접속에서는 장비 지문을 검토한 뒤 승인해야 합니다. 승인된 지문이
 나중에 바뀌면 연결을 차단합니다. 인증 실패와 호스트 키 불일치는
-Standby 우회 조건이 아닙니다.
+Standby 우회 조건이 아닙니다. 승인 뒤에는 별도 지문 확인 연결을 반복하지
+않고 실제 strict SSH 연결 한 번에서 저장된 키를 검증합니다.
 
 ## 조회 흐름
 
@@ -243,6 +250,9 @@ show datapath session table <IPv4>
 인증, 호스트 키, 명령 정책과 저장 실패는 자동으로 우회하지 않습니다.
 상태 표시는 `대기`, `조회 중`, `정상`, `재시도 중`, `확인 필요` 다섯
 값만 사용하고 자세한 단계와 오류 코드는 상태 표시줄과 진단에 남깁니다.
+`현재 조회`의 실행 기록은 권위 있는 정상 결과를 `COMPLETED`, 일부 양성
+관측만 남은 비권위 결과를 `PARTIAL`, 관측이 없는 비권위 기술 실패를
+`FAILED`로 구분합니다.
 
 결과에는 사용한 MM/MD, 마지막 관측 시각, Protocol, Source/Destination,
 포트, Packets/Bytes와 증분, Age, CPU, Raw Flags, 해석 상태가 표시됩니다.
@@ -367,7 +377,9 @@ GitHub 이슈나 외부 지원 채널에 올리지 말고, 공유가 필요하�
 | `MM_UNREACHABLE` | MM 네트워크 연결 또는 시간 초과 |
 | `MD_UNREACHABLE` | MD 네트워크 연결 또는 시간 초과 |
 | `CURRENT_SWITCH_UNMAPPED` | Current switch를 등록된 MD와 매핑할 수 없음 |
+| `COMMAND_REJECTED` | 계정에 조회 명령 실행 권한이 없어 확인 필요 |
 | `COMMAND_VARIANT_UNVERIFIED` | 필터형 명령 구문을 장비가 거부함 |
+| `DUPLICATE_FLOW_ACROSS_CONTROLLERS` | 같은 흐름이 여러 MD에서 동시에 관측되어 이동 확정을 보류함 |
 | `PARSE_PARTIAL` | 일부 출력만 안전하게 해석됨 |
 | `POLL_DEADLINE_EXCEEDED` | 단일 poll이 300초 제한을 초과함 |
 | `OUTPUT_LIMIT_EXCEEDED` | Raw 크기 또는 관측 수 안전 상한 초과 |
