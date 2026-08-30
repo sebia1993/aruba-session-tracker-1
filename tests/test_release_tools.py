@@ -720,6 +720,13 @@ def test_continuous_workflow_delegates_to_durable_reconciler() -> None:
     assert "-ExpectedCommit $env:EXPECTED_COMMIT" in workflow
     assert "GH_TOKEN: ${{ github.token }}" in workflow
     assert "gh release" not in workflow
+    publish_job = workflow[workflow.index("  publish:") :]
+    dependency_install = publish_job.index(
+        "python -m pip install --no-input -r requirements-runtime.lock"
+    )
+    package_verification = publish_job.index("./tools/publish_continuous.ps1")
+    assert dependency_install < package_verification
+    assert "Continuous publish verification dependency check failed." in publish_job
 
 
 def test_continuous_reconciler_persists_stages_and_uses_release_ids() -> None:
