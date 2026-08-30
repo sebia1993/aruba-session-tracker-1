@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.1 - 2026-08-30
+
 - Versioned release 게시 작업에도 고정 runtime 검증 의존성을 설치하고
   `pip check`를 수행해, 검증된 ZIP 생성 후 게시 전 패키지 재검증이
   `paramiko` 누락으로 중단되지 않도록 수정.
