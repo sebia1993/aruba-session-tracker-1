@@ -28,6 +28,63 @@ def test_cli_metadata_modes_exit_without_starting_gui(
     assert capsys.readouterr().out.startswith(output_prefix)
 
 
+def test_loopback_smoke_requires_all_private_fixture_arguments() -> None:
+    with pytest.raises(SystemExit) as caught:
+        main(["--loopback-ssh-smoke", "success"])
+
+    assert caught.value.code == 2
+
+
+@pytest.mark.parametrize("guard_mode", ("already-running", "guard-error"))
+def test_single_instance_guard_failures_are_bounded_and_sanitized(
+    qtbot: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    guard_mode: str,
+) -> None:
+    del qtbot
+    root = tmp_path / "app"
+    paths = AppPaths(
+        root=root,
+        config=root / "config.json",
+        known_hosts=root / "known_hosts",
+        database=root / "tracker.db",
+        raw=root / "raw",
+        exports=root / "exports",
+    )
+    shown: list[tuple[str, str]] = []
+
+    class _Guard:
+        def __init__(self, _identity: str) -> None:
+            pass
+
+        def acquire(self) -> bool:
+            if guard_mode == "guard-error":
+                raise OSError("GUARD_SECRET_CANARY")
+            return False
+
+        def release(self) -> None:
+            raise AssertionError("unacquired guard must not be released")
+
+    monkeypatch.setattr(main_module.AppPaths, "default", lambda: paths)
+    monkeypatch.setattr(main_module, "SingleInstanceGuard", _Guard)
+    monkeypatch.setattr(
+        main_module.QMessageBox,
+        "information",
+        lambda _parent, title, message: shown.append((title, message)),
+    )
+    monkeypatch.setattr(
+        main_module.QMessageBox,
+        "critical",
+        lambda _parent, title, message: shown.append((title, message)),
+    )
+
+    expected = 1 if guard_mode == "guard-error" else 0
+    assert main([]) == expected
+    assert shown
+    assert "GUARD_SECRET_CANARY" not in repr(shown)
+
+
 class _SmokeApplication:
     def __init__(self) -> None:
         self.exit_codes: list[int] = []
@@ -167,3 +224,48 @@ def test_startup_storage_failure_is_visible_and_returns_nonzero(
     assert main([]) == 1
     assert shown and "시작 실패" in shown[0][0]
     assert str(error) not in shown[0][1]
+
+
+def test_main_window_failure_is_sanitized_and_journaled_before_hook_restore(
+    qtbot: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del qtbot
+    root = tmp_path / "app"
+    paths = AppPaths(
+        root=root,
+        config=root / "config.json",
+        known_hosts=root / "known_hosts",
+        database=root / "tracker.db",
+        raw=root / "raw",
+        exports=root / "exports",
+    )
+    records: list[tuple[str, str, str]] = []
+
+    class _Journal:
+        def start_session(self) -> bool:
+            return False
+
+        def record(self, event: str, exception_type: object, *, stage: str) -> str:
+            records.append((event, str(exception_type), stage))
+            return "sanitized-incident"
+
+        def mark_clean_exit(self) -> None:
+            raise AssertionError("failed startup must not be marked clean")
+
+    def fail_main_window(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("MAIN_WINDOW_SECRET_CANARY")
+
+    monkeypatch.setattr(main_module.AppPaths, "default", lambda: paths)
+    monkeypatch.setattr(main_module, "CrashJournal", lambda *_args, **_kwargs: _Journal())
+    monkeypatch.setattr(main_module, "MainWindow", fail_main_window)
+
+    with pytest.raises(RuntimeError, match="MAIN_WINDOW_SECRET_CANARY"):
+        main([])
+
+    assert records == [
+        ("UNHANDLED_EXCEPTION", "RuntimeError", "MAIN_THREAD"),
+        ("CONTROLLED_SHUTDOWN_INCOMPLETE", "RecoveryRequired", "SHUTDOWN"),
+    ]
+    assert "MAIN_WINDOW_SECRET_CANARY" not in repr(records)

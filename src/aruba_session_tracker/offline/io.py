@@ -49,16 +49,21 @@ def parse_offline_tech_support_file(
         raise ParseError("Offline input file changed while it was being read.")
     _raise_if_cancelled(is_cancelled)
     text = _decode_utf8(payload)
+    del payload
     if text is None:
         raise ParseError("Offline input file is not valid UTF-8 text.")
-    return parse_offline_tech_support(text, limits=selected_limits)
+    return parse_offline_tech_support(
+        text,
+        limits=selected_limits,
+        is_cancelled=is_cancelled,
+    )
 
 
 def _read_bounded_payload(
     path: Path,
     limits: OfflineParseLimits,
     is_cancelled: Callable[[], bool] | None,
-) -> tuple[bytes, os.stat_result, os.stat_result] | None:
+) -> tuple[bytearray, os.stat_result, os.stat_result] | None:
     payload = bytearray()
     try:
         with path.open("rb") as stream:
@@ -91,10 +96,10 @@ def _read_bounded_payload(
         raise
     except (OSError, ValueError):
         return None
-    return bytes(payload), before, after
+    return payload, before, after
 
 
-def _decode_utf8(payload: bytes) -> str | None:
+def _decode_utf8(payload: bytes | bytearray) -> str | None:
     try:
         return payload.decode("utf-8-sig")
     except UnicodeDecodeError:

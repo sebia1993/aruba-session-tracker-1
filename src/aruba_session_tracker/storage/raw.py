@@ -21,6 +21,7 @@ from aruba_session_tracker.paths import (
     reject_link_or_reparse,
     verify_managed_directory,
 )
+from aruba_session_tracker.storage.durable_io import replace_with_retry
 
 _SAFE_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
@@ -112,7 +113,13 @@ class RawOutputStore:
                 stream.write(data)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary_path, path)
+            replace_with_retry(
+                temporary_path,
+                path,
+                replace=os.replace,
+                expected_sha256=hashlib.sha256(data).hexdigest(),
+                expected_size=len(data),
+            )
         finally:
             temporary_path.unlink(missing_ok=True)
 

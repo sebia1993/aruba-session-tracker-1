@@ -569,3 +569,23 @@ def test_unsupported_public_command_is_rejected_without_echoing_it() -> None:
     with pytest.raises(ValueError) as caught:
         extract_exact_command_block(fixture(), "show running-config")
     assert "running-config" not in str(caught.value)
+
+
+def test_offline_parser_can_be_cancelled_after_input_validation_starts() -> None:
+    checks = 0
+
+    def cancel_during_parse() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 4
+
+    with pytest.raises(ParseError) as caught:
+        parse_offline_tech_support(fixture(), is_cancelled=cancel_during_parse)
+
+    assert caught.value.code is ErrorCode.CANCELLED
+    assert checks >= 4
+
+
+def test_offline_parser_rejects_non_callable_cancellation_probe() -> None:
+    with pytest.raises(TypeError):
+        parse_offline_tech_support(fixture(), is_cancelled=True)  # type: ignore[arg-type]

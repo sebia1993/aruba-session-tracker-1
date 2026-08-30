@@ -3,6 +3,7 @@
 from .monitoring import (
     LifecycleEvent,
     LifecycleEventType,
+    MonitorDaemonError,
     MonitorEngine,
     MonitorPollResult,
     SessionInstance,
@@ -26,6 +27,7 @@ __all__ = [
     "LifecycleEvent",
     "LifecycleEventType",
     "LocationSnapshot",
+    "MonitorDaemonError",
     "MonitorEngine",
     "MonitorPollResult",
     "PollBudget",

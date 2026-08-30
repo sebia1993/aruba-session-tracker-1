@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import io
 import json
 import os
 import re
@@ -13,8 +14,8 @@ import sqlite3
 import stat
 import threading
 import time
-from collections.abc import Iterable, Iterator, Sequence
-from contextlib import contextmanager, suppress
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -36,9 +37,10 @@ from aruba_session_tracker.paths import (
     verify_managed_directory,
 )
 from aruba_session_tracker.storage.csv_export import write_csv_atomic
+from aruba_session_tracker.storage.durable_io import replace_with_retry
 from aruba_session_tracker.storage.html_report import (
     RunReportSnapshot,
-    write_html_report_atomic,
+    write_html_report_stream_atomic,
 )
 from aruba_session_tracker.storage.raw import (
     RawArtifact,
@@ -50,7 +52,7 @@ from aruba_session_tracker.storage.raw import (
 
 if TYPE_CHECKING:
     from aruba_session_tracker.services.monitoring import LifecycleEvent
-    from aruba_session_tracker.services.tracker import QueryOutcome
+    from aruba_session_tracker.services.tracker import QueryOutcome, RawSnapshot
 
 _SCHEMA_VERSION = 2
 _DELETE_PREVIEW_TTL_SECONDS = 300
@@ -58,6 +60,13 @@ _CSV_FETCH_BATCH = 1000
 _HASH_CHUNK_SIZE = 1024 * 1024
 _MANIFEST_VERSION = 1
 _MAX_PENDING_DELETIONS = 16
+_MAX_POLL_RAW_BYTES = 32 * 1024 * 1024
+_MAX_POLL_OBSERVATIONS = 20_000
+# One already-active observation can legitimately produce OBSERVED plus
+# controller, flags and counter-change events in the same poll. Lifecycle rows
+# therefore need their own bound; reusing the observation limit would make a
+# valid saturated poll fail forever before prepared state can commit.
+_MAX_POLL_LIFECYCLE_EVENTS = _MAX_POLL_OBSERVATIONS * 4
 STORAGE_WARNING_FREE_BYTES = 5 * 1024**3
 STORAGE_HARD_STOP_FREE_BYTES = 1024**3
 _OPERATION_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -67,6 +76,12 @@ _IPV4_TEXT = re.compile(r"(?<![0-9.])(?:\d{1,3}\.){3}\d{1,3}(?![0-9.])")
 _CREDENTIAL_TEXT = re.compile(
     r"(?i)\b(username|user|password|passwd|secret|token)\s*[:=]\s*([^\s,;]+)"
 )
+_RAW_BUNDLE_MAGIC = b"ARUBA_SESSION_TRACKER_RAW_BUNDLE_V1\n"
+_RAW_BUNDLE_CONTROLLER = "POLL_BUNDLE"
+_RAW_BUNDLE_KIND = "poll-bundle"
+
+CancelCheck = Callable[[], bool]
+ProgressCallback = Callable[[str, int, int | None], None]
 
 _CSV_COLUMNS = (
     "observed_at",
@@ -291,6 +306,9 @@ class _StagedFile:
     sha256: str
     byte_size: int
     registered: bool
+    device: int
+    inode: int
+    modified_ns: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,6 +317,9 @@ class _DeletionFile:
     sha256: str | None
     byte_size: int
     registered: bool
+    device: int | None
+    inode: int | None
+    modified_ns: int | None
 
 
 @dataclass(slots=True)
@@ -330,6 +351,13 @@ class _ExternalExportOwner:
 
 
 @dataclass(frozen=True, slots=True)
+class _RawBundleSection:
+    index: int
+    sha256: str
+    byte_size: int
+
+
+@dataclass(frozen=True, slots=True)
 class _PreparedRaw:
     artifact: RawArtifact
     staged_path: Path
@@ -339,6 +367,7 @@ class _PreparedRaw:
     controller_name: str
     observations: tuple[SessionObservation, ...]
     data: bytes
+    bundle_sections: tuple[_RawBundleSection, ...] = ()
 
 
 class SessionStore:
@@ -363,6 +392,9 @@ class SessionStore:
         self._pending_deletions: dict[str, _PendingDeletion] = {}
         self._directory_identities: dict[Path, DirectoryIdentity] = {}
         self._run_leases: dict[str, _RunLease] = {}
+        self._raw_unregistered_usage = (0, 0)
+        self._export_unregistered_usage = (0, 0)
+        self._pending_external_recoveries: dict[str, str] = {}
 
     def initialize(self) -> None:
         with self._lock:
@@ -370,7 +402,7 @@ class SessionStore:
                 return
             try:
                 self._prepare_managed_layout()
-                with self._connection(uninitialized=True) as connection:
+                with self._connection(uninitialized=True, configure_wal=True) as connection:
                     _require_quick_check(connection)
                     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
                     if version not in {0, 1, _SCHEMA_VERSION}:
@@ -416,8 +448,185 @@ class SessionStore:
         try:
             with self._lock:
                 return self._storage_health_unlocked()
-        except (OSError, UnsafeManagedPath, UnsafeStoragePath) as error:
+        except (OSError, sqlite3.Error, UnsafeManagedPath, UnsafeStoragePath) as error:
             raise StorageError(f"저장소 상태를 확인할 수 없습니다: {error}") from error
+
+    def reconcile_storage_health(
+        self,
+        *,
+        cancel_check: CancelCheck | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> StorageHealth:
+        """Perform an explicit deep filesystem reconciliation and return health."""
+
+        self._ensure_initialized()
+        _check_cancelled(cancel_check)
+        maintenance = self._acquire_maintenance_lease()
+        if maintenance is None:
+            raise StorageError("다른 저장소 유지보수 작업이 진행 중입니다.")
+        try:
+            for _attempt in range(2):
+                registered_before = self._registered_storage_usage()
+                filesystem_before = (
+                    _directory_revision(self.raw_root),
+                    _directory_revision(self.exports_root),
+                )
+                raw_actual = _storage_tree_stats(
+                    self.raw_root,
+                    cancel_check=cancel_check,
+                    progress=progress,
+                    phase="storage_reconcile_raw",
+                )
+                export_actual = _storage_tree_stats(
+                    self.exports_root,
+                    cancel_check=cancel_check,
+                    progress=progress,
+                    phase="storage_reconcile_exports",
+                )
+                registered_after = self._registered_storage_usage()
+                filesystem_after = (
+                    _directory_revision(self.raw_root),
+                    _directory_revision(self.exports_root),
+                )
+                if registered_before != registered_after or filesystem_before != filesystem_after:
+                    continue
+                raw_unregistered = (
+                    max(0, raw_actual[0] - registered_after[0][0]),
+                    max(0, raw_actual[1] - registered_after[0][1]),
+                )
+                export_unregistered = (
+                    max(0, export_actual[0] - registered_after[1][0]),
+                    max(0, export_actual[1] - registered_after[1][1]),
+                )
+                with self._lock:
+                    # Poll publication holds this same lock across its file and
+                    # DB phases.  A final revision comparison prevents a file
+                    # observed before its DB row from being cached as an orphan.
+                    if (
+                        self._registered_storage_usage() != registered_after
+                        or (
+                            _directory_revision(self.raw_root),
+                            _directory_revision(self.exports_root),
+                        )
+                        != filesystem_after
+                    ):
+                        continue
+                    self._raw_unregistered_usage = raw_unregistered
+                    self._export_unregistered_usage = export_unregistered
+                    return self._storage_health_unlocked()
+            raise StorageError("저장소 대조 중 기록이 변경되었습니다. 잠시 후 다시 시도하십시오.")
+        except (OSError, sqlite3.Error, UnsafeManagedPath, UnsafeStoragePath) as error:
+            raise StorageError(f"저장소 상태를 대조할 수 없습니다: {error}") from error
+        finally:
+            _release_run_lease(maintenance, remove=True)
+
+    @property
+    def pending_external_recovery_count(self) -> int:
+        """Number of safe external-export recoveries waiting for their target."""
+
+        with self._lock:
+            return len(self._pending_external_recoveries)
+
+    def retry_pending_external_recoveries(self) -> int:
+        """Retry deferred external recoveries without exposing their private paths."""
+
+        self._ensure_initialized()
+        with self._lock:
+            previous = dict(self._pending_external_recoveries)
+            self._pending_external_recoveries.clear()
+        try:
+            recovered = self._recover_operations()
+        except BaseException:
+            remaining = {
+                operation_id: reason
+                for operation_id, reason in previous.items()
+                if os.path.lexists(self._manifests_root / f"{operation_id}.json")
+            }
+            with self._lock:
+                self._pending_external_recoveries.update(remaining)
+            raise
+        if not recovered:
+            with self._lock:
+                self._pending_external_recoveries.update(previous)
+        with self._lock:
+            return len(self._pending_external_recoveries)
+
+    def checkpoint_database(self) -> tuple[int, int, int]:
+        """Request a non-blocking SQLite WAL checkpoint.
+
+        The returned tuple is ``(busy, log_pages, checkpointed_pages)`` from
+        SQLite's PASSIVE checkpoint and can be surfaced by a maintenance worker.
+        """
+
+        self._ensure_initialized()
+        try:
+            with self._lock, self._connection() as connection:
+                row = connection.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                if row is None or len(row) != 3:
+                    raise StorageError("SQLite checkpoint 결과를 확인할 수 없습니다.")
+                return int(row[0]), int(row[1]), int(row[2])
+        except StorageError:
+            raise
+        except sqlite3.Error as error:
+            raise StorageError(f"SQLite checkpoint를 실행할 수 없습니다: {error}") from error
+
+    def backup_database(
+        self,
+        destination: Path | str,
+        *,
+        cancel_check: CancelCheck | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> Path:
+        """Create a consistent user-requested SQLite backup via atomic replace."""
+
+        self._ensure_initialized()
+        _check_cancelled(cancel_check)
+        path = Path(os.path.abspath(Path(destination)))
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        try:
+            path = self._external_export_destination(path)
+            _ensure_plain_directory(path.parent)
+            path = self._external_export_destination(path)
+            self._require_storage_capacity(
+                path,
+                required_extra_bytes=max(
+                    _regular_file_size(self.db_path)
+                    + _regular_file_size(Path(f"{self.db_path}-wal")),
+                    1024 * 1024,
+                ),
+            )
+            if os.path.lexists(temporary):  # pragma: no cover - UUID collision defense
+                raise StorageError("데이터베이스 backup 임시 경로가 이미 존재합니다.")
+
+            def report_backup(_status: int, remaining: int, total: int) -> None:
+                _check_cancelled(cancel_check)
+                _notify_progress(progress, "database_backup", total - remaining, total)
+
+            with self._connection() as source, closing(sqlite3.connect(temporary)) as target:
+                source.backup(target, pages=256, progress=report_backup, sleep=0.05)
+                target.commit()
+            _check_cancelled(cancel_check)
+            with closing(sqlite3.connect(temporary)) as verification:
+                _require_quick_check(verification)
+                _require_foreign_key_check(verification)
+            with temporary.open("r+b") as stream:
+                os.fsync(stream.fileno())
+            backup_sha, backup_size = _file_fingerprint(temporary)
+            _replace_file(
+                temporary,
+                path,
+                expected_sha256=backup_sha,
+                expected_size=backup_size,
+            )
+            return path
+        except StorageError:
+            raise
+        except (OSError, sqlite3.Error, UnsafeManagedPath, UnsafeStoragePath) as error:
+            raise StorageError(f"데이터베이스 backup을 만들 수 없습니다: {error}") from error
+        finally:
+            if os.path.lexists(temporary):
+                with suppress(OSError, UnsafeManagedPath, UnsafeStoragePath):
+                    _unlink_regular(temporary, missing_ok=True)
 
     def ensure_query_capacity(self) -> None:
         """Fail before network I/O when the next query cannot be stored safely.
@@ -529,101 +738,63 @@ class SessionStore:
         raw_kind: str = "session",
         captured_at: datetime | None = None,
     ) -> tuple[int, ...]:
-        """Record one poll and optionally link all rows to its raw UTF-8 file."""
+        """Compatibility wrapper over the recoverable poll-batch writer."""
 
-        self._ensure_initialized()
-        self._require_storage_capacity()
-        self._require_owned_running_run(run_id)
+        from aruba_session_tracker.services.tracker import QueryOutcome, RawSnapshot
+
         values = tuple(observations)
-        artifact: RawArtifact | None = None
-        raw_file_id: int | None = None
+        snapshots: tuple[RawSnapshot, ...] = ()
         if raw_text is not None:
             selected_controller = controller_name or _single_controller_name(values)
-            try:
-                artifact = self._raw.write(
-                    run_id,
-                    kind=raw_kind,
-                    controller_name=selected_controller,
-                    content=raw_text,
-                    captured_at=captured_at,
+            observed_at = captured_at or datetime.now(UTC)
+            command = (
+                "show datapath session table"
+                if raw_kind == "session"
+                else "show global-user-table list ip"
+            )
+            snapshots = (
+                RawSnapshot(
+                    selected_controller,
+                    command,
+                    raw_text,
+                    observed_at=observed_at,
+                    observation_keys=tuple(item.session_key for item in values),
+                ),
+            )
+        with self._lock:
+            self._ensure_initialized()
+            with self._connection() as connection:
+                previous_id = int(
+                    connection.execute(
+                        "SELECT coalesce(max(id), 0) FROM observations WHERE run_id = ?",
+                        (run_id,),
+                    ).fetchone()[0]
                 )
-            except (OSError, UnsafeStoragePath, ValueError) as error:
-                raise StorageError(f"Raw 출력을 저장할 수 없습니다: {error}") from error
-
-        try:
-            with self._lock, self._connection() as connection:
-                self._require_run(connection, run_id, require_running=True)
-                if artifact is not None:
-                    cursor = connection.execute(
+            self.record_poll_batch(
+                run_id,
+                QueryOutcome(observations=values, raw_snapshots=snapshots, authoritative=True),
+                _raw_kind_overrides=(raw_kind,) if snapshots else (),
+            )
+            with self._connection() as connection:
+                return tuple(
+                    int(row[0])
+                    for row in connection.execute(
                         """
-                        INSERT INTO raw_files (
-                            run_id, captured_at, kind, controller_name,
-                            relative_path, sha256, byte_size
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        SELECT id FROM observations
+                        WHERE run_id = ? AND id > ?
+                        ORDER BY id
                         """,
-                        (
-                            run_id,
-                            _iso(captured_at),
-                            raw_kind,
-                            controller_name or _single_controller_name(values),
-                            artifact.relative_path,
-                            artifact.sha256,
-                            artifact.byte_size,
-                        ),
+                        (run_id, previous_id),
                     )
-                    raw_file_id = _last_row_id(cursor)
-
-                observation_ids = []
-                for observation in values:
-                    cursor = connection.execute(
-                        """
-                        INSERT INTO observations (
-                            run_id, raw_file_id, observed_at, controller_name,
-                            controller_host, protocol, source_ip, destination_ip,
-                            source_port, destination_port, counter, priority, tos,
-                            age, destination, tunnel_age, packets, bytes_count,
-                            flags, cpu_id, session_key
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            run_id,
-                            raw_file_id,
-                            _iso(observation.observed_at),
-                            observation.controller_name,
-                            observation.controller_host,
-                            observation.protocol,
-                            observation.source_ip,
-                            observation.destination_ip,
-                            observation.source_port,
-                            observation.destination_port,
-                            observation.counter,
-                            observation.priority,
-                            observation.tos,
-                            observation.age,
-                            observation.destination,
-                            observation.tunnel_age,
-                            observation.packets,
-                            observation.bytes_count,
-                            observation.flags,
-                            observation.cpu_id,
-                            observation.session_key,
-                        ),
-                    )
-                    observation_ids.append(_last_row_id(cursor))
-                return tuple(observation_ids)
-        except (sqlite3.Error, StorageError) as error:
-            if artifact is not None:
-                with suppress(OSError, UnsafeStoragePath):
-                    self._raw.remove(artifact.relative_path)
-            if isinstance(error, StorageError):
-                raise
-            raise StorageError(f"세션 관측을 기록할 수 없습니다: {error}") from error
+                )
 
     def record_poll_batch(
         self,
         run_id: str,
         outcome: QueryOutcome,
         events: Sequence[LifecycleEvent] = (),
+        *,
+        _raw_kind_overrides: Sequence[str] = (),
     ) -> None:
         """Persist one complete query/poll as one recoverable SQLite transaction."""
 
@@ -631,6 +802,7 @@ class SessionStore:
         self._require_storage_capacity()
         safe_segment(run_id, "run_id")
         self._require_owned_running_run(run_id)
+        self._validate_poll_batch_limits(outcome, events)
         operation_id = uuid4().hex
         stage_root = self.raw_root / f".raw-staging-{operation_id}"
         prepared: tuple[_PreparedRaw, ...] = ()
@@ -648,6 +820,7 @@ class SessionStore:
                     run_id,
                     outcome,
                     stage_root,
+                    raw_kind_overrides=tuple(_raw_kind_overrides),
                 )
                 manifest_path = self._write_manifest(
                     operation_id,
@@ -662,27 +835,47 @@ class SessionStore:
                                 "relative_path": item.artifact.relative_path,
                                 "sha256": item.artifact.sha256,
                                 "byte_size": item.artifact.byte_size,
+                                "bundle_sections": [
+                                    {
+                                        "index": section.index,
+                                        "sha256": section.sha256,
+                                        "byte_size": section.byte_size,
+                                    }
+                                    for section in item.bundle_sections
+                                ],
                             }
                             for item in prepared
                         ],
                     },
                 )
                 self._stage_prepared_raw(stage_root, prepared)
+                for item in prepared:
+                    item.destination.parent.mkdir(parents=True, exist_ok=True)
+                    _reject_managed_chain(self.raw_root, item.destination.parent)
+                    if os.path.lexists(item.destination):
+                        raise StorageError("Raw 대상 파일이 이미 존재합니다.")
+                    _verify_file_fingerprint(
+                        item.staged_path,
+                        item.artifact.sha256,
+                        item.artifact.byte_size,
+                    )
+                    if item.bundle_sections:
+                        _verify_raw_bundle_file(item.staged_path, item.bundle_sections)
+                    _replace_file(
+                        item.staged_path,
+                        item.destination,
+                        expected_sha256=item.artifact.sha256,
+                        expected_size=item.artifact.byte_size,
+                    )
+                    installed.append(item)
+
+                # Durable Raw file publication is manifest-protected and
+                # complete before taking SQLite's writer lock.  The short
+                # transaction below stores only references and poll rows.
                 with self._connection() as connection:
                     connection.execute("BEGIN IMMEDIATE")
                     self._require_run(connection, run_id, require_running=True)
                     for item in prepared:
-                        item.destination.parent.mkdir(parents=True, exist_ok=True)
-                        _reject_managed_chain(self.raw_root, item.destination.parent)
-                        if os.path.lexists(item.destination):
-                            raise StorageError("Raw 대상 파일이 이미 존재합니다.")
-                        _verify_file_fingerprint(
-                            item.staged_path,
-                            item.artifact.sha256,
-                            item.artifact.byte_size,
-                        )
-                        os.replace(item.staged_path, item.destination)
-                        installed.append(item)
                         raw_file_id = _insert_raw_file(connection, run_id, item)
                         _insert_observations(connection, run_id, item.observations, raw_file_id)
                     _insert_observations(connection, run_id, remaining, None)
@@ -717,6 +910,36 @@ class SessionStore:
             if cleanup_error is not None:
                 wrapped.add_note(f"Raw batch 정리도 실패했습니다: {type(cleanup_error).__name__}")
             raise wrapped from error
+
+    @staticmethod
+    def _validate_poll_batch_limits(
+        outcome: QueryOutcome,
+        events: Sequence[LifecycleEvent],
+    ) -> None:
+        observation_count = len(outcome.observations)
+        if observation_count > _MAX_POLL_OBSERVATIONS:
+            raise StorageError(
+                "한 번의 조회에서 저장할 수 있는 관측 수를 초과했습니다.",
+                code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+            )
+        if len(events) > _MAX_POLL_LIFECYCLE_EVENTS:
+            raise StorageError(
+                "한 번의 조회에서 저장할 수 있는 수명주기 이벤트 수를 초과했습니다.",
+                code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+            )
+        if len(outcome.raw_snapshots) > _MAX_POLL_OBSERVATIONS:
+            raise StorageError(
+                "한 번의 조회에서 저장할 수 있는 Raw 항목 수를 초과했습니다.",
+                code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+            )
+        raw_bytes = 0
+        for snapshot in outcome.raw_snapshots:
+            raw_bytes += len(snapshot.output.encode("utf-8", errors="replace"))
+            if raw_bytes > _MAX_POLL_RAW_BYTES:
+                raise StorageError(
+                    "한 번의 조회에서 저장할 수 있는 Raw 출력 총량을 초과했습니다.",
+                    code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+                )
 
     def record_lifecycle(
         self,
@@ -843,8 +1066,16 @@ class SessionStore:
         except sqlite3.Error as error:
             raise StorageError(f"조회 실행 목록을 읽을 수 없습니다: {error}") from error
 
-    def export_run_csv(self, run_id: str, destination: Path | str | None = None) -> Path:
+    def export_run_csv(
+        self,
+        run_id: str,
+        destination: Path | str | None = None,
+        *,
+        cancel_check: CancelCheck | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> Path:
         self._ensure_initialized()
+        _check_cancelled(cancel_check)
         safe_segment(run_id, "run_id")
         path = (
             Path(destination)
@@ -852,16 +1083,31 @@ class SessionStore:
             else self.exports_root / f"run-{run_id}.csv"
         )
         managed_destination, export_destination = self._resolve_export_destination(path)
+        self._require_storage_capacity(
+            export_destination,
+            required_extra_bytes=self._estimate_export_bytes(run_id, html=False),
+        )
         try:
             if managed_destination is None:
                 stage = self._prepare_external_export(run_id, export_destination)
             else:
                 stage = self._prepare_managed_export(run_id, managed_destination)
             try:
-                with self._lock, self._connection() as connection:
+                self._verify_run_raw_integrity(
+                    run_id,
+                    cancel_check=cancel_check,
+                    progress=progress,
+                )
+                with self._connection() as connection:
                     connection.execute("BEGIN")
                     self._require_run(connection, run_id)
-                    self._verify_run_raw_integrity(connection, run_id)
+                    _check_cancelled(cancel_check)
+                    row_total = int(
+                        connection.execute(
+                            "SELECT count(*) FROM observations WHERE run_id = ?",
+                            (run_id,),
+                        ).fetchone()[0]
+                    )
                     cursor = connection.execute(
                         """
                         SELECT o.observed_at, o.controller_name, o.controller_host,
@@ -881,7 +1127,14 @@ class SessionStore:
                     write_csv_atomic(
                         stage.path,
                         columns=_CSV_COLUMNS,
-                        rows=_iter_cursor_dicts(cursor, batch_size=_CSV_FETCH_BATCH),
+                        rows=_iter_cursor_dicts(
+                            cursor,
+                            batch_size=_CSV_FETCH_BATCH,
+                            cancel_check=cancel_check,
+                            progress=progress,
+                            phase="csv_rows",
+                            total=row_total,
+                        ),
                     )
             except BaseException as error:
                 cleanup_error = (
@@ -910,10 +1163,18 @@ class SessionStore:
         ) as error:
             raise StorageError(f"CSV를 내보낼 수 없습니다: {error}") from error
 
-    def export_run_html(self, run_id: str, destination: Path | str | None = None) -> Path:
+    def export_run_html(
+        self,
+        run_id: str,
+        destination: Path | str | None = None,
+        *,
+        cancel_check: CancelCheck | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> Path:
         """Export one completed run as a standalone, offline HTML5 report."""
 
         self._ensure_initialized()
+        _check_cancelled(cancel_check)
         safe_segment(run_id, "run_id")
         path = (
             Path(destination)
@@ -921,209 +1182,132 @@ class SessionStore:
             else self.exports_root / f"run-{run_id}.html"
         )
         managed_destination, export_destination = self._resolve_export_destination(path)
+        self._require_storage_capacity(
+            export_destination,
+            required_extra_bytes=self._estimate_export_bytes(run_id, html=True),
+        )
         try:
-            with self._lock, self._connection() as connection:
-                connection.execute("BEGIN")
-                run = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-                if run is None:
-                    raise StorageError("요청한 조회 실행 기록이 없습니다.")
-                if run["status"] == "RUNNING":
-                    raise StorageError("RUNNING 상태의 실행은 중지 후 HTML 보고서를 만드십시오.")
-                self._verify_run_raw_integrity(connection, run_id)
-
-                controllers = connection.execute(
-                    """
-                    SELECT controller_name AS name FROM observations
-                    WHERE run_id = ? AND controller_name IS NOT NULL
-                    UNION
-                    SELECT controller_name AS name FROM raw_files
-                    WHERE run_id = ? AND controller_name IS NOT NULL
-                    UNION
-                    SELECT previous_controller AS name FROM controller_events
-                    WHERE run_id = ? AND previous_controller IS NOT NULL
-                    UNION
-                    SELECT current_controller AS name FROM controller_events
-                    WHERE run_id = ? AND current_controller IS NOT NULL
-                    ORDER BY name
-                    """,
-                    (run_id, run_id, run_id, run_id),
-                ).fetchall()
-                mm_controllers = connection.execute(
-                    """
-                    SELECT DISTINCT controller_name AS name
-                    FROM raw_files
-                    WHERE run_id = ? AND kind = 'mm-location'
-                          AND controller_name IS NOT NULL
-                    ORDER BY name
-                    """,
-                    (run_id,),
-                ).fetchall()
-                md_controllers = connection.execute(
-                    """
-                    SELECT controller_name AS name FROM observations
-                    WHERE run_id = ? AND controller_name IS NOT NULL
-                    UNION
-                    SELECT controller_name AS name FROM raw_files
-                    WHERE run_id = ? AND kind = 'session' AND controller_name IS NOT NULL
-                    UNION
-                    SELECT previous_controller AS name FROM controller_events
-                    WHERE run_id = ? AND previous_controller IS NOT NULL
-                    UNION
-                    SELECT current_controller AS name FROM controller_events
-                    WHERE run_id = ? AND current_controller IS NOT NULL
-                    ORDER BY name
-                    """,
-                    (run_id, run_id, run_id, run_id),
-                ).fetchall()
-
-                observation_total = int(
-                    connection.execute(
-                        "SELECT count(*) FROM observations WHERE run_id = ?", (run_id,)
-                    ).fetchone()[0]
-                )
-                unique_session_total = int(
-                    connection.execute(
-                        "SELECT count(DISTINCT session_key) FROM observations WHERE run_id = ?",
-                        (run_id,),
-                    ).fetchone()[0]
-                )
-                observations = connection.execute(
-                    """
-                    WITH ranked AS (
-                        SELECT o.*,
-                               row_number() OVER (
-                                   PARTITION BY o.session_key
-                                   ORDER BY o.observed_at DESC, o.id DESC
-                               ) AS rank_in_session
-                        FROM observations o
-                        WHERE o.run_id = ?
-                    )
-                    SELECT observed_at, controller_name, controller_host, protocol,
-                           source_ip, destination_ip, source_port, destination_port,
-                           counter, priority, tos, age, destination, tunnel_age,
-                           packets, bytes_count, flags, cpu_id, session_key
-                    FROM ranked
-                    WHERE rank_in_session = 1
-                    ORDER BY observed_at DESC, id DESC
-                    """,
-                    (run_id,),
-                ).fetchall()
-                observation_history = connection.execute(
-                    """
-                    SELECT observed_at, controller_name, controller_host, protocol,
-                           source_ip, destination_ip, source_port, destination_port,
-                           counter, priority, tos, age, destination, tunnel_age,
-                           packets, bytes_count, flags, cpu_id, session_key
-                    FROM observations
-                    WHERE run_id = ?
-                    ORDER BY observed_at, id
-                    """,
-                    (run_id,),
-                ).fetchall()
-
-                lifecycle_total = int(
-                    connection.execute(
-                        "SELECT count(*) FROM lifecycle_events WHERE run_id = ?", (run_id,)
-                    ).fetchone()[0]
-                )
-                lifecycle_counts = connection.execute(
-                    """
-                    SELECT event_type, count(*) AS event_count
-                    FROM lifecycle_events
-                    WHERE run_id = ?
-                    GROUP BY event_type
-                    ORDER BY event_type
-                    """,
-                    (run_id,),
-                ).fetchall()
-                lifecycle_events = connection.execute(
-                    """
-                    SELECT occurred_at, session_key, instance_id, event_type,
-                           controller_name, details_json
-                    FROM lifecycle_events
-                    WHERE run_id = ?
-                    ORDER BY occurred_at DESC, id DESC
-                    """,
-                    (run_id,),
-                ).fetchall()
-
-                controller_total = int(
-                    connection.execute(
-                        "SELECT count(*) FROM controller_events WHERE run_id = ?", (run_id,)
-                    ).fetchone()[0]
-                )
-                controller_events = connection.execute(
-                    """
-                    SELECT occurred_at, previous_controller, current_controller, reason
-                    FROM controller_events
-                    WHERE run_id = ?
-                    ORDER BY occurred_at DESC, id DESC
-                    """,
-                    (run_id,),
-                ).fetchall()
-
-                diagnostic_total = int(
-                    connection.execute(
-                        "SELECT count(*) FROM diagnostic_events WHERE run_id = ?", (run_id,)
-                    ).fetchone()[0]
-                )
-                diagnostics = connection.execute(
-                    """
-                    SELECT occurred_at, stage, code, message
-                    FROM diagnostic_events
-                    WHERE run_id = ?
-                    ORDER BY occurred_at DESC, id DESC
-                    """,
-                    (run_id,),
-                ).fetchall()
-
-                raw_totals = connection.execute(
-                    """
-                    SELECT count(*) AS file_count, coalesce(sum(byte_size), 0) AS byte_count
-                    FROM raw_files
-                    WHERE run_id = ?
-                    """,
-                    (run_id,),
-                ).fetchone()
-                raw_files = connection.execute(
-                    """
-                    SELECT id, captured_at, kind, controller_name, sha256, byte_size
-                    FROM raw_files
-                    WHERE run_id = ?
-                    ORDER BY captured_at DESC, id DESC
-                    """,
-                    (run_id,),
-                ).fetchall()
-
-                snapshot = RunReportSnapshot(
-                    run=dict(run),
-                    controllers=tuple(str(row["name"]) for row in controllers),
-                    mm_controllers=tuple(str(row["name"]) for row in mm_controllers),
-                    md_controllers=tuple(str(row["name"]) for row in md_controllers),
-                    observations=tuple(dict(row) for row in observations),
-                    observation_total=observation_total,
-                    unique_session_total=unique_session_total,
-                    lifecycle_events=tuple(dict(row) for row in lifecycle_events),
-                    lifecycle_total=lifecycle_total,
-                    lifecycle_counts=tuple(
-                        (str(row["event_type"]), int(row["event_count"]))
-                        for row in lifecycle_counts
-                    ),
-                    controller_events=tuple(dict(row) for row in controller_events),
-                    controller_total=controller_total,
-                    diagnostics=tuple(dict(row) for row in diagnostics),
-                    diagnostic_total=diagnostic_total,
-                    raw_files=tuple(dict(row) for row in raw_files),
-                    raw_file_total=int(raw_totals["file_count"]),
-                    raw_byte_total=int(raw_totals["byte_count"]),
-                    observation_history=tuple(dict(row) for row in observation_history),
-                )
             if managed_destination is None:
                 stage = self._prepare_external_export(run_id, export_destination)
             else:
                 stage = self._prepare_managed_export(run_id, managed_destination)
             try:
-                write_html_report_atomic(stage.path, snapshot)
+                self._verify_run_raw_integrity(
+                    run_id,
+                    cancel_check=cancel_check,
+                    progress=progress,
+                )
+                with self._connection() as connection:
+                    connection.execute("BEGIN")
+                    run = connection.execute(
+                        "SELECT * FROM runs WHERE id = ?", (run_id,)
+                    ).fetchone()
+                    if run is None:
+                        raise StorageError("요청한 조회 실행 기록이 없습니다.")
+                    if run["status"] == "RUNNING":
+                        raise StorageError(
+                            "RUNNING 상태의 실행은 중지 후 HTML 보고서를 만드십시오."
+                        )
+                    _check_cancelled(cancel_check)
+                    observation_total = int(
+                        connection.execute(
+                            "SELECT count(*) FROM observations WHERE run_id = ?", (run_id,)
+                        ).fetchone()[0]
+                    )
+                    unique_session_total = int(
+                        connection.execute(
+                            "SELECT count(DISTINCT session_key) FROM observations WHERE run_id = ?",
+                            (run_id,),
+                        ).fetchone()[0]
+                    )
+                    logical_session_total = int(
+                        connection.execute(
+                            """
+                            SELECT count(*) FROM (
+                                SELECT 1 FROM observations
+                                WHERE run_id = ?
+                                GROUP BY protocol, source_ip, destination_ip,
+                                         source_port, destination_port
+                            )
+                            """,
+                            (run_id,),
+                        ).fetchone()[0]
+                    )
+                    latest = tuple(
+                        dict(row)
+                        for row in connection.execute(
+                            """
+                            WITH ranked AS (
+                                SELECT o.*,
+                                       row_number() OVER (
+                                           PARTITION BY protocol, source_ip, destination_ip,
+                                                        source_port, destination_port
+                                           ORDER BY observed_at DESC, id DESC
+                                       ) AS rank_in_flow
+                                FROM observations o
+                                WHERE run_id = ?
+                            )
+                            SELECT observed_at, controller_name, protocol,
+                                   source_ip, destination_ip, source_port,
+                                   destination_port, session_key
+                            FROM ranked
+                            WHERE rank_in_flow = 1
+                            ORDER BY observed_at DESC, id DESC
+                            LIMIT 50
+                            """,
+                            (run_id,),
+                        )
+                    )
+                    lifecycle_events = self._latest_report_lifecycle_events(
+                        connection,
+                        run_id,
+                        latest,
+                        cancel_check=cancel_check,
+                        progress=progress,
+                    )
+                    snapshot = RunReportSnapshot(
+                        run=dict(run),
+                        controllers=(),
+                        mm_controllers=(),
+                        md_controllers=(),
+                        observations=latest,
+                        observation_total=observation_total,
+                        unique_session_total=unique_session_total,
+                        lifecycle_events=lifecycle_events,
+                        lifecycle_total=0,
+                        lifecycle_counts=(),
+                        controller_events=(),
+                        controller_total=0,
+                        diagnostics=(),
+                        diagnostic_total=0,
+                        raw_files=(),
+                        raw_file_total=0,
+                        raw_byte_total=0,
+                    )
+                    history = _iter_cursor_dicts(
+                        connection.execute(
+                            """
+                            SELECT observed_at, controller_name, protocol,
+                                   source_ip, destination_ip, source_port,
+                                   destination_port, session_key
+                            FROM observations
+                            WHERE run_id = ?
+                            ORDER BY observed_at, id
+                            """,
+                            (run_id,),
+                        ),
+                        batch_size=_CSV_FETCH_BATCH,
+                        cancel_check=cancel_check,
+                        progress=progress,
+                        phase="html_history",
+                        total=observation_total,
+                    )
+                    write_html_report_stream_atomic(
+                        stage.path,
+                        snapshot,
+                        history,
+                        logical_session_total=logical_session_total,
+                    )
             except BaseException as error:
                 cleanup_error = (
                     self._discard_external_export_stage(stage)
@@ -1151,10 +1335,17 @@ class SessionStore:
         ) as error:
             raise StorageError(f"HTML 보고서를 내보낼 수 없습니다: {error}") from error
 
-    def preview_delete(self, run_id: str | None = None) -> DeletePreview:
+    def preview_delete(
+        self,
+        run_id: str | None = None,
+        *,
+        cancel_check: CancelCheck | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> DeletePreview:
         """Create a five-minute, one-use deletion preview; this does not delete data."""
 
         self._ensure_initialized()
+        _check_cancelled(cancel_check)
         with self._lock:
             self._sweep_expired_delete_previews_unlocked()
             if len(self._pending_deletions) >= _MAX_PENDING_DELETIONS:
@@ -1162,36 +1353,47 @@ class SessionStore:
                     "동시에 유지할 수 있는 삭제 미리보기는 최대 16개입니다. "
                     "기존 미리보기를 취소하거나 만료 후 다시 시도하십시오."
                 )
-            try:
-                snapshot = self._collect_deletion_snapshot(run_id)
-            except UnsafeStoragePath as error:
-                raise StorageError(f"삭제 대상 경로가 안전하지 않습니다: {error}") from error
-            preview_id = uuid4().hex
-            confirmation_token = secrets.token_urlsafe(24)
-            expires_at = datetime.now(UTC) + timedelta(seconds=_DELETE_PREVIEW_TTL_SECONDS)
-            scope = "전체 기록" if run_id is None else f"실행 {run_id}"
-            preview = DeletePreview(
-                preview_id=preview_id,
-                confirmation_token=confirmation_token,
-                run_ids=snapshot.run_ids,
-                database_rows=snapshot.database_rows,
-                raw_files=len(snapshot.raw_files),
-                export_files=len(snapshot.export_files),
-                total_file_bytes=snapshot.total_file_bytes,
-                expires_at=expires_at,
-                summary=(
-                    f"{scope}: 실행 {len(snapshot.run_ids)}개, DB 행 "
-                    f"{snapshot.database_rows}개, Raw {len(snapshot.raw_files)}개, "
-                    f"내보내기 파일 {len(snapshot.export_files)}개를 삭제합니다."
-                ),
+        try:
+            snapshot = self._collect_deletion_snapshot(
+                run_id,
+                cancel_check=cancel_check,
+                progress=progress,
             )
+        except UnsafeStoragePath as error:
+            raise StorageError(f"삭제 대상 경로가 안전하지 않습니다: {error}") from error
+        preview_id = uuid4().hex
+        confirmation_token = secrets.token_urlsafe(24)
+        expires_at = datetime.now(UTC) + timedelta(seconds=_DELETE_PREVIEW_TTL_SECONDS)
+        scope = "전체 기록" if run_id is None else f"실행 {run_id}"
+        preview = DeletePreview(
+            preview_id=preview_id,
+            confirmation_token=confirmation_token,
+            run_ids=snapshot.run_ids,
+            database_rows=snapshot.database_rows,
+            raw_files=len(snapshot.raw_files),
+            export_files=len(snapshot.export_files),
+            total_file_bytes=snapshot.total_file_bytes,
+            expires_at=expires_at,
+            summary=(
+                f"{scope}: 실행 {len(snapshot.run_ids)}개, DB 행 "
+                f"{snapshot.database_rows}개, Raw {len(snapshot.raw_files)}개, "
+                f"내보내기 파일 {len(snapshot.export_files)}개를 삭제합니다."
+            ),
+        )
+        with self._lock:
+            self._sweep_expired_delete_previews_unlocked()
+            if len(self._pending_deletions) >= _MAX_PENDING_DELETIONS:
+                raise StorageError(
+                    "동시에 유지할 수 있는 삭제 미리보기는 최대 16개입니다. "
+                    "기존 미리보기를 취소하거나 만료 후 다시 시도하십시오."
+                )
             self._pending_deletions[preview_id] = _PendingDeletion(
                 preview=preview,
                 snapshot=snapshot,
                 expires_monotonic=time.monotonic() + _DELETE_PREVIEW_TTL_SECONDS,
                 target_run_id=run_id,
             )
-            return preview
+        return preview
 
     def discard_delete_preview(self, preview: DeletePreview) -> bool:
         """Discard one exact pending preview without deleting any data."""
@@ -1205,10 +1407,18 @@ class SessionStore:
             self._pending_deletions.pop(preview.preview_id, None)
             return True
 
-    def delete(self, preview: DeletePreview, *, confirmation_token: str) -> DeletionResult:
+    def delete(
+        self,
+        preview: DeletePreview,
+        *,
+        confirmation_token: str,
+        cancel_check: CancelCheck | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> DeletionResult:
         """Delete exactly the unchanged items described by a valid preview."""
 
         self._ensure_initialized()
+        _check_cancelled(cancel_check)
         with self._lock:
             now = time.monotonic()
             pending = self._pending_deletions.get(preview.preview_id)
@@ -1221,121 +1431,166 @@ class SessionStore:
                 raise StorageError("먼저 현재 삭제 대상을 미리 확인해야 합니다.")
             if not secrets.compare_digest(pending.preview.confirmation_token, confirmation_token):
                 raise StorageError("삭제 확인 토큰이 일치하지 않습니다.")
-
-            staged: list[_StagedFile] = []
-            manifest_path: Path | None = None
-            operation_lease = self._acquire_operation_lease(preview.preview_id)
-            if operation_lease is None:
-                raise StorageError("삭제 작업 잠금을 획득할 수 없습니다.")
-            phase = "snapshot"
-            try:
-                with self._connection() as connection:
-                    connection.execute("BEGIN IMMEDIATE")
-                    current = self._collect_deletion_snapshot(
-                        pending.target_run_id,
-                        connection=connection,
-                    )
-                    if current != pending.snapshot:
-                        self._pending_deletions.pop(preview.preview_id, None)
-                        raise StorageError(
-                            "미리보기 이후 기록이 변경되었습니다. 다시 확인하십시오."
-                        )
-
-                    manifest_path = self._write_manifest(
-                        preview.preview_id,
-                        {
-                            "version": _MANIFEST_VERSION,
-                            "kind": "delete",
-                            "operation_id": preview.preview_id,
-                            "files": [
-                                {
-                                    "category": category,
-                                    "relative_path": item.relative_path,
-                                    "sha256": item.sha256,
-                                    "byte_size": item.byte_size,
-                                    "registered": item.registered,
-                                }
-                                for category, items in (
-                                    ("raw", current.raw_files),
-                                    ("export", current.export_files),
-                                )
-                                for item in items
-                            ],
-                        },
-                    )
-                    phase = "staging"
-                    _stage_files(
-                        self.raw_root,
-                        current.raw_files,
-                        preview.preview_id,
-                        "raw",
-                        staged,
-                    )
-                    _stage_files(
-                        self.exports_root,
-                        current.export_files,
-                        preview.preview_id,
-                        "export",
-                        staged,
-                    )
-
-                    phase = "database"
-                    if current.run_ids:
-                        placeholders = ",".join("?" for _ in current.run_ids)
-                        cursor = connection.execute(
-                            f"DELETE FROM runs WHERE id IN ({placeholders})",  # noqa: S608
-                            current.run_ids,
-                        )
-                        if cursor.rowcount != len(current.run_ids):
-                            raise StorageError("삭제 대상 실행 기록이 미리보기와 다릅니다.")
-            except (
-                OSError,
-                sqlite3.Error,
-                StorageError,
-                UnsafeStoragePath,
-                UnsafeManagedPath,
-            ) as error:
-                restoration_error = _restore_staged_files(staged)
-                if restoration_error is not None:
-                    error.add_note(
-                        "삭제 취소 후 일부 파일 복원도 실패했습니다: "
-                        f"{type(restoration_error).__name__}"
-                    )
-                    _release_run_lease(operation_lease, remove=False)
-                else:
-                    if manifest_path is not None:
-                        _unlink_regular(manifest_path, missing_ok=True)
-                    _release_run_lease(operation_lease, remove=True)
-                if isinstance(error, StorageError):
-                    raise
-                if isinstance(error, (UnsafeStoragePath, UnsafeManagedPath)):
-                    raise StorageError(f"삭제 대상 경로가 안전하지 않습니다: {error}") from error
-                if phase == "staging":
-                    raise StorageError(
-                        f"삭제 대상 파일을 안전하게 격리할 수 없습니다: {error}"
-                    ) from error
-                raise StorageError(f"데이터베이스 기록을 삭제할 수 없습니다: {error}") from error
-
             self._pending_deletions.pop(preview.preview_id, None)
-            try:
-                _purge_staged_files(staged)
-                if manifest_path is not None:
-                    _unlink_regular(manifest_path, missing_ok=False)
-                _release_run_lease(operation_lease, remove=True)
-            except (OSError, UnsafeStoragePath) as error:
-                _release_run_lease(operation_lease, remove=False)
-                raise StorageError(
-                    "데이터베이스 삭제는 완료되었지만 격리된 파일을 마지막으로 제거하지 못했습니다."
-                ) from error
-            _remove_known_empty_run_directories(self.raw_root, current.run_ids)
-            deleted_raw = sum(item.category == "raw" for item in staged)
-            deleted_exports = sum(item.category == "export" for item in staged)
-            return DeletionResult(
-                deleted_runs=len(current.run_ids),
-                deleted_database_rows=current.database_rows,
-                deleted_raw_files=deleted_raw,
-                deleted_export_files=deleted_exports,
+
+        staged: list[_StagedFile] = []
+        manifest_path: Path | None = None
+        operation_lease = self._acquire_operation_lease(preview.preview_id)
+        if operation_lease is None:
+            raise StorageError("삭제 작업 잠금을 획득할 수 없습니다.")
+        maintenance_lease = self._acquire_maintenance_lease()
+        if maintenance_lease is None:
+            _release_run_lease(operation_lease, remove=True)
+            raise StorageError("다른 저장소 유지보수 작업이 진행 중입니다.")
+        phase = "snapshot"
+        try:
+            current = self._collect_deletion_snapshot(
+                pending.target_run_id,
+                cancel_check=cancel_check,
+                progress=progress,
+                expected=pending.snapshot,
             )
+            if current != pending.snapshot:
+                raise StorageError("미리보기 이후 기록이 변경되었습니다. 다시 확인하십시오.")
+
+            manifest_path = self._write_manifest(
+                preview.preview_id,
+                {
+                    "version": _MANIFEST_VERSION,
+                    "kind": "delete",
+                    "operation_id": preview.preview_id,
+                    "files": [
+                        {
+                            "category": category,
+                            "relative_path": item.relative_path,
+                            "sha256": item.sha256,
+                            "byte_size": item.byte_size,
+                            "registered": item.registered,
+                        }
+                        for category, items in (
+                            ("raw", current.raw_files),
+                            ("export", current.export_files),
+                        )
+                        for item in items
+                    ],
+                },
+            )
+            phase = "staging"
+            _stage_files(
+                self.raw_root,
+                current.raw_files,
+                preview.preview_id,
+                "raw",
+                staged,
+                cancel_check=cancel_check,
+                progress=progress,
+            )
+            _stage_files(
+                self.exports_root,
+                current.export_files,
+                preview.preview_id,
+                "export",
+                staged,
+                cancel_check=cancel_check,
+                progress=progress,
+            )
+            self._require_no_new_deletion_files(
+                pending.target_run_id,
+                cancel_check=cancel_check,
+                progress=progress,
+            )
+
+            phase = "database"
+            _check_cancelled(cancel_check)
+            with self._lock, self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                self._require_deletion_database_state(
+                    connection,
+                    pending.target_run_id,
+                    current,
+                )
+                _verify_staged_file_identities(staged)
+                if current.run_ids:
+                    placeholders = ",".join("?" for _ in current.run_ids)
+                    cursor = connection.execute(
+                        f"DELETE FROM runs WHERE id IN ({placeholders})",  # noqa: S608
+                        current.run_ids,
+                    )
+                    if cursor.rowcount != len(current.run_ids):
+                        raise StorageError("삭제 대상 실행 기록이 미리보기와 다릅니다.")
+        except (
+            OSError,
+            sqlite3.Error,
+            StorageError,
+            UnsafeStoragePath,
+            UnsafeManagedPath,
+        ) as error:
+            restoration_error = _restore_staged_files(staged)
+            if restoration_error is not None:
+                error.add_note(
+                    "삭제 취소 후 일부 파일 복원도 실패했습니다: "
+                    f"{type(restoration_error).__name__}"
+                )
+                _release_run_lease(operation_lease, remove=False)
+                _release_run_lease(maintenance_lease, remove=True)
+            else:
+                if manifest_path is not None:
+                    _unlink_regular(manifest_path, missing_ok=True)
+                _release_run_lease(operation_lease, remove=True)
+                _release_run_lease(maintenance_lease, remove=True)
+            if isinstance(error, StorageError):
+                raise
+            if isinstance(error, (UnsafeStoragePath, UnsafeManagedPath)):
+                raise StorageError(f"삭제 대상 경로가 안전하지 않습니다: {error}") from error
+            if phase == "staging":
+                raise StorageError(
+                    f"삭제 대상 파일을 안전하게 격리할 수 없습니다: {error}"
+                ) from error
+            raise StorageError(f"데이터베이스 기록을 삭제할 수 없습니다: {error}") from error
+
+        try:
+            _purge_staged_files(staged)
+            if manifest_path is not None:
+                _unlink_regular(manifest_path, missing_ok=False)
+            _release_run_lease(operation_lease, remove=True)
+            _release_run_lease(maintenance_lease, remove=True)
+        except (OSError, StorageError, UnsafeStoragePath) as error:
+            _release_run_lease(operation_lease, remove=False)
+            _release_run_lease(maintenance_lease, remove=True)
+            raise StorageError(
+                "데이터베이스 삭제는 완료되었지만 격리된 파일을 마지막으로 제거하지 못했습니다."
+            ) from error
+        raw_orphans = tuple(
+            item for item in staged if item.category == "raw" and not item.registered
+        )
+        export_orphans = tuple(
+            item for item in staged if item.category == "export" and not item.registered
+        )
+        with self._lock:
+            self._raw_unregistered_usage = (
+                max(
+                    0,
+                    self._raw_unregistered_usage[0] - sum(item.byte_size for item in raw_orphans),
+                ),
+                max(0, self._raw_unregistered_usage[1] - len(raw_orphans)),
+            )
+            self._export_unregistered_usage = (
+                max(
+                    0,
+                    self._export_unregistered_usage[0]
+                    - sum(item.byte_size for item in export_orphans),
+                ),
+                max(0, self._export_unregistered_usage[1] - len(export_orphans)),
+            )
+        _remove_known_empty_run_directories(self.raw_root, current.run_ids)
+        deleted_raw = sum(item.category == "raw" for item in staged)
+        deleted_exports = sum(item.category == "export" for item in staged)
+        return DeletionResult(
+            deleted_runs=len(current.run_ids),
+            deleted_database_rows=current.database_rows,
+            deleted_raw_files=deleted_raw,
+            deleted_export_files=deleted_exports,
+        )
 
     def _sweep_expired_delete_previews_unlocked(self, now: float | None = None) -> int:
         current = time.monotonic() if now is None else now
@@ -1385,8 +1640,19 @@ class SessionStore:
 
     def _storage_health_unlocked(self) -> StorageHealth:
         self._assert_managed_layout()
-        raw_bytes, raw_count = _storage_tree_stats(self.raw_root)
-        export_bytes, export_count = _storage_tree_stats(self.exports_root)
+        with self._connection() as connection:
+            raw_registered = connection.execute(
+                "SELECT coalesce(sum(byte_size), 0), count(*) FROM raw_files"
+            ).fetchone()
+            export_registered = connection.execute(
+                "SELECT coalesce(sum(byte_size), 0), count(*) FROM exports"
+            ).fetchone()
+        raw_registered_usage = (int(raw_registered[0]), int(raw_registered[1]))
+        export_registered_usage = (int(export_registered[0]), int(export_registered[1]))
+        raw_bytes = raw_registered_usage[0] + self._raw_unregistered_usage[0]
+        raw_count = raw_registered_usage[1] + self._raw_unregistered_usage[1]
+        export_bytes = export_registered_usage[0] + self._export_unregistered_usage[0]
+        export_count = export_registered_usage[1] + self._export_unregistered_usage[1]
         free_bytes = _minimum_free_bytes((self.db_path.parent, self.raw_root, self.exports_root))
         return StorageHealth(
             database_bytes=_regular_file_size(self.db_path),
@@ -1398,7 +1664,30 @@ class SessionStore:
             free_bytes=free_bytes,
         )
 
-    def _require_storage_capacity(self, destination: Path | None = None) -> None:
+    def _registered_storage_usage(
+        self,
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        self._assert_managed_layout()
+        with self._connection() as connection:
+            raw_registered = connection.execute(
+                "SELECT coalesce(sum(byte_size), 0), count(*) FROM raw_files"
+            ).fetchone()
+            export_registered = connection.execute(
+                "SELECT coalesce(sum(byte_size), 0), count(*) FROM exports"
+            ).fetchone()
+        return (
+            (int(raw_registered[0]), int(raw_registered[1])),
+            (int(export_registered[0]), int(export_registered[1])),
+        )
+
+    def _require_storage_capacity(
+        self,
+        destination: Path | None = None,
+        *,
+        required_extra_bytes: int = 0,
+    ) -> None:
+        if required_extra_bytes < 0:
+            raise ValueError("추가 저장 공간 예상치는 음수일 수 없습니다.")
         try:
             with self._lock:
                 self._assert_managed_layout()
@@ -1410,7 +1699,7 @@ class SessionStore:
                         free_bytes,
                         _minimum_free_bytes((_nearest_existing_directory(destination.parent),)),
                     )
-                if free_bytes < STORAGE_HARD_STOP_FREE_BYTES:
+                if free_bytes - required_extra_bytes < STORAGE_HARD_STOP_FREE_BYTES:
                     raise StorageError(
                         "저장 공간이 1 GiB 미만이므로 새 기록을 안전하게 저장할 수 없습니다.",
                         code=ErrorCode.STORAGE_LOW_SPACE,
@@ -1420,6 +1709,21 @@ class SessionStore:
         except (OSError, UnsafeManagedPath, UnsafeStoragePath) as error:
             raise StorageError(f"저장소 여유 공간을 확인할 수 없습니다: {error}") from error
 
+    def _estimate_export_bytes(self, run_id: str, *, html: bool) -> int:
+        """Return a conservative preflight size without materializing report rows."""
+
+        with self._lock, self._connection() as connection:
+            self._require_run(connection, run_id)
+            row_count = int(
+                connection.execute(
+                    "SELECT count(*) FROM observations WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()[0]
+            )
+        fixed_overhead = 256 * 1024 if html else 64 * 1024
+        per_row = 1024 if html else 768
+        return fixed_overhead + row_count * per_row
+
     def _acquire_run_lease(self, run_id: str) -> _RunLease | None:
         safe_segment(run_id, "run_id")
         return _acquire_file_lease(self._leases_root / f"run-{run_id}.lease")
@@ -1427,6 +1731,9 @@ class SessionStore:
     def _acquire_operation_lease(self, operation_id: str) -> _RunLease | None:
         _validate_operation_id(operation_id)
         return _acquire_file_lease(self._leases_root / f"operation-{operation_id}.lease")
+
+    def _acquire_maintenance_lease(self) -> _RunLease | None:
+        return _acquire_file_lease(self._leases_root / "storage-maintenance.lease")
 
     def _interrupt_abandoned_runs(self) -> None:
         acquired: list[tuple[str, _RunLease]] = []
@@ -1481,23 +1788,61 @@ class SessionStore:
         run_id: str,
         outcome: QueryOutcome,
         stage_root: Path,
+        *,
+        raw_kind_overrides: tuple[str, ...] = (),
     ) -> tuple[tuple[_PreparedRaw, ...], tuple[SessionObservation, ...]]:
         remaining = {item.session_key: item for item in outcome.observations}
+        snapshots = tuple(outcome.raw_snapshots)
+        if raw_kind_overrides and len(raw_kind_overrides) != len(snapshots):
+            raise ValueError("Raw kind override 수가 snapshot 수와 일치하지 않습니다.")
+        if len(snapshots) > 1:
+            bundled_observations: list[SessionObservation] = []
+            section_observations: list[tuple[SessionObservation, ...]] = []
+            for snapshot in snapshots:
+                observations = _select_snapshot_observations(snapshot, remaining)
+                section_observations.append(observations)
+                bundled_observations.extend(observations)
+            captured_at = min(snapshot.observed_at for snapshot in snapshots)
+            data, sections = _raw_bundle_data(snapshots, tuple(section_observations))
+            artifact = _raw_artifact_for_data(
+                run_id,
+                kind=_RAW_BUNDLE_KIND,
+                controller_name=_RAW_BUNDLE_CONTROLLER,
+                data=data,
+                captured_at=captured_at,
+            )
+            relative = Path(artifact.relative_path)
+            return (
+                (
+                    _PreparedRaw(
+                        artifact=artifact,
+                        staged_path=stage_root / relative,
+                        destination=_managed_file_path(
+                            self.raw_root,
+                            artifact.relative_path,
+                            allow_missing=True,
+                        ),
+                        captured_at=captured_at,
+                        kind=_RAW_BUNDLE_KIND,
+                        controller_name=_RAW_BUNDLE_CONTROLLER,
+                        observations=tuple(bundled_observations),
+                        data=data,
+                        bundle_sections=sections,
+                    ),
+                ),
+                tuple(remaining.values()),
+            )
+
         prepared: list[_PreparedRaw] = []
-        for snapshot in outcome.raw_snapshots:
-            if snapshot.observation_keys is None:
-                observations = tuple(
-                    item
-                    for item in remaining.values()
-                    if item.controller_name == snapshot.device_name
-                )
-            else:
-                observations = tuple(
-                    remaining[key] for key in snapshot.observation_keys if key in remaining
-                )
-            for observation in observations:
-                remaining.pop(observation.session_key, None)
-            raw_kind = "session" if "datapath" in snapshot.command else "mm-location"
+        for index, snapshot in enumerate(snapshots):
+            observations = _select_snapshot_observations(snapshot, remaining)
+            raw_kind = (
+                raw_kind_overrides[index]
+                if raw_kind_overrides
+                else "session"
+                if "datapath" in snapshot.command
+                else "mm-location"
+            )
             artifact, data = _raw_artifact_for_batch(
                 run_id,
                 kind=raw_kind,
@@ -1563,7 +1908,17 @@ class SessionStore:
             return error
         return None
 
-    def _recover_operations(self) -> None:
+    def _recover_operations(self) -> bool:
+        maintenance = self._acquire_maintenance_lease()
+        if maintenance is None:
+            return False
+        try:
+            self._recover_operations_under_maintenance()
+            return True
+        finally:
+            _release_run_lease(maintenance, remove=True)
+
+    def _recover_operations_under_maintenance(self) -> None:
         self._assert_managed_layout()
         with os.scandir(self._manifests_root) as entries:
             manifest_paths: list[Path] = []
@@ -1611,7 +1966,13 @@ class SessionStore:
                 elif kind == "export":
                     self._recover_export_manifest(path, payload)
                 elif kind == "external_export":
-                    self._recover_external_export_manifest(path, payload)
+                    try:
+                        self._recover_external_export_manifest(path, payload)
+                    except OSError as error:
+                        if not _external_recovery_target_unavailable(error):
+                            raise
+                        with self._lock:
+                            self._pending_external_recoveries[operation_id] = type(error).__name__
                 else:
                     raise StorageError("지원하지 않는 저장 작업 manifest 종류입니다.")
             finally:
@@ -1668,16 +2029,27 @@ class SessionStore:
                 if committed:
                     if os.path.lexists(destination):
                         _verify_file_fingerprint(destination, item["sha256"], item["byte_size"])
+                        if item["bundle_sections"]:
+                            _verify_raw_bundle_file(destination, item["bundle_sections"])
                     elif os.path.lexists(staged):
                         _verify_file_fingerprint(staged, item["sha256"], item["byte_size"])
+                        if item["bundle_sections"]:
+                            _verify_raw_bundle_file(staged, item["bundle_sections"])
                         destination.parent.mkdir(parents=True, exist_ok=True)
-                        os.replace(staged, destination)
+                        _replace_file(
+                            staged,
+                            destination,
+                            expected_sha256=item["sha256"],
+                            expected_size=item["byte_size"],
+                        )
                     else:
                         raise StorageError("DB가 참조하는 Raw 파일을 복구할 수 없습니다.")
                 else:
                     for candidate in (destination, staged):
                         if os.path.lexists(candidate):
                             _verify_file_fingerprint(candidate, item["sha256"], item["byte_size"])
+                            if item["bundle_sections"]:
+                                _verify_raw_bundle_file(candidate, item["bundle_sections"])
                             candidate.unlink()
         self._remove_operation_artifacts(path, stage_root)
 
@@ -1785,7 +2157,12 @@ class SessionStore:
                 _verify_file_fingerprint(destination, new_sha, new_size)
             elif os.path.lexists(staged):
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(staged, destination)
+                _replace_file(
+                    staged,
+                    destination,
+                    expected_sha256=new_sha,
+                    expected_size=new_size,
+                )
             else:
                 raise StorageError("등록된 내보내기 파일을 복구할 수 없습니다.")
         elif db_is_previous:
@@ -1804,7 +2181,12 @@ class SessionStore:
                     if os.path.lexists(destination):
                         _verify_file_fingerprint(destination, new_sha, new_size)
                         _unlink_regular(destination, missing_ok=False)
-                    os.replace(backup, destination)
+                    _replace_file(
+                        backup,
+                        destination,
+                        expected_sha256=previous_file[0],
+                        expected_size=previous_file[1],
+                    )
                 elif os.path.lexists(destination):
                     _verify_file_fingerprint(destination, *previous_file)
                 else:
@@ -1892,7 +2274,12 @@ class SessionStore:
                 if os.path.lexists(destination):
                     _verify_file_fingerprint(destination, new_sha, new_size)
                     _unlink_regular(destination, missing_ok=False)
-                os.replace(backup, destination)
+                _replace_file(
+                    backup,
+                    destination,
+                    expected_sha256=previous_file[0],
+                    expected_size=previous_file[1],
+                )
             elif previous_file is None:
                 if os.path.lexists(destination):
                     _verify_file_fingerprint(destination, new_sha, new_size)
@@ -2036,7 +2423,12 @@ class SessionStore:
                     if os.path.lexists(destination):
                         _verify_file_fingerprint(destination, expected_sha, expected_size)
                     elif len(matching) == 1:
-                        os.replace(matching[0], destination)
+                        _replace_file(
+                            matching[0],
+                            destination,
+                            expected_sha256=expected_sha,
+                            expected_size=expected_size,
+                        )
                     else:
                         raise StorageError("legacy 내보내기 파일 상태가 모호합니다.")
                     for artifact, _kind in artifacts:
@@ -2061,7 +2453,12 @@ class SessionStore:
             )
 
     @contextmanager
-    def _connection(self, *, uninitialized: bool = False) -> Iterator[sqlite3.Connection]:
+    def _connection(
+        self,
+        *,
+        uninitialized: bool = False,
+        configure_wal: bool = False,
+    ) -> Iterator[sqlite3.Connection]:
         if not uninitialized and not self._initialized:
             raise StorageError("데이터베이스가 초기화되지 않았습니다.")
         if self._directory_identities:
@@ -2070,7 +2467,11 @@ class SessionStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 10000")
-        connection.execute("PRAGMA journal_mode = WAL")
+        if configure_wal:
+            mode = str(connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]).lower()
+            if mode != "wal":
+                connection.close()
+                raise StorageError("SQLite WAL journal mode를 활성화할 수 없습니다.")
         connection.execute("PRAGMA synchronous = FULL")
         try:
             with connection:
@@ -2388,6 +2789,26 @@ class SessionStore:
         destination: Path,
         stage: _ManagedExportStage,
     ) -> None:
+        maintenance = self._acquire_maintenance_lease()
+        if maintenance is None:
+            cleanup_error = self._discard_managed_export_stage(stage)
+            error = StorageError("삭제 또는 다른 저장소 유지보수 작업이 진행 중입니다.")
+            if cleanup_error is not None:
+                error.add_note(
+                    f"내보내기 staging 정리도 실패했습니다: {type(cleanup_error).__name__}"
+                )
+            raise error
+        try:
+            self._commit_managed_export_under_maintenance(run_id, destination, stage)
+        finally:
+            _release_run_lease(maintenance, remove=True)
+
+    def _commit_managed_export_under_maintenance(
+        self,
+        run_id: str,
+        destination: Path,
+        stage: _ManagedExportStage,
+    ) -> None:
         try:
             self._assert_managed_layout()
             exports_root = self.exports_root
@@ -2407,6 +2828,20 @@ class SessionStore:
             previous_file_size: int | None = None
             if os.path.lexists(destination):
                 previous_file_sha, previous_file_size = _file_fingerprint(destination)
+            with self._connection() as connection:
+                self._require_run(connection, run_id)
+                previous_row = connection.execute(
+                    "SELECT sha256, byte_size FROM exports WHERE relative_path = ?",
+                    (relative,),
+                ).fetchone()
+            previous_db_sha = str(previous_row["sha256"]) if previous_row else None
+            previous_db_size = int(previous_row["byte_size"]) if previous_row else None
+            if previous_row is not None and (
+                previous_file_sha is None
+                or previous_file_sha != previous_db_sha
+                or previous_file_size != previous_db_size
+            ):
+                raise StorageError("기존 관리 내보내기 파일의 무결성이 일치하지 않습니다.")
         except (
             OSError,
             StorageError,
@@ -2425,70 +2860,86 @@ class SessionStore:
         db_committed = False
         phase_payload: dict[str, object] | None = None
         try:
-            with self._lock:
-                with self._connection() as connection:
-                    connection.execute("BEGIN IMMEDIATE")
-                    self._require_run(connection, run_id)
-                    previous_row = connection.execute(
-                        "SELECT sha256, byte_size FROM exports WHERE relative_path = ?",
-                        (relative,),
-                    ).fetchone()
-                    previous_db_sha = str(previous_row["sha256"]) if previous_row else None
-                    previous_db_size = int(previous_row["byte_size"]) if previous_row else None
-                    if previous_row is not None and (
-                        previous_file_sha is None
-                        or (
-                            previous_file_sha != previous_db_sha
-                            or previous_file_size != previous_db_size
-                        )
-                    ):
-                        raise StorageError("기존 관리 내보내기 파일의 무결성이 일치하지 않습니다.")
-                    phase_payload = {
-                        "version": _MANIFEST_VERSION,
-                        "kind": "export",
-                        "phase": "RENDERED",
-                        "operation_id": operation_id,
-                        "run_id": run_id,
-                        "relative_path": relative,
-                        "staged_relative": staged_relative,
-                        "backup_relative": backup_relative,
-                        "sha256": new_sha,
-                        "byte_size": new_size,
-                        "previous_file_sha256": previous_file_sha,
-                        "previous_file_byte_size": previous_file_size,
-                        "previous_db_sha256": previous_db_sha,
-                        "previous_db_byte_size": previous_db_size,
-                    }
-                    self._replace_manifest(stage.manifest_path, phase_payload)
-                    if os.path.lexists(destination):
-                        os.replace(destination, backup)
-                    os.replace(stage.path, destination)
-                    installed = True
-                    phase_payload = {**phase_payload, "phase": "INSTALLED"}
-                    self._replace_manifest(stage.manifest_path, phase_payload)
-                    connection.execute(
-                        """
-                        INSERT INTO exports (
-                            run_id, created_at, relative_path, sha256, byte_size
-                        ) VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(relative_path) DO UPDATE SET
-                            run_id = excluded.run_id,
-                            created_at = excluded.created_at,
-                            sha256 = excluded.sha256,
-                            byte_size = excluded.byte_size
-                        """,
-                        (
-                            run_id,
-                            _iso(None),
-                            relative,
-                            new_sha,
-                            new_size,
-                        ),
-                    )
-                db_committed = True
-                assert phase_payload is not None
-                phase_payload = {**phase_payload, "phase": "DB_COMMITTED"}
-                self._replace_manifest(stage.manifest_path, phase_payload)
+            phase_payload = {
+                "version": _MANIFEST_VERSION,
+                "kind": "export",
+                "phase": "RENDERED",
+                "operation_id": operation_id,
+                "run_id": run_id,
+                "relative_path": relative,
+                "staged_relative": staged_relative,
+                "backup_relative": backup_relative,
+                "sha256": new_sha,
+                "byte_size": new_size,
+                "previous_file_sha256": previous_file_sha,
+                "previous_file_byte_size": previous_file_size,
+                "previous_db_sha256": previous_db_sha,
+                "previous_db_byte_size": previous_db_size,
+            }
+            self._replace_manifest(stage.manifest_path, phase_payload)
+            if os.path.lexists(destination):
+                assert previous_file_sha is not None
+                assert previous_file_size is not None
+                _replace_file(
+                    destination,
+                    backup,
+                    expected_sha256=previous_file_sha,
+                    expected_size=previous_file_size,
+                )
+            _replace_file(
+                stage.path,
+                destination,
+                expected_sha256=new_sha,
+                expected_size=new_size,
+            )
+            installed = True
+            phase_payload = {**phase_payload, "phase": "INSTALLED"}
+            self._replace_manifest(stage.manifest_path, phase_payload)
+
+            # File hashing, durable moves, and manifest fsync are deliberately
+            # complete before this short writer transaction.  Recheck the DB
+            # receipt state under the lock, then publish only the metadata.
+            with self._lock, self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                self._require_run(connection, run_id)
+                current_row = connection.execute(
+                    "SELECT sha256, byte_size FROM exports WHERE relative_path = ?",
+                    (relative,),
+                ).fetchone()
+                current_db = (
+                    (str(current_row["sha256"]), int(current_row["byte_size"]))
+                    if current_row is not None
+                    else None
+                )
+                previous_db = (
+                    (previous_db_sha, previous_db_size)
+                    if previous_db_sha is not None and previous_db_size is not None
+                    else None
+                )
+                if current_db != previous_db:
+                    raise StorageError("내보내기 설치 중 DB 등록 상태가 변경되었습니다.")
+                connection.execute(
+                    """
+                    INSERT INTO exports (
+                        run_id, created_at, relative_path, sha256, byte_size
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(relative_path) DO UPDATE SET
+                        run_id = excluded.run_id,
+                        created_at = excluded.created_at,
+                        sha256 = excluded.sha256,
+                        byte_size = excluded.byte_size
+                    """,
+                    (
+                        run_id,
+                        _iso(None),
+                        relative,
+                        new_sha,
+                        new_size,
+                    ),
+                )
+            db_committed = True
+            phase_payload = {**phase_payload, "phase": "DB_COMMITTED"}
+            self._replace_manifest(stage.manifest_path, phase_payload)
         except (
             OSError,
             sqlite3.Error,
@@ -2512,7 +2963,14 @@ class SessionStore:
                     if os.path.lexists(destination):
                         _verify_file_fingerprint(destination, new_sha, new_size)
                         _unlink_regular(destination, missing_ok=False)
-                    os.replace(backup, destination)
+                    assert previous_file_sha is not None
+                    assert previous_file_size is not None
+                    _replace_file(
+                        backup,
+                        destination,
+                        expected_sha256=previous_file_sha,
+                        expected_size=previous_file_size,
+                    )
                 elif installed:
                     _verify_file_fingerprint(destination, new_sha, new_size)
                     _unlink_regular(destination, missing_ok=False)
@@ -2560,6 +3018,26 @@ class SessionStore:
             ) from final_cleanup_error
 
     def _commit_external_export(
+        self,
+        run_id: str,
+        destination: Path,
+        stage: _ManagedExportStage,
+    ) -> None:
+        maintenance = self._acquire_maintenance_lease()
+        if maintenance is None:
+            cleanup_error = self._discard_external_export_stage(stage)
+            error = StorageError("삭제 또는 다른 저장소 유지보수 작업이 진행 중입니다.")
+            if cleanup_error is not None:
+                error.add_note(
+                    f"외부 내보내기 staging 정리도 실패했습니다: {type(cleanup_error).__name__}"
+                )
+            raise error
+        try:
+            self._commit_external_export_under_maintenance(run_id, destination, stage)
+        finally:
+            _release_run_lease(maintenance, remove=True)
+
+    def _commit_external_export_under_maintenance(
         self,
         run_id: str,
         destination: Path,
@@ -2614,50 +3092,65 @@ class SessionStore:
             "previous_file_byte_size": previous_file_size,
         }
         try:
-            with self._lock:
-                with self._connection() as connection:
-                    connection.execute("BEGIN IMMEDIATE")
-                    self._require_run(connection, run_id)
-                    self._read_external_export_owner(stage.operation_id, manifest)
-                    self._replace_manifest(stage.manifest_path, phase_payload)
-                    if os.path.lexists(destination):
-                        assert previous_file_sha is not None
-                        assert previous_file_size is not None
-                        _verify_file_fingerprint(
-                            destination,
-                            previous_file_sha,
-                            previous_file_size,
-                        )
-                        os.replace(destination, backup)
-                        _verify_file_fingerprint(
-                            backup,
-                            previous_file_sha,
-                            previous_file_size,
-                        )
-                    os.replace(stage.path, destination)
-                    installed = True
-                    _verify_file_fingerprint(destination, new_sha, new_size)
-                    phase_payload = {**phase_payload, "phase": "INSTALLED"}
-                    self._replace_manifest(stage.manifest_path, phase_payload)
-                    connection.execute(
-                        """
-                        INSERT INTO external_export_commits (
-                            operation_id, target_key, run_id,
-                            committed_at, sha256, byte_size
-                        ) VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            stage.operation_id,
-                            owner.target_key,
-                            run_id,
-                            _iso(None),
-                            new_sha,
-                            new_size,
-                        ),
-                    )
-                database_committed = True
-                phase_payload = {**phase_payload, "phase": "DB_COMMITTED"}
-                self._replace_manifest(stage.manifest_path, phase_payload)
+            self._replace_manifest(stage.manifest_path, phase_payload)
+            if os.path.lexists(destination):
+                assert previous_file_sha is not None
+                assert previous_file_size is not None
+                _verify_file_fingerprint(
+                    destination,
+                    previous_file_sha,
+                    previous_file_size,
+                )
+                _replace_file(
+                    destination,
+                    backup,
+                    expected_sha256=previous_file_sha,
+                    expected_size=previous_file_size,
+                )
+                _verify_file_fingerprint(
+                    backup,
+                    previous_file_sha,
+                    previous_file_size,
+                )
+            _replace_file(
+                stage.path,
+                destination,
+                expected_sha256=new_sha,
+                expected_size=new_size,
+            )
+            installed = True
+            _verify_file_fingerprint(destination, new_sha, new_size)
+            phase_payload = {**phase_payload, "phase": "INSTALLED"}
+            self._replace_manifest(stage.manifest_path, phase_payload)
+
+            # Revalidate the external ownership proof before entering the
+            # transaction.  The operation and maintenance leases keep this
+            # export serialized; SQLite then stores only the small receipt.
+            current_owner = self._read_external_export_owner(stage.operation_id, phase_payload)
+            if current_owner != owner:
+                raise StorageError("외부 내보내기 소유권 증표가 설치 중 변경되었습니다.")
+            with self._lock, self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                self._require_run(connection, run_id)
+                connection.execute(
+                    """
+                    INSERT INTO external_export_commits (
+                        operation_id, target_key, run_id,
+                        committed_at, sha256, byte_size
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        stage.operation_id,
+                        owner.target_key,
+                        run_id,
+                        _iso(None),
+                        new_sha,
+                        new_size,
+                    ),
+                )
+            database_committed = True
+            phase_payload = {**phase_payload, "phase": "DB_COMMITTED"}
+            self._replace_manifest(stage.manifest_path, phase_payload)
         except (
             OSError,
             sqlite3.Error,
@@ -2691,7 +3184,12 @@ class SessionStore:
                     if os.path.lexists(destination):
                         _verify_file_fingerprint(destination, new_sha, new_size)
                         _unlink_regular(destination, missing_ok=False)
-                    os.replace(backup, destination)
+                    _replace_file(
+                        backup,
+                        destination,
+                        expected_sha256=previous_file_sha,
+                        expected_size=previous_file_size,
+                    )
                 elif installed or (previous_file_sha is None and os.path.lexists(destination)):
                     _verify_file_fingerprint(destination, new_sha, new_size)
                     _unlink_regular(destination, missing_ok=False)
@@ -2769,21 +3267,46 @@ class SessionStore:
 
     def _verify_run_raw_integrity(
         self,
-        connection: sqlite3.Connection,
         run_id: str,
+        *,
+        cancel_check: CancelCheck | None = None,
+        progress: ProgressCallback | None = None,
     ) -> None:
-        cursor = connection.execute(
-            """
-            SELECT relative_path, sha256, byte_size
-            FROM raw_files WHERE run_id = ? ORDER BY id
-            """,
-            (run_id,),
-        )
+        """Verify Raw artifacts without retaining a long SQLite read snapshot."""
+
+        last_id = 0
+        verified_files = 0
+        verified_bytes = 0
+        with self._connection() as connection:
+            self._require_run(connection, run_id)
+            totals = connection.execute(
+                """
+                SELECT count(*), coalesce(sum(byte_size), 0)
+                FROM raw_files WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        file_total = int(totals[0])
+        byte_total = int(totals[1])
+        if file_total == 0:
+            return
         while True:
-            rows = cursor.fetchmany(_CSV_FETCH_BATCH)
+            _check_cancelled(cancel_check)
+            with self._connection() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT id, relative_path, sha256, byte_size
+                    FROM raw_files
+                    WHERE run_id = ? AND id > ?
+                    ORDER BY id
+                    LIMIT ?
+                    """,
+                    (run_id, last_id, _CSV_FETCH_BATCH),
+                ).fetchall()
             if not rows:
                 break
             for row in rows:
+                _check_cancelled(cancel_check)
                 path = _managed_file_path(
                     self.raw_root,
                     str(row["relative_path"]),
@@ -2793,14 +3316,88 @@ class SessionStore:
                     path,
                     str(row["sha256"]),
                     int(row["byte_size"]),
+                    cancel_check=cancel_check,
+                    progress=progress,
+                    phase="export_raw_bytes",
+                    completed_base=verified_bytes,
+                    total=byte_total,
                 )
+                last_id = int(row["id"])
+                verified_files += 1
+                verified_bytes += int(row["byte_size"])
+                _notify_progress(
+                    progress,
+                    "export_raw_files",
+                    verified_files,
+                    file_total,
+                )
+
+    @staticmethod
+    def _latest_report_lifecycle_events(
+        connection: sqlite3.Connection,
+        run_id: str,
+        latest_observations: tuple[dict[str, object], ...],
+        *,
+        cancel_check: CancelCheck | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> tuple[dict[str, object], ...]:
+        """Keep only the latest lifecycle row needed by each displayed flow.
+
+        A long-running monitor may contain many lifecycle rows.  The concise
+        HTML report needs status only for its latest fifty flows, so retaining
+        the complete lifecycle history would defeat the streaming export.
+        """
+
+        wanted_flows = {_report_flow_key(row) for row in latest_observations}
+        wanted_sessions = {str(row.get("session_key") or "") for row in latest_observations} - {""}
+        selected_flows: set[tuple[str, str, str, str, str]] = set()
+        selected_sessions: set[str] = set()
+        selected: list[dict[str, object]] = []
+        cursor = connection.execute(
+            """
+            SELECT occurred_at, session_key, event_type
+            FROM lifecycle_events
+            WHERE run_id = ?
+            ORDER BY occurred_at DESC, id DESC
+            """,
+            (run_id,),
+        )
+        scanned = 0
+        while True:
+            _check_cancelled(cancel_check)
+            rows = cursor.fetchmany(_CSV_FETCH_BATCH)
+            if not rows:
+                break
+            scanned += len(rows)
+            _notify_progress(progress, "html_lifecycle", scanned, None)
+            for row in rows:
+                session_key = str(row["session_key"] or "")
+                flow = _report_flow_key_from_session_key(session_key)
+                keep_flow = flow in wanted_flows and flow not in selected_flows
+                keep_session = (
+                    session_key in wanted_sessions and session_key not in selected_sessions
+                )
+                if not keep_flow and not keep_session:
+                    continue
+                selected.append(dict(row))
+                if keep_flow and flow is not None:
+                    selected_flows.add(flow)
+                if keep_session:
+                    selected_sessions.add(session_key)
+            if selected_flows >= wanted_flows and selected_sessions >= wanted_sessions:
+                break
+        return tuple(selected)
 
     def _collect_deletion_snapshot(
         self,
         run_id: str | None,
         *,
         connection: sqlite3.Connection | None = None,
+        cancel_check: CancelCheck | None = None,
+        progress: ProgressCallback | None = None,
+        expected: _DeletionSnapshot | None = None,
     ) -> _DeletionSnapshot:
+        _check_cancelled(cancel_check)
         if run_id is not None:
             safe_segment(run_id, "run_id")
         try:
@@ -2815,11 +3412,31 @@ class SessionStore:
         run_ids, row_counts, registered_raw_paths, registered_export_paths = database_state
 
         if run_id is None:
-            filesystem_raw_paths = set(_scan_regular_files(self.raw_root))
-            filesystem_export_paths = set(_scan_regular_files(self.exports_root))
+            filesystem_raw_paths = set(
+                _scan_regular_files(
+                    self.raw_root,
+                    cancel_check=cancel_check,
+                    progress=progress,
+                    phase="delete_scan_raw",
+                )
+            )
+            filesystem_export_paths = set(
+                _scan_regular_files(
+                    self.exports_root,
+                    cancel_check=cancel_check,
+                    progress=progress,
+                    phase="delete_scan_exports",
+                )
+            )
         else:
             filesystem_raw_paths = set(
-                _scan_regular_files(self.raw_root, relative_directory=Path(run_id))
+                _scan_regular_files(
+                    self.raw_root,
+                    relative_directory=Path(run_id),
+                    cancel_check=cancel_check,
+                    progress=progress,
+                    phase="delete_scan_raw",
+                )
             )
             filesystem_export_paths = set()
 
@@ -2827,15 +3444,72 @@ class SessionStore:
             self.raw_root,
             registered_raw_paths | filesystem_raw_paths,
             registered_raw_paths,
+            cancel_check=cancel_check,
+            progress=progress,
+            phase="delete_hash_raw",
+            expected_files=expected.raw_files if expected is not None else (),
         )
         export_files = _snapshot_managed_files(
             self.exports_root,
             registered_export_paths | filesystem_export_paths,
             registered_export_paths,
+            cancel_check=cancel_check,
+            progress=progress,
+            phase="delete_hash_exports",
+            expected_files=expected.export_files if expected is not None else (),
         )
         total_bytes = sum(item.byte_size for item in raw_files)
         total_bytes += sum(item.byte_size for item in export_files)
         return _DeletionSnapshot(run_ids, row_counts, raw_files, export_files, total_bytes)
+
+    def _require_no_new_deletion_files(
+        self,
+        run_id: str | None,
+        *,
+        cancel_check: CancelCheck | None,
+        progress: ProgressCallback | None,
+    ) -> None:
+        remaining_raw = _scan_regular_files(
+            self.raw_root,
+            relative_directory=Path(run_id) if run_id is not None else None,
+            cancel_check=cancel_check,
+            progress=progress,
+            phase="delete_recheck_raw",
+        )
+        remaining_exports = (
+            _scan_regular_files(
+                self.exports_root,
+                cancel_check=cancel_check,
+                progress=progress,
+                phase="delete_recheck_exports",
+            )
+            if run_id is None
+            else ()
+        )
+        if remaining_raw or remaining_exports:
+            raise StorageError("삭제 격리 중 새 관리 파일이 생겼습니다. 다시 확인하십시오.")
+
+    def _require_deletion_database_state(
+        self,
+        connection: sqlite3.Connection,
+        run_id: str | None,
+        expected: _DeletionSnapshot,
+    ) -> None:
+        run_ids, row_counts, raw_paths, export_paths = self._deletion_database_state(
+            connection,
+            run_id,
+        )
+        expected_raw_paths = {item.relative_path for item in expected.raw_files if item.registered}
+        expected_export_paths = {
+            item.relative_path for item in expected.export_files if item.registered
+        }
+        if (
+            run_ids != expected.run_ids
+            or row_counts != expected.row_counts
+            or raw_paths != expected_raw_paths
+            or export_paths != expected_export_paths
+        ):
+            raise StorageError("미리보기 이후 데이터베이스 기록이 변경되었습니다.")
 
     def _deletion_database_state(
         self,
@@ -3037,22 +3711,56 @@ def _validate_operation_id(value: str) -> str:
 
 
 def _acquire_file_lease(path: Path) -> _RunLease | None:
-    if os.path.lexists(path):
+    path = Path(os.path.abspath(path))
+    try:
+        parent_before = reject_link_or_reparse(path.parent)
+    except UnsafeManagedPath as error:
+        raise StorageError(str(error)) from error
+    if not stat.S_ISDIR(parent_before.st_mode):
+        raise StorageError("잠금 파일의 상위 경로가 디렉터리가 아닙니다.")
+
+    open_flags = os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+    before: os.stat_result | None = None
+    created = False
+    try:
+        descriptor = os.open(path, open_flags | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:
         try:
-            info = reject_link_or_reparse(path)
+            before = os.lstat(path)
+            _validate_lease_file_info(before)
+            descriptor = os.open(path, open_flags | getattr(os, "O_NOFOLLOW", 0))
         except UnsafeManagedPath as error:
             raise StorageError(str(error)) from error
-        if not stat.S_ISREG(info.st_mode):
-            raise StorageError("잠금 경로가 일반 파일이 아닙니다.")
-    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+
     stream = os.fdopen(descriptor, "r+b", buffering=0)
     try:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode):
-            raise StorageError("잠금 파일이 일반 파일이 아닙니다.")
-        if info.st_size == 0:
+        opened = os.fstat(stream.fileno())
+        path_after_open = os.lstat(path)
+        parent_after_open = reject_link_or_reparse(path.parent)
+        _validate_lease_file_info(opened)
+        _validate_lease_file_info(path_after_open)
+        _require_same_file_identity(opened, path_after_open)
+        if before is not None:
+            _require_same_file_identity(before, opened)
+        if not created and before is None:  # pragma: no cover - defensive invariant
+            raise StorageError("기존 잠금 파일의 최초 신원을 확인할 수 없습니다.")
+        _require_same_directory_identity(parent_before, parent_after_open)
+
+        # Windows byte-range locking needs the first byte to exist.  No write
+        # occurs until the opened handle, path, parent, regular-file type,
+        # reparse state, and single-link identity all agree.
+        if opened.st_size == 0:
             stream.write(b"0")
         stream.seek(0)
+        after_write = os.fstat(stream.fileno())
+        path_after_write = os.lstat(path)
+        parent_after_write = reject_link_or_reparse(path.parent)
+        _validate_lease_file_info(after_write)
+        _validate_lease_file_info(path_after_write)
+        _require_same_file_identity(opened, after_write)
+        _require_same_file_identity(after_write, path_after_write)
+        _require_same_directory_identity(parent_before, parent_after_write)
         try:
             if os.name == "nt":
                 import msvcrt
@@ -3067,10 +3775,48 @@ def _acquire_file_lease(path: Path) -> _RunLease | None:
         except OSError:
             stream.close()
             return None
-        return _RunLease(path, stream, int(info.st_dev), int(info.st_ino))
+
+        locked = os.fstat(stream.fileno())
+        path_after_lock = os.lstat(path)
+        parent_after_lock = reject_link_or_reparse(path.parent)
+        _validate_lease_file_info(locked)
+        _validate_lease_file_info(path_after_lock)
+        _require_same_file_identity(after_write, locked)
+        _require_same_file_identity(locked, path_after_lock)
+        _require_same_directory_identity(parent_before, parent_after_lock)
+        return _RunLease(path, stream, int(locked.st_dev), int(locked.st_ino))
     except Exception:
         stream.close()
         raise
+
+
+def _validate_lease_file_info(info: os.stat_result) -> None:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = int(getattr(info, "st_file_attributes", 0))
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or (reparse_flag and attributes & reparse_flag)
+    ):
+        raise StorageError("잠금 경로가 일반 비-reparse 파일이 아닙니다.")
+    if int(info.st_nlink) != 1:
+        raise StorageError("잠금 파일에는 hardlink를 사용할 수 없습니다.")
+
+
+def _require_same_file_identity(left: os.stat_result, right: os.stat_result) -> None:
+    if (int(left.st_dev), int(left.st_ino)) != (int(right.st_dev), int(right.st_ino)):
+        raise StorageError("잠금 파일 경로가 여는 동안 다른 파일로 변경되었습니다.")
+
+
+def _require_same_directory_identity(left: os.stat_result, right: os.stat_result) -> None:
+    if not stat.S_ISDIR(right.st_mode) or (
+        int(left.st_dev),
+        int(left.st_ino),
+    ) != (
+        int(right.st_dev),
+        int(right.st_ino),
+    ):
+        raise StorageError("잠금 파일의 상위 경로가 여는 동안 변경되었습니다.")
 
 
 def _release_run_lease(lease: _RunLease, *, remove: bool) -> None:
@@ -3099,6 +3845,24 @@ def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
     _write_bytes_atomic(path, data)
 
 
+def _replace_file(
+    source: Path,
+    destination: Path,
+    *,
+    expected_sha256: str | None = None,
+    expected_size: int | None = None,
+) -> None:
+    """Replace a file with bounded retries for transient Windows sharing locks."""
+
+    replace_with_retry(
+        source,
+        destination,
+        replace=os.replace,
+        expected_sha256=expected_sha256,
+        expected_size=expected_size,
+    )
+
+
 def _write_bytes_atomic(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
@@ -3108,7 +3872,12 @@ def _write_bytes_atomic(path: Path, data: bytes) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        _replace_file(
+            temporary,
+            path,
+            expected_sha256=hashlib.sha256(data).hexdigest(),
+            expected_size=len(data),
+        )
     finally:
         if os.path.lexists(temporary):
             _unlink_regular(temporary, missing_ok=False)
@@ -3192,9 +3961,34 @@ def _manifest_files(payload: dict[str, Any]) -> tuple[dict[str, Any], ...]:
                 "relative_path": relative,
                 "sha256": sha256,
                 "byte_size": _manifest_int(value, "byte_size"),
+                "bundle_sections": _manifest_bundle_sections(value),
             }
         )
     return tuple(result)
+
+
+def _manifest_bundle_sections(payload: dict[str, Any]) -> tuple[_RawBundleSection, ...]:
+    raw_sections = payload.get("bundle_sections", [])
+    if not isinstance(raw_sections, list):
+        raise StorageError("Raw bundle manifest section 목록이 올바르지 않습니다.")
+    sections: list[_RawBundleSection] = []
+    for expected_index, value in enumerate(raw_sections, start=1):
+        if not isinstance(value, dict):
+            raise StorageError("Raw bundle manifest section이 올바르지 않습니다.")
+        index = _manifest_int(value, "index")
+        sha256 = _manifest_text(value, "sha256")
+        if index != expected_index or re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
+            raise StorageError("Raw bundle manifest section 순서 또는 SHA-256이 올바르지 않습니다.")
+        sections.append(
+            _RawBundleSection(
+                index=index,
+                sha256=sha256,
+                byte_size=_manifest_int(value, "byte_size"),
+            )
+        )
+    if len(sections) == 1:
+        raise StorageError("Raw poll bundle에는 두 개 이상의 section이 필요합니다.")
+    return tuple(sections)
 
 
 def _manifest_delete_files(payload: dict[str, Any]) -> tuple[dict[str, Any], ...]:
@@ -3228,7 +4022,16 @@ def _manifest_delete_files(payload: dict[str, Any]) -> tuple[dict[str, Any], ...
     return tuple(result)
 
 
-def _file_fingerprint(path: Path) -> tuple[str, int]:
+def _file_fingerprint(
+    path: Path,
+    *,
+    cancel_check: CancelCheck | None = None,
+    progress: ProgressCallback | None = None,
+    phase: str = "file_hash",
+    completed_base: int = 0,
+    total: int | None = None,
+) -> tuple[str, int]:
+    _check_cancelled(cancel_check)
     _reject_link_or_reparse(path)
     info = os.lstat(path)
     if not stat.S_ISREG(info.st_mode):
@@ -3242,9 +4045,14 @@ def _file_fingerprint(path: Path) -> tuple[str, int]:
             int(info.st_ino),
         ):
             raise StorageError("fingerprint 대상 파일이 열기 전에 변경되었습니다.")
-        while chunk := stream.read(_HASH_CHUNK_SIZE):
+        while True:
+            _check_cancelled(cancel_check)
+            chunk = stream.read(_HASH_CHUNK_SIZE)
+            if not chunk:
+                break
             digest.update(chunk)
             size += len(chunk)
+            _notify_progress(progress, phase, completed_base + size, total)
         opened_after = os.fstat(stream.fileno())
     after = os.lstat(path)
     if (
@@ -3272,8 +4080,34 @@ def _file_fingerprint(path: Path) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
-def _verify_file_fingerprint(path: Path, sha256: str, byte_size: int) -> None:
-    actual_sha, actual_size = _file_fingerprint(path)
+def _verify_file_fingerprint(
+    path: Path,
+    sha256: str,
+    byte_size: int,
+    *,
+    cancel_check: CancelCheck | None = None,
+    progress: ProgressCallback | None = None,
+    phase: str = "file_hash",
+    completed_base: int = 0,
+    total: int | None = None,
+) -> None:
+    if (
+        cancel_check is None
+        and progress is None
+        and phase == "file_hash"
+        and completed_base == 0
+        and total is None
+    ):
+        actual_sha, actual_size = _file_fingerprint(path)
+    else:
+        actual_sha, actual_size = _file_fingerprint(
+            path,
+            cancel_check=cancel_check,
+            progress=progress,
+            phase=phase,
+            completed_base=completed_base,
+            total=total,
+        )
     if actual_sha != sha256 or actual_size != byte_size:
         raise StorageError("관리 파일의 SHA-256 또는 크기가 변경되었습니다.")
 
@@ -3286,19 +4120,67 @@ def _fingerprint_matches(path: Path, sha256: str, byte_size: int) -> bool:
     return True
 
 
+def _check_cancelled(cancel_check: CancelCheck | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise StorageError("작업이 취소되었습니다.", code=ErrorCode.CANCELLED)
+
+
+def _notify_progress(
+    progress: ProgressCallback | None,
+    phase: str,
+    completed: int,
+    total: int | None,
+) -> None:
+    if progress is not None:
+        progress(phase, completed, total)
+
+
 def _snapshot_managed_files(
     root: Path,
     paths: set[str],
     registered_paths: set[str],
+    *,
+    cancel_check: CancelCheck | None = None,
+    progress: ProgressCallback | None = None,
+    phase: str = "delete_hash",
+    expected_files: tuple[_DeletionFile, ...] = (),
 ) -> tuple[_DeletionFile, ...]:
     result: list[_DeletionFile] = []
-    for relative in sorted(paths):
+    expected_by_path = {item.relative_path: item for item in expected_files}
+    ordered = sorted(paths)
+    total = len(ordered)
+    for index, relative in enumerate(ordered, start=1):
+        _check_cancelled(cancel_check)
         path = _managed_file_path(root, relative, allow_missing=True)
         if os.path.lexists(path):
-            sha256, byte_size = _file_fingerprint(path)
+            info = os.lstat(path)
+            identity = (int(info.st_dev), int(info.st_ino), int(info.st_mtime_ns))
+            expected = expected_by_path.get(relative)
+            if (
+                expected is not None
+                and expected.sha256 is not None
+                and expected.byte_size == int(info.st_size)
+                and (expected.device, expected.inode, expected.modified_ns) == identity
+            ):
+                sha256, byte_size = expected.sha256, expected.byte_size
+            else:
+                sha256, byte_size = _file_fingerprint(path)
+            device, inode, modified_ns = identity
         else:
             sha256, byte_size = None, 0
-        result.append(_DeletionFile(relative, sha256, byte_size, relative in registered_paths))
+            device, inode, modified_ns = None, None, None
+        result.append(
+            _DeletionFile(
+                relative,
+                sha256,
+                byte_size,
+                relative in registered_paths,
+                device,
+                inode,
+                modified_ns,
+            )
+        )
+        _notify_progress(progress, phase, index, total)
     return tuple(result)
 
 
@@ -3306,13 +4188,21 @@ def _iter_cursor_dicts(
     cursor: sqlite3.Cursor,
     *,
     batch_size: int,
+    cancel_check: CancelCheck | None = None,
+    progress: ProgressCallback | None = None,
+    phase: str = "rows",
+    total: int | None = None,
 ) -> Iterator[dict[str, object]]:
+    completed = 0
     while True:
+        _check_cancelled(cancel_check)
         rows = cursor.fetchmany(batch_size)
         if not rows:
             return
         for row in rows:
             yield dict(row)
+        completed += len(rows)
+        _notify_progress(progress, phase, completed, total)
 
 
 def _raw_filename_segment(value: str, label: str) -> str:
@@ -3323,14 +4213,92 @@ def _raw_filename_segment(value: str, label: str) -> str:
     return f"{normalized[:48]}-{digest}"
 
 
-def _raw_artifact_for_batch(
+def _select_snapshot_observations(
+    snapshot: RawSnapshot,
+    remaining: dict[str, SessionObservation],
+) -> tuple[SessionObservation, ...]:
+    if snapshot.observation_keys is None:
+        observations = tuple(
+            item for item in remaining.values() if item.controller_name == snapshot.device_name
+        )
+    else:
+        observations = tuple(
+            remaining[key] for key in snapshot.observation_keys if key in remaining
+        )
+    for observation in observations:
+        remaining.pop(observation.session_key, None)
+    return observations
+
+
+def _raw_bundle_data(
+    snapshots: tuple[RawSnapshot, ...],
+    section_observations: tuple[tuple[SessionObservation, ...], ...],
+) -> tuple[bytes, tuple[_RawBundleSection, ...]]:
+    if len(snapshots) != len(section_observations) or len(snapshots) < 2:
+        raise ValueError("Raw poll bundle에는 두 개 이상의 일치하는 section이 필요합니다.")
+    buffer = io.BytesIO()
+
+    def write_part(part: bytes) -> None:
+        if buffer.tell() + len(part) > _MAX_POLL_RAW_BYTES:
+            raise StorageError(
+                "한 번의 조회에서 저장할 수 있는 Raw bundle 총량을 초과했습니다.",
+                code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+            )
+        buffer.write(part)
+
+    write_part(_RAW_BUNDLE_MAGIC)
+    write_part(
+        json.dumps(
+            {"snapshot_count": len(snapshots)},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    sections: list[_RawBundleSection] = []
+    for index, (snapshot, observations) in enumerate(
+        zip(snapshots, section_observations, strict=True),
+        start=1,
+    ):
+        output = snapshot.output.encode("utf-8")
+        digest = hashlib.sha256(output).hexdigest()
+        section = _RawBundleSection(index, digest, len(output))
+        sections.append(section)
+        metadata = {
+            "command": snapshot.command,
+            "device_name": snapshot.device_name,
+            "index": index,
+            "observation_keys": [item.session_key for item in observations],
+            "observed_at": _iso(snapshot.observed_at),
+            "output_sha256": digest,
+            "output_utf8_bytes": len(output),
+        }
+        write_part(f"--- BEGIN SNAPSHOT {index} ---\n".encode())
+        write_part(
+            json.dumps(
+                metadata,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+        write_part(output)
+        write_part(f"\n--- END SNAPSHOT {index} ---\n".encode())
+    data = buffer.getvalue()
+    _verify_raw_bundle_stream(io.BytesIO(data), tuple(sections))
+    return data, tuple(sections)
+
+
+def _raw_artifact_for_data(
     run_id: str,
     *,
     kind: str,
     controller_name: str,
-    content: str,
+    data: bytes,
     captured_at: datetime,
-) -> tuple[RawArtifact, bytes]:
+) -> RawArtifact:
     run_segment = safe_segment(run_id, "run_id")
     if captured_at.tzinfo is None:
         raise ValueError("시간 값에는 timezone 정보가 필요합니다.")
@@ -3344,11 +4312,82 @@ def _raw_artifact_for_batch(
     relative = (
         Path(run_segment) / captured_utc.strftime("%Y%m%d") / captured_utc.strftime("%H") / filename
     ).as_posix()
+    return RawArtifact(relative, hashlib.sha256(data).hexdigest(), len(data))
+
+
+def _raw_artifact_for_batch(
+    run_id: str,
+    *,
+    kind: str,
+    controller_name: str,
+    content: str,
+    captured_at: datetime,
+) -> tuple[RawArtifact, bytes]:
     data = content.encode("utf-8")
-    return (
-        RawArtifact(relative, hashlib.sha256(data).hexdigest(), len(data)),
-        data,
-    )
+    return _raw_artifact_for_data(
+        run_id,
+        kind=kind,
+        controller_name=controller_name,
+        data=data,
+        captured_at=captured_at,
+    ), data
+
+
+def _verify_raw_bundle_file(
+    path: Path,
+    sections: tuple[_RawBundleSection, ...],
+) -> None:
+    with path.open("rb") as stream:
+        _verify_raw_bundle_stream(stream, sections)
+
+
+def _verify_raw_bundle_stream(
+    stream: BinaryIO,
+    sections: tuple[_RawBundleSection, ...],
+) -> None:
+    if stream.readline() != _RAW_BUNDLE_MAGIC:
+        raise StorageError("Raw poll bundle 헤더가 올바르지 않습니다.")
+    try:
+        header = json.loads(stream.readline().decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise StorageError("Raw poll bundle 메타데이터를 읽을 수 없습니다.") from error
+    if not isinstance(header, dict) or header.get("snapshot_count") != len(sections):
+        raise StorageError("Raw poll bundle section 수가 일치하지 않습니다.")
+    for section in sections:
+        if stream.readline() != f"--- BEGIN SNAPSHOT {section.index} ---\n".encode():
+            raise StorageError("Raw poll bundle section 시작 위치가 올바르지 않습니다.")
+        try:
+            metadata = json.loads(stream.readline().decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise StorageError("Raw poll bundle section 메타데이터를 읽을 수 없습니다.") from error
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("index") != section.index
+            or metadata.get("output_sha256") != section.sha256
+            or metadata.get("output_utf8_bytes") != section.byte_size
+            or not isinstance(metadata.get("device_name"), str)
+            or not isinstance(metadata.get("command"), str)
+            or not isinstance(metadata.get("observed_at"), str)
+            or not isinstance(metadata.get("observation_keys"), list)
+            or not all(isinstance(value, str) for value in metadata["observation_keys"])
+        ):
+            raise StorageError("Raw poll bundle section 메타데이터가 manifest와 다릅니다.")
+        digest = hashlib.sha256()
+        remaining = section.byte_size
+        while remaining:
+            chunk = stream.read(min(_HASH_CHUNK_SIZE, remaining))
+            if not chunk:
+                raise StorageError("Raw poll bundle section 본문이 잘렸습니다.")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if digest.hexdigest() != section.sha256:
+            raise StorageError("Raw poll bundle section SHA-256이 일치하지 않습니다.")
+        if stream.read(1) != b"\n" or stream.readline() != (
+            f"--- END SNAPSHOT {section.index} ---\n".encode()
+        ):
+            raise StorageError("Raw poll bundle section 종료 위치가 올바르지 않습니다.")
+    if stream.read(1):
+        raise StorageError("Raw poll bundle 뒤에 예상하지 못한 데이터가 있습니다.")
 
 
 def _insert_raw_file(
@@ -3497,6 +4536,25 @@ def _numeric_delta(current: int | None, previous: int | None) -> int | None:
     return current - previous
 
 
+def _report_flow_key(row: dict[str, object]) -> tuple[str, str, str, str, str]:
+    return (
+        str(row.get("protocol") or ""),
+        str(row.get("source_ip") or ""),
+        str(row.get("destination_ip") or ""),
+        str(row.get("source_port") if row.get("source_port") is not None else ""),
+        str(row.get("destination_port") if row.get("destination_port") is not None else ""),
+    )
+
+
+def _report_flow_key_from_session_key(
+    session_key: str,
+) -> tuple[str, str, str, str, str] | None:
+    parts = session_key.split("|")
+    if len(parts) != 6:
+        return None
+    return parts[1], parts[2], parts[3], parts[4], parts[5]
+
+
 def _reject_managed_chain(root: Path, directory: Path) -> None:
     root_absolute = Path(os.path.abspath(root))
     directory_absolute = Path(os.path.abspath(directory))
@@ -3581,7 +4639,12 @@ def _reconcile_deleted_file(
     if should_restore:
         if not canonical_exists and staged_exists:
             canonical.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(staged, canonical)
+            _replace_file(
+                staged,
+                canonical,
+                expected_sha256=sha256,
+                expected_size=byte_size,
+            )
         elif canonical_exists and staged_exists:
             staged.unlink()
         elif not canonical_exists:
@@ -3690,6 +4753,12 @@ def _external_export_target_key(
     normalized = os.path.normcase(str(Path(os.path.abspath(destination))))
     payload = f"{parent_device}\0{parent_inode}\0{normalized}".encode()
     return hashlib.sha256(payload).hexdigest()
+
+
+def _external_recovery_target_unavailable(error: OSError) -> bool:
+    if isinstance(error, (FileNotFoundError, NotADirectoryError)):
+        return True
+    return getattr(error, "winerror", None) in {2, 3, 21, 53, 64, 67, 121, 1231}
 
 
 def _validate_external_export_aliases(path: Path) -> None:
@@ -3812,9 +4881,35 @@ def _regular_file_size(path: Path) -> int:
     return int(info.st_size)
 
 
-def _storage_tree_stats(root: Path) -> tuple[int, int]:
-    files = _scan_regular_files(root, include_internal=True)
-    return sum(_regular_file_size(root / Path(relative)) for relative in files), len(files)
+def _directory_revision(path: Path) -> tuple[int, int, int]:
+    _reject_link_or_reparse(path)
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode):
+        raise UnsafeStoragePath("저장소 대조 루트가 디렉터리가 아닙니다.")
+    return int(info.st_dev), int(info.st_ino), int(info.st_mtime_ns)
+
+
+def _storage_tree_stats(
+    root: Path,
+    *,
+    cancel_check: CancelCheck | None = None,
+    progress: ProgressCallback | None = None,
+    phase: str = "storage_scan",
+) -> tuple[int, int]:
+    files = _scan_regular_files(
+        root,
+        include_internal=True,
+        cancel_check=cancel_check,
+        progress=progress,
+        phase=phase,
+    )
+    total_bytes = 0
+    total = len(files)
+    for index, relative in enumerate(files, start=1):
+        _check_cancelled(cancel_check)
+        total_bytes += _regular_file_size(root / Path(relative))
+        _notify_progress(progress, f"{phase}_sizes", index, total)
+    return total_bytes, total
 
 
 def _minimum_free_bytes(paths: Iterable[Path]) -> int:
@@ -3841,6 +4936,9 @@ def _scan_regular_files(
     *,
     relative_directory: Path | None = None,
     include_internal: bool = False,
+    cancel_check: CancelCheck | None = None,
+    progress: ProgressCallback | None = None,
+    phase: str = "scan_files",
 ) -> tuple[str, ...]:
     if os.path.lexists(root):
         _reject_link_or_reparse(root)
@@ -3865,9 +4963,11 @@ def _scan_regular_files(
     files: list[str] = []
     directories = [start]
     while directories:
+        _check_cancelled(cancel_check)
         directory = directories.pop()
         with os.scandir(directory) as entries:
             for entry in entries:
+                _check_cancelled(cancel_check)
                 path = Path(entry.path)
                 _reject_link_or_reparse(path)
                 mode = entry.stat(follow_symlinks=False).st_mode
@@ -3880,6 +4980,7 @@ def _scan_regular_files(
                     directories.append(path)
                 elif stat.S_ISREG(mode):
                     files.append(path.relative_to(root_resolved).as_posix())
+                    _notify_progress(progress, phase, len(files), None)
                 else:
                     raise UnsafeStoragePath("관리 루트에 일반 파일이 아닌 항목이 있습니다.")
     return tuple(sorted(files))
@@ -3891,6 +4992,9 @@ def _stage_files(
     preview_id: str,
     category: str,
     staged: list[_StagedFile],
+    *,
+    cancel_check: CancelCheck | None = None,
+    progress: ProgressCallback | None = None,
 ) -> None:
     if not files:
         return
@@ -3899,7 +5003,9 @@ def _stage_files(
     if os.path.lexists(stage_root):
         raise UnsafeStoragePath("삭제 격리 디렉터리가 이미 있습니다.")
 
-    for item in files:
+    total = len(files)
+    for index, item in enumerate(files, start=1):
+        _check_cancelled(cancel_check)
         relative = item.relative_path
         source = _managed_file_path(root, relative, allow_missing=True)
         if not os.path.lexists(source):
@@ -3908,13 +5014,25 @@ def _stage_files(
             continue
         if item.sha256 is None:
             raise StorageError("삭제 미리보기 이후 관리 파일이 새로 생겼습니다.")
-        _verify_file_fingerprint(source, item.sha256, item.byte_size)
+        source_info = os.lstat(source)
+        if (
+            int(source_info.st_size) != item.byte_size
+            or int(source_info.st_dev) != item.device
+            or int(source_info.st_ino) != item.inode
+            or int(source_info.st_mtime_ns) != item.modified_ns
+        ):
+            raise StorageError("삭제 격리 직전에 관리 파일이 변경되었습니다.")
         parts = _safe_relative_parts(relative)
         destination = contained_path(stage_root, Path(*parts))
         destination.parent.mkdir(parents=True, exist_ok=True)
         if os.path.lexists(destination):
             raise UnsafeStoragePath("삭제 격리 경로가 이미 있습니다.")
-        os.replace(source, destination)
+        _replace_file(
+            source,
+            destination,
+            expected_sha256=item.sha256,
+            expected_size=item.byte_size,
+        )
         staged.append(
             _StagedFile(
                 source,
@@ -3924,9 +5042,13 @@ def _stage_files(
                 item.sha256,
                 item.byte_size,
                 item.registered,
+                int(source_info.st_dev),
+                int(source_info.st_ino),
+                int(source_info.st_mtime_ns),
             )
         )
         _verify_file_fingerprint(destination, item.sha256, item.byte_size)
+        _notify_progress(progress, f"delete_stage_{category}", index, total)
 
 
 def _restore_staged_files(staged: list[_StagedFile]) -> OSError | None:
@@ -3937,12 +5059,32 @@ def _restore_staged_files(staged: list[_StagedFile]) -> OSError | None:
                 raise FileExistsError(item.source)
             _verify_file_fingerprint(item.destination, item.sha256, item.byte_size)
             item.source.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(item.destination, item.source)
+            _replace_file(
+                item.destination,
+                item.source,
+                expected_sha256=item.sha256,
+                expected_size=item.byte_size,
+            )
         except (OSError, UnsafeStoragePath, StorageError) as error:
             if first_error is None:
                 first_error = OSError(str(error))
     _remove_staging_directories(staged)
     return first_error
+
+
+def _verify_staged_file_identities(staged: list[_StagedFile]) -> None:
+    """Perform a metadata-only recheck while the SQLite write lock is held."""
+
+    for item in staged:
+        info = reject_link_or_reparse(item.destination)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or int(info.st_dev) != item.device
+            or int(info.st_ino) != item.inode
+            or int(info.st_size) != item.byte_size
+            or int(info.st_mtime_ns) != item.modified_ns
+        ):
+            raise StorageError("삭제 격리 파일이 데이터베이스 반영 직전에 변경되었습니다.")
 
 
 def _purge_staged_files(staged: list[_StagedFile]) -> None:

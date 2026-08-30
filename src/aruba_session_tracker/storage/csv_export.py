@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import os
 import re
 import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
+
+from aruba_session_tracker.storage.durable_io import replace_with_retry
 
 _FORMULA_PREFIX = re.compile(r"^[\s\x00-\x1f]*[=+\-@]")
 
@@ -45,7 +48,19 @@ def write_csv_atomic(
                 writer.writerow({column: guard_csv_cell(row.get(column)) for column in columns})
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_path, path)
+        digest = hashlib.sha256()
+        byte_size = 0
+        with temporary_path.open("rb") as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+                byte_size += len(chunk)
+        replace_with_retry(
+            temporary_path,
+            path,
+            replace=os.replace,
+            expected_sha256=digest.hexdigest(),
+            expected_size=byte_size,
+        )
     finally:
         temporary_path.unlink(missing_ok=True)
     return path

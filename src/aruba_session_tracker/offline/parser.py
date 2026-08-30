@@ -9,7 +9,7 @@ ambiguous or incomplete.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from ipaddress import IPv4Address
 
 from aruba_session_tracker.models import ErrorCode
@@ -44,6 +44,8 @@ _BARE_COMMAND_RE = re.compile(
     re.IGNORECASE,
 )
 _DASH_RUN_RE = re.compile(r"-+")
+_LINE_BREAK_RE = re.compile(r"\r\n|\r|\n")
+_UNSUPPORTED_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _COUNT_RE = re.compile(r"^(?:Total\s+)?Entries\s*[:=]\s*([0-9]+)\s*$", re.IGNORECASE)
 _USER_COUNT_RE = re.compile(
     r"^User Entries\s*:\s*([0-9]+)(?:/[0-9]+)?\s*$",
@@ -105,14 +107,16 @@ def extract_exact_command_block(
     command: str,
     *,
     limits: OfflineParseLimits | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> OfflineCommandBlock:
     """Extract exactly one supported echoed command and its output lines."""
 
+    _validate_cancellation_callback(is_cancelled)
     selected_limits = limits or OfflineParseLimits()
-    lines = _validated_lines(text, selected_limits)
+    lines = _validated_lines(text, selected_limits, is_cancelled=is_cancelled)
     if command not in _SUPPORTED_COMMANDS:
         raise ValueError("Unsupported offline command.")
-    block = _find_exact_command_block(lines, command)
+    block = _find_exact_command_block(lines, command, is_cancelled=is_cancelled)
     if block is None:
         raise ParseError("Required offline command block was not found.")
     return block
@@ -122,22 +126,40 @@ def parse_offline_tech_support(
     text: str,
     *,
     limits: OfflineParseLimits | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> OfflineTechSupportResult:
     """Parse the required session block and safe optional enrichment records."""
 
+    _validate_cancellation_callback(is_cancelled)
     selected_limits = limits or OfflineParseLimits()
-    lines = _validated_lines(text, selected_limits)
-    datapath_block = _find_exact_command_block(lines, DATAPATH_INTERNAL_COMMAND)
+    lines = _validated_lines(text, selected_limits, is_cancelled=is_cancelled)
+    datapath_block = _find_exact_command_block(
+        lines,
+        DATAPATH_INTERNAL_COMMAND,
+        is_cancelled=is_cancelled,
+    )
     if datapath_block is None:
         raise ParseError("Required offline command block was not found.")
-    sessions = _parse_internal_block(datapath_block, selected_limits)
+    sessions = _parse_internal_block(
+        datapath_block,
+        selected_limits,
+        is_cancelled=is_cancelled,
+    )
 
     user_records: tuple[OfflineUserRecord, ...] = ()
     user_status = OfflineEnrichmentStatus.NOT_PRESENT
     try:
-        user_block = _find_exact_command_block(lines, USER_TABLE_VERBOSE_COMMAND)
+        user_block = _find_exact_command_block(
+            lines,
+            USER_TABLE_VERBOSE_COMMAND,
+            is_cancelled=is_cancelled,
+        )
         if user_block is not None:
-            user_records = _parse_user_enrichment(user_block, selected_limits)
+            user_records = _parse_user_enrichment(
+                user_block,
+                selected_limits,
+                is_cancelled=is_cancelled,
+            )
             user_status = OfflineEnrichmentStatus.VALIDATED
     except ParseError as exc:
         if exc.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED:
@@ -147,9 +169,17 @@ def parse_offline_tech_support(
     station_records: tuple[OfflineStationRecord, ...] = ()
     station_status = OfflineEnrichmentStatus.NOT_PRESENT
     try:
-        station_block = _find_exact_command_block(lines, STATION_TABLE_COMMAND)
+        station_block = _find_exact_command_block(
+            lines,
+            STATION_TABLE_COMMAND,
+            is_cancelled=is_cancelled,
+        )
         if station_block is not None:
-            station_records = _parse_station_enrichment(station_block, selected_limits)
+            station_records = _parse_station_enrichment(
+                station_block,
+                selected_limits,
+                is_cancelled=is_cancelled,
+            )
             station_status = OfflineEnrichmentStatus.VALIDATED
     except ParseError as exc:
         if exc.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED:
@@ -174,7 +204,13 @@ def parse_offline_tech_support(
     )
 
 
-def _validated_lines(text: str, limits: OfflineParseLimits) -> tuple[str, ...]:
+def _validated_lines(
+    text: str,
+    limits: OfflineParseLimits,
+    *,
+    is_cancelled: Callable[[], bool] | None = None,
+) -> tuple[str, ...]:
+    _raise_if_cancelled(is_cancelled)
     if not isinstance(text, str):
         raise TypeError("Offline input must be text.")
     if len(text) > limits.max_text_bytes:
@@ -183,6 +219,7 @@ def _validated_lines(text: str, limits: OfflineParseLimits) -> tuple[str, ...]:
             code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
         )
     byte_count = _utf8_length(text)
+    _raise_if_cancelled(is_cancelled)
     if byte_count is None:
         raise ParseError("Offline input contains unsupported text encoding.")
     if byte_count > limits.max_text_bytes:
@@ -190,33 +227,40 @@ def _validated_lines(text: str, limits: OfflineParseLimits) -> tuple[str, ...]:
             "Offline input exceeds the configured size limit.",
             code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
         )
-    if any(
-        (ord(character) < 32 and character not in "\t\r\n") or ord(character) == 127
-        for character in text
-    ):
-        raise ParseError("Offline input contains unsupported control characters.")
     line_count = text.count("\n") + text.count("\r") - text.count("\r\n") + 1
     if line_count > limits.max_lines:
         raise ParseError(
             "Offline input exceeds the configured line limit.",
             code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
         )
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    lines = tuple(normalized.split("\n"))
-    if any(len(line) > limits.max_line_characters for line in lines):
-        raise ParseError(
-            "Offline input contains an overlong line.",
-            code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
-        )
+    if _UNSUPPORTED_CONTROL_RE.search(text) is not None:
+        raise ParseError("Offline input contains unsupported control characters.")
+    _raise_if_cancelled(is_cancelled)
+    lines = tuple(_LINE_BREAK_RE.split(text))
+    for index, line in enumerate(lines):
+        if index % 256 == 0:
+            _raise_if_cancelled(is_cancelled)
+        if len(line) > limits.max_line_characters:
+            raise ParseError(
+                "Offline input contains an overlong line.",
+                code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+            )
+    _raise_if_cancelled(is_cancelled)
     return lines
 
 
-def _find_exact_command_block(lines: Sequence[str], command: str) -> OfflineCommandBlock | None:
-    target_indexes = [
-        index
-        for index, line in enumerate(lines)
-        if (_echoed_show_command(line) or "").casefold() == command.casefold()
-    ]
+def _find_exact_command_block(
+    lines: Sequence[str],
+    command: str,
+    *,
+    is_cancelled: Callable[[], bool] | None = None,
+) -> OfflineCommandBlock | None:
+    target_indexes: list[int] = []
+    for index, line in enumerate(lines):
+        if index % 256 == 0:
+            _raise_if_cancelled(is_cancelled)
+        if (_echoed_show_command(line) or "").casefold() == command.casefold():
+            target_indexes.append(index)
     if not target_indexes:
         return None
     if len(target_indexes) != 1:
@@ -225,6 +269,8 @@ def _find_exact_command_block(lines: Sequence[str], command: str) -> OfflineComm
     end = len(lines)
     terminated = False
     for index in range(start + 1, len(lines)):
+        if index % 256 == 0:
+            _raise_if_cancelled(is_cancelled)
         if _echoed_show_command(lines[index]) is not None:
             end = index
             terminated = True
@@ -245,11 +291,18 @@ def _echoed_show_command(line: str) -> str | None:
 
 
 def _parse_internal_block(
-    block: OfflineCommandBlock, limits: OfflineParseLimits
+    block: OfflineCommandBlock,
+    limits: OfflineParseLimits,
+    *,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> tuple[OfflineSessionRecord, ...]:
     output = "\n".join(block.lines)
     reject_command_errors(output)
-    layout = _find_exact_layout(block.lines, _INTERNAL_HEADERS)
+    layout = _find_exact_layout(
+        block.lines,
+        _INTERNAL_HEADERS,
+        is_cancelled=is_cancelled,
+    )
     if layout is None:
         raise ParseError("Offline datapath header is missing, incomplete, or unsupported.")
     _, separator_index, columns = layout
@@ -257,7 +310,9 @@ def _parse_internal_block(
     rows: list[OfflineSessionRecord] = []
     declared_count: int | None = None
     completed_by_prompt = False
-    for line in block.lines[separator_index + 1 :]:
+    for index, line in enumerate(block.lines[separator_index + 1 :]):
+        if index % 256 == 0:
+            _raise_if_cancelled(is_cancelled)
         stripped = line.strip()
         if not stripped:
             continue
@@ -365,16 +420,25 @@ def _parse_internal_row(line: str, columns: tuple[tuple[int, int], ...]) -> Offl
 
 
 def _parse_user_enrichment(
-    block: OfflineCommandBlock, limits: OfflineParseLimits
+    block: OfflineCommandBlock,
+    limits: OfflineParseLimits,
+    *,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> tuple[OfflineUserRecord, ...]:
     reject_command_errors("\n".join(block.lines))
-    layout = _find_prefix_layout(block.lines, ("IP", "MAC", "Name", "Role"))
+    layout = _find_prefix_layout(
+        block.lines,
+        ("IP", "MAC", "Name", "Role"),
+        is_cancelled=is_cancelled,
+    )
     if layout is None:
         raise ParseError("Optional user enrichment table is unavailable.")
     _, separator_index, columns = layout
     records: list[OfflineUserRecord] = []
     declared_count: int | None = None
-    for line in block.lines[separator_index + 1 :]:
+    for index, line in enumerate(block.lines[separator_index + 1 :]):
+        if index % 256 == 0:
+            _raise_if_cancelled(is_cancelled)
         stripped = line.strip()
         if not stripped:
             continue
@@ -419,16 +483,25 @@ def _parse_user_enrichment(
 
 
 def _parse_station_enrichment(
-    block: OfflineCommandBlock, limits: OfflineParseLimits
+    block: OfflineCommandBlock,
+    limits: OfflineParseLimits,
+    *,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> tuple[OfflineStationRecord, ...]:
     reject_command_errors("\n".join(block.lines))
-    layout = _find_prefix_layout(block.lines, ("MAC", "Name", "Role"))
+    layout = _find_prefix_layout(
+        block.lines,
+        ("MAC", "Name", "Role"),
+        is_cancelled=is_cancelled,
+    )
     if layout is None:
         raise ParseError("Optional station enrichment table is unavailable.")
     _, separator_index, columns = layout
     records: list[OfflineStationRecord] = []
     declared_count: int | None = None
-    for line in block.lines[separator_index + 1 :]:
+    for index, line in enumerate(block.lines[separator_index + 1 :]):
+        if index % 256 == 0:
+            _raise_if_cancelled(is_cancelled)
         stripped = line.strip()
         if not stripped:
             continue
@@ -469,10 +542,15 @@ def _parse_station_enrichment(
 
 
 def _find_exact_layout(
-    lines: Sequence[str], expected_headers: tuple[str, ...]
+    lines: Sequence[str],
+    expected_headers: tuple[str, ...],
+    *,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> tuple[int, int, tuple[tuple[int, int], ...]] | None:
     matches: list[tuple[int, int, tuple[tuple[int, int], ...]]] = []
     for index in range(len(lines) - 1):
+        if index % 256 == 0:
+            _raise_if_cancelled(is_cancelled)
         columns = _separator_columns(lines[index + 1])
         if columns is None or len(columns) != len(expected_headers):
             continue
@@ -485,10 +563,15 @@ def _find_exact_layout(
 
 
 def _find_prefix_layout(
-    lines: Sequence[str], expected_prefix: tuple[str, ...]
+    lines: Sequence[str],
+    expected_prefix: tuple[str, ...],
+    *,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> tuple[int, int, tuple[tuple[int, int], ...]] | None:
     matches: list[tuple[int, int, tuple[tuple[int, int], ...]]] = []
     for index in range(len(lines) - 1):
+        if index % 256 == 0:
+            _raise_if_cancelled(is_cancelled)
         columns = _separator_columns(lines[index + 1])
         if columns is None or len(columns) < len(expected_prefix):
             continue
@@ -591,3 +674,13 @@ def _normalized_ipv4(value: str) -> str | None:
         return str(IPv4Address(value))
     except ValueError:
         return None
+
+
+def _raise_if_cancelled(is_cancelled: Callable[[], bool] | None) -> None:
+    if is_cancelled is not None and is_cancelled():
+        raise ParseError("Offline analysis was cancelled.", code=ErrorCode.CANCELLED)
+
+
+def _validate_cancellation_callback(is_cancelled: Callable[[], bool] | None) -> None:
+    if is_cancelled is not None and not callable(is_cancelled):
+        raise TypeError("is_cancelled must be callable.")

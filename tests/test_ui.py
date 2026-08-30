@@ -522,6 +522,13 @@ class _FailingExecutor(_Executor):
 
 
 class _EmptyStore:
+    @property
+    def pending_external_recovery_count(self) -> int:
+        return 0
+
+    def retry_pending_external_recoveries(self) -> int:
+        return 0
+
     def list_runs(self, *, limit: int = 100) -> tuple[object, ...]:
         del limit
         return ()
@@ -575,7 +582,11 @@ class _DelayedPreviewStore(_EmptyStore):
         self.discard_threads: list[int] = []
         self.discarded: list[DeletePreview] = []
 
-    def preview_delete(self, _run_id: str | None = None) -> DeletePreview:
+    def preview_delete(
+        self,
+        _run_id: str | None = None,
+        **_kwargs: object,
+    ) -> DeletePreview:
         self.preview_threads.append(threading.get_ident())
         self.preview_started.set()
         if not self.preview_release.wait(timeout=3):
@@ -596,14 +607,70 @@ class _CommitFailureStore(_EmptyStore):
         self.delete_calls = 0
         self.discarded: list[DeletePreview] = []
 
-    def preview_delete(self, _run_id: str | None = None) -> DeletePreview:
+    def preview_delete(
+        self,
+        _run_id: str | None = None,
+        **_kwargs: object,
+    ) -> DeletePreview:
         return self.preview
 
-    def delete(self, preview: DeletePreview, *, confirmation_token: str) -> object:
+    def delete(
+        self,
+        preview: DeletePreview,
+        *,
+        confirmation_token: str,
+        cancel_check: object | None = None,
+        progress: object | None = None,
+    ) -> object:
         assert preview == self.preview
         assert confirmation_token == self.preview.confirmation_token
+        assert callable(cancel_check)
+        assert callable(progress)
         self.delete_calls += 1
         raise StorageError("sanitized commit fixture")
+
+    def discard_delete_preview(self, preview: DeletePreview) -> bool:
+        self.discarded.append(preview)
+        return preview == self.preview
+
+
+class _CancelableDeleteStore(_EmptyStore):
+    def __init__(self) -> None:
+        self.preview = _delete_preview_fixture()
+        self.delete_started = threading.Event()
+        self.delete_cancelled = threading.Event()
+        self.progress_events: list[tuple[str, int, int | None]] = []
+        self.discarded: list[DeletePreview] = []
+
+    def preview_delete(
+        self,
+        _run_id: str | None = None,
+        **_kwargs: object,
+    ) -> DeletePreview:
+        return self.preview
+
+    def delete(
+        self,
+        preview: DeletePreview,
+        *,
+        confirmation_token: str,
+        cancel_check: object | None = None,
+        progress: object | None = None,
+    ) -> object:
+        assert preview == self.preview
+        assert confirmation_token == self.preview.confirmation_token
+        assert callable(cancel_check)
+        assert callable(progress)
+        progress("SCAN", 0, None)
+        self.progress_events.append(("SCAN", 0, None))
+        self.delete_started.set()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if cancel_check():
+                self.delete_cancelled.set()
+                raise StorageError("cancelled delete fixture", code=ErrorCode.CANCELLED)
+            time.sleep(0.005)
+        raise TimeoutError("delete cancellation was not observed")
 
     def discard_delete_preview(self, preview: DeletePreview) -> bool:
         self.discarded.append(preview)
@@ -1015,6 +1082,10 @@ def test_result_rendering_caps_visible_rows_without_dropping_outcome_count(
         )
     )
 
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: window.result_table.rowCount() == 2_000,
+        timeout=5_000,
+    )
     assert window.result_table.rowCount() == 2_000
     assert "화면 표시: 2000/2005" in window.context_label.text()
     assert "DISPLAY_LIMIT" in window.diagnostics_list.item(0).text()
@@ -1033,6 +1104,23 @@ class _CountingHistoryStore(_EmptyStore):
         del limit
         self.list_calls += 1
         return ()
+
+
+class _PendingRecoveryStore(_EmptyStore):
+    def __init__(self) -> None:
+        self.pending = 2
+        self.retry_calls = 0
+        self.retry_threads: list[int] = []
+
+    @property
+    def pending_external_recovery_count(self) -> int:
+        return self.pending
+
+    def retry_pending_external_recoveries(self) -> int:
+        self.retry_calls += 1
+        self.retry_threads.append(threading.get_ident())
+        self.pending = 1
+        return self.pending
 
 
 def test_history_refresh_is_dirty_driven_instead_of_running_after_every_poll(
@@ -1061,6 +1149,29 @@ def test_history_refresh_is_dirty_driven_instead_of_running_after_every_poll(
         timeout=3000,
     )
     assert not window._history_dirty
+    window.close()
+
+
+def test_history_refresh_retries_external_recovery_off_gui_thread_and_warns(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    store = _PendingRecoveryStore()
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        store,  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: not window._history_task_running and store.retry_calls == 1,
+        timeout=3000,
+    )
+
+    assert store.retry_threads
+    assert all(thread_id != threading.get_ident() for thread_id in store.retry_threads)
+    assert "외부 보고서 복구 1건 대기 중" in window.statusBar().currentMessage()
+    assert "대상 드라이브" in window.statusBar().currentMessage()
     window.close()
 
 
@@ -1165,6 +1276,40 @@ def test_delete_commit_failure_asynchronously_discards_exact_preview(
     assert window._pending_preview_discards == []
     assert warnings == ["확인된 기록을 안전하게 삭제하지 못했습니다."]
     window.close()
+
+
+def test_close_cancels_delete_commit_through_storage_callbacks(
+    qtbot: object,
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    store = _CancelableDeleteStore()
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        store,  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    window.show()
+    qtbot.waitUntil(lambda: not window._history_task_running, timeout=3000)  # type: ignore[attr-defined]
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        QMessageBox,
+        "warning",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    window._delete_history(all_runs=True)
+    qtbot.waitUntil(store.delete_started.is_set, timeout=3000)  # type: ignore[attr-defined]
+    assert not window.close()
+    qtbot.waitUntil(store.delete_cancelled.is_set, timeout=3000)  # type: ignore[attr-defined]
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: not window.isVisible() and not window._storage_task_running,
+        timeout=5000,
+    )
+
+    assert store.progress_events == [("SCAN", 0, None)]
+    assert store.discarded == [store.preview]
+    assert window.clean_shutdown_completed is True
 
 
 def test_confirmation_start_failure_queues_exact_preview_cleanup(
@@ -1409,7 +1554,11 @@ def test_query_worker_lifecycle_soak_leaves_no_owned_task_or_approval(
         tracemalloc.stop()
 
     qtbot.waitUntil(  # type: ignore[attr-defined]
-        lambda: window._thread_pool.activeThreadCount() == 0,
+        lambda: (
+            not any(
+                thread.name.startswith("aruba-session-query-") for thread in threading.enumerate()
+            )
+        ),
         timeout=3000,
     )
     assert window.result_table.rowCount() == 1
@@ -1458,7 +1607,9 @@ def test_slow_monitor_ignores_heartbeat_and_stale_task_signals(
     assert executor.started.wait(timeout=3)
     generation = window._task_generation
     assert window._current_task is not None
-    assert window._thread_pool.maxThreadCount() == 1
+    assert (
+        sum(thread.name.startswith("aruba-session-query-") for thread in threading.enumerate()) == 1
+    )
 
     window._monitor_timer.timeout.emit()
     window._task_succeeded(generation - 1, _Executor().execute())

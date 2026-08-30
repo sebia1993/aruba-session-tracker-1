@@ -24,7 +24,9 @@ CRITICAL_BRANCH_FLOORS = {
     "src/aruba_session_tracker/analysis/summary.py": 0.65,
     "src/aruba_session_tracker/analysis/tos.py": 0.65,
     "src/aruba_session_tracker/main.py": 0.65,
+    "src/aruba_session_tracker/observability.py": 0.65,
     "src/aruba_session_tracker/runtime.py": 0.65,
+    "src/aruba_session_tracker/single_instance.py": 0.65,
     "src/aruba_session_tracker/collectors/ssh.py": 0.65,
     "src/aruba_session_tracker/offline/io.py": 0.65,
     "src/aruba_session_tracker/offline/parser.py": 0.65,
@@ -32,8 +34,12 @@ CRITICAL_BRANCH_FLOORS = {
     "src/aruba_session_tracker/services/monitoring.py": 0.65,
     "src/aruba_session_tracker/services/tracker.py": 0.65,
     "src/aruba_session_tracker/storage/html_report.py": 0.65,
+    "src/aruba_session_tracker/storage/durable_io.py": 0.65,
     "src/aruba_session_tracker/storage/session_store.py": 0.65,
     "src/aruba_session_tracker/ui/main_window.py": 0.65,
+    "src/aruba_session_tracker/ui/runtime_environment.py": 0.65,
+    "src/aruba_session_tracker/ui/shutdown.py": 0.65,
+    "src/aruba_session_tracker/ui/startup.py": 0.65,
 }
 
 

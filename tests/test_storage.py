@@ -12,12 +12,14 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import aruba_session_tracker.storage.durable_io as durable_io_module
 import aruba_session_tracker.storage.raw as raw_module
 import aruba_session_tracker.storage.session_store as session_store_module
 from aruba_session_tracker.models import (
@@ -28,6 +30,8 @@ from aruba_session_tracker.models import (
 )
 from aruba_session_tracker.services.tracker import QueryOutcome, RawSnapshot
 from aruba_session_tracker.storage import (
+    DeletePreview,
+    DeletionResult,
     RunReportSnapshot,
     SessionStore,
     StorageError,
@@ -165,6 +169,33 @@ def test_initialize_creates_required_schema(tmp_path: Path) -> None:
     assert "instance_id" in lifecycle_columns
 
 
+def test_wal_mode_is_configured_only_during_initialize(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    statements: list[str] = []
+    original_connect = session_store_module.sqlite3.connect
+
+    def traced_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = original_connect(*args, **kwargs)  # type: ignore[arg-type]
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(session_store_module.sqlite3, "connect", traced_connect)
+    store = SessionStore(tmp_path / "tracker.db", tmp_path / "raw", tmp_path / "exports")
+    store.initialize()
+    normalized = [statement.upper().replace(" ", "") for statement in statements]
+    assert normalized.count("PRAGMAJOURNAL_MODE=WAL") == 1
+
+    statements.clear()
+    store.list_runs()
+    normalized = [statement.upper().replace(" ", "") for statement in statements]
+    assert "PRAGMAJOURNAL_MODE=WAL" not in normalized
+    assert "PRAGMAFOREIGN_KEYS=ON" in normalized
+    assert "PRAGMABUSY_TIMEOUT=10000" in normalized
+    assert "PRAGMASYNCHRONOUS=FULL" in normalized
+
+
 def test_initialize_migrates_v1_lifecycle_instance_id(tmp_path: Path) -> None:
     db_path = tmp_path / "tracker.db"
     with closing(sqlite3.connect(db_path)) as connection, connection:
@@ -251,6 +282,24 @@ def test_initialize_preserves_a_run_leased_by_another_live_store(tmp_path: Path)
     assert reopened.list_runs()[0]["status"] == "COMPLETED"
 
 
+def test_file_lease_rejects_hardlink_without_modifying_external_file(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    external = tmp_path / "external-empty-file.bin"
+    external.write_bytes(b"")
+    lease_path = store._leases_root / "hardlink-canary.lease"
+    try:
+        os.link(external, lease_path)
+    except OSError as error:
+        pytest.skip(f"hardlink creation is unavailable: {error}")
+
+    with pytest.raises(StorageError, match="hardlink"):
+        session_store_module._acquire_file_lease(lease_path)
+
+    assert external.read_bytes() == b""
+    assert lease_path.read_bytes() == b""
+    assert os.stat(external).st_nlink >= 2
+
+
 def test_second_store_cannot_mutate_another_process_owned_run(tmp_path: Path) -> None:
     owner = _store(tmp_path)
     run_id = _run(owner)
@@ -296,7 +345,7 @@ os._exit(0)
     assert row["ended_at"] is not None
 
 
-def test_record_query_links_relative_raw_path_and_sha256(tmp_path: Path) -> None:
+def test_record_query_links_relative_raw_path_sha256_and_legacy_kind(tmp_path: Path) -> None:
     store = _store(tmp_path)
     run_id = _run(store)
     raw_text = "한글 Raw 출력\n"
@@ -306,12 +355,13 @@ def test_record_query_links_relative_raw_path_and_sha256(tmp_path: Path) -> None
         [_observation(controller_name="서울-MD")],
         raw_text=raw_text,
         controller_name="서울-MD",
+        raw_kind="legacy-custom-kind",
     )
 
     assert len(observation_ids) == 1
     with closing(sqlite3.connect(store.db_path)) as connection, connection:
-        relative_path, digest, size = connection.execute(
-            "SELECT relative_path, sha256, byte_size FROM raw_files WHERE run_id = ?",
+        relative_path, digest, size, raw_kind = connection.execute(
+            "SELECT relative_path, sha256, byte_size, kind FROM raw_files WHERE run_id = ?",
             (run_id,),
         ).fetchone()
         stored_raw_line = connection.execute(
@@ -323,6 +373,7 @@ def test_record_query_links_relative_raw_path_and_sha256(tmp_path: Path) -> None
     assert raw_path.read_text(encoding="utf-8") == raw_text
     assert digest == hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
     assert size == len(raw_text.encode("utf-8"))
+    assert raw_kind == "legacy-custom-kind"
     assert "raw_line" not in stored_raw_line
 
 
@@ -368,6 +419,115 @@ def test_record_poll_batch_is_atomic_when_a_late_insert_fails(tmp_path: Path) ->
     assert not tuple(store.raw_root.glob(".raw-staging-*"))
 
 
+def test_raw_file_install_runs_without_sqlite_writer_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    checked_install = False
+    original_replace = session_store_module._replace_file
+
+    def observe_replace(
+        source: Path,
+        target: Path,
+        **kwargs: object,
+    ) -> None:
+        nonlocal checked_install
+        if target.is_relative_to(store.raw_root) and not target.name.startswith("."):
+            with closing(sqlite3.connect(store.db_path, timeout=0.1)) as connection:
+                connection.execute("PRAGMA busy_timeout = 100")
+                connection.execute("BEGIN IMMEDIATE")
+                connection.rollback()
+            checked_install = True
+        original_replace(source, target, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(session_store_module, "_replace_file", observe_replace)
+
+    store.record_query(run_id, [_observation()], raw_text="writer-lock-canary")
+
+    assert checked_install is True
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM raw_files").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("limit_kind", ("observations", "raw"))
+def test_record_poll_batch_rejects_storage_limits_before_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_kind: str,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    first = _observation()
+    second = replace(first, destination_port=8443)
+    if limit_kind == "observations":
+        monkeypatch.setattr(session_store_module, "_MAX_POLL_OBSERVATIONS", 1)
+        outcome = QueryOutcome(observations=(first, second), authoritative=True)
+    else:
+        monkeypatch.setattr(session_store_module, "_MAX_POLL_RAW_BYTES", 3)
+        outcome = QueryOutcome(
+            raw_snapshots=(RawSnapshot("MD-01", "show test", "1234"),),
+            authoritative=True,
+        )
+
+    with pytest.raises(StorageError) as caught:
+        store.record_poll_batch(run_id, outcome)
+
+    assert caught.value.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM raw_files").fetchone()[0] == 0
+    assert not tuple(store.raw_root.rglob("*.txt"))
+    assert not tuple(store._manifests_root.glob("*.json"))
+
+
+def test_poll_batch_allows_bounded_lifecycle_events_above_observation_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _observation()
+    second = replace(first, destination_port=8443)
+    outcome = QueryOutcome(observations=(first, second), authoritative=True)
+    monkeypatch.setattr(session_store_module, "_MAX_POLL_OBSERVATIONS", 2)
+    monkeypatch.setattr(session_store_module, "_MAX_POLL_LIFECYCLE_EVENTS", 8)
+
+    SessionStore._validate_poll_batch_limits(outcome, (object(),) * 8)  # type: ignore[arg-type]
+
+    with pytest.raises(StorageError) as caught:
+        SessionStore._validate_poll_batch_limits(  # type: ignore[arg-type]
+            outcome,
+            (object(),) * 9,
+        )
+    assert caught.value.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
+
+
+def test_poll_bundle_limit_counts_metadata_and_delimiters_before_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    monkeypatch.setattr(session_store_module, "_MAX_POLL_RAW_BYTES", 512)
+    observed_at = datetime(2026, 8, 28, 8, 0, tzinfo=UTC)
+    outcome = QueryOutcome(
+        raw_snapshots=(
+            RawSnapshot("M1", "show one", "A" * 200, observed_at, observation_keys=()),
+            RawSnapshot("M2", "show two", "B" * 200, observed_at, observation_keys=()),
+        ),
+        authoritative=True,
+    )
+
+    with pytest.raises(StorageError) as caught:
+        store.record_poll_batch(run_id, outcome)
+
+    assert caught.value.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM raw_files").fetchone()[0] == 0
+    assert not tuple(store.raw_root.rglob("*.txt"))
+    assert not tuple(store._manifests_root.glob("*.json"))
+
+
 def test_record_poll_batch_uses_explicit_same_controller_raw_provenance(
     tmp_path: Path,
 ) -> None:
@@ -400,21 +560,210 @@ def test_record_poll_batch_uses_explicit_same_controller_raw_provenance(
     store.record_poll_batch(run_id, outcome)
 
     with closing(sqlite3.connect(store.db_path)) as connection:
-        relative_path = connection.execute(
+        relative_path, kind, controller_name = connection.execute(
             """
-            SELECT rf.relative_path
+            SELECT rf.relative_path, rf.kind, rf.controller_name
             FROM observations AS observation
             JOIN raw_files AS rf ON rf.id = observation.raw_file_id
             WHERE observation.run_id = ?
             """,
             (run_id,),
-        ).fetchone()[0]
+        ).fetchone()
         raw_file_count = connection.execute(
             "SELECT count(*) FROM raw_files WHERE run_id = ?", (run_id,)
         ).fetchone()[0]
 
-    assert raw_file_count == 2
-    assert (store.raw_root / relative_path).read_text(encoding="utf-8") == second_output
+    raw_path = store.raw_root / relative_path
+    sections = (
+        session_store_module._RawBundleSection(
+            1,
+            hashlib.sha256(first_output.encode()).hexdigest(),
+            len(first_output.encode()),
+        ),
+        session_store_module._RawBundleSection(
+            2,
+            hashlib.sha256(second_output.encode()).hexdigest(),
+            len(second_output.encode()),
+        ),
+    )
+    assert raw_file_count == 1
+    assert kind == "poll-bundle"
+    assert controller_name == "POLL_BUNDLE"
+    session_store_module._verify_raw_bundle_file(raw_path, sections)
+    bundle = raw_path.read_text(encoding="utf-8")
+    assert first_output in bundle
+    assert second_output in bundle
+    assert '"snapshot_count":2' in bundle
+    assert '"observation_keys":[]' in bundle
+    assert f'"observation_keys":["{observation.session_key}"]' in bundle
+
+
+def test_poll_bundle_keeps_csv_references_and_deletes_as_one_file(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    first = _observation(controller_name="MD-01")
+    second = replace(
+        first,
+        controller_name="MD-02",
+        controller_host="198.51.100.22",
+        destination_port=8443,
+    )
+    store.record_poll_batch(
+        run_id,
+        QueryOutcome(
+            observations=(first, second),
+            raw_snapshots=(
+                RawSnapshot(
+                    "MD-01",
+                    "show datapath session table first",
+                    "first body",
+                    first.observed_at,
+                    observation_keys=(first.session_key,),
+                ),
+                RawSnapshot(
+                    "MD-02",
+                    "show datapath session table second",
+                    "second body",
+                    second.observed_at,
+                    observation_keys=(second.session_key,),
+                ),
+            ),
+            authoritative=True,
+        ),
+    )
+    store.finish_run(run_id)
+
+    exported = store.export_run_csv(run_id, tmp_path / "bundle.csv")
+    with exported.open("r", encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 2
+    assert len({row["raw_relative_path"] for row in rows}) == 1
+    assert len({row["raw_sha256"] for row in rows}) == 1
+
+    preview = store.preview_delete(run_id)
+    result = store.delete(preview, confirmation_token=preview.confirmation_token)
+    assert preview.raw_files == 1
+    assert result.deleted_raw_files == 1
+    assert not tuple(store.raw_root.rglob("*.txt"))
+
+
+def test_raw_bundle_section_hash_detects_tampered_body(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    observation = _observation()
+    outputs = ("first-body", "second-body")
+    store.record_poll_batch(
+        run_id,
+        QueryOutcome(
+            observations=(observation,),
+            raw_snapshots=(
+                RawSnapshot("MM-01", "show first", outputs[0], observation.observed_at, ()),
+                RawSnapshot(
+                    "MD-01",
+                    "show second",
+                    outputs[1],
+                    observation.observed_at,
+                    (observation.session_key,),
+                ),
+            ),
+            authoritative=True,
+        ),
+    )
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        relative_path = str(connection.execute("SELECT relative_path FROM raw_files").fetchone()[0])
+    raw_path = store.raw_root / relative_path
+    sections = tuple(
+        session_store_module._RawBundleSection(
+            index,
+            hashlib.sha256(output.encode()).hexdigest(),
+            len(output.encode()),
+        )
+        for index, output in enumerate(outputs, start=1)
+    )
+    session_store_module._verify_raw_bundle_file(raw_path, sections)
+    tampered = raw_path.read_bytes().replace(b"first-body", b"first-bodz", 1)
+    raw_path.write_bytes(tampered)
+
+    with pytest.raises(StorageError, match="section SHA-256"):
+        session_store_module._verify_raw_bundle_file(raw_path, sections)
+
+
+def test_startup_recovers_committed_poll_bundle_manifest(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    observation = _observation()
+    outputs = ("mm raw", "md raw")
+    store.record_poll_batch(
+        run_id,
+        QueryOutcome(
+            observations=(observation,),
+            raw_snapshots=(
+                RawSnapshot("MM-01", "show mm", outputs[0], observation.observed_at, ()),
+                RawSnapshot(
+                    "MD-01",
+                    "show md",
+                    outputs[1],
+                    observation.observed_at,
+                    (observation.session_key,),
+                ),
+            ),
+            authoritative=True,
+        ),
+    )
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        relative_path, sha256, byte_size = connection.execute(
+            "SELECT relative_path, sha256, byte_size FROM raw_files"
+        ).fetchone()
+    sections = [
+        {
+            "index": index,
+            "sha256": hashlib.sha256(output.encode()).hexdigest(),
+            "byte_size": len(output.encode()),
+        }
+        for index, output in enumerate(outputs, start=1)
+    ]
+    operation_id = "b" * 32
+    stage_root = store.raw_root / f".raw-staging-{operation_id}"
+    staged = stage_root / Path(str(relative_path))
+    staged.parent.mkdir(parents=True)
+    os.replace(store.raw_root / str(relative_path), staged)
+    manifest = store._write_manifest(
+        operation_id,
+        {
+            "version": 1,
+            "kind": "raw_batch",
+            "operation_id": operation_id,
+            "run_id": run_id,
+            "stage_root": stage_root.name,
+            "files": [
+                {
+                    "relative_path": relative_path,
+                    "sha256": sha256,
+                    "byte_size": byte_size,
+                    "bundle_sections": sections,
+                }
+            ],
+        },
+    )
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+
+    destination = store.raw_root / str(relative_path)
+    assert destination.exists()
+    assert not staged.exists()
+    assert not manifest.exists()
+    session_store_module._verify_raw_bundle_file(
+        destination,
+        tuple(
+            session_store_module._RawBundleSection(
+                int(section["index"]),
+                str(section["sha256"]),
+                int(section["byte_size"]),
+            )
+            for section in sections
+        ),
+    )
 
 
 def test_startup_completes_committed_raw_batch_manifest(tmp_path: Path) -> None:
@@ -1019,15 +1368,184 @@ def test_csv_export_uses_the_bounded_cursor_stream(
         cursor: sqlite3.Cursor,
         *,
         batch_size: int,
+        **kwargs: object,
     ) -> Iterator[dict[str, object]]:
         seen_batch_sizes.append(batch_size)
-        return original(cursor, batch_size=batch_size)
+        return original(cursor, batch_size=batch_size, **kwargs)
 
     monkeypatch.setattr(session_store_module, "_iter_cursor_dicts", observe_batches)
     exported = store.export_run_csv(run_id, tmp_path / "stream.csv")
 
     assert exported.exists()
     assert seen_batch_sizes == [1000]
+
+
+def test_streaming_csv_export_does_not_hold_store_lock_against_poll_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()])
+    renderer_started = threading.Event()
+    release_renderer = threading.Event()
+    original_writer = session_store_module.write_csv_atomic
+
+    def blocking_writer(*args: object, **kwargs: object) -> Path:
+        renderer_started.set()
+        if not release_renderer.wait(timeout=10):
+            raise TimeoutError("CSV renderer test synchronization timed out")
+        return original_writer(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(session_store_module, "write_csv_atomic", blocking_writer)
+    export_errors: list[BaseException] = []
+
+    def export() -> None:
+        try:
+            store.export_run_csv(run_id, tmp_path / "concurrent.csv")
+        except BaseException as error:  # pragma: no cover - asserted below
+            export_errors.append(error)
+
+    exporter = threading.Thread(target=export)
+    exporter.start()
+    assert renderer_started.wait(timeout=5)
+    write_completed = threading.Event()
+
+    def write_poll() -> None:
+        store.record_query(run_id, [replace(_observation(), destination_port=8443)])
+        write_completed.set()
+
+    writer = threading.Thread(target=write_poll)
+    writer.start()
+    try:
+        assert write_completed.wait(timeout=5)
+    finally:
+        release_renderer.set()
+    writer.join(timeout=5)
+    exporter.join(timeout=10)
+
+    assert not writer.is_alive()
+    assert not exporter.is_alive()
+    assert export_errors == []
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM observations WHERE run_id = ?", (run_id,)
+            ).fetchone()[0]
+            == 2
+        )
+
+
+@pytest.mark.parametrize("external", (False, True), ids=("managed", "external"))
+def test_export_file_install_and_manifest_fsync_run_without_sqlite_writer_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    external: bool,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()])
+    store.finish_run(run_id)
+    destination = (
+        tmp_path / "chosen" / "report.csv" if external else store.exports_root / "report.csv"
+    )
+    if external:
+        destination.parent.mkdir()
+    checked_phases: list[str] = []
+    checked_install = False
+    original_manifest = store._replace_manifest
+    original_replace = session_store_module._replace_file
+
+    def assert_writer_available() -> None:
+        with closing(sqlite3.connect(store.db_path, timeout=0.1)) as connection:
+            connection.execute("PRAGMA busy_timeout = 100")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.rollback()
+
+    def observe_manifest(path: Path, payload: dict[str, object]) -> None:
+        phase = str(payload.get("phase") or "")
+        if phase in {"RENDERED", "INSTALLED", "DB_COMMITTED"}:
+            assert_writer_available()
+            checked_phases.append(phase)
+        original_manifest(path, payload)
+
+    def observe_replace(
+        source: Path,
+        target: Path,
+        **kwargs: object,
+    ) -> None:
+        nonlocal checked_install
+        if target == destination:
+            assert_writer_available()
+            checked_install = True
+        original_replace(source, target, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "_replace_manifest", observe_manifest)
+    monkeypatch.setattr(session_store_module, "_replace_file", observe_replace)
+
+    exported = store.export_run_csv(run_id, destination)
+
+    assert exported == destination
+    assert checked_install is True
+    assert checked_phases == ["RENDERED", "INSTALLED", "DB_COMMITTED"]
+
+
+@pytest.mark.parametrize("html", (False, True), ids=("csv", "html"))
+def test_export_cancellation_is_observed_during_chunked_raw_integrity_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    html: bool,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    raw_bytes = b"R" * (session_store_module._HASH_CHUNK_SIZE * 2 + 17)
+    store.record_query(
+        run_id,
+        [_observation()],
+        raw_text=raw_bytes.decode("ascii"),
+    )
+    store.finish_run(run_id)
+    cancel_requested = False
+    byte_progress: list[tuple[int, int | None]] = []
+
+    def request_cancel(
+        phase: str,
+        completed: int,
+        total: int | None,
+    ) -> None:
+        nonlocal cancel_requested
+        if phase == "export_raw_bytes":
+            byte_progress.append((completed, total))
+            cancel_requested = True
+
+    def fail_renderer(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("renderer must not start after Raw integrity cancellation")
+
+    monkeypatch.setattr(session_store_module, "write_csv_atomic", fail_renderer)
+    monkeypatch.setattr(
+        session_store_module,
+        "write_html_report_stream_atomic",
+        fail_renderer,
+    )
+    destination = tmp_path / "chosen" / ("cancelled.html" if html else "cancelled.csv")
+    destination.parent.mkdir()
+    export = store.export_run_html if html else store.export_run_csv
+
+    with pytest.raises(StorageError) as caught:
+        export(
+            run_id,
+            destination,
+            cancel_check=lambda: cancel_requested,
+            progress=request_cancel,
+        )
+
+    assert caught.value.code is ErrorCode.CANCELLED
+    assert byte_progress == [
+        (session_store_module._HASH_CHUNK_SIZE, len(raw_bytes)),
+    ]
+    assert not destination.exists()
+    assert not tuple(store._manifests_root.glob("*.json"))
+    assert not tuple(store._export_owners_root.glob("*.json"))
 
 
 def test_delete_rejects_stale_preview(tmp_path: Path) -> None:
@@ -1254,14 +1772,29 @@ def test_managed_html_is_rolled_back_if_another_instance_deletes_the_run(
     exporter.record_query(run_id, [_observation()])
     exporter.finish_run(run_id)
     preview = deleter.preview_delete(run_id)
-    original_writer = session_store_module.write_html_report_atomic
+    original_writer = session_store_module.write_html_report_stream_atomic
 
-    def write_then_delete(destination: Path, snapshot: RunReportSnapshot) -> Path:
-        written = original_writer(destination, snapshot)
+    def write_then_delete(
+        destination: Path,
+        snapshot: RunReportSnapshot,
+        observation_history: Iterator[dict[str, object]],
+        *,
+        logical_session_total: int,
+    ) -> Path:
+        written = original_writer(
+            destination,
+            snapshot,
+            observation_history,
+            logical_session_total=logical_session_total,
+        )
         deleter.delete(preview, confirmation_token=preview.confirmation_token)
         return written
 
-    monkeypatch.setattr(session_store_module, "write_html_report_atomic", write_then_delete)
+    monkeypatch.setattr(
+        session_store_module,
+        "write_html_report_stream_atomic",
+        write_then_delete,
+    )
     destination = exporter.exports_root / f"run-{run_id}.html"
 
     with pytest.raises(StorageError, match="조회 실행 기록이 없습니다"):
@@ -1558,10 +2091,11 @@ def test_delete_write_lock_prevents_a_late_managed_html_orphan(
 
     def pause_after_locked_snapshot(
         root: Path,
-        relative_paths: tuple[str, ...],
+        relative_paths: tuple[session_store_module._DeletionFile, ...],
         preview_id: str,
         category: str,
         staged: list[session_store_module._StagedFile],
+        **kwargs: object,
     ) -> None:
         nonlocal first_stage
         if first_stage:
@@ -1569,7 +2103,7 @@ def test_delete_write_lock_prevents_a_late_managed_html_orphan(
             delete_locked.set()
             if not continue_delete.wait(timeout=10):
                 raise TimeoutError("delete test synchronization timed out")
-        original_stage_files(root, relative_paths, preview_id, category, staged)
+        original_stage_files(root, relative_paths, preview_id, category, staged, **kwargs)
 
     monkeypatch.setattr(session_store_module, "_stage_files", pause_after_locked_snapshot)
     deletion_results: list[object] = []
@@ -1596,9 +2130,9 @@ def test_delete_write_lock_prevents_a_late_managed_html_orphan(
     assert delete_locked.wait(timeout=10)
     export_thread.start()
     deadline = time.monotonic() + 10
-    while not tuple(exporter.exports_root.glob("*.staged")) and time.monotonic() < deadline:
+    while not export_errors and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert tuple(exporter.exports_root.glob("*.staged"))
+    assert export_errors
     continue_delete.set()
     delete_thread.join(timeout=10)
     export_thread.join(timeout=10)
@@ -1609,7 +2143,7 @@ def test_delete_write_lock_prevents_a_late_managed_html_orphan(
     assert len(deletion_results) == 1
     assert len(export_errors) == 1
     assert isinstance(export_errors[0], StorageError)
-    assert "조회 실행 기록이 없습니다" in str(export_errors[0])
+    assert "유지보수" in str(export_errors[0])
     assert deleter.list_runs() == ()
     assert not tuple(exporter.exports_root.rglob("*.html"))
     assert not tuple(exporter.exports_root.glob("*.staged"))
@@ -1770,6 +2304,7 @@ def test_html_export_uses_database_id_order_for_equal_observation_and_lifecycle_
 
 def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _store(tmp_path)
     run_id = _run(store)
@@ -1894,6 +2429,29 @@ def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
         )
 
     store.finish_run(run_id)
+    original_writer = session_store_module.write_html_report_stream_atomic
+    streaming_inputs: list[bool] = []
+
+    def observe_streaming_writer(
+        destination: Path,
+        snapshot: RunReportSnapshot,
+        observation_history: Iterator[dict[str, object]],
+        *,
+        logical_session_total: int,
+    ) -> Path:
+        streaming_inputs.append(not isinstance(observation_history, (tuple, list)))
+        return original_writer(
+            destination,
+            snapshot,
+            observation_history,
+            logical_session_total=logical_session_total,
+        )
+
+    monkeypatch.setattr(
+        session_store_module,
+        "write_html_report_stream_atomic",
+        observe_streaming_writer,
+    )
     destination = store.export_run_html(run_id, tmp_path / "all-stored-data.html")
     document = destination.read_text(encoding="utf-8")
     history_section = re.search(
@@ -1918,6 +2476,7 @@ def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
     assert "세션별 수치 변화" not in document
     assert "패킷" not in document
     assert "바이트" not in document
+    assert streaming_inputs == [True]
 
 
 def test_record_writes_and_second_finish_require_running_run(tmp_path: Path) -> None:
@@ -2215,6 +2774,397 @@ def test_storage_health_reports_managed_usage_and_thresholds(
     assert hard_stop.hard_stop is True
 
 
+def test_first_storage_health_is_incremental_until_explicit_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    orphan = store.raw_root / "orphan" / "capture.txt"
+    orphan.parent.mkdir()
+    orphan.write_bytes(b"orphan")
+    scans: list[Path] = []
+    original_scan = session_store_module._storage_tree_stats
+
+    def count_scan(root: Path, **kwargs: object) -> tuple[int, int]:
+        scans.append(root)
+        return original_scan(root, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(session_store_module, "_storage_tree_stats", count_scan)
+
+    initial = store.storage_health()
+    assert scans == []
+    assert initial.raw_file_count == 0
+
+    reconciled = store.reconcile_storage_health()
+    assert scans == [store.raw_root, store.exports_root]
+    assert reconciled.raw_file_count == 1
+    assert reconciled.raw_bytes == len(b"orphan")
+
+    monkeypatch.setattr(session_store_module.time, "monotonic", lambda: 10**12)
+    store.storage_health()
+    assert scans == [store.raw_root, store.exports_root]
+
+
+def test_deep_storage_reconciliation_does_not_hold_store_lock_against_poll_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    scan_started = threading.Event()
+    release_scan = threading.Event()
+    original_scan = session_store_module._storage_tree_stats
+
+    def blocking_scan(root: Path, **kwargs: object) -> tuple[int, int]:
+        if not scan_started.is_set():
+            scan_started.set()
+            if not release_scan.wait(timeout=10):
+                raise TimeoutError("storage reconciliation synchronization timed out")
+        return original_scan(root, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(session_store_module, "_storage_tree_stats", blocking_scan)
+    results: list[StorageHealth] = []
+    errors: list[BaseException] = []
+
+    def reconcile() -> None:
+        try:
+            results.append(store.reconcile_storage_health())
+        except BaseException as error:  # pragma: no cover - asserted below
+            errors.append(error)
+
+    reconciliation = threading.Thread(target=reconcile)
+    reconciliation.start()
+    assert scan_started.wait(timeout=5)
+    assert store.storage_health().raw_file_count == 0
+    write_completed = threading.Event()
+
+    def write_poll() -> None:
+        store.record_query(run_id, [_observation()], raw_text="reconcile-concurrency")
+        write_completed.set()
+
+    writer = threading.Thread(target=write_poll)
+    writer.start()
+    try:
+        assert write_completed.wait(timeout=5)
+    finally:
+        release_scan.set()
+    writer.join(timeout=5)
+    reconciliation.join(timeout=10)
+
+    assert not writer.is_alive()
+    assert not reconciliation.is_alive()
+    assert errors == []
+    assert len(results) == 1
+    assert results[0].raw_file_count == 1
+
+
+def test_deep_storage_reconciliation_supports_cancel_and_releases_lease(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    orphan_root = store.raw_root / "orphans"
+    orphan_root.mkdir()
+    for index in range(3):
+        (orphan_root / f"{index}.txt").write_text("raw", encoding="utf-8")
+    cancel_requested = False
+    progress_events: list[tuple[str, int, int | None]] = []
+
+    def request_cancel(phase: str, completed: int, total: int | None) -> None:
+        nonlocal cancel_requested
+        progress_events.append((phase, completed, total))
+        cancel_requested = True
+
+    with pytest.raises(StorageError) as caught:
+        store.reconcile_storage_health(
+            cancel_check=lambda: cancel_requested,
+            progress=request_cancel,
+        )
+
+    assert caught.value.code is ErrorCode.CANCELLED
+    assert progress_events
+    recovered = store.reconcile_storage_health()
+    assert recovered.raw_file_count == 3
+
+
+def test_export_and_delete_preview_support_cooperative_cancellation(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    with closing(sqlite3.connect(store.db_path)) as connection, connection:
+        connection.executemany(
+            """
+            INSERT INTO observations (
+                run_id, raw_file_id, observed_at, controller_name,
+                controller_host, protocol, source_ip, destination_ip,
+                source_port, destination_port, counter, priority, tos,
+                age, destination, tunnel_age, packets, bytes_count,
+                flags, cpu_id, session_key
+            ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    run_id,
+                    "2026-08-28T08:01:00.000Z",
+                    "MD-01",
+                    "198.51.100.21",
+                    6,
+                    "192.0.2.100",
+                    "203.0.113.80",
+                    53000 + index,
+                    443,
+                    "0/0",
+                    0,
+                    0,
+                    index,
+                    "local",
+                    0,
+                    index,
+                    index,
+                    "FC",
+                    1,
+                    f"session-{index}",
+                )
+                for index in range(1_500)
+            ),
+        )
+    store.finish_run(run_id)
+    checks = 0
+    progress_events: list[tuple[str, int, int | None]] = []
+
+    def cancel_export() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 4
+
+    with pytest.raises(StorageError) as caught:
+        store.export_run_csv(
+            run_id,
+            tmp_path / "cancelled.csv",
+            cancel_check=cancel_export,
+            progress=lambda *event: progress_events.append(event),
+        )
+    assert caught.value.code is ErrorCode.CANCELLED
+    assert progress_events
+    assert not (tmp_path / "cancelled.csv").exists()
+    assert not tuple(store._manifests_root.glob("*.json"))
+
+    orphan_root = store.raw_root / "orphan"
+    orphan_root.mkdir()
+    for index in range(5):
+        (orphan_root / f"{index}.txt").write_text("raw", encoding="utf-8")
+    preview_checks = 0
+
+    def cancel_preview() -> bool:
+        nonlocal preview_checks
+        preview_checks += 1
+        return preview_checks >= 4
+
+    with pytest.raises(StorageError) as caught:
+        store.preview_delete(cancel_check=cancel_preview)
+    assert caught.value.code is ErrorCode.CANCELLED
+    assert store._pending_deletions == {}
+
+
+def test_delete_reuses_unchanged_preview_fingerprint_before_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()], raw_text="one managed raw")
+    store.finish_run(run_id)
+    calls = 0
+    original = session_store_module._file_fingerprint
+
+    def count_fingerprint(path: Path) -> tuple[str, int]:
+        nonlocal calls
+        calls += 1
+        return original(path)
+
+    monkeypatch.setattr(session_store_module, "_file_fingerprint", count_fingerprint)
+    preview = store.preview_delete(run_id)
+    assert calls == 1
+
+    result = store.delete(preview, confirmation_token=preview.confirmation_token)
+    assert result.deleted_raw_files == 1
+    # Preview hashes once; delete then verifies the staged file and final purge.
+    assert calls == 3
+
+
+def test_delete_stages_large_files_before_taking_sqlite_write_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()], raw_text="staging outside transaction")
+    store.finish_run(run_id)
+    preview = store.preview_delete(run_id)
+    original_stage = session_store_module._stage_files
+    write_lock_available: list[bool] = []
+
+    def observe_stage(
+        root: Path,
+        files: tuple[session_store_module._DeletionFile, ...],
+        preview_id: str,
+        category: str,
+        staged: list[session_store_module._StagedFile],
+        **kwargs: object,
+    ) -> None:
+        if not write_lock_available:
+            with closing(sqlite3.connect(store.db_path, timeout=0.1)) as connection:
+                connection.execute("PRAGMA busy_timeout = 100")
+                connection.execute("BEGIN IMMEDIATE")
+                connection.rollback()
+            write_lock_available.append(True)
+        original_stage(root, files, preview_id, category, staged, **kwargs)
+
+    monkeypatch.setattr(session_store_module, "_stage_files", observe_stage)
+
+    result = store.delete(preview, confirmation_token=preview.confirmation_token)
+
+    assert write_lock_available == [True]
+    assert result.deleted_runs == 1
+
+
+def test_delete_preview_scan_does_not_hold_store_lock_against_poll_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    completed_run = _run(store)
+    store.record_query(completed_run, [_observation()], raw_text="preview scan")
+    store.finish_run(completed_run)
+    active_run = _run(store)
+    scan_started = threading.Event()
+    release_scan = threading.Event()
+    original_snapshot = session_store_module._snapshot_managed_files
+
+    def blocking_snapshot(*args: object, **kwargs: object) -> object:
+        if not scan_started.is_set():
+            scan_started.set()
+            if not release_scan.wait(timeout=10):
+                raise TimeoutError("delete preview scan synchronization timed out")
+        return original_snapshot(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(session_store_module, "_snapshot_managed_files", blocking_snapshot)
+    previews: list[DeletePreview] = []
+    preview_errors: list[BaseException] = []
+
+    def create_preview() -> None:
+        try:
+            previews.append(store.preview_delete(completed_run))
+        except BaseException as error:  # pragma: no cover - asserted below
+            preview_errors.append(error)
+
+    preview_thread = threading.Thread(target=create_preview)
+    preview_thread.start()
+    assert scan_started.wait(timeout=5)
+    write_completed = threading.Event()
+
+    def write_poll() -> None:
+        store.record_query(active_run, [replace(_observation(), destination_port=8443)])
+        write_completed.set()
+
+    writer = threading.Thread(target=write_poll)
+    writer.start()
+    try:
+        assert write_completed.wait(timeout=5)
+    finally:
+        release_scan.set()
+    writer.join(timeout=5)
+    preview_thread.join(timeout=10)
+
+    assert not writer.is_alive()
+    assert not preview_thread.is_alive()
+    assert preview_errors == []
+    assert len(previews) == 1
+    assert store.discard_delete_preview(previews[0]) is True
+
+
+def test_delete_file_staging_does_not_hold_store_lock_against_poll_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    completed_run = _run(store)
+    store.record_query(completed_run, [_observation()], raw_text="delete staging")
+    store.finish_run(completed_run)
+    active_run = _run(store)
+    preview = store.preview_delete(completed_run)
+    stage_started = threading.Event()
+    release_stage = threading.Event()
+    original_stage = session_store_module._stage_files
+
+    def blocking_stage(*args: object, **kwargs: object) -> None:
+        if not stage_started.is_set():
+            stage_started.set()
+            if not release_stage.wait(timeout=10):
+                raise TimeoutError("delete staging synchronization timed out")
+        original_stage(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(session_store_module, "_stage_files", blocking_stage)
+    deletion_results: list[DeletionResult] = []
+    deletion_errors: list[BaseException] = []
+
+    def delete_run() -> None:
+        try:
+            deletion_results.append(
+                store.delete(preview, confirmation_token=preview.confirmation_token)
+            )
+        except BaseException as error:  # pragma: no cover - asserted below
+            deletion_errors.append(error)
+
+    delete_thread = threading.Thread(target=delete_run)
+    delete_thread.start()
+    assert stage_started.wait(timeout=5)
+    write_completed = threading.Event()
+
+    def write_poll() -> None:
+        store.record_query(active_run, [replace(_observation(), destination_port=9443)])
+        write_completed.set()
+
+    writer = threading.Thread(target=write_poll)
+    writer.start()
+    try:
+        assert write_completed.wait(timeout=5)
+    finally:
+        release_stage.set()
+    writer.join(timeout=5)
+    delete_thread.join(timeout=10)
+
+    assert not writer.is_alive()
+    assert not delete_thread.is_alive()
+    assert deletion_errors == []
+    assert len(deletion_results) == 1
+    assert deletion_results[0].deleted_runs == 1
+
+
+def test_database_checkpoint_and_atomic_user_backup(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()], raw_text="backup raw")
+    store.finish_run(run_id)
+    progress_events: list[tuple[str, int, int | None]] = []
+    backup = store.backup_database(
+        tmp_path / "user-backups" / "tracker-backup.db",
+        progress=lambda *event: progress_events.append(event),
+    )
+
+    assert backup.exists()
+    assert progress_events
+    with closing(sqlite3.connect(backup)) as connection:
+        assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("SELECT count(*) FROM runs").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 1
+    busy, log_pages, checkpointed_pages = store.checkpoint_database()
+    assert busy in {0, 1}
+    assert log_pages >= 0
+    assert checkpointed_pages >= 0
+
+
 def test_low_space_blocks_growth_with_stable_error_but_allows_run_finish(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2234,6 +3184,160 @@ def test_low_space_blocks_growth_with_stable_error_but_allows_run_finish(
     assert caught.value.code is ErrorCode.STORAGE_LOW_SPACE
     assert len(store.list_runs()) == 1
     assert store.list_runs()[0]["status"] == "COMPLETED"
+
+
+def test_export_preflight_reserves_space_for_the_staged_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()])
+    store.finish_run(run_id)
+    estimate = store._estimate_export_bytes(run_id, html=False)
+    monkeypatch.setattr(
+        session_store_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(
+            free=session_store_module.STORAGE_HARD_STOP_FREE_BYTES + estimate - 1
+        ),
+    )
+
+    with pytest.raises(StorageError) as caught:
+        store.export_run_csv(run_id, tmp_path / "preflight.csv")
+
+    assert caught.value.code is ErrorCode.STORAGE_LOW_SPACE
+    assert not (tmp_path / "preflight.csv").exists()
+    assert not tuple(store._manifests_root.glob("*.json"))
+
+
+@pytest.mark.windows
+def test_windows_atomic_replace_retries_transient_sharing_violation(tmp_path: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows sharing violations apply only on Windows")
+    source = tmp_path / "source.tmp"
+    destination = tmp_path / "destination.txt"
+    source.write_bytes(b"replacement")
+    attempts = 0
+
+    def flaky_replace(current: Path, target: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError("fixture sharing violation")
+        os.replace(current, target)
+
+    durable_io_module.replace_with_retry(source, destination, replace=flaky_replace)
+
+    assert attempts == 3
+    assert destination.read_bytes() == b"replacement"
+
+
+@pytest.mark.windows
+def test_windows_replace_retry_fails_closed_if_source_changes(tmp_path: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows sharing violations apply only on Windows")
+    source = tmp_path / "source.tmp"
+    destination = tmp_path / "destination.txt"
+    original = b"trusted replacement"
+    source.write_bytes(original)
+    attempts = 0
+
+    def mutate_then_fail(_current: Path, _target: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        source.write_bytes(b"tampered replacement")
+        raise PermissionError("fixture sharing violation")
+
+    with pytest.raises(OSError, match="identity or fingerprint changed"):
+        durable_io_module.replace_with_retry(
+            source,
+            destination,
+            replace=mutate_then_fail,
+            expected_sha256=hashlib.sha256(original).hexdigest(),
+            expected_size=len(original),
+        )
+
+    assert attempts == 1
+    assert not destination.exists()
+
+
+def test_atomic_replace_rejects_same_size_corruption_before_first_attempt(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.tmp"
+    destination = tmp_path / "destination.txt"
+    trusted = b"trusted-content"
+    corrupted = b"altered-content"
+    assert len(corrupted) == len(trusted)
+    source.write_bytes(corrupted)
+    replace_calls = 0
+
+    def unexpected_replace(_current: Path, _target: Path) -> None:
+        nonlocal replace_calls
+        replace_calls += 1
+
+    with pytest.raises(OSError, match="differs from expected content"):
+        durable_io_module.replace_with_retry(
+            source,
+            destination,
+            replace=unexpected_replace,
+            expected_sha256=hashlib.sha256(trusted).hexdigest(),
+            expected_size=len(trusted),
+        )
+
+    assert replace_calls == 0
+    assert source.read_bytes() == corrupted
+    assert not destination.exists()
+
+
+def test_atomic_replace_revalidates_destination_before_first_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_parent = tmp_path / "source"
+    destination_parent = tmp_path / "destination"
+    source_parent.mkdir()
+    destination_parent.mkdir()
+    source = source_parent / "source.tmp"
+    destination = destination_parent / "destination.txt"
+    source.write_bytes(b"replacement")
+    destination.write_bytes(b"trusted-old")
+    replace_calls = 0
+    mutated = False
+    original_validate = durable_io_module._validate_directory_state
+
+    def mutate_before_destination_validation(
+        path: Path,
+        expected: object,
+    ) -> None:
+        nonlocal mutated
+        if path == destination_parent and not mutated:
+            mutated = True
+            destination.write_bytes(b"altered-old")
+        original_validate(path, expected)
+
+    def unexpected_replace(_current: Path, _target: Path) -> None:
+        nonlocal replace_calls
+        replace_calls += 1
+
+    monkeypatch.setattr(
+        durable_io_module,
+        "_validate_directory_state",
+        mutate_before_destination_validation,
+    )
+
+    with pytest.raises(OSError, match="identity or fingerprint changed"):
+        durable_io_module.replace_with_retry(
+            source,
+            destination,
+            replace=unexpected_replace,
+        )
+
+    assert mutated is True
+    assert replace_calls == 0
+    assert source.read_bytes() == b"replacement"
+    assert destination.read_bytes() == b"altered-old"
 
 
 def test_query_capacity_check_is_fast_and_fails_before_a_poll(
@@ -2554,6 +3658,86 @@ def test_startup_recovers_external_export_after_every_durable_boundary(
     assert not tuple(reopened._manifests_root.iterdir())
     assert not tuple(reopened._leases_root.iterdir())
     assert not tuple(reopened._export_owners_root.iterdir())
+
+
+def test_missing_external_export_target_is_deferred_without_blocking_startup(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()])
+    store.finish_run(run_id)
+    destination = tmp_path / "removable-drive" / "report.csv"
+    destination.parent.mkdir()
+    destination.write_bytes(b"previous report")
+    completed = _run_export_crash(store, run_id, destination, "PREPARED")
+    assert completed.returncode == 91, (completed.stdout, completed.stderr)
+
+    detached = tmp_path / "detached-removable-drive"
+    destination.parent.rename(detached)
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+
+    assert reopened.pending_external_recovery_count == 1
+    assert reopened.list_runs()[0]["id"] == run_id
+    assert tuple(reopened._manifests_root.glob("*.json"))
+    detached.rename(destination.parent)
+
+    assert reopened.retry_pending_external_recoveries() == 0
+    assert destination.read_bytes() == b"previous report"
+    assert not tuple(reopened._manifests_root.glob("*.json"))
+    assert not tuple(reopened._export_owners_root.glob("*.json"))
+
+
+def test_pending_external_recovery_does_not_hold_store_lock_against_poll_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store._pending_external_recoveries["a" * 32] = "FileNotFoundError"
+    recovery_started = threading.Event()
+    release_recovery = threading.Event()
+
+    def slow_recovery() -> bool:
+        recovery_started.set()
+        if not release_recovery.wait(timeout=10):
+            raise TimeoutError("external recovery synchronization timed out")
+        return True
+
+    monkeypatch.setattr(store, "_recover_operations", slow_recovery)
+    results: list[int] = []
+    errors: list[BaseException] = []
+
+    def retry_recovery() -> None:
+        try:
+            results.append(store.retry_pending_external_recoveries())
+        except BaseException as error:  # pragma: no cover - asserted below
+            errors.append(error)
+
+    recovery = threading.Thread(target=retry_recovery)
+    recovery.start()
+    assert recovery_started.wait(timeout=5)
+    assert store.storage_health().raw_file_count == 0
+    write_completed = threading.Event()
+
+    def write_poll() -> None:
+        store.record_query(run_id, [_observation()], raw_text="recovery-concurrency")
+        write_completed.set()
+
+    writer = threading.Thread(target=write_poll)
+    writer.start()
+    try:
+        assert write_completed.wait(timeout=5)
+    finally:
+        release_recovery.set()
+    writer.join(timeout=5)
+    recovery.join(timeout=10)
+
+    assert not writer.is_alive()
+    assert not recovery.is_alive()
+    assert errors == []
+    assert results == [0]
 
 
 def test_external_export_manifest_path_tamper_cannot_touch_unrelated_file(

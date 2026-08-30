@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import hmac
 import json
 import os
 import re
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import tomllib
 import zipfile
+from contextlib import AbstractContextManager, suppress
 from pathlib import Path, PurePosixPath
+from types import TracebackType
+from typing import Self
+
+import paramiko
 
 PRODUCT = "ArubaSessionTracker"
 REQUIRED_BUNDLE_FILES = {
@@ -60,10 +69,241 @@ _MAX_ZIP_MEMBER_BYTES = 512 * 1024 * 1024
 _MAX_ZIP_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 _SCAN_CHUNK_BYTES = 1024 * 1024
 _SCAN_OVERLAP_BYTES = 256
+_LOOPBACK = "127.0.0.1"
+_LOOPBACK_PROMPT = "fixture-mm#"
+_GLOBAL_SOURCE_OUTPUT = """Global Users
+------------
+IP Address      MAC                Name           Current switch Role         Auth   AP name
+--------------- ------------------ -------------- -------------- ------------ ------ -------------
+192.0.2.10      00:00:5e:00:53:01  test-user      127.0.0.1      employee     dot1x  fixture-ap
+Total entries = 1
+"""
+_GLOBAL_DESTINATION_OUTPUT = """Global Users
+------------
+IP Address      MAC                Name           Current switch Role         Auth   AP name
+--------------- ------------------ -------------- -------------- ------------ ------ -------------
+Total entries = 0
+"""
+_DATAPATH_OUTPUT = (
+    "Datapath Session Table Entries\n"
+    "------------------------------\n"
+    "Source IP or MAC  Destination IP  Prot SPort DPort Cntr Prio ToS Age "
+    "Destination TAge Packets Bytes Flags CPU ID\n"
+    "----------------  --------------  ---- ----- ----- ---- ---- --- --- "
+    "----------- ---- ------- ----- ----- ------\n"
+    "192.0.2.10        203.0.113.20    6    54321 443   0/0  0    0   12  "
+    "local       0    10      2048  FCI   1\n"
+    "Entries: 1\n"
+)
 
 
 class ReleaseVerificationError(ValueError):
     pass
+
+
+class _PasswordServer(paramiko.ServerInterface):  # type: ignore[misc]
+    def __init__(self, owner: _PackagedLoopbackSshServer) -> None:
+        self._owner = owner
+        self.shell_requested = threading.Event()
+
+    def check_auth_password(self, username: str, password: str) -> int:
+        accepted = username == self._owner.username and password == self._owner.password
+        with self._owner.lock:
+            self._owner.auth_results.append(accepted)
+        return paramiko.AUTH_SUCCESSFUL if accepted else paramiko.AUTH_FAILED
+
+    def get_allowed_auths(self, username: str) -> str:
+        del username
+        return "password"
+
+    def check_channel_request(self, kind: str, chanid: int) -> int:
+        del chanid
+        return (
+            paramiko.OPEN_SUCCEEDED
+            if kind == "session"
+            else paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+        )
+
+    def check_channel_pty_request(
+        self,
+        channel: paramiko.Channel,
+        term: bytes,
+        width: int,
+        height: int,
+        pixelwidth: int,
+        pixelheight: int,
+        modes: bytes,
+    ) -> bool:
+        del channel, term, width, height, pixelwidth, pixelheight, modes
+        return True
+
+    def check_channel_shell_request(self, channel: paramiko.Channel) -> bool:
+        del channel
+        self.shell_requested.set()
+        return True
+
+
+class _PackagedLoopbackSshServer(AbstractContextManager["_PackagedLoopbackSshServer"]):
+    """Bounded SSH fixture that refuses every non-loopback peer."""
+
+    def __init__(self) -> None:
+        self.username = "fixture-operator"
+        self.password = self.username[::-1]
+        self.host_key = paramiko.RSAKey.generate(1024)
+        self.command_outputs = {
+            "no paging": "",
+            'show global-user-table list ip "192.0.2.10"': _GLOBAL_SOURCE_OUTPUT,
+            'show global-user-table list ip "203.0.113.20"': _GLOBAL_DESTINATION_OUTPUT,
+            "show datapath session table 192.0.2.10": _DATAPATH_OUTPUT,
+        }
+        self.auth_results: list[bool] = []
+        self.commands: list[str] = []
+        self.failures: list[str] = []
+        self.lock = threading.Lock()
+        self._stop = threading.Event()
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind((_LOOPBACK, 0))
+        self._listener.listen(8)
+        self._listener.settimeout(0.2)
+        self.port = int(self._listener.getsockname()[1])
+        self._threads: list[threading.Thread] = []
+        self._transports: set[paramiko.Transport] = set()
+        self._accept_thread = threading.Thread(
+            target=self._accept_connections,
+            name=f"release-loopback-ssh-accept-{self.port}",
+            daemon=True,
+        )
+
+    @property
+    def fingerprint(self) -> str:
+        digest = hashlib.sha256(self.host_key.asbytes()).digest()
+        return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+    def __enter__(self) -> Self:
+        self._accept_thread.start()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc_value, traceback
+        self.close()
+
+    def close(self) -> None:
+        self._stop.set()
+        with suppress(OSError):
+            self._listener.close()
+        with self.lock:
+            active = tuple(self._transports)
+        for transport in active:
+            transport.close()
+        self._accept_thread.join(timeout=3)
+        deadline = time.monotonic() + 5
+        for worker in tuple(self._threads):
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        leaked = [worker.name for worker in self._threads if worker.is_alive()]
+        if self._accept_thread.is_alive() or leaked:
+            raise ReleaseVerificationError(f"packaged loopback SSH fixture leaked: {leaked}")
+        if self.failures:
+            raise ReleaseVerificationError(
+                f"packaged loopback SSH fixture failed at sanitized stages: {self.failures}"
+            )
+
+    def _accept_connections(self) -> None:
+        while not self._stop.is_set():
+            try:
+                client, peer = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                if not self._stop.is_set():
+                    self.failures.append("LISTENER")
+                return
+            if peer[0] != _LOOPBACK:
+                client.close()
+                self.failures.append("NON_LOOPBACK_PEER")
+                continue
+            worker = threading.Thread(
+                target=self._handle_client,
+                args=(client,),
+                name=f"release-loopback-ssh-client-{len(self._threads) + 1}",
+                daemon=True,
+            )
+            self._threads.append(worker)
+            worker.start()
+
+    def _handle_client(self, client: socket.socket) -> None:
+        transport: paramiko.Transport | None = None
+        channel: paramiko.Channel | None = None
+        try:
+            client.settimeout(3)
+            transport = paramiko.Transport(client)
+            with self.lock:
+                self._transports.add(transport)
+            transport.add_server_key(self.host_key)
+            server = _PasswordServer(self)
+            transport.start_server(server=server)
+            channel = transport.accept(timeout=2)
+            if channel is None:
+                return
+            if not server.shell_requested.wait(timeout=2):
+                raise TimeoutError
+            channel.settimeout(0.2)
+            channel.sendall(_LOOPBACK_PROMPT.encode("ascii"))
+            self._serve_shell(channel)
+        except (EOFError, OSError, paramiko.SSHException):
+            if not self._stop.is_set() and transport is not None and transport.is_active():
+                self.failures.append("ACTIVE_TRANSPORT")
+        except BaseException:
+            self.failures.append("SERVER_WORKER")
+        finally:
+            if channel is not None:
+                with suppress(Exception):
+                    channel.close()
+            if transport is not None:
+                with suppress(Exception):
+                    transport.close()
+                with self.lock:
+                    self._transports.discard(transport)
+            with suppress(OSError):
+                client.close()
+
+    def _serve_shell(self, channel: paramiko.Channel) -> None:
+        buffer = bytearray()
+        while not self._stop.is_set() and not channel.closed:
+            try:
+                data = channel.recv(4096)
+            except TimeoutError:
+                continue
+            if not data:
+                return
+            buffer.extend(data)
+            while True:
+                terminators = [index for value in (10, 13) if (index := buffer.find(value)) >= 0]
+                if not terminators:
+                    break
+                index = min(terminators)
+                command = bytes(buffer[:index]).decode("utf-8", errors="strict").strip()
+                del buffer[: index + 1]
+                while buffer and buffer[0] in (10, 13):
+                    del buffer[0]
+                if not command:
+                    channel.sendall(_LOOPBACK_PROMPT.encode("ascii"))
+                    continue
+                with self.lock:
+                    self.commands.append(command)
+                if command == "exit":
+                    return
+                output = self.command_outputs.get(command, "% Invalid input")
+                response = f"{command}\r\n"
+                if output:
+                    response += f"{output}\r\n"
+                response += _LOOPBACK_PROMPT
+                channel.sendall(response.encode("utf-8"))
 
 
 def _sha256(path: Path) -> str:
@@ -393,6 +633,54 @@ def smoke_executable(zip_path: Path) -> None:
             raise ReleaseVerificationError(
                 f"packaged EXE smoke failed with exit code {result.returncode}"
             )
+
+        loopback_local_app_data = root / "loopback-smoke" / "LocalAppData"
+        loopback_local_app_data.mkdir(parents=True)
+        loopback_environment = logic_environment.copy()
+        loopback_environment["LOCALAPPDATA"] = str(loopback_local_app_data)
+        with _PackagedLoopbackSshServer() as server:
+            for mode in ("success", "auth-failure"):
+                try:
+                    loopback_result = subprocess.run(  # noqa: S603
+                        [
+                            executable,
+                            "--loopback-ssh-smoke",
+                            mode,
+                            "--loopback-ssh-port",
+                            str(server.port),
+                            "--loopback-ssh-fingerprint",
+                            server.fingerprint,
+                        ],
+                        check=False,
+                        capture_output=True,
+                        timeout=60,
+                        env=loopback_environment,
+                    )
+                except subprocess.TimeoutExpired as error:
+                    raise ReleaseVerificationError(
+                        f"packaged loopback SSH {mode} smoke timed out"
+                    ) from error
+                expected_marker = (
+                    f"ARUBA_SESSION_TRACKER_LOOPBACK_SSH_{mode.upper().replace('-', '_')}_OK"
+                ).encode("ascii")
+                if loopback_result.returncode != 0 or expected_marker not in loopback_result.stdout:
+                    raise ReleaseVerificationError(
+                        f"packaged loopback SSH {mode} smoke failed with exit code "
+                        f"{loopback_result.returncode}"
+                    )
+            required_commands = {
+                'show global-user-table list ip "192.0.2.10"',
+                'show global-user-table list ip "203.0.113.20"',
+                "show datapath session table 192.0.2.10",
+            }
+            if not required_commands.issubset(server.commands):
+                raise ReleaseVerificationError(
+                    "packaged loopback SSH success smoke skipped the MM/MD command path"
+                )
+            if True not in server.auth_results or False not in server.auth_results:
+                raise ReleaseVerificationError(
+                    "packaged loopback SSH smoke did not cover success and authentication failure"
+                )
 
         korean_local_app_data = root / "한국어 경로" / "LocalAppData"
         korean_local_app_data.mkdir(parents=True)

@@ -2,10 +2,47 @@
 
 ## Unreleased
 
+## 0.5.0 - 2026-08-30
+
 - HTML 결과 보고서에서 패킷·바이트와 증감 영역을 제거하고, 최신 세션 결과와
   전체 추적 이력을 프로토콜 및 출발지·목적지 `IP:포트` 중심으로 단순화.
 - 패킷·바이트 원본은 SQLite, CSV와 Raw에 계속 보존하며 기존 내보내기
   인터페이스와 저장 형식을 변경하지 않음.
+- 비식별 Aruba tech-support 텍스트를 제한된 크기로 읽는 오프라인 파서와
+  프로토콜·포트·Flags·ToS의 추측 없는 분석 코어를 추가하고 live
+  `SessionObservation`/DB에 자동 합치지 않는 안전 경계를 유지.
+- SSH 연결 수립·prompt·enable·명령 수신에 4 MiB·50,000행 상한을 적용하고,
+  전체 poll 300초 deadline 또는 취소 시 socket-first abort로 blocked read를
+  깨운 뒤 caller 경로에서 transport를 정리하도록 강화.
+- Primary/Standby 및 여러 MD에 남은 poll 시간을 공정하게 배분하고 전수조회
+  시작 MD를 순환하며, 활성 흐름 20,000개 포화 시 비권위 결과로 처리해
+  잘못된 `MISS/CLOSED`가 발생하지 않도록 보완. 같은 poll에서 합법적으로
+  여러 상태 전환이 발생해도 별도 수명주기 이벤트 상한 안에서 저장을 반복
+  실패하지 않도록 관측 상한과 이벤트 상한을 분리.
+- 매 poll 전체 Raw 32 MiB·관측 20,000건 상한을 수집기와 저장소 양쪽에서
+  검증하고, 여러 command Raw를 section 길이·SHA-256이 포함된 단일 poll
+  bundle로 저장해 장시간 실행의 파일 수 증가를 완화.
+- Raw/DB poll 기록, 관리·외부 CSV/HTML 내보내기와 삭제를 manifest 기반으로
+  복구하며 파일 hash·fsync·이동을 SQLite writer transaction 밖에서 끝내
+  모니터링 기록과의 잠금 경합을 줄임.
+- HTML/CSV 행을 cursor로 스트리밍하고 Raw 무결성 hash에 chunk별 취소·진행
+  확인을 추가해 대용량 보고서가 GUI 종료와 WAL 정리를 장시간 막지 않도록 함.
+- 저장소 상태의 빠른 DB 집계와 명시적 background 파일 대조를 분리하고,
+  외부 드라이브 부재로 미뤄진 보고서 복구는 기록 새로 고침에서 재시도하며
+  남은 건수를 민감 경로 없이 안내.
+- 조회·기록·내보내기·삭제를 daemon 작업으로 분리하고 15초 종료 grace 후
+  다음 실행 복구로 전환하며, 시작 초기화는 반응형 화면과 30초 grace를 사용.
+- 사용자 세션당 단일 실행 mutex, 절전 복귀·네트워크 변경 감지, MM 위치
+  cache 무효화와 실행 중 자격증명 변경 감지를 추가.
+- 예외 메시지·traceback·경로·운영 데이터를 제외한 1 MiB 순환 crash journal과
+  비밀정보를 보존하지 않는 monitor failure DTO를 추가.
+- GitHub Actions를 검증한 immutable Node 24 action commit으로 갱신하고,
+  명령 생성→가짜 SSH→실제 파서→수명주기→SQLite/Raw 전체 파이프라인
+  2,000회 PR soak 및 최대 50,000회 야간 경로를 추가.
+- Windows 패키지 검증에서 Python 없는 PATH, 한국어 LocalAppData/보고서 경로,
+  loopback fake SSH 정상·인증 실패, 실제 MM/MD 명령·파서·SQLite 저장을 확인.
+- 실제 Aruba 장비와 회사 네트워크에는 접속하지 않았으며 자동·가상·패키지
+  검증을 현장 호환성 증거로 확대 해석하지 않음.
 
 ## 0.4.1 - 2026-08-30
 

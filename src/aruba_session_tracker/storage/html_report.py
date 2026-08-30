@@ -3,14 +3,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 
 from aruba_session_tracker.analysis import protocol_label
+from aruba_session_tracker.storage.durable_io import replace_with_retry
 
 ReportRow = dict[str, object]
 FlowKey = tuple[str, str, str, str, str]
@@ -64,9 +67,31 @@ class RunReportSnapshot:
 def render_html_report(snapshot: RunReportSnapshot) -> str:
     """Return a concise standalone HTML5 report containing tracked results only."""
 
+    return "".join(_report_chunks(snapshot))
+
+
+def _report_chunks(
+    snapshot: RunReportSnapshot,
+    *,
+    observation_history: Iterable[ReportRow] | None = None,
+    logical_session_total: int | None = None,
+) -> Iterator[str]:
+    """Yield one report in bounded chunks.
+
+    ``observation_history`` is used by :class:`SessionStore` to stream a stable
+    SQLite cursor directly to the atomic destination.  The public renderer
+    keeps its historical behavior by deriving both the latest results and the
+    complete history from the supplied snapshot.
+    """
+
     run = snapshot.run
-    history = snapshot.observation_history or snapshot.observations
-    flow_groups = _group_observations(history)
+    if observation_history is None:
+        history: Iterable[ReportRow] = snapshot.observation_history or snapshot.observations
+        latest_source = snapshot.observation_history or snapshot.observations
+    else:
+        history = observation_history
+        latest_source = snapshot.observations
+    flow_groups = _group_observations(latest_source)
     flow_statuses, session_statuses = _lifecycle_statuses(snapshot.lifecycle_events)
     latest_groups = flow_groups[:_LATEST_SESSION_LIMIT]
 
@@ -77,22 +102,20 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
         )
         for _flow, rows in latest_groups
     )
-    history_rows = "".join(_observation_row(row, "관측됨") for row in history)
-
-    logical_session_total = len(flow_groups)
+    total_sessions = len(flow_groups) if logical_session_total is None else logical_session_total
     displayed_latest = len(latest_groups)
     latest_note = (
-        f"고유 세션 {_format_integer(logical_session_total)}개를 모두 표시합니다."
-        if displayed_latest >= logical_session_total
+        f"고유 세션 {_format_integer(total_sessions)}개를 모두 표시합니다."
+        if displayed_latest >= total_sessions
         else (
-            f"고유 세션 {_format_integer(logical_session_total)}개 중 마지막 확인 시각을 기준으로 "
+            f"고유 세션 {_format_integer(total_sessions)}개 중 마지막 확인 시각을 기준으로 "
             f"최근 {_format_integer(displayed_latest)}개를 표시합니다."
         )
     )
     query_direction = "양방향" if bool(run.get("bidirectional")) else "단방향"
     run_status = _RUN_STATUS_KO.get(str(run.get("status") or "").upper(), "상태 확인 필요")
 
-    return f"""<!doctype html>
+    yield f"""<!doctype html>
 <html lang="ko">
 <head>
   <meta charset="utf-8">
@@ -172,7 +195,7 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
         {_card("목적지 포트", run.get("destination_port"))}
         {_card("검색 방향", query_direction)}
         {_card("전체 관측", f"{_format_integer(snapshot.observation_total)}건")}
-        {_card("고유 세션", f"{_format_integer(logical_session_total)}개")}
+        {_card("고유 세션", f"{_format_integer(total_sessions)}개")}
         {_card("수집 상태", run_status)}
       </div>
     </div>
@@ -196,7 +219,14 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
           <div class="table-wrap" role="region" aria-label="전체 추적 이력 표" tabindex="0"><table>
             <caption class="sr-only">전체 추적 이력</caption>
             <thead><tr><th scope="col">확인 시각</th><th scope="col">장비명</th><th scope="col">프로토콜</th><th scope="col">출발지 IP:포트</th><th scope="col">목적지 IP:포트</th><th scope="col">추적 상태</th></tr></thead>
-            <tbody>{history_rows or _empty_row(6, "저장된 관측 이력이 없습니다.")}</tbody>
+            <tbody>"""
+    history_count = 0
+    for row in history:
+        history_count += 1
+        yield _observation_row(row, "관측됨")
+    if history_count == 0:
+        yield _empty_row(6, "저장된 관측 이력이 없습니다.")
+    yield """</tbody>
           </table></div>
         </div>
       </details>
@@ -211,6 +241,29 @@ def render_html_report(snapshot: RunReportSnapshot) -> str:
 def write_html_report_atomic(destination: Path | str, snapshot: RunReportSnapshot) -> Path:
     """Atomically write one deterministic UTF-8 report."""
 
+    return _write_html_chunks_atomic(destination, _report_chunks(snapshot))
+
+
+def write_html_report_stream_atomic(
+    destination: Path | str,
+    snapshot: RunReportSnapshot,
+    observation_history: Iterable[ReportRow],
+    *,
+    logical_session_total: int,
+) -> Path:
+    """Atomically write a report while consuming history rows incrementally."""
+
+    return _write_html_chunks_atomic(
+        destination,
+        _report_chunks(
+            snapshot,
+            observation_history=observation_history,
+            logical_session_total=logical_session_total,
+        ),
+    )
+
+
+def _write_html_chunks_atomic(destination: Path | str, chunks: Iterable[str]) -> Path:
     path = Path(destination)
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -218,11 +271,23 @@ def write_html_report_atomic(destination: Path | str, snapshot: RunReportSnapsho
     )
     temporary_path = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(render_html_report(snapshot))
+        digest = hashlib.sha256()
+        byte_size = 0
+        with os.fdopen(descriptor, "wb") as stream:
+            for chunk in chunks:
+                encoded = chunk.encode("utf-8")
+                stream.write(encoded)
+                digest.update(encoded)
+                byte_size += len(encoded)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_path, path)
+        replace_with_retry(
+            temporary_path,
+            path,
+            replace=os.replace,
+            expected_sha256=digest.hexdigest(),
+            expected_size=byte_size,
+        )
     finally:
         temporary_path.unlink(missing_ok=True)
     return path

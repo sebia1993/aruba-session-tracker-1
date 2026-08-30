@@ -65,6 +65,23 @@ def test_file_reader_supports_cooperative_cancellation(tmp_path: Path) -> None:
     assert str(source) not in str(caught.value)
 
 
+def test_file_reader_keeps_cancellation_active_during_parse(tmp_path: Path) -> None:
+    source = tmp_path / "cancel-during-parse.log"
+    source.write_bytes(FIXTURE.read_bytes())
+    checks = 0
+
+    def cancel_after_read() -> bool:
+        nonlocal checks
+        checks += 1
+        return checks >= 5
+
+    with pytest.raises(ParseError) as caught:
+        parse_offline_tech_support_file(source, is_cancelled=cancel_after_read)
+
+    assert caught.value.code is ErrorCode.CANCELLED
+    assert checks >= 5
+
+
 def test_file_reader_validates_public_arguments(tmp_path: Path) -> None:
     with pytest.raises(TypeError):
         parse_offline_tech_support_file(123)  # type: ignore[arg-type]

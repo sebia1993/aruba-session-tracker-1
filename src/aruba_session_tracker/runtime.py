@@ -48,6 +48,7 @@ class RuntimeExecutor:
         self._lock = threading.RLock()
         self._monitor: MonitorEngine | None = None
         self._monitor_signature: str | None = None
+        self._monitor_credentials: Credentials | None = None
         self._monitor_run_id: str | None = None
         self._monitor_generation = 0
         self._next_poll_id = 0
@@ -113,6 +114,13 @@ class RuntimeExecutor:
             self._finish_or_queue(run_id, "STOPPED")
         self._retry_pending_finishes(required=True)
 
+    def invalidate_monitor_location(self) -> None:
+        """Force the next monitor poll to refresh MM routing information."""
+
+        with self._lock:
+            if self._monitor is not None:
+                self._monitor.invalidate_location()
+
     def _execute_monitor_poll(
         self,
         config: AppConfig,
@@ -136,7 +144,9 @@ class RuntimeExecutor:
                 cancel_token=cancel_token,
             )
             self._active_monitor_poll = lease
-            if self._monitor is not None and self._monitor_signature != signature:
+            if self._monitor is not None and (
+                self._monitor_signature != signature or self._monitor_credentials != credentials
+            ):
                 restart_run_id = self._detach_monitor_locked(reset_stop_request=False)
 
         prepared: _PreparedMonitorPoll | None = None
@@ -167,6 +177,7 @@ class RuntimeExecutor:
                     self._monitor_generation += 1
                     self._monitor = monitor
                     self._monitor_signature = signature
+                    self._monitor_credentials = credentials
                     self._monitor_run_id = run_id
                     lease.generation = self._monitor_generation
                     lease.run_id = run_id
@@ -250,6 +261,7 @@ class RuntimeExecutor:
         run_id = self._monitor_run_id
         self._monitor = None
         self._monitor_signature = None
+        self._monitor_credentials = None
         self._monitor_run_id = None
         self._monitor_generation += 1
         if reset_stop_request:
