@@ -2033,7 +2033,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "외부 보고서 복구 "
                 f"{result.pending_external_recoveries}건 대기 중입니다. "
-                "대상 드라이브를 연결한 뒤 새로 고침을 누르십시오.",
+                "외부 저장 위치를 다시 사용할 수 있게 한 뒤 새로 고침을 누르십시오.",
                 15_000,
             )
         self._drain_preview_discard_queue()

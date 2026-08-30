@@ -58,12 +58,15 @@ datapath session rows from the relevant 7240XM managed device.
   lifecycle-critical modules listed in `tools/check_coverage_policy.py` at or
   above 65 percent. Do not lower these floors to make CI pass.
 - Build with `powershell -ExecutionPolicy Bypass -File .\build_windows.ps1`.
-- Run the fixture-only 20,000-poll release soak with
+- Run the fixture-only 20,000-poll release soak locally with
   `$env:ARUBA_SOAK_POLLS='20000'; .\.venv\Scripts\python.exe -m pytest -m soak -q`
-  before a versioned tag. This is not live-device evidence.
+  before creating a versioned tag.
+- The versioned release workflow must repeat that fixture-only soak in a
+  separate bounded job on the exact annotated-tag commit before publication.
+  Both soak results are test evidence only, not live-device evidence.
 - Keep synthetic soak inputs between 1 and 20,000 polls. Each child-process
   timeout must remain between 500 and 3,200 seconds so the two sequential
-  nightly soaks stay inside the outer 120-minute workflow watchdog.
+  long-soak subprocesses stay inside each outer 120-minute workflow watchdog.
 - Deadline watchdogs must recheck the shared monotonic deadline after an OS
   timer wait returns. Never treat one early Windows timer wakeup as expiry, and
   keep the connection-manager and owned-socket guards on the same policy.

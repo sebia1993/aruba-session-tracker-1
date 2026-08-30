@@ -3841,17 +3841,47 @@ def test_startup_recovers_external_export_after_every_durable_boundary(
     assert not tuple(reopened._export_owners_root.iterdir())
 
 
+@pytest.mark.parametrize("export_format", ("csv", "html"))
+@pytest.mark.parametrize(
+    "target_phase",
+    (
+        "PREPARED",
+        "RENDERED",
+        "INSTALLED",
+        "DB_RECEIPT_COMMITTED",
+        "DB_COMMITTED",
+    ),
+)
 def test_missing_external_export_target_is_deferred_without_blocking_startup(
     tmp_path: Path,
+    export_format: str,
+    target_phase: str,
 ) -> None:
     store = _store(tmp_path)
     run_id = _run(store)
     store.record_query(run_id, [_observation()])
     store.finish_run(run_id)
-    destination = tmp_path / "removable-drive" / "report.csv"
+    suffix = ".csv" if export_format == "csv" else ".html"
+    destination = tmp_path / "removable-drive" / f"report{suffix}"
     destination.parent.mkdir()
-    destination.write_bytes(b"previous report")
-    completed = _run_export_crash(store, run_id, destination, "PREPARED")
+    previous_bytes = f"previous report {export_format}".encode()
+    destination.write_bytes(previous_bytes)
+
+    expected_path = tmp_path / "expected" / f"report{suffix}"
+    if export_format == "csv":
+        store.export_run_csv(run_id, expected_path)
+    else:
+        store.export_run_html(run_id, expected_path)
+    replacement_bytes = expected_path.read_bytes()
+    assert replacement_bytes != previous_bytes
+
+    completed = _run_export_crash(
+        store,
+        run_id,
+        destination,
+        target_phase,
+        export_format,
+    )
     assert completed.returncode == 91, (completed.stdout, completed.stderr)
 
     detached = tmp_path / "detached-removable-drive"
@@ -3865,7 +3895,12 @@ def test_missing_external_export_target_is_deferred_without_blocking_startup(
     detached.rename(destination.parent)
 
     assert reopened.retry_pending_external_recoveries() == 0
-    assert destination.read_bytes() == b"previous report"
+    expected_bytes = (
+        replacement_bytes
+        if target_phase in {"DB_RECEIPT_COMMITTED", "DB_COMMITTED"}
+        else previous_bytes
+    )
+    assert destination.read_bytes() == expected_bytes
     assert not tuple(reopened._manifests_root.glob("*.json"))
     assert not tuple(reopened._export_owners_root.glob("*.json"))
 
