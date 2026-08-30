@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import math
 import os
 import sqlite3
 import subprocess
@@ -25,8 +26,8 @@ def test_storage_poll_soak(tmp_path: Path) -> None:
     if os.name != "nt":
         pytest.skip("Windows process resource counters are required for this soak")
     polls = int(os.environ.get("ARUBA_SOAK_POLLS", "2000"))
-    if not 1 <= polls <= 100_000:
-        raise ValueError("ARUBA_SOAK_POLLS must be between 1 and 100000")
+    if not 1 <= polls <= 20_000:
+        raise ValueError("ARUBA_SOAK_POLLS must be between 1 and 20000")
 
     repository = Path(__file__).resolve().parents[1]
     worker = Path(__file__).with_name("storage_soak_worker.py")
@@ -42,10 +43,10 @@ def test_storage_poll_soak(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
         check=False,
-        # Durable writes intentionally fsync each poll. GitHub-hosted Windows
-        # disks can be substantially slower than a local NTFS volume, so use
-        # the same bounded budget as the full fixture-pipeline soak.
-        timeout=max(300, polls // 4),
+        # Durable writes intentionally fsync each poll. Allow hosted-disk
+        # variance while keeping both nightly subprocess ceilings below the
+        # workflow's outer 120-minute watchdog.
+        timeout=min(3_200, max(500, math.ceil(polls * 0.16))),
     )
     assert completed.returncode == 0, completed.stderr[-4000:]
     output_lines = tuple(line for line in completed.stdout.splitlines() if line.strip())

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -17,8 +18,8 @@ def test_fixture_ssh_parser_runtime_storage_soak(tmp_path: Path) -> None:
     if os.name != "nt":
         pytest.skip("Windows process resource counters are required for this soak")
     polls = int(os.environ.get("ARUBA_SOAK_POLLS", "2000"))
-    if not 1 <= polls <= 50_000:
-        raise ValueError("ARUBA_SOAK_POLLS must be between 1 and 50000")
+    if not 1 <= polls <= 20_000:
+        raise ValueError("ARUBA_SOAK_POLLS must be between 1 and 20000")
 
     repository = Path(__file__).resolve().parents[1]
     worker = Path(__file__).with_name("end_to_end_soak_worker.py")
@@ -34,7 +35,7 @@ def test_fixture_ssh_parser_runtime_storage_soak(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
         check=False,
-        timeout=max(300, polls // 4),
+        timeout=min(3_200, max(500, math.ceil(polls * 0.16))),
     )
     assert completed.returncode == 0, completed.stderr[-6000:]
     lines = tuple(line for line in completed.stdout.splitlines() if line.strip())
