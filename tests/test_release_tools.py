@@ -712,6 +712,32 @@ def test_versioned_workflow_verifies_draft_and_public_download_before_done() -> 
     assert final_main_index > final_tag_index > workflow.index("# Re-peel the annotated tag")
 
 
+def test_versioned_workflow_requires_parallel_exact_tag_soak_before_publish() -> None:
+    workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+    build_start = workflow.index("  build:")
+    soak_start = workflow.index("  release-soak:")
+    publish_start = workflow.index("  publish:")
+    build_job = workflow[build_start:soak_start]
+    soak_job = workflow[soak_start:publish_start]
+    publish_job = workflow[publish_start:]
+
+    assert "timeout-minutes: 60" in build_job
+    assert 'ARUBA_SOAK_POLLS: "20000"' not in build_job
+    assert "timeout-minutes: 120" in soak_job
+    assert "permissions:\n      contents: read" in soak_job
+    assert 'ARUBA_SOAK_POLLS: "20000"' in soak_job
+    environment = soak_job.index('ARUBA_SOAK_POLLS: "20000"')
+    exact_tag_gate = soak_job.index("python tools/check_release_ref.py")
+    version_gate = soak_job.index("python tools/check_version.py --tag $env:RELEASE_TAG")
+    dependencies = soak_job.index("python -m pip install --no-input -r requirements-dev.lock")
+    soak = soak_job.index("python -m pytest -m soak -q --junitxml=artifacts/release-soak.xml")
+    retained_result = soak_job.index("- name: Retain non-sensitive release soak result")
+    assert environment < exact_tag_gate < version_gate < dependencies < soak < retained_result
+    assert "if: always()" in soak_job[retained_result:]
+    assert "if-no-files-found: warn" in soak_job[retained_result:]
+    assert "needs:\n      - build\n      - release-soak" in publish_job
+
+
 def test_continuous_workflow_delegates_to_durable_reconciler() -> None:
     workflow = Path(".github/workflows/continuous.yml").read_text(encoding="utf-8")
 

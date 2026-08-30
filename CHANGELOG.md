@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.5.2 - 2026-08-30
+
+- 외부 USB 드라이브가 분리되거나 UNC 공유를 사용할 수 없어도 앱은
+  정상적으로 시작하고 해당 외부 복구 건만 보류한다고 안내하도록 개선.
+- CSV와 HTML 각각 `PREPARED`, `RENDERED`, `INSTALLED`,
+  `DB_RECEIPT_COMMITTED`, `DB_COMMITTED`에서 저장 위치가 분리되는 10개
+  조합을 회귀 시험해 재연결 뒤 단계별 복구 결과를 검증.
+- 버전 릴리스가 exact tag commit에서 `ARUBA_SOAK_POLLS=20000`인 fixture-only
+  장시간 시험을 별도 120분 제한 job으로 반복하고, 패키지 build와 이 시험이
+  모두 성공한 뒤에만 게시되도록 자동화와 회귀 검사를 보강.
 - 이동형 `continuous` 사전릴리스의 별도 게시 runner에도 고정 runtime lock과
   `pip check`를 적용해 검증 도구가 `paramiko` 누락으로 중단되지 않도록 수정.
 

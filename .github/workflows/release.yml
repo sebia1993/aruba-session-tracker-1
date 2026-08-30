@@ -84,9 +84,77 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  release-soak:
+    name: Verify exact tag with 20,000-poll fixture-only soak
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      ARUBA_SOAK_POLLS: "20000"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+      QT_QPA_PLATFORM: offscreen
+      RELEASE_TAG: ${{ github.ref_name }}
+
+    steps:
+      - name: Check out tagged commit with history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python 3.13 x64
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements-dev.lock
+
+      - name: Require exact annotated tag provenance
+        shell: pwsh
+        run: |
+          python tools/check_release_ref.py --tag $env:RELEASE_TAG --event-sha $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { throw "Release soak ref gate failed." }
+
+      - name: Require synchronized version
+        shell: pwsh
+        run: |
+          python tools/check_version.py --tag $env:RELEASE_TAG
+          if ($LASTEXITCODE -ne 0) { throw "Release soak version gate failed." }
+
+      - name: Install pinned test dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --no-input -r requirements-dev.lock
+          if ($LASTEXITCODE -ne 0) { throw "Pinned test dependency installation failed." }
+          python -m pip install --no-input --no-deps --no-build-isolation `
+            --check-build-dependencies -e .
+          if ($LASTEXITCODE -ne 0) { throw "Editable package installation failed." }
+
+      - name: Run exact-tag synthetic soak tests only
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          python -m pytest -m soak -q --junitxml=artifacts/release-soak.xml
+          if ($LASTEXITCODE -ne 0) { throw "Release synthetic soak tests failed." }
+
+      - name: Retain non-sensitive release soak result
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ArubaSessionTracker-${{ github.ref_name }}-release-soak
+          path: artifacts/release-soak.xml
+          if-no-files-found: warn
+          retention-days: 30
+
   publish:
     name: Publish workflow-protected versioned prerelease
-    needs: build
+    needs:
+      - build
+      - release-soak
     runs-on: windows-latest
     timeout-minutes: 10
     permissions:

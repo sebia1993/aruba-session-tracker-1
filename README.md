@@ -19,7 +19,7 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 - 로컬 SQLite 이력, 실행별 Raw TXT, 독립적인 CSV와 HTML 보고서 내보내기
 - 실행할 때마다 꺼진 상태로 시작하는 `F12` 화면 개선 도우미
 
-다음은 v0.5.1 범위에 포함되지 않습니다.
+다음은 v0.5.2 범위에 포함되지 않습니다.
 
 - 장비 설정 변경, 사용자 삭제 또는 쓰기 API
 - 무필터 `show datapath session table` 실행
@@ -31,13 +31,13 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 
 ### 포터블 ZIP
 
-1. GitHub Releases에서 `ArubaSessionTracker_v0.5.1_windows_x64.zip`을
+1. GitHub Releases에서 `ArubaSessionTracker_v0.5.2_windows_x64.zip`을
    받습니다. GitHub의 자동 생성 Source code ZIP/TAR는 실행 프로그램이
    아닙니다.
 2. 릴리스 본문의 SHA-256과 PowerShell 계산 결과를 비교합니다.
 
    ```powershell
-   Get-FileHash -Algorithm SHA256 .\ArubaSessionTracker_v0.5.1_windows_x64.zip
+   Get-FileHash -Algorithm SHA256 .\ArubaSessionTracker_v0.5.2_windows_x64.zip
    ```
 
 3. ZIP을 쓰기 가능한 일반 폴더에 풀고 `ArubaSessionTracker.exe`를
@@ -48,7 +48,7 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 검증한 뒤 같은 ID를 다시 공개합니다. 중단되면 이전 커밋으로 되돌려
 재공개하지 않고 숨겨진 단계 기록에서 다음 실행이 이어집니다. 이 방식은
 GitHub 기본 토큰에 없는 과거 워크플로 수정 권한을 요구하지 않으며, 태그로
-초안을 추측해 중복 릴리스를 만드는 문제도 피합니다. `v0.5.1` 같은 버전
+초안을 추측해 중복 릴리스를 만드는 문제도 피합니다. `v0.5.2` 같은 버전
 태그 릴리스는 자동화가 기존 릴리스 덮어쓰기를 거부하는 1회성
 사전릴리스입니다. 공개 자산은 Windows x64 ZIP 하나이며 SHA-256은 릴리스
 본문에, CycloneDX SBOM은 ZIP 내부 `ArubaSessionTracker/sbom.cdx.json`에
@@ -65,9 +65,9 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m aruba_session_tracker
 ```
 
-## v0.5.1 장시간 안정성과 결과 보고서
+## v0.5.2 장시간 안정성과 결과 보고서
 
-v0.5.1은 자주 쓰는 입력과 결과를 먼저 보여주는 기존 흐름을 유지하면서,
+v0.5.2는 v0.5.1의 자주 쓰는 입력과 결과를 먼저 보여주는 흐름을 유지하면서,
 장시간 수집·종료·내보내기·복구 경로의 자원 사용과 실패 경계를 강화합니다.
 HTML은 프로토콜과 출발지·목적지 `IP:포트` 중심의 실제 추적 결과만
 정리하며 패킷·바이트는 SQLite, CSV와 Raw에만 보존합니다.
@@ -83,7 +83,10 @@ HTML은 프로토콜과 출발지·목적지 `IP:포트` 중심의 실제 추적
   실패는 세션 종료로 판정하지 않은 채 제한된 간격으로 재시도합니다.
 - 관리 폴더와 사용자가 선택한 외부 경로의 CSV/HTML 내보내기에 단계별
   복구 기록을 남기고, 저장 공간 상태, 삭제 미리보기 수명과 poll별
-  시간·Raw·관측 상한으로 장시간 실행의 복구와 자원 사용을 제한합니다.
+  시간·Raw·관측 상한으로 장시간 실행의 복구와 자원 사용을 제한합니다. 외부
+  USB 드라이브가 분리되거나 UNC 공유를 사용할 수 없어도 앱은 정상적으로
+  시작하고 해당 보고서 복구만 보류합니다. 저장 위치를 다시 사용할 수 있게
+  한 뒤 기록을 새로 고치면 보류된 복구를 다시 시도합니다.
 - 매 poll의 SSH 실행 전에 빠른 여유 공간 검사를 수행해 1 GiB 미만이면
   조회 자체를 중단합니다. DB·WAL·Raw·내보내기 전체 통계는 최대 60초
   간격으로 계산하고 5 GiB 미만이면 경고합니다.
@@ -330,16 +333,17 @@ GitHub 이슈나 외부 지원 채널에 올리지 말고, 공유가 필요하�
 저장소는 네트워크와 분리된 비식별 fixture 및 메모리 내 SSH 프로토콜
 fake를 기본 검증 경계로 사용합니다. 127.0.0.1에만 바인딩하는 최소
 Paramiko 서버를 통한 실제 Paramiko/Netmiko loopback 통합시험도 포함합니다.
-실제 Aruba 장비 접속과 회사 네트워크 현장 검증은 v0.5.1 검증 범위에
+실제 Aruba 장비 접속과 회사 네트워크 현장 검증은 v0.5.2 검증 범위에
 포함되지 않습니다.
 
-내보내기 복구 시험은 각 단계에서 별도 프로세스를 `os._exit()`로 종료한 뒤
-재시작하는 경계를 검증합니다. 이는 갑작스러운 전원 차단이나 파일 시스템
-메타데이터의 물리적 내구성을 증명하는 시험은 아닙니다.
+내보내기 복구 시험은 CSV와 HTML 각각 다섯 단계에서 별도 프로세스를
+`os._exit()`로 종료한 뒤 외부 저장 위치를 분리하고 재연결하는 10개 조합을
+검증합니다. 이는 갑작스러운 전원 차단이나 파일 시스템 메타데이터의 물리적
+내구성을 증명하는 시험은 아닙니다.
 
 ```powershell
 .\tools\validate.ps1 -PythonPath .\.venv\Scripts\python.exe
-.\build_windows.ps1 -PythonPath .\.venv\Scripts\python.exe -Version 0.5.1
+.\build_windows.ps1 -PythonPath .\.venv\Scripts\python.exe -Version 0.5.2
 ```
 
 `validate.ps1`은 Python/아키텍처, 해시 고정 lock 동기화, 의존성, 버전
@@ -364,8 +368,11 @@ PR과 `main`은 GitHub-hosted Windows x64 CI를 통과해야 합니다. `main`
 전진식으로 갱신합니다.
 `vMAJOR.MINOR.PATCH`는 반드시 annotated tag여야 하며 원격 tag, checkout
 HEAD, GitHub event SHA, 최신 원격 `main`이 같은 commit일 때만 변경 불가
-정책의 사전릴리스를 처음 한 번 게시합니다. 이 불변성은 release workflow
-정책이며, 저장소 관리자 권한 자체를 제거하지는 않습니다. GitHub의
+정책의 사전릴리스를 처음 한 번 게시합니다. 태그 전 로컬 20,000회 시험에
+더해, 게시 전에는 별도 120분 제한 job이 exact tag commit에서
+`ARUBA_SOAK_POLLS=20000`인 fixture-only 장시간 시험을 반복합니다. 패키지
+build와 이 시험이 모두 성공해야 게시 job이 시작됩니다. 이 불변성은 release
+workflow 정책이며, 저장소 관리자 권한 자체를 제거하지는 않습니다. GitHub의
 저장소 전체 immutable release 설정은 이동형 `continuous`도 함께
 고정하므로 이 저장소에서는 사용하지 않습니다.
 
@@ -380,7 +387,7 @@ smoke와 패키지 검증은 다음을 증명하지 않습니다.
 - Authenticode 서명 또는 조직 보안 제품의 허용
 - 실장비 네트워크 상태나 세션 존재/종료
 
-v0.5.1은 이 한계를 명시한 unsigned 사전릴리스입니다. 사용자가 실제 장비에서
+v0.5.2는 이 한계를 명시한 unsigned 사전릴리스입니다. 사용자가 실제 장비에서
 확인한 결과는 자동 테스트 증거와 구분합니다.
 
 라이선스는 MIT이며 제3자 구성요소 고지는

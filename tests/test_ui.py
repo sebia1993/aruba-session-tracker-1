@@ -1171,7 +1171,10 @@ def test_history_refresh_retries_external_recovery_off_gui_thread_and_warns(
     assert store.retry_threads
     assert all(thread_id != threading.get_ident() for thread_id in store.retry_threads)
     assert "외부 보고서 복구 1건 대기 중" in window.statusBar().currentMessage()
-    assert "대상 드라이브" in window.statusBar().currentMessage()
+    assert (
+        "외부 저장 위치를 다시 사용할 수 있게 한 뒤 새로 고침을 누르십시오."
+        in window.statusBar().currentMessage()
+    )
     window.close()
 
 
