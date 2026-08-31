@@ -6,6 +6,7 @@ from contextlib import AbstractContextManager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from itertools import count
+from pathlib import Path
 from threading import Event, Thread
 from types import TracebackType
 from typing import Self
@@ -47,6 +48,8 @@ from aruba_session_tracker.services import (
 )
 
 GLOBAL_HEADER = "IP              MAC                Name              Current switch    Role"
+GLOBAL_SEPARATOR = "-" * len(GLOBAL_HEADER)
+FIXTURES = Path(__file__).parent / "fixtures"
 DATAPATH_HEADER = """Datapath Session Table Entries
 Source IP Destination IP Prot SPort DPort Cnt Prio ToS Age Destination TAge
 Packets Bytes Flags CPU ID
@@ -56,9 +59,9 @@ DATAPATH_EMPTY = DATAPATH_HEADER + "Entries: 0\n"
 
 def _global_output(client_ip: str, switch: str | None) -> str:
     if switch is None:
-        return f"{GLOBAL_HEADER}\n{'-' * len(GLOBAL_HEADER)}\nTotal entries = 0\n"
+        return f"{GLOBAL_HEADER}\n{GLOBAL_SEPARATOR}\nTotal entries = 0\n"
     row = _global_row(client_ip, switch)
-    return f"{GLOBAL_HEADER}\n{'-' * len(GLOBAL_HEADER)}\n{row}\nTotal entries = 1\n"
+    return f"{GLOBAL_HEADER}\n{GLOBAL_SEPARATOR}\n{row}\nTotal entries = 1\n"
 
 
 def _global_row(client_ip: str, switch: str) -> str:
@@ -81,7 +84,7 @@ def _global_row(client_ip: str, switch: str) -> str:
 
 def _ambiguous_global_output(client_ip: str) -> str:
     rows = "\n".join((_global_row(client_ip, "192.0.2.101"), _global_row(client_ip, "192.0.2.102")))
-    return f"{GLOBAL_HEADER}\n{'-' * len(GLOBAL_HEADER)}\n{rows}\nTotal entries = 2\n"
+    return f"{GLOBAL_HEADER}\n{GLOBAL_SEPARATOR}\n{rows}\nTotal entries = 2\n"
 
 
 def _datapath_output(
@@ -287,6 +290,116 @@ def test_source_only_query_uses_only_the_entered_ip_for_mm_and_md() -> None:
     assert factory.calls == ["MM-Primary", "MD-1"]
     assert factory.commands_by_device["MM-Primary"] == [NO_PAGING_COMMAND, source_lookup]
     assert factory.commands_by_device["MD-1"] == [NO_PAGING_COMMAND, source_filter]
+
+
+def test_source_only_query_accepts_centered_aos8_global_user_output() -> None:
+    source_ip = "198.51.100.10"
+    request = QueryRequest(source_ip, "")
+    source_lookup = build_global_user_command(source_ip)
+    source_filter = build_datapath_session_command(source_ip)
+    factory = FakeFactory(
+        {
+            "MM-Primary": {
+                NO_PAGING_COMMAND: "",
+                source_lookup: (FIXTURES / "global_user_aos8_centered.txt").read_text(
+                    encoding="utf-8"
+                ),
+            },
+            "MD-1": {
+                NO_PAGING_COMMAND: "",
+                source_filter: _datapath_output(source=source_ip),
+            },
+        }
+    )
+
+    outcome = TrackerService(_config(), factory).query_once(request, CREDENTIALS)
+
+    assert len(outcome.observations) == 1
+    assert outcome.authoritative is True
+    assert outcome.source_location is not None
+    assert outcome.source_location.current_switch == "192.0.2.101"
+    assert outcome.destination_location is None
+    assert all(event.stage != "MM_PARSE" for event in outcome.diagnostics)
+    assert factory.commands_by_device["MM-Primary"] == [NO_PAGING_COMMAND, source_lookup]
+    assert factory.commands_by_device["MD-1"] == [NO_PAGING_COMMAND, source_filter]
+
+
+def test_two_ip_query_accepts_centered_aos8_global_user_outputs() -> None:
+    source_ip = "198.51.100.10"
+    destination_ip = "198.51.100.20"
+    request = QueryRequest(source_ip, destination_ip)
+    source_lookup = build_global_user_command(source_ip)
+    destination_lookup = build_global_user_command(destination_ip)
+    source_filter = build_datapath_session_command(source_ip)
+    destination_filter = build_datapath_session_command(destination_ip)
+    source_output = (FIXTURES / "global_user_aos8_centered.txt").read_text(encoding="utf-8")
+    destination_output = source_output.replace(source_ip, destination_ip).replace(
+        "192.0.2.101", "192.0.2.102"
+    )
+    factory = FakeFactory(
+        {
+            "MM-Primary": {
+                NO_PAGING_COMMAND: "",
+                source_lookup: source_output,
+                destination_lookup: destination_output,
+            },
+            "MD-1": {
+                NO_PAGING_COMMAND: "",
+                source_filter: _datapath_output(
+                    source=source_ip,
+                    destination=destination_ip,
+                ),
+            },
+            "MD-2": {
+                NO_PAGING_COMMAND: "",
+                destination_filter: DATAPATH_EMPTY,
+            },
+        }
+    )
+
+    outcome = TrackerService(_config(), factory).query_once(request, CREDENTIALS)
+
+    assert len(outcome.observations) == 1
+    assert outcome.authoritative is True
+    assert outcome.source_location is not None
+    assert outcome.source_location.current_switch == "192.0.2.101"
+    assert outcome.destination_location is not None
+    assert outcome.destination_location.current_switch == "192.0.2.102"
+    assert all(event.stage != "MM_PARSE" for event in outcome.diagnostics)
+    assert factory.calls == ["MM-Primary", "MD-1", "MD-2"]
+
+
+def test_malformed_centered_destination_stops_before_any_md_query() -> None:
+    source_ip = "198.51.100.10"
+    destination_ip = "198.51.100.20"
+    request = QueryRequest(source_ip, destination_ip)
+    source_lookup = build_global_user_command(source_ip)
+    destination_lookup = build_global_user_command(destination_ip)
+    source_output = (FIXTURES / "global_user_aos8_centered.txt").read_text(encoding="utf-8")
+    destination_output = source_output.replace(source_ip, "not-an-ip")
+    factory = FakeFactory(
+        {
+            "MM-Primary": {
+                NO_PAGING_COMMAND: "",
+                source_lookup: source_output,
+                destination_lookup: destination_output,
+            }
+        }
+    )
+
+    outcome = TrackerService(_config(), factory).query_once(request, CREDENTIALS)
+
+    assert outcome.observations == ()
+    assert outcome.authoritative is False
+    assert factory.calls == ["MM-Primary"]
+    assert factory.commands_by_device["MM-Primary"] == [
+        NO_PAGING_COMMAND,
+        source_lookup,
+        destination_lookup,
+    ]
+    parse_event = next(event for event in outcome.diagnostics if event.stage == "MM_PARSE")
+    assert parse_event.code is ErrorCode.PARSE_PARTIAL
+    assert "Global user row IP is missing or is not an IPv4 address" in parse_event.message
 
 
 def test_destination_only_query_uses_only_the_entered_ip_for_mm_and_md() -> None:

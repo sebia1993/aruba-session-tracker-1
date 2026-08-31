@@ -1,0 +1,8 @@
+(mm-primary) [mynode] # show global-user-table list ip "198.51.100.10"
+
+Global Users
+------------
+    IP              MAC            Name   Current switch  Role           Auth  AP name            Roaming   Essid      Bssid              Phy   Profile    Type   User Type
+----------     ------------       ------  --------------  ----           ----  -------            -------   -----      -----              ---   -------    ----   ---------
+198.51.100.10  00:00:5e:00:53:01          192.0.2.101     authenticated        00:00:5e:00:53:02  Wireless  corp-wifi  00:00:5e:00:53:03  g-HT  corp       Linux  WIRELESS
+Total entries = 1
