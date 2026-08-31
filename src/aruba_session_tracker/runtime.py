@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from dataclasses import dataclass
+from uuid import uuid4
 
 from aruba_session_tracker.collectors import (
     CancellationToken,
@@ -21,15 +22,38 @@ from aruba_session_tracker.services import (
     TrackerService,
 )
 from aruba_session_tracker.services.monitoring import _PreparedMonitorPoll
-from aruba_session_tracker.storage import SessionStore
+from aruba_session_tracker.storage import (
+    PollPersistenceIndeterminate,
+    PollPersistenceResult,
+    PollPersistenceStatus,
+    SessionStore,
+)
 
 
 @dataclass(slots=True)
 class _ActiveMonitorPoll:
-    poll_id: int
+    poll_id: str
     generation: int
     run_id: str | None
     cancel_token: CancellationToken
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingOneShotPersistence:
+    poll_id: str
+    run_id: str
+    signature: str
+    request: QueryRequest
+    outcome: QueryOutcome
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingMonitorPersistence:
+    poll_id: str
+    generation: int
+    run_id: str
+    monitor: MonitorEngine
+    prepared: _PreparedMonitorPoll
 
 
 class RuntimeExecutor:
@@ -51,10 +75,15 @@ class RuntimeExecutor:
         self._monitor_credentials: Credentials | None = None
         self._monitor_run_id: str | None = None
         self._monitor_generation = 0
-        self._next_poll_id = 0
         self._active_monitor_poll: _ActiveMonitorPoll | None = None
+        self._pending_one_shot_persistence: _PendingOneShotPersistence | None = None
+        self._pending_one_shot_retrying = False
+        self._one_shot_active = False
+        self._pending_monitor_persistence: _PendingMonitorPersistence | None = None
         self._monitor_stop_requested = False
         self._pending_finishes: dict[str, str] = {}
+        self._finish_retry_lock = threading.Lock()
+        self.last_persistence_status: PollPersistenceStatus | None = None
         self.last_shutdown_error: str | None = None
 
     def execute(
@@ -69,8 +98,38 @@ class RuntimeExecutor:
         full_scan_approval: FullScanApproval,
     ) -> QueryOutcome | MonitorPollResult:
         self._retry_pending_finishes(required=True)
+        recovered = self._retry_pending_one_shot_persistence(
+            signature=_monitor_signature(config, request, credentials.username),
+            request=request,
+            monitoring=monitoring,
+        )
+        if recovered is not None:
+            return recovered
         if monitoring:
-            return self._execute_monitor_poll(
+            try:
+                return self._execute_monitor_poll(
+                    config,
+                    request,
+                    credentials,
+                    cancel_token=cancel_token,
+                    host_key_approval=host_key_approval,
+                    full_scan_approval=full_scan_approval,
+                )
+            except PollPersistenceIndeterminate:
+                # The poll's finally block has released its active lease. If a
+                # concurrent stop arrived while persistence became
+                # indeterminate, consume that stop here so shutdown cannot
+                # report success while leaving a pending RUNNING monitor.
+                stopped = self._recover_stopped_monitor_after_indeterminate()
+                if stopped is not None:
+                    return stopped
+                raise
+        with self._lock:
+            if self._one_shot_active:
+                raise RuntimeError("단일 조회가 이미 진행 중입니다.")
+            self._one_shot_active = True
+        try:
+            return self._execute_one_shot(
                 config,
                 request,
                 credentials,
@@ -78,8 +137,23 @@ class RuntimeExecutor:
                 host_key_approval=host_key_approval,
                 full_scan_approval=full_scan_approval,
             )
+        finally:
+            with self._lock:
+                self._one_shot_active = False
+
+    def _execute_one_shot(
+        self,
+        config: AppConfig,
+        request: QueryRequest,
+        credentials: Credentials,
+        *,
+        cancel_token: CancellationToken,
+        host_key_approval: HostKeyApproval,
+        full_scan_approval: FullScanApproval,
+    ) -> QueryOutcome:
         service = self._service(config, host_key_approval, full_scan_approval)
         run_id = self._store.start_run(request)
+        poll_id = uuid4().hex
         try:
             outcome = service.query_once(
                 request,
@@ -87,7 +161,25 @@ class RuntimeExecutor:
                 full_scan_approval=full_scan_approval,
                 cancel_token=cancel_token,
             )
-            self._store.record_poll_batch(run_id, outcome)
+        except Exception as exc:
+            finish_error = self._finish_or_queue(run_id, "FAILED")
+            if finish_error is not None:
+                exc.add_note("실행 실패 상태도 저장하지 못했습니다.")
+            raise
+        try:
+            persistence = self._store.record_poll_batch(run_id, outcome, poll_id=poll_id)
+            self._remember_persistence(poll_id, persistence)
+        except PollPersistenceIndeterminate as exc:
+            with self._lock:
+                self._pending_one_shot_persistence = _PendingOneShotPersistence(
+                    poll_id=poll_id,
+                    run_id=run_id,
+                    signature=_monitor_signature(config, request, credentials.username),
+                    request=request,
+                    outcome=outcome,
+                )
+            self._require_indeterminate_poll_id(exc, poll_id)
+            raise
         except Exception as exc:
             finish_error = self._finish_or_queue(run_id, "FAILED")
             if finish_error is not None:
@@ -102,17 +194,107 @@ class RuntimeExecutor:
     def stop_monitor(self) -> None:
         run_id: str | None = None
         active_token: CancellationToken | None = None
+        pending: _PendingMonitorPersistence | None = None
+        retry_lease: _ActiveMonitorPoll | None = None
         with self._lock:
             self._monitor_stop_requested = True
             if self._active_monitor_poll is not None:
                 active_token = self._active_monitor_poll.cancel_token
+            elif self._pending_monitor_persistence is not None:
+                pending = self._pending_monitor_persistence
+                if (
+                    pending.monitor is not self._monitor
+                    or pending.generation != self._monitor_generation
+                    or pending.run_id != self._monitor_run_id
+                ):
+                    raise RuntimeError("보류된 모니터링 저장 상태가 현재 실행과 일치하지 않습니다.")
+                retry_token = CancellationToken()
+                retry_token.cancel()
+                retry_lease = _ActiveMonitorPoll(
+                    poll_id=pending.poll_id,
+                    generation=pending.generation,
+                    run_id=pending.run_id,
+                    cancel_token=retry_token,
+                )
+                self._active_monitor_poll = retry_lease
             else:
                 run_id = self._detach_monitor_locked()
         if active_token is not None:
             active_token.cancel()
+        if pending is not None and retry_lease is not None:
+            self._resolve_pending_monitor_stop(pending, retry_lease)
+            return
         if run_id is not None:
             self._finish_or_queue(run_id, "STOPPED")
         self._retry_pending_finishes(required=True)
+
+    def _resolve_pending_monitor_stop(
+        self,
+        pending: _PendingMonitorPersistence,
+        lease: _ActiveMonitorPoll,
+    ) -> MonitorPollResult:
+        try:
+            persistence = self._store.record_poll_batch(
+                pending.run_id,
+                pending.prepared.result.outcome,
+                events=pending.prepared.result.events,
+                poll_id=pending.poll_id,
+            )
+            self._remember_persistence(pending.poll_id, persistence)
+            recovered = pending.monitor._commit_prepared(pending.prepared)
+        except PollPersistenceIndeterminate as exc:
+            with self._lock:
+                if self._active_monitor_poll is lease:
+                    self._active_monitor_poll = None
+            self._require_indeterminate_poll_id(exc, pending.poll_id)
+            raise
+        except Exception:
+            # This is a retry of an already-indeterminate commit. Preserve the
+            # prepared state and poll ID on every non-successful result so a
+            # later stop/retry cannot create a duplicate poll.
+            with self._lock:
+                if self._active_monitor_poll is lease:
+                    self._active_monitor_poll = None
+            raise
+
+        with self._lock:
+            if self._pending_monitor_persistence is pending:
+                self._pending_monitor_persistence = None
+            run_id = (
+                self._detach_monitor_locked() if self._lease_owns_monitor_locked(lease) else None
+            )
+            if self._active_monitor_poll is lease:
+                self._active_monitor_poll = None
+        if run_id is not None:
+            self._finish_or_queue(run_id, "STOPPED")
+        self._retry_pending_finishes(required=True)
+        return recovered
+
+    def _recover_stopped_monitor_after_indeterminate(self) -> MonitorPollResult | None:
+        with self._lock:
+            pending = self._pending_monitor_persistence
+            if (
+                not self._monitor_stop_requested
+                or self._active_monitor_poll is not None
+                or pending is None
+            ):
+                return None
+            if (
+                pending.monitor is not self._monitor
+                or pending.generation != self._monitor_generation
+                or pending.run_id != self._monitor_run_id
+            ):
+                raise RuntimeError("보류된 모니터링 저장 상태가 현재 실행과 일치하지 않습니다.")
+            retry_token = CancellationToken()
+            retry_token.cancel()
+            lease = _ActiveMonitorPoll(
+                poll_id=pending.poll_id,
+                generation=pending.generation,
+                run_id=pending.run_id,
+                cancel_token=retry_token,
+            )
+            self._active_monitor_poll = lease
+        return self._resolve_pending_monitor_stop(pending, lease)
 
     def invalidate_monitor_location(self) -> None:
         """Force the next monitor poll to refresh MM routing information."""
@@ -133,26 +315,74 @@ class RuntimeExecutor:
     ) -> MonitorPollResult:
         signature = _monitor_signature(config, request, credentials.username)
         restart_run_id: str | None = None
+        pending: _PendingMonitorPersistence | None = None
         with self._lock:
             if self._active_monitor_poll is not None:
                 raise RuntimeError("모니터링 조회가 이미 진행 중입니다.")
-            self._next_poll_id += 1
+            pending = self._pending_monitor_persistence
+            if pending is not None and (
+                pending.monitor is not self._monitor
+                or pending.generation != self._monitor_generation
+                or pending.run_id != self._monitor_run_id
+            ):
+                raise RuntimeError("보류된 모니터링 저장 상태가 현재 실행과 일치하지 않습니다.")
             lease = _ActiveMonitorPoll(
-                poll_id=self._next_poll_id,
-                generation=self._monitor_generation,
-                run_id=self._monitor_run_id,
+                poll_id=pending.poll_id if pending is not None else uuid4().hex,
+                generation=(
+                    pending.generation if pending is not None else self._monitor_generation
+                ),
+                run_id=pending.run_id if pending is not None else self._monitor_run_id,
                 cancel_token=cancel_token,
             )
             self._active_monitor_poll = lease
-            if self._monitor is not None and (
-                self._monitor_signature != signature or self._monitor_credentials != credentials
+            if (
+                pending is None
+                and self._monitor is not None
+                and (
+                    self._monitor_signature != signature or self._monitor_credentials != credentials
+                )
             ):
                 restart_run_id = self._detach_monitor_locked(reset_stop_request=False)
 
         prepared: _PreparedMonitorPoll | None = None
         monitor: MonitorEngine | None = None
         run_id: str | None = None
+        persistence_indeterminate = False
+        pending_retry_failed = False
         try:
+            if pending is not None:
+                monitor = pending.monitor
+                run_id = pending.run_id
+                prepared = pending.prepared
+                persistence = self._store.record_poll_batch(
+                    run_id,
+                    prepared.result.outcome,
+                    events=prepared.result.events,
+                    poll_id=pending.poll_id,
+                )
+                self._remember_persistence(pending.poll_id, persistence)
+                recovered = monitor._commit_prepared(prepared)
+                prepared = None
+                with self._lock:
+                    if self._pending_monitor_persistence is pending:
+                        self._pending_monitor_persistence = None
+                    same_identity = (
+                        self._monitor_signature == signature
+                        and self._monitor_credentials == credentials
+                    )
+                    stop_requested = self._monitor_stop_requested
+                if same_identity or stop_requested:
+                    return recovered
+
+                with self._lock:
+                    if not self._lease_owns_monitor_locked(lease):
+                        raise RuntimeError("모니터링 실행 소유권이 변경되었습니다.")
+                    restart_run_id = self._detach_monitor_locked(reset_stop_request=False)
+                    lease.poll_id = uuid4().hex
+                    lease.generation = self._monitor_generation
+                    lease.run_id = None
+                pending = None
+
             if restart_run_id is not None:
                 finish_error = self._finish_or_queue(restart_run_id, "RESTARTED")
                 if finish_error is not None:
@@ -193,15 +423,54 @@ class RuntimeExecutor:
 
             prepared = monitor._prepare_for_persistence(cancel_token=cancel_token)
             result = prepared.result
-            self._store.record_poll_batch(run_id, result.outcome, events=result.events)
+            persistence = self._store.record_poll_batch(
+                run_id,
+                result.outcome,
+                events=result.events,
+                poll_id=lease.poll_id,
+            )
+            self._remember_persistence(lease.poll_id, persistence)
             committed = monitor._commit_prepared(prepared)
             prepared = None
             return committed
+        except PollPersistenceIndeterminate as exc:
+            persistence_indeterminate = True
+            if prepared is not None and monitor is not None and run_id is not None:
+                with self._lock:
+                    if self._lease_owns_monitor_locked(lease):
+                        self._pending_monitor_persistence = _PendingMonitorPersistence(
+                            poll_id=lease.poll_id,
+                            generation=lease.generation,
+                            run_id=run_id,
+                            monitor=monitor,
+                            prepared=prepared,
+                        )
+                    else:
+                        raise RuntimeError(
+                            "확인할 수 없는 poll 저장 상태의 소유권이 변경되었습니다."
+                        ) from exc
+            self._require_indeterminate_poll_id(exc, lease.poll_id)
+            raise
         except Exception as exc:
+            if pending is not None and prepared is pending.prepared:
+                # Once a previous attempt became indeterminate, only a
+                # confirmed committed result may release this prepared poll.
+                # Treat every other retry failure as fail-closed: discarding it
+                # could allow a new poll ID to duplicate an earlier commit.
+                pending_retry_failed = True
+                with self._lock:
+                    if self._active_monitor_poll is lease:
+                        self._active_monitor_poll = None
+                raise
             if prepared is not None and monitor is not None:
                 monitor._discard_prepared(prepared)
             failed_run_id: str | None = None
             with self._lock:
+                if (
+                    self._pending_monitor_persistence is not None
+                    and self._pending_monitor_persistence.prepared is prepared
+                ):
+                    self._pending_monitor_persistence = None
                 stop_requested = self._monitor_stop_requested or cancel_token.is_cancelled
                 if self._lease_owns_monitor_locked(lease):
                     failed_run_id = self._detach_monitor_locked()
@@ -221,7 +490,10 @@ class RuntimeExecutor:
         finally:
             stopped_run_id: str | None = None
             with self._lock:
-                if self._monitor_stop_requested and self._lease_owns_monitor_locked(lease):
+                if persistence_indeterminate or pending_retry_failed:
+                    if self._active_monitor_poll is lease:
+                        self._active_monitor_poll = None
+                elif self._monitor_stop_requested and self._lease_owns_monitor_locked(lease):
                     stopped_run_id = self._detach_monitor_locked()
                 elif self._monitor_stop_requested and self._monitor is None:
                     self._monitor_stop_requested = False
@@ -282,16 +554,96 @@ class RuntimeExecutor:
                 self.last_shutdown_error = None
         return None
 
-    def _retry_pending_finishes(self, *, required: bool) -> None:
+    def _retry_pending_one_shot_persistence(
+        self,
+        *,
+        signature: str,
+        request: QueryRequest,
+        monitoring: bool,
+    ) -> QueryOutcome | None:
         with self._lock:
-            pending = tuple(self._pending_finishes.items())
-        first_error: Exception | None = None
-        for run_id, status in pending:
-            error = self._finish_or_queue(run_id, status)
-            if error is not None and first_error is None:
-                first_error = error
-        if required and first_error is not None:
-            raise RuntimeError("이전 실행 종료 상태를 저장하지 못했습니다.") from first_error
+            pending = self._pending_one_shot_persistence
+            if pending is None:
+                return None
+            if self._one_shot_active:
+                raise RuntimeError("이전 단일 조회가 아직 종료되지 않았습니다.")
+            if self._pending_one_shot_retrying:
+                raise RuntimeError("이전 단일 조회의 저장 상태를 확인하고 있습니다.")
+            self._pending_one_shot_retrying = True
+
+        try:
+            try:
+                persistence = self._store.record_poll_batch(
+                    pending.run_id,
+                    pending.outcome,
+                    poll_id=pending.poll_id,
+                )
+                self._remember_persistence(pending.poll_id, persistence)
+            except PollPersistenceIndeterminate as exc:
+                self._require_indeterminate_poll_id(exc, pending.poll_id)
+                raise
+            except Exception:
+                # The first attempt's commit state is still unknown. Preserve
+                # the exact request, result, run and poll ID until a durable
+                # receipt confirms success; starting a fresh query here could
+                # duplicate a commit that actually completed.
+                raise
+
+            with self._lock:
+                if self._pending_one_shot_persistence is pending:
+                    self._pending_one_shot_persistence = None
+            status = _one_shot_status(pending.outcome)
+            finish_error = self._finish_or_queue(pending.run_id, status)
+            if finish_error is not None:
+                raise RuntimeError("실행 종료 상태를 저장하지 못했습니다.") from finish_error
+            if not monitoring and signature == pending.signature and request == pending.request:
+                return pending.outcome
+            return None
+        finally:
+            with self._lock:
+                self._pending_one_shot_retrying = False
+
+    def _remember_persistence(
+        self,
+        poll_id: str,
+        persistence: PollPersistenceResult,
+    ) -> None:
+        committed_statuses = {
+            PollPersistenceStatus.COMMITTED,
+            PollPersistenceStatus.ALREADY_COMMITTED,
+            PollPersistenceStatus.COMMITTED_RECOVERY_PENDING,
+        }
+        if persistence.poll_id != poll_id or persistence.status not in committed_statuses:
+            raise PollPersistenceIndeterminate(
+                "poll 저장 결과를 확인할 수 없어 동일 poll ID로 복구해야 합니다.",
+                poll_id=poll_id,
+            )
+        with self._lock:
+            self.last_persistence_status = persistence.status
+
+    @staticmethod
+    def _require_indeterminate_poll_id(
+        error: PollPersistenceIndeterminate,
+        poll_id: str,
+    ) -> None:
+        if error.poll_id != poll_id:
+            raise RuntimeError("확인할 수 없는 poll 저장 상태의 ID가 일치하지 않습니다.") from error
+
+    def _retry_pending_finishes(self, *, required: bool) -> None:
+        # A query and a concurrent stop can both reach this recovery point.
+        # Serialize the complete snapshot-and-retry pass so a second caller
+        # cannot retry a run after the first caller has already finished it and
+        # released its ownership lease.
+        with self._finish_retry_lock:
+            with self._lock:
+                pending = tuple(self._pending_finishes.items())
+            first_error: Exception | None = None
+            for run_id, status in pending:
+                error = self._finish_or_queue(run_id, status)
+                if error is not None and first_error is None:
+                    first_error = error
+            if required and first_error is not None:
+                raise RuntimeError("이전 실행 종료 상태를 저장하지 못했습니다.") from first_error
 
 
 def _monitor_signature(config: AppConfig, request: QueryRequest, username: str) -> str:

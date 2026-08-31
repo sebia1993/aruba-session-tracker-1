@@ -10,6 +10,9 @@ from aruba_session_tracker.storage.raw import RawArtifact, RawOutputStore, Unsaf
 from aruba_session_tracker.storage.session_store import (
     DeletePreview,
     DeletionResult,
+    PollPersistenceIndeterminate,
+    PollPersistenceResult,
+    PollPersistenceStatus,
     SessionStore,
     StorageError,
     StorageHealth,
@@ -18,6 +21,9 @@ from aruba_session_tracker.storage.session_store import (
 __all__ = [
     "DeletePreview",
     "DeletionResult",
+    "PollPersistenceIndeterminate",
+    "PollPersistenceResult",
+    "PollPersistenceStatus",
     "RawArtifact",
     "RawOutputStore",
     "RunReportSnapshot",

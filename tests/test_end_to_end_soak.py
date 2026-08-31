@@ -59,6 +59,7 @@ def test_fixture_ssh_parser_runtime_storage_soak(tmp_path: Path) -> None:
         "runs": 1,
         "observations": polls * 2,
         "raw_files": polls,
+        "poll_commits": polls,
         "lifecycle_events": 2,
     }
     assert result["connections"] >= polls + 1

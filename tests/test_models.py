@@ -138,6 +138,111 @@ def test_config_round_trip_and_bounds() -> None:
         DeviceTarget("MD", "198.51.100.21", port=True)
 
 
+def test_config_rejects_enabled_mm_with_the_same_ssh_endpoint() -> None:
+    with pytest.raises(ValueError, match="서로 다른 SSH endpoint"):
+        AppConfig(
+            mm_primary=DeviceTarget("MM-1", "192.0.2.10", port=22),
+            mm_standby=DeviceTarget("MM-2", "192.0.2.10", port=22),
+            managed_devices=(DeviceTarget("MD-1", "198.51.100.21"),),
+        )
+
+
+def test_config_allows_enabled_mm_on_the_same_host_with_distinct_ports() -> None:
+    config = AppConfig(
+        mm_primary=DeviceTarget("MM-1", "192.0.2.10", port=22),
+        mm_standby=DeviceTarget("MM-2", "192.0.2.10", port=2222),
+        managed_devices=(DeviceTarget("MD-1", "198.51.100.21"),),
+    )
+
+    assert config.mm_primary.host == config.mm_standby.host
+
+
+@pytest.mark.parametrize("disabled_role", ["primary", "standby"])
+def test_config_ignores_disabled_mm_endpoint_collision(disabled_role: str) -> None:
+    primary_enabled = disabled_role != "primary"
+    standby_enabled = disabled_role != "standby"
+
+    config = AppConfig(
+        mm_primary=DeviceTarget("MM-1", "192.0.2.10", enabled=primary_enabled),
+        mm_standby=DeviceTarget("MM-2", "192.0.2.10", enabled=standby_enabled),
+        managed_devices=(DeviceTarget("MD-1", "198.51.100.21"),),
+    )
+
+    assert config.mm_primary.enabled is primary_enabled
+    assert config.mm_standby.enabled is standby_enabled
+    assert AppConfig.from_dict(config.to_dict()) == config
+
+
+def test_config_rejects_enabled_md_host_collision_even_when_ports_differ() -> None:
+    with pytest.raises(ValueError, match="SSH 포트와 관계없이 중복"):
+        AppConfig(
+            mm_primary=DeviceTarget("MM-1", "192.0.2.10"),
+            mm_standby=DeviceTarget("MM-2", "192.0.2.11"),
+            managed_devices=(
+                DeviceTarget("MD-1", "198.51.100.21", port=22),
+                DeviceTarget("MD-2", "198.51.100.21", port=2222),
+            ),
+        )
+
+
+def test_config_rejects_enabled_md_normalized_name_collision() -> None:
+    with pytest.raises(ValueError, match="정규화된 이름은 중복"):
+        AppConfig(
+            mm_primary=DeviceTarget("MM-1", "192.0.2.10"),
+            mm_standby=DeviceTarget("MM-2", "192.0.2.11"),
+            managed_devices=(
+                DeviceTarget(" MD-1. ", "198.51.100.21"),
+                DeviceTarget("md-1", "198.51.100.22"),
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "managed_devices",
+    [
+        (
+            DeviceTarget("md-1.example.test", "198.51.100.21"),
+            DeviceTarget("MD-1.other.test", "198.51.100.22"),
+        ),
+        (
+            DeviceTarget("MD-1", "198.51.100.21"),
+            DeviceTarget("md-1.example.test", "198.51.100.22"),
+        ),
+        (
+            DeviceTarget("198.51.100.22", "198.51.100.21"),
+            DeviceTarget("MD-2", "198.51.100.22"),
+        ),
+    ],
+    ids=("short-name", "full-name-to-short-name", "name-to-host"),
+)
+def test_config_rejects_other_enabled_md_mapping_token_collisions(
+    managed_devices: tuple[DeviceTarget, ...],
+) -> None:
+    with pytest.raises(ValueError, match="Current switch 매핑 토큰은 중복"):
+        AppConfig(
+            mm_primary=DeviceTarget("MM-1", "192.0.2.10"),
+            mm_standby=DeviceTarget("MM-2", "192.0.2.11"),
+            managed_devices=managed_devices,
+        )
+
+
+def test_config_ignores_disabled_md_mapping_collisions() -> None:
+    config = AppConfig(
+        mm_primary=DeviceTarget("MM-1", "192.0.2.10"),
+        mm_standby=DeviceTarget("MM-2", "192.0.2.11"),
+        managed_devices=(
+            DeviceTarget("MD-1.example.test", "198.51.100.21"),
+            DeviceTarget("md-1.other.test", "198.51.100.21", port=2222, enabled=False),
+            DeviceTarget("198.51.100.21", "198.51.100.22", enabled=False),
+        ),
+    )
+
+    assert tuple(device.name for device in config.managed_devices if device.enabled) == (
+        "MD-1.example.test",
+    )
+    assert AppConfig.from_dict(config.to_dict()) == config
+
+
 def test_session_key_excludes_flags() -> None:
     first = _observation(flags="FC")
     second = _observation(flags="D")
