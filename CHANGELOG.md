@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.5.5 - 2026-09-01
+
+- AOS 8 `show global-user-table list ip`가 열 이름을 가운데 정렬해 출력하는
+  형식에서도 대시 구분선의 실제 시작 위치로 IP, MAC, Name, Current switch,
+  Role, Auth와 AP name을 분리하도록 수정. 빈 Name/Auth 필드가 있어도
+  Current switch를 정확히 찾으며, 출발지·목적지 단독 또는 동시 조회에서
+  동일하게 적용.
+- 열 구분선과 헤더가 일치하지 않거나 헤더 연속 줄이 역순·중복인 출력은
+  기존처럼 `PARSE_PARTIAL`로 안전 중단하고 MD 조회를 시작하지 않음. 구형
+  좌측 정렬 헤더와 단일 연속 구분선 형식은 제한된 호환 경로로 유지.
+- 실제 장비에는 접속하지 않고 HPE 문서 형태를 비식별 문서용 주소로 재현한
+  fixture와 GitHub-hosted Windows x64 검증으로 범위를 제한.
+
 ## 0.5.4 - 2026-08-31
 
 - 출발지 IP와 목적지 IP를 각각 선택 입력으로 바꾸고 둘 중 하나만 입력해도

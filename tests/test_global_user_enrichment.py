@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -34,6 +35,114 @@ def test_matching_entry_exposes_normalized_fixed_width_context() -> None:
             ap_name="ap-doc-01",
         ),
     )
+
+
+def test_centered_aos8_header_uses_separator_geometry() -> None:
+    result = parse_global_user_table(
+        fixture("global_user_aos8_centered.txt"), client_ip="198.51.100.10"
+    )
+
+    assert result.status is GlobalUserStatus.FOUND
+    assert result.current_switch == "192.0.2.101"
+    assert result.row_count == 1
+    assert result.entries == (
+        GlobalUserEntry(
+            client_ip="198.51.100.10",
+            mac_address="00:00:5e:00:53:01",
+            user_name="",
+            current_switch="192.0.2.101",
+            role="authenticated",
+            auth_method="",
+            ap_name="00:00:5e:00:53:02",
+        ),
+    )
+
+
+def test_centered_name_column_keeps_its_first_character() -> None:
+    output = fixture("global_user_aos8_centered.txt").replace(
+        "00:00:5e:00:53:01          192.0.2.101",
+        "00:00:5e:00:53:01  alice   192.0.2.101",
+    )
+
+    result = parse_global_user_table(output, client_ip="198.51.100.10")
+
+    assert result.entries[0].user_name == "alice"
+
+
+def test_known_trailing_header_continuation_is_skipped_before_separator() -> None:
+    output = fixture("global_user_aos8_centered.txt").replace(
+        "  AP name            Roaming   Essid      Bssid              Phy   "
+        "Profile    Type   User Type\n",
+        "  AP name\nRoaming Essid Bssid Phy Profile Type User Type\n",
+    )
+
+    result = parse_global_user_table(output, client_ip="198.51.100.10")
+
+    assert result.status is GlobalUserStatus.FOUND
+    assert result.current_switch == "192.0.2.101"
+
+
+def test_unknown_header_continuation_still_fails_closed() -> None:
+    output = fixture("global_user_aos8_centered.txt").replace(
+        "\n----------     ------------",
+        "\nUnexpected device warning\n----------     ------------",
+    )
+
+    with pytest.raises(ParseError, match="unrecognized header continuation"):
+        parse_global_user_table(output, client_ip="198.51.100.10")
+
+
+@pytest.mark.parametrize(
+    "continuation",
+    (
+        "Type Roaming Essid Bssid Phy Profile User Type",
+        "Roaming Essid Bssid Phy Profile Type User Type\n"
+        "Roaming Essid Bssid Phy Profile Type User Type",
+    ),
+)
+def test_out_of_order_or_duplicate_header_continuation_fails_closed(
+    continuation: str,
+) -> None:
+    output = fixture("global_user_aos8_centered.txt").replace(
+        "  AP name            Roaming   Essid      Bssid              Phy   "
+        "Profile    Type   User Type\n",
+        f"  AP name\n{continuation}\n",
+    )
+
+    with pytest.raises(ParseError, match="unrecognized header continuation"):
+        parse_global_user_table(output, client_ip="198.51.100.10")
+
+
+def test_centered_header_with_continuous_separator_fails_closed() -> None:
+    output = fixture("global_user_aos8_centered.txt")
+    header = next(line for line in output.splitlines() if "Current switch" in line)
+    output = output.replace(
+        "----------     ------------       ------  --------------  ----           "
+        "----  -------            -------   -----      -----              ---   "
+        "-------    ----   ---------",
+        "-" * len(header),
+    )
+
+    with pytest.raises(ParseError, match="unverified continuous separator geometry"):
+        parse_global_user_table(output, client_ip="198.51.100.10")
+
+
+def test_short_separator_runs_cannot_move_data_column_boundaries() -> None:
+    output = fixture("global_user_aos8_centered.txt")
+    separator = next(line for line in output.splitlines() if "     ------------" in line)
+    output = output.replace(separator, re.sub(r"-+", "--", separator))
+
+    with pytest.raises(ParseError, match="conflicting column geometry"):
+        parse_global_user_table(output, client_ip="198.51.100.10")
+
+
+def test_excessive_separator_runs_fail_before_geometry_materialization() -> None:
+    output = fixture("global_user_aos8_centered.txt")
+    separator = next(line for line in output.splitlines() if "     ------------" in line)
+    output = output.replace(separator, "- " * 15)
+
+    with pytest.raises(ParseError, match="too many column separators"):
+        parse_global_user_table(output, client_ip="198.51.100.10")
 
 
 def test_entry_is_immutable_and_repr_does_not_expose_context_values() -> None:
@@ -207,6 +316,10 @@ def test_columns_after_ap_name_are_not_folded_into_the_ap_value() -> None:
         .replace(
             "employee     dot1x  ap-doc-01",
             "employee     dot1x  ap-doc-01     No      corp-wifi",
+        )
+        .replace(
+            "------------ ------ -------------",
+            "------------ ------ ------------- ------- -----",
         )
     )
 
