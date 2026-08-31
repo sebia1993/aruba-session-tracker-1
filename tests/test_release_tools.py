@@ -1370,3 +1370,14 @@ def test_nightly_workflow_runs_fixture_only_scaled_soak() -> None:
     assert "python -m pytest -m soak" in workflow
     assert "QT_QPA_PLATFORM: offscreen" in workflow
     assert "github.token" not in workflow
+
+
+def test_soak_worker_timeouts_allow_hosted_variance_without_extending_20k_cap() -> None:
+    expected = "timeout=min(3_200, max(900, math.ceil(polls * 0.16)))"
+    for path in ("tests/test_end_to_end_soak.py", "tests/test_storage_soak.py"):
+        source = Path(path).read_text(encoding="utf-8")
+        assert expected in source
+        assert "max(500, math.ceil(polls * 0.16))" not in source
+
+    guidance = Path("AGENTS.md").read_text(encoding="utf-8")
+    assert "between 900 and 3,200 seconds" in guidance
