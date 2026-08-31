@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QWidget
+from PySide6.QtWidgets import QApplication, QFileDialog, QGridLayout, QMessageBox, QWidget
 
 from aruba_session_tracker.collectors.ssh import (
     CancellationToken,
@@ -35,13 +35,17 @@ from aruba_session_tracker.storage import DeletePreview, SessionStore, StorageEr
 from aruba_session_tracker.ui import MainWindow
 from aruba_session_tracker.ui.main_window import (
     _OPERATOR_STATES,
+    _RAW_FILE_COUNT_WARNING,
     ApprovalBridge,
     _counter_delta,
     _display_bytes,
     _fatal_diagnostic_code,
+    _history_status_label,
     _lifecycle_status,
     _optional_port,
+    _prepare_display_outcome,
     _safe_query_failure,
+    _storage_status_text,
 )
 
 
@@ -160,6 +164,7 @@ def test_result_semantic_labels_fall_back_for_out_of_range_legacy_values(
     assert window.result_table.item(0, 1).text() == "999"
     assert window.result_table.item(0, 3).toolTip() == ""
     assert window.result_table.item(0, 5).toolTip() == ""
+    assert window.result_table.item(0, 14).toolTip() == window.result_table.item(0, 14).text()
     window.close()
 
 
@@ -171,6 +176,44 @@ def test_operator_state_vocabulary_is_fixed_to_five_plain_states() -> None:
         "재시도 중",
         "확인 필요",
     } == _OPERATOR_STATES
+
+
+def test_operator_states_keep_plain_text_and_assign_semantic_visual_roles(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        _EmptyStore(),  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+
+    for state, role in (
+        ("대기", "neutral"),
+        ("조회 중", "active"),
+        ("정상", "success"),
+        ("재시도 중", "warning"),
+        ("확인 필요", "danger"),
+    ):
+        window._set_state(state)
+        assert window.state_label.text() == state
+        assert window.state_label.property("stateRole") == role
+
+    window.close()
+
+
+def test_history_status_presenter_translates_known_codes_without_guessing_unknowns() -> None:
+    assert _history_status_label("COMPLETED") == "완료"
+    assert _history_status_label(" partial ") == "일부 결과"
+    assert _history_status_label("FAILED") == "실패"
+    assert _history_status_label("STOPPED") == "중지"
+    assert _history_status_label("INTERRUPTED") == "수집 중단"
+    assert _history_status_label("RESTARTED") == "조건 변경 종료"
+    assert _history_status_label("CANCELLED") == "취소"
+    assert _history_status_label("RUNNING") == "진행 중"
+    assert _history_status_label("RECOVERED_CUSTOM") == "RECOVERED_CUSTOM"
+    assert _history_status_label("") == "-"
 
 
 def test_optional_port_accepts_only_blank_or_ascii_port_range() -> None:
@@ -251,6 +294,60 @@ def test_lifecycle_status_distinguishes_uncertain_missing_and_active_changes() -
     )
 
 
+def test_display_preparation_keeps_same_flow_from_multiple_controllers_visible() -> None:
+    first = SessionObservation(
+        controller_name="MD-01",
+        controller_host="198.51.100.21",
+        protocol=6,
+        source_ip="192.0.2.10",
+        destination_ip="203.0.113.20",
+        source_port=54321,
+        destination_port=443,
+        packets=10,
+        bytes_count=100,
+    )
+    second = SessionObservation(
+        controller_name="MD-02",
+        controller_host="198.51.100.22",
+        protocol=6,
+        source_ip="192.0.2.10",
+        destination_ip="203.0.113.20",
+        source_port=54321,
+        destination_port=443,
+        packets=20,
+        bytes_count=200,
+    )
+    prepared = _prepare_display_outcome(
+        SimpleNamespace(
+            observations=(second, first),
+            active_sessions=(SimpleNamespace(observation=first, miss_count=0),),
+            events=(),
+            authoritative=True,
+        ),
+        previous_counters={
+            first.session_key: (5, 50),
+            second.session_key: (15, 150),
+        },
+        close_after_misses=3,
+        monitoring=True,
+    )
+
+    assert [row.observation.controller_name for row in prepared.visible_rows] == [
+        "MD-01",
+        "MD-02",
+    ]
+    assert [(row.packet_delta, row.byte_delta) for row in prepared.visible_rows] == [
+        ("+5", "+50"),
+        ("+5", "+50"),
+    ]
+    assert {row.lifecycle_status for row in prepared.visible_rows} == {"활성 · 여러 MD에서 관측"}
+    assert prepared.total_rows == 2
+    assert prepared.next_counters == {
+        first.session_key: (10, 100),
+        second.session_key: (20, 200),
+    }
+
+
 def test_fatal_diagnostic_code_and_file_size_display_cover_boundaries() -> None:
     nonfatal = SimpleNamespace(code=ErrorCode.PARSE_PARTIAL)
     fatal = SimpleNamespace(code=ErrorCode.AUTH_FAILED)
@@ -288,6 +385,69 @@ def test_fatal_diagnostic_code_and_file_size_display_cover_boundaries() -> None:
     assert _display_bytes(1024) == "1.0 KiB"
     assert _display_bytes(1024**2) == "1.0 MiB"
     assert _display_bytes(1024**3) == "1.0 GiB"
+
+
+def test_storage_status_text_reports_usage_and_advises_at_raw_file_threshold() -> None:
+    below_threshold = SimpleNamespace(
+        raw_file_count=_RAW_FILE_COUNT_WARNING - 1,
+        raw_bytes=2 * 1024**3,
+        total_managed_bytes=3 * 1024**3,
+        free_bytes=20 * 1024**3,
+    )
+    at_threshold = SimpleNamespace(
+        raw_file_count=_RAW_FILE_COUNT_WARNING,
+        raw_bytes=2 * 1024**3,
+        total_managed_bytes=3 * 1024**3,
+        free_bytes=20 * 1024**3,
+    )
+
+    normal = _storage_status_text(below_threshold)
+    advisory = _storage_status_text(at_threshold)
+
+    assert "Raw 파일 99,999개" in normal
+    assert "Raw 용량 2.0 GiB" in normal
+    assert "전체 관리 데이터 3.0 GiB" in normal
+    assert "여유 공간 20.0 GiB" in normal
+    assert "주의:" not in normal
+    assert "Raw 파일 100,000개" in advisory
+    assert "주의:" in advisory
+    assert "자동 삭제되지 않으므로" in advisory
+
+
+def test_history_tab_shows_read_only_storage_status_without_changing_default_tab(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "tracker.db", tmp_path / "raw", tmp_path / "exports")
+    store.initialize()
+    run_id = store.start_run(QueryRequest("192.0.2.10", "203.0.113.20"))
+    store.record_query(
+        run_id,
+        (),
+        raw_text="raw-status",
+        controller_name="MD-01",
+        captured_at=datetime(2026, 8, 31, 1, 0, tzinfo=UTC),
+    )
+    store.finish_run(run_id)
+
+    window = MainWindow(ConfigRepository(tmp_path / "config.json"), store, _Executor())
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: (
+            not window._history_task_running
+            and window.storage_status_label.text() != "저장소 현황을 확인하는 중입니다."
+        ),
+        timeout=5000,
+    )
+
+    status = window.storage_status_label.text()
+    assert window.tabs.currentWidget() is window.query_page
+    assert "Raw 파일 1개" in status
+    assert "Raw 용량 10 B" in status
+    assert "전체 관리 데이터" in status
+    assert "여유 공간" in status
+    assert "주의:" not in status
+    window.close()
 
 
 def test_html_report_export_is_independent_from_csv(
@@ -340,8 +500,8 @@ def test_html_report_export_is_independent_from_csv(
         timeout=5000,
     )
 
-    assert window.export_button.text() == "선택 실행 CSV 내보내기"
-    assert window.html_export_button.text() == "선택 실행 HTML 보고서"
+    assert window.export_button.text() == "CSV 내보내기"
+    assert window.html_export_button.text() == "HTML 보고서"
     assert destination.is_file()
     assert messages == [("HTML 보고서 완료", str(destination))]
     window.close()
@@ -603,10 +763,18 @@ class _StorageHealthStore(_EmptyStore):
         warning: bool = False,
         hard_stop: bool = False,
         capacity_failure: StorageError | None = None,
+        raw_file_count: int = 0,
+        raw_bytes: int = 0,
+        total_managed_bytes: int = 0,
+        free_bytes: int = 10 * 1024**3,
     ) -> None:
         self.warning = warning
         self.hard_stop = hard_stop
         self.capacity_failure = capacity_failure
+        self.raw_file_count = raw_file_count
+        self.raw_bytes = raw_bytes
+        self.total_managed_bytes = total_managed_bytes
+        self.free_bytes = free_bytes
         self.capacity_calls = 0
         self.health_calls = 0
 
@@ -617,7 +785,14 @@ class _StorageHealthStore(_EmptyStore):
 
     def storage_health(self) -> object:
         self.health_calls += 1
-        return SimpleNamespace(warning=self.warning, hard_stop=self.hard_stop)
+        return SimpleNamespace(
+            warning=self.warning,
+            hard_stop=self.hard_stop,
+            raw_file_count=self.raw_file_count,
+            raw_bytes=self.raw_bytes,
+            total_managed_bytes=self.total_managed_bytes,
+            free_bytes=self.free_bytes,
+        )
 
 
 def _delete_preview_fixture() -> DeletePreview:
@@ -921,6 +1096,8 @@ def test_query_screen_defaults_to_primary_monitoring_and_progressive_details(
 
     assert window.setup_guide.isVisible()
     assert window.monitor_button.isDefault()
+    assert window.query_group.title() == "조회할 세션 흐름"
+    assert window.connection_group.title() == "로그인 정보 · 이번 실행에만 사용"
     assert window.monitor_button.text() == "지속 모니터링 시작"
     assert window.query_button.text() == "현재 조회"
     assert window.advanced_toggle_button.text() == "고급 조건 보기"
@@ -929,6 +1106,19 @@ def test_query_screen_defaults_to_primary_monitoring_and_progressive_details(
     assert not window.advanced_panel.isVisible()
     assert not window.details.isVisible()
     assert all(window.result_table.isColumnHidden(column) for column in range(5, 12))
+    assert [
+        window.result_table.horizontalHeaderItem(column).text()
+        for column in (0, 1, 2, 3, 4, 12, 13, 14)
+    ] == [
+        "장비",
+        "프로토콜",
+        "출발지 IP",
+        "출발지 포트",
+        "목적지 IP",
+        "마지막 확인 시각",
+        "장비 Flags",
+        "상태",
+    ]
 
     window.advanced_toggle_button.setChecked(True)
     window.detail_columns_toggle.setChecked(True)
@@ -938,6 +1128,18 @@ def test_query_screen_defaults_to_primary_monitoring_and_progressive_details(
     assert window.advanced_toggle_button.text() == "고급 조건 숨기기"
     assert window.raw_diagnostics_toggle.text() == "상세 정보 숨기기"
     assert all(not window.result_table.isColumnHidden(column) for column in range(5, 12))
+    advanced_layout = window.advanced_panel.layout()
+    assert isinstance(advanced_layout, QGridLayout)
+    for control in (
+        window.enable_edit,
+        window.source_port_edit,
+        window.destination_port_edit,
+        window.bidirectional_check,
+    ):
+        row, _column, _row_span, _column_span = advanced_layout.getItemPosition(
+            advanced_layout.indexOf(control)
+        )
+        assert row == 0
 
     _configure_valid_query(window)
     window._update_setup_guide()
@@ -965,10 +1167,17 @@ def test_query_progressive_controls_are_keyboard_and_accessibility_ready(
     )
     assert all(control.accessibleName() for control in controls)
     assert all(control.accessibleDescription() for control in controls)
+    assert window.source_ip_edit.accessibleName() == "출발지 IP"
+    assert window.destination_ip_edit.accessibleName() == "목적지 IP"
+    assert window.source_port_edit.accessibleName() == "출발지 포트"
+    assert window.destination_port_edit.accessibleName() == "목적지 포트"
+    assert "Source" not in window.bidirectional_check.accessibleDescription()
+    assert "DPort" not in window.detail_columns_toggle.accessibleDescription()
 
+    assert _next_keyboard_focus(window.source_ip_edit) is window.destination_ip_edit
+    assert _next_keyboard_focus(window.destination_ip_edit) is window.username_edit
     assert _next_keyboard_focus(window.username_edit) is window.password_edit
-    assert _next_keyboard_focus(window.password_edit) is window.source_ip_edit
-    assert _next_keyboard_focus(window.destination_ip_edit) is window.advanced_toggle_button
+    assert _next_keyboard_focus(window.password_edit) is window.advanced_toggle_button
 
     qtbot.keyClick(window.advanced_toggle_button, Qt.Key.Key_Space)  # type: ignore[attr-defined]
     assert window.advanced_toggle_button.isChecked()
@@ -980,6 +1189,30 @@ def test_query_progressive_controls_are_keyboard_and_accessibility_ready(
     qtbot.keyClick(window.raw_diagnostics_toggle, Qt.Key.Key_Space)  # type: ignore[attr-defined]
     assert window.raw_diagnostics_toggle.isChecked()
     assert window.details.isVisible()
+    window.close()
+
+
+def test_query_port_validation_uses_the_same_korean_labels_as_the_screen(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        _EmptyStore(),  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    _configure_valid_query(window)
+
+    window.source_port_edit.setText("invalid")
+    with pytest.raises(ValueError, match="출발지 포트"):
+        window._read_query()
+
+    window.source_port_edit.clear()
+    window.destination_port_edit.setText("65536")
+    with pytest.raises(ValueError, match="목적지 포트"):
+        window._read_query()
+
     window.close()
 
 
@@ -997,9 +1230,11 @@ from pathlib import Path
 from PySide6.QtWidgets import QApplication
 
 from aruba_session_tracker.config import ConfigRepository
+from aruba_session_tracker.models import AppConfig, DeviceTarget
 from aruba_session_tracker.services import QueryOutcome
 from aruba_session_tracker.storage import SessionStore
 from aruba_session_tracker.ui import MainWindow
+from aruba_session_tracker.ui.theme import apply_main_window_theme
 
 
 class Executor:
@@ -1014,7 +1249,17 @@ app = QApplication([])
 root = Path(sys.argv[1])
 store = SessionStore(root / "세션.db", root / "원본", root / "내보내기")
 store.initialize()
-window = MainWindow(ConfigRepository(root / "설정.json"), store, Executor())
+repository = ConfigRepository(root / "설정.json")
+repository.save(
+    AppConfig(
+        mm_primary=DeviceTarget("MM-Primary", "192.0.2.10"),
+        mm_standby=DeviceTarget("MM-Standby", "192.0.2.11"),
+        managed_devices=(DeviceTarget("MD-01", "198.51.100.21"),),
+    )
+)
+window = MainWindow(repository, store, Executor())
+apply_main_window_theme(window)
+window.resize(window.minimumSize())
 window.show()
 deadline = time.monotonic() + 3
 while window._history_task_running and time.monotonic() < deadline:
@@ -1034,6 +1279,24 @@ assert window.advanced_toggle_button.accessibleDescription()
 assert window.advanced_panel.isHidden()
 assert window.details.isHidden()
 assert all(window.result_table.isColumnHidden(column) for column in range(5, 12))
+window.advanced_toggle_button.setChecked(True)
+window.raw_diagnostics_toggle.setChecked(True)
+app.processEvents()
+assert window.advanced_panel.isVisible()
+assert window.details.isVisible()
+assert window.advanced_panel.height() >= window.advanced_panel.sizeHint().height()
+for control in (
+    window.enable_edit,
+    window.source_port_edit,
+    window.destination_port_edit,
+    window.bidirectional_check,
+):
+    assert control.isVisible()
+    assert control.geometry().height() > 0
+    assert window.advanced_panel.rect().contains(control.geometry().topLeft())
+    assert window.advanced_panel.rect().contains(control.geometry().bottomRight())
+assert window.result_table.viewport().geometry().height() >= 40
+assert window.details.width() >= 300
 window.close()
 app.processEvents()
 """
@@ -1501,9 +1764,22 @@ class _CountingExecutor(_Executor):
 def test_monitor_rechecks_storage_health_on_a_bounded_interval(
     qtbot: object,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = _StorageHealthStore(warning=True)
+    store = _StorageHealthStore(
+        warning=True,
+        raw_file_count=_RAW_FILE_COUNT_WARNING,
+        raw_bytes=2 * 1024**3,
+        total_managed_bytes=3 * 1024**3,
+        free_bytes=4 * 1024**3,
+    )
     executor = _CountingExecutor()
+    popup_warnings: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, _title, message, *_args: popup_warnings.append(str(message)),
+    )
     window = MainWindow(
         ConfigRepository(tmp_path / "config.json"),
         store,  # type: ignore[arg-type]
@@ -1521,6 +1797,9 @@ def test_monitor_rechecks_storage_health_on_a_bounded_interval(
     assert store.capacity_calls == 1
     assert store.health_calls == 1
     assert "저장 공간이 부족" in window.statusBar().currentMessage()
+    assert "Raw 파일 100,000개" in window.storage_status_label.text()
+    assert "주의:" in window.storage_status_label.text()
+    assert popup_warnings == []
 
     window._start_query()
     qtbot.waitUntil(  # type: ignore[attr-defined]

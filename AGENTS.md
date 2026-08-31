@@ -22,10 +22,19 @@ datapath session rows from the relevant 7240XM managed device.
   Keep every controller that owns an active flow in the authoritative poll
   scope; a positive result from one MD must never advance another MD's flow to
   `MISSED` or `CLOSED`.
+- Keep one logical lifecycle instance for a controller-free five-tuple while
+  preserving every controller-specific observation and Raw link. An
+  authoritative controller overlap must not emit `CONTROLLER_CHANGED`; retain
+  all overlap controllers in the next required poll scope and confirm a move
+  only after an authoritative singleton resolves the overlap.
 - Host-key and full-MD-scan approvals share the poll cancellation and monotonic
   deadline. Ignore every approval result that arrives after either boundary,
   and never save a host key or start a scan from that late result. Process and
   Windows file locks for known_hosts must share the same boundary.
+- Probe an unknown SSH host before approval, but do not repeat the probe for a
+  safely loaded known-host token when the production connector performs the
+  strict authenticated check. A wrapped BadHostKey or missing known-host entry
+  remains non-retryable `HOST_KEY_CHANGED`; ordinary timeouts remain transient.
 - Never fall back to an unfiltered datapath table query.
 - Treat managed files, operation manifests, leases, crash journals and their
   parent directories as local security boundaries. Reject symbolic links,
@@ -53,6 +62,9 @@ datapath session rows from the relevant 7240XM managed device.
   shutdown work off the Qt GUI thread. Every new lifecycle worker must have a
   bounded wait, cancellation boundary, sanitized failure result and recovery
   behavior that is safe after process interruption.
+- Persist one-shot runs as `COMPLETED` for authoritative results, `PARTIAL` only
+  when a non-authoritative result retains positive observations, `FAILED` for
+  zero-observation non-authoritative failures, and `CANCELLED` for cancellation.
 - Bind deferred Qt callbacks to their owning `QObject` lifetime. Daemon workers
   must tolerate their signal sender being deleted during final Qt teardown;
   never leave an unowned callback that can call a deleted window later.
@@ -73,7 +85,7 @@ datapath session rows from the relevant 7240XM managed device.
   separate bounded job on the exact annotated-tag commit before publication.
   Both soak results are test evidence only, not live-device evidence.
 - Keep synthetic soak inputs between 1 and 20,000 polls. Each child-process
-  timeout must remain between 500 and 3,200 seconds so the two sequential
+  timeout must remain between 900 and 3,200 seconds so the two sequential
   long-soak subprocesses stay inside each outer 120-minute workflow watchdog.
 - Deadline watchdogs must recheck the shared monotonic deadline after an OS
   timer wait returns. Never treat one early Windows timer wakeup as expiry, and
@@ -83,15 +95,42 @@ datapath session rows from the relevant 7240XM managed device.
 - Preserve CSV export as an independent manual path. HTML is a result-only
   presentation of the selected run, not an operator guide or diagnostic
   document. Keep it as a separate single-file HTML5 document with inline CSS,
-  no external resources or JavaScript, responsive and print layouts, and
-  escaped database/device values.
+  no external resources or external JavaScript, responsive and print layouts,
+  and escaped database/device values. The only permitted script is exactly one
+  deterministic inline result-filter script authorized by its exact SHA-256 in
+  the Content Security Policy.
 - Show KST as the primary display time and focus the latest 50 results and the
   collapsed full-history section on protocol, source IP:port, and destination
-  IP:port. HTML must include every stored observation row on screen and in
-  print; the 2,000-row cap applies only to the live Qt result table.
+  IP:port. Partial IP or port input may offer at most 12 values from the stored
+  full history, but filtering must begin only after the user selects an exact
+  value or enters an exact value and presses Enter. Filters apply only to
+  presentation, never remove an observation row from the document, are never
+  persisted, and must reset whenever the report is reopened.
+- Keep the report summary ordered as query source IP:port, direction, query
+  destination IP:port, run status, and four compact values: start, end, total
+  observations, and unique sessions. Do not add protocol/device distributions,
+  event timelines, or controller cards; the report is intentionally focused on
+  protocol and source/destination IP and port results.
+- Build autocomplete candidates from one full-history reverse index. Partial
+  keystrokes may search only the cached unique candidate set, must discard any
+  stale active option immediately, and must not rescan the report DOM. Touch
+  pointer-down and list scrolling must never select a value; selection occurs
+  only after a completed tap/click or explicit keyboard confirmation.
+- HTML must preserve every stored observation row regardless of the live Qt
+  table's 2,000-row cap. Screen and print show the current exact filter result;
+  clearing all filters restores and prints the complete stored history. Show
+  both filtered and total counts so hidden rows cannot be mistaken for missing
+  data.
+- The local report-filter script must not use network access, external
+  libraries, browser storage, URLs, clipboard APIs, `eval`, or database/device
+  values as executable markup. If CSP blocks it, hide the filter controls and
+  leave the complete static report readable.
 - Omit packet, byte, and counter-delta values from HTML while preserving them
   in SQLite, CSV, and Raw data. Do not change those storage formats for this
   presentation-only simplification.
+- The History and Export screen may show read-only Raw file count, Raw bytes,
+  total managed bytes and free space. A 100,000-file Raw warning is advisory
+  only: it must not stop polling, show repeated popups, compact, or delete data.
 - Exclude diagnostic events and codes, Raw bodies, paths and hashes, CLI and
   program-flow material, troubleshooting, developer information, credentials,
   and logs from HTML. Do not change the SQLite schema, CSV or Raw format for
@@ -115,6 +154,12 @@ datapath session rows from the relevant 7240XM managed device.
 - Preserve the labels `지속 모니터링 시작`, `현재 조회`, `고급 조건 보기/숨기기`,
   and `상세 정보 보기/숨기기`. Operator state must be one of only `대기`,
   `조회 중`, `정상`, `재시도 중`, or `확인 필요`.
+- Desktop presentation changes must not replace Qt widgets or Inspector IDs.
+  Keep role-aware keyboard focus visible, retain clickable scrollbar line
+  controls, and use native palette roles for high-contrast scrollbars.
+- Keep the query flow and session-only credentials in one compact two-column
+  work area, with the source/destination flow first. Stored history status codes
+  remain unchanged even when the table presents their Korean display labels.
 
 ## Release
 
@@ -129,7 +174,19 @@ datapath session rows from the relevant 7240XM managed device.
   draft and resume it instead of republishing an older workflow target.
 - Every public release must contain exactly one uploaded Windows x64 ZIP. Keep
   the verified SHA-256 in the release body and the CycloneDX SBOM inside the ZIP.
-  Local build inputs still include the sidecar and external SBOM for verification.
+  Also include `THIRD_PARTY_COMPONENTS.json`, the declared license evidence, and
+  `OPEN_SOURCE_SOURCE_OFFER.txt` inside that ZIP. Local build inputs still include
+  the sidecar and external SBOM for verification.
+- Isolate the PyInstaller PATH. Require Qt's Schannel TLS backend and reject the
+  Qt OpenSSL backend plus host-derived `libcrypto-3-x64.dll` and
+  `libssl-3-x64.dll`; inventory the CPython OpenSSL pair that is intentionally
+  shipped.
+- Keep every packaged EXE, DLL, and PYD on a case-insensitive exact component
+  allowlist. Any unassigned native file, casefold collision, API-set/UCRT copy,
+  or renamed forbidden backend must fail package creation and verification.
+- Package tests may prove that reviewed license/source-offer evidence and hashes
+  are present. They must not claim to prove future source retention or request
+  fulfillment; those remain distributor operations for the stated period.
 - Install the pinned runtime lock and require `pip check` in a publish runner
   before invoking package or remote-release verification tools.
 - Verify release assets while draft, compare GitHub-reported SHA-256 digests,

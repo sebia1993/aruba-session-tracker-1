@@ -35,6 +35,40 @@ def test_loopback_smoke_requires_all_private_fixture_arguments() -> None:
     assert caught.value.code == 2
 
 
+def test_tls_backend_smoke_accepts_schannel_only(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        main_module,
+        "QSslSocket",
+        SimpleNamespace(
+            availableBackends=lambda: ["cert-only", "schannel"],
+            activeBackend=lambda: "schannel",
+        ),
+    )
+
+    assert main(["--tls-backend-smoke"]) == 0
+    assert "ARUBA_SESSION_TRACKER_TLS_BACKEND_OK active=schannel" in capsys.readouterr().out
+
+
+def test_tls_backend_smoke_rejects_available_openssl(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        main_module,
+        "QSslSocket",
+        SimpleNamespace(
+            availableBackends=lambda: ["cert-only", "openssl", "schannel"],
+            activeBackend=lambda: "openssl",
+        ),
+    )
+
+    assert main(["--tls-backend-smoke"]) == 1
+    assert "ARUBA_SESSION_TRACKER_TLS_BACKEND_FAILED" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("guard_mode", ("already-running", "guard-error"))
 def test_single_instance_guard_failures_are_bounded_and_sanitized(
     qtbot: object,
@@ -170,6 +204,7 @@ def test_report_smoke_writes_standalone_html_to_korean_path(tmp_path: Path) -> N
     text = destination.read_text(encoding="utf-8")
     assert "<!doctype html>" in text.casefold()
     assert "한국어-MD" in text
+    assert "결과 찾기" in text
     assert "최신 세션 결과" in text
     assert "전체 추적 이력" in text
     assert "KST" in text
@@ -180,13 +215,30 @@ def test_report_smoke_writes_standalone_html_to_korean_path(tmp_path: Path) -> N
     assert "세션별 수치 변화" not in text
     assert "패킷" not in text
     assert "바이트" not in text
-    assert text.index("최신 세션 결과") < text.index("전체 추적 이력")
+    assert text.index("결과 찾기") < text.index("최신 세션 결과") < text.index("전체 추적 이력")
+    assert 'id="filter-ip"' in text
+    assert 'id="filter-protocol"' in text
+    assert 'id="filter-port"' in text
+    assert text.count("<script>") == 1
+    assert main_module._report_filter_script_is_hash_authorized(text)
+    assert not main_module._report_filter_script_is_hash_authorized(
+        text.replace("script-src 'sha256-", "script-src 'sha256-broken-", 1)
+    )
     assert '<details class="history-toggle">' in text
     assert '<div class="details-body" id="observation-history-body">' in text
     assert ".history-toggle + .details-body { display:block !important; }" in text
     assert "<details open" not in text
     assert "https://" not in text.casefold()
     assert "http://" not in text.casefold()
+    for forbidden in (
+        "XMLHttpRequest",
+        "WebSocket",
+        "navigator.clipboard",
+        "localStorage",
+        "sessionStorage",
+        "eval(",
+    ):
+        assert forbidden not in text
 
 
 def test_report_smoke_releases_run_lease_after_storage_failure(

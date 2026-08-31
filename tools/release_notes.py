@@ -39,6 +39,10 @@ def build_release_notes(reviewed: str, zip_path: Path, sidecar_path: Path) -> st
         f"- Windows 11 x64 실행 파일: `{zip_path.name}`\n"
         f"- SHA-256: `{actual_digest}`\n"
         "- SBOM: ZIP 내부 `ArubaSessionTracker/sbom.cdx.json`\n"
+        "- Native 파일 해시 목록: ZIP 내부 "
+        "`ArubaSessionTracker/THIRD_PARTY_COMPONENTS.json`\n"
+        "- LGPL 대응 소스 요청·재빌드 안내: ZIP 내부 "
+        "`ArubaSessionTracker/OPEN_SOURCE_SOURCE_OFFER.txt`\n"
         "- GitHub의 `Source code (zip)`과 `Source code (tar.gz)`는 자동 생성된 "
         "소스 스냅샷이며 실행 프로그램이 아닙니다.\n"
     )

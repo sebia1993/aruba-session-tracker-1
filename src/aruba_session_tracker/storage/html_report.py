@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
 import tempfile
@@ -38,6 +39,464 @@ _RUN_STATUS_KO = {
     "RESTARTED": "조건 변경 종료",
     "CANCELLED": "사용자 취소",
 }
+_RUN_STATUS_CLASS = {
+    "RUNNING": "running",
+    "COMPLETED": "completed",
+    "STOPPED": "attention",
+    "PARTIAL": "attention",
+    "FAILED": "failed",
+    "INTERRUPTED": "attention",
+    "RESTARTED": "attention",
+    "CANCELLED": "neutral",
+}
+
+
+_FILTER_SCRIPT = r"""(() => {
+  "use strict";
+
+  const SUGGESTION_LIMIT = 12;
+  const INPUT_DELAY_MS = 120;
+  const filterRoot = document.getElementById("result-filter");
+  const latestBody = document.getElementById("latest-results-body");
+  const historyBody = document.getElementById("history-results-body");
+  const protocolSelect = document.getElementById("filter-protocol");
+  const resetButton = document.getElementById("filter-reset");
+  const filterStatus = document.getElementById("filter-status");
+  const latestCount = document.getElementById("latest-filter-count");
+  const historyCount = document.getElementById("history-filter-count");
+  const historySummary = document.getElementById("history-filter-summary");
+  const printSummary = document.getElementById("print-filter-summary");
+  const latestEmpty = document.getElementById("latest-filter-empty");
+  const historyEmpty = document.getElementById("history-filter-empty");
+  if (!filterRoot || !latestBody || !historyBody || !protocolSelect || !resetButton ||
+      !filterStatus || !latestCount || !historyCount || !historySummary || !printSummary ||
+      !latestEmpty || !historyEmpty) {
+    return;
+  }
+
+  const naturalOrder = new Intl.Collator("ko-KR", {numeric: true, sensitivity: "base"});
+  const integerFormat = new Intl.NumberFormat("ko-KR");
+  const normalize = (value) => String(value || "").trim().toLocaleLowerCase("ko-KR");
+  const toRecord = (row) => {
+    const record = {
+      row,
+      sourceIp: row.dataset.sourceIp || "",
+      destinationIp: row.dataset.destinationIp || "",
+      sourcePort: row.dataset.sourcePort || "",
+      destinationPort: row.dataset.destinationPort || "",
+      protocol: row.dataset.protocol || ""
+    };
+    record.sourceIpKey = normalize(record.sourceIp);
+    record.destinationIpKey = normalize(record.destinationIp);
+    record.sourcePortKey = normalize(record.sourcePort);
+    record.destinationPortKey = normalize(record.destinationPort);
+    record.protocolKey = normalize(record.protocol);
+    return record;
+  };
+
+  // The DOM is read once. All later matching uses these small record objects.
+  const latestRecords = Array.from(latestBody.querySelectorAll("tr.report-row")).map(toRecord);
+  const historyRecords = Array.from(historyBody.querySelectorAll("tr.report-row")).map(toRecord);
+  const indexes = {ip: new Map(), port: new Map(), protocol: new Map()};
+  const addDirectionalIndex = (kind, key, value, direction, rowId) => {
+    const cleanValue = String(value || "").trim();
+    if (!key || !cleanValue || cleanValue === "-") return;
+    let candidate = indexes[kind].get(key);
+    if (!candidate) {
+      candidate = {value: cleanValue, sourceRows: [], destinationRows: [], rowSet: null};
+      indexes[kind].set(key, candidate);
+    }
+    candidate[direction === "source" ? "sourceRows" : "destinationRows"].push(rowId);
+  };
+  const addProtocolIndex = (record, rowId) => {
+    if (!record.protocolKey || !record.protocol || record.protocol === "-") return;
+    let candidate = indexes.protocol.get(record.protocolKey);
+    if (!candidate) {
+      candidate = {value: record.protocol, rows: [], rowSet: null};
+      indexes.protocol.set(record.protocolKey, candidate);
+    }
+    candidate.rows.push(rowId);
+  };
+  historyRecords.forEach((record, rowId) => {
+    addDirectionalIndex("ip", record.sourceIpKey, record.sourceIp, "source", rowId);
+    addDirectionalIndex("ip", record.destinationIpKey, record.destinationIp, "destination", rowId);
+    addDirectionalIndex("port", record.sourcePortKey, record.sourcePort, "source", rowId);
+    addDirectionalIndex("port", record.destinationPortKey, record.destinationPort, "destination", rowId);
+    addProtocolIndex(record, rowId);
+  });
+  const state = {ip: "", port: "", protocol: ""};
+  const controls = {};
+  const candidateCache = {ip: null, port: null};
+  const invalidateCandidateCaches = () => {
+    candidateCache.ip = null;
+    candidateCache.port = null;
+  };
+
+  const matchesIp = (record, value) => {
+    const key = normalize(value);
+    return !key || record.sourceIpKey === key || record.destinationIpKey === key;
+  };
+  const matchesPort = (record, value) => {
+    const key = normalize(value);
+    return !key || record.sourcePortKey === key || record.destinationPortKey === key;
+  };
+  const matchesProtocol = (record, value) => {
+    const key = normalize(value);
+    return !key || record.protocolKey === key;
+  };
+  const matchesAll = (record) => (
+    matchesIp(record, state.ip) &&
+    matchesPort(record, state.port) &&
+    matchesProtocol(record, state.protocol)
+  );
+  const announce = (message) => {
+    filterStatus.textContent = message;
+  };
+  const activeDescription = () => {
+    const parts = [];
+    if (state.ip) parts.push(`IP ${state.ip}`);
+    if (state.protocol) parts.push(`프로토콜 ${state.protocol}`);
+    if (state.port) parts.push(`포트 ${state.port}`);
+    return parts.length ? parts.join(" · ") : "없음 (전체 결과)";
+  };
+
+  const applyFilters = (message) => {
+    let latestVisible = 0;
+    let historyVisible = 0;
+    for (const record of latestRecords) {
+      const visible = matchesAll(record);
+      record.row.hidden = !visible;
+      if (visible) latestVisible += 1;
+    }
+    for (const record of historyRecords) {
+      const visible = matchesAll(record);
+      record.row.hidden = !visible;
+      if (visible) historyVisible += 1;
+    }
+
+    latestEmpty.hidden = latestRecords.length === 0 || latestVisible !== 0;
+    historyEmpty.hidden = historyRecords.length === 0 || historyVisible !== 0;
+    latestCount.textContent = `최신 ${integerFormat.format(latestVisible)}/${integerFormat.format(latestRecords.length)}건`;
+    historyCount.textContent = `전체 ${integerFormat.format(historyVisible)}/${integerFormat.format(historyRecords.length)}건`;
+    historySummary.textContent = `전체 추적 이력 ${integerFormat.format(historyVisible)}/${integerFormat.format(historyRecords.length)}건 보기`;
+    printSummary.textContent = `적용 필터: ${activeDescription()} · 최신 ${integerFormat.format(latestVisible)}/${integerFormat.format(latestRecords.length)}건 · 전체 ${integerFormat.format(historyVisible)}/${integerFormat.format(historyRecords.length)}건`;
+
+    let importantResult = "";
+    if (historyRecords.length === 0) {
+      importantResult = "저장된 관측 이력이 없습니다.";
+    } else if (historyVisible === 0) {
+      importantResult = "선택한 조건과 일치하는 전체 추적 이력이 없습니다.";
+    } else if (latestVisible === 0) {
+      importantResult = `전체 이력에는 ${integerFormat.format(historyVisible)}건이 있지만 최신 결과에는 없습니다.`;
+    }
+    if (message && importantResult) {
+      announce(`${message} ${importantResult}`);
+    } else if (message) {
+      announce(message);
+    } else if (importantResult) {
+      announce(importantResult);
+    } else if (state.ip || state.port || state.protocol) {
+      announce(`선택한 조건으로 전체 이력 ${integerFormat.format(historyVisible)}건을 표시합니다.`);
+    } else {
+      announce("IP나 포트의 일부를 입력하면 실제 보고서 값이 추천됩니다.");
+    }
+  };
+
+  const directionalRowSet = (candidate) => {
+    if (candidate.rowSet === null) {
+      candidate.rowSet = new Set([...candidate.sourceRows, ...candidate.destinationRows]);
+    }
+    return candidate.rowSet;
+  };
+  const protocolRowSet = (candidate) => {
+    if (candidate.rowSet === null) candidate.rowSet = new Set(candidate.rows);
+    return candidate.rowSet;
+  };
+  const eligibleRowsForOtherFilters = (kind) => {
+    const rowSets = [];
+    if (kind === "ip" && state.port) {
+      const port = indexes.port.get(normalize(state.port));
+      rowSets.push(port ? directionalRowSet(port) : new Set());
+    }
+    if (kind === "port" && state.ip) {
+      const ip = indexes.ip.get(normalize(state.ip));
+      rowSets.push(ip ? directionalRowSet(ip) : new Set());
+    }
+    if (state.protocol) {
+      const protocol = indexes.protocol.get(normalize(state.protocol));
+      rowSets.push(protocol ? protocolRowSet(protocol) : new Set());
+    }
+    if (!rowSets.length) return null;
+    rowSets.sort((left, right) => left.size - right.size);
+    const remainingRowSets = rowSets.slice(1);
+    const eligible = new Set();
+    for (const rowId of rowSets[0]) {
+      if (remainingRowSets.every((rowSet) => rowSet.has(rowId))) eligible.add(rowId);
+    }
+    return eligible;
+  };
+  const hasEligibleRow = (rows, eligibleRows) => (
+    eligibleRows === null ? rows.length > 0 : rows.some((rowId) => eligibleRows.has(rowId))
+  );
+  const candidateValues = (kind) => {
+    if (candidateCache[kind] !== null) return candidateCache[kind];
+    const eligibleRows = eligibleRowsForOtherFilters(kind);
+    const found = [];
+    for (const candidate of indexes[kind].values()) {
+      const source = hasEligibleRow(candidate.sourceRows, eligibleRows);
+      const destination = hasEligibleRow(candidate.destinationRows, eligibleRows);
+      if (source || destination) found.push({value: candidate.value, source, destination});
+    }
+    candidateCache[kind] = found;
+    return candidateCache[kind];
+  };
+  const matchRank = (value, query) => {
+    if (value === query) return 0;
+    if (value.startsWith(query)) return 1;
+    if (value.includes(query)) return 2;
+    return 3;
+  };
+  const suggestionsFor = (kind, query) => {
+    const queryKey = normalize(query);
+    if (!queryKey) return [];
+    const matched = [];
+    for (const candidate of candidateValues(kind)) {
+      const rank = matchRank(normalize(candidate.value), queryKey);
+      if (rank < 3) matched.push({...candidate, rank});
+    }
+    return matched
+      .sort((left, right) => left.rank - right.rank || naturalOrder.compare(left.value, right.value))
+      .slice(0, SUGGESTION_LIMIT);
+  };
+  const directionLabel = (candidate) => {
+    if (candidate.source && candidate.destination) return "양쪽";
+    return candidate.source ? "출발지" : "목적지";
+  };
+
+  const closeSuggestions = (control) => {
+    if (control.timer) {
+      window.clearTimeout(control.timer);
+      control.timer = 0;
+    }
+    control.list.hidden = true;
+    control.input.setAttribute("aria-expanded", "false");
+    control.input.removeAttribute("aria-activedescendant");
+    control.activeIndex = -1;
+    control.pointerInteracting = false;
+    control.suggestions = [];
+    control.options = [];
+    control.list.replaceChildren();
+  };
+  const closeAllSuggestions = () => {
+    for (const control of Object.values(controls)) closeSuggestions(control);
+  };
+  const setActiveOption = (control, index) => {
+    if (!control.options.length) return;
+    const bounded = (index + control.options.length) % control.options.length;
+    control.activeIndex = bounded;
+    control.options.forEach((option, optionIndex) => {
+      option.setAttribute("aria-selected", optionIndex === bounded ? "true" : "false");
+    });
+    const active = control.options[bounded];
+    control.input.setAttribute("aria-activedescendant", active.id);
+    active.scrollIntoView({block: "nearest"});
+  };
+  const selectCandidate = (control, value) => {
+    state[control.kind] = value;
+    invalidateCandidateCaches();
+    control.input.value = value;
+    control.input.dataset.selectedValue = value;
+    closeAllSuggestions();
+    applyFilters(`${control.label} ${value} 필터를 적용했습니다.`);
+  };
+  const renderSuggestions = (control) => {
+    if (control.timer) {
+      window.clearTimeout(control.timer);
+      control.timer = 0;
+    }
+    const query = control.input.value.trim();
+    control.suggestions = suggestionsFor(control.kind, query);
+    control.options = [];
+    control.activeIndex = -1;
+    control.input.removeAttribute("aria-activedescendant");
+    const fragment = document.createDocumentFragment();
+    control.suggestions.forEach((candidate, index) => {
+      const option = document.createElement("div");
+      const value = document.createElement("span");
+      const direction = document.createElement("span");
+      option.id = `${control.kind}-suggestion-${index}`;
+      option.setAttribute("role", "option");
+      option.setAttribute("aria-selected", "false");
+      option.dataset.value = candidate.value;
+      value.className = "suggestion-value";
+      value.textContent = candidate.value;
+      direction.className = "suggestion-direction";
+      direction.textContent = directionLabel(candidate);
+      option.append(value, direction);
+      fragment.appendChild(option);
+      control.options.push(option);
+    });
+    control.list.replaceChildren(fragment);
+    if (!query || !control.options.length) {
+      closeSuggestions(control);
+      if (query) announce(`일치하는 ${control.label} 추천값이 없습니다.`);
+      return;
+    }
+    control.list.hidden = false;
+    control.input.setAttribute("aria-expanded", "true");
+  };
+  const scheduleSuggestions = (control) => {
+    if (control.timer) window.clearTimeout(control.timer);
+    control.timer = window.setTimeout(() => {
+      control.timer = 0;
+      renderSuggestions(control);
+    }, INPUT_DELAY_MS);
+  };
+
+  const makeCombobox = (kind, label) => {
+    const input = document.getElementById(`filter-${kind}`);
+    const list = document.getElementById(`filter-${kind}-list`);
+    if (!input || !list) return null;
+    const control = {
+      kind, label, input, list, suggestions: [], options: [], activeIndex: -1,
+      timer: 0, pointerInteracting: false
+    };
+    controls[kind] = control;
+    input.addEventListener("input", () => {
+      // Never let a delayed recommendation from the previous input be selected.
+      closeSuggestions(control);
+      const selectionChanged = Boolean(state[kind] && input.value !== state[kind]);
+      if (selectionChanged) {
+        state[kind] = "";
+        invalidateCandidateCaches();
+        delete input.dataset.selectedValue;
+      }
+      if (!input.value.trim()) {
+        delete input.dataset.selectedValue;
+        if (selectionChanged) applyFilters();
+        return;
+      }
+      if (selectionChanged) applyFilters();
+      scheduleSuggestions(control);
+    });
+    input.addEventListener("focus", () => {
+      if (input.value.trim()) scheduleSuggestions(control);
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        if (control.list.hidden || !control.options.length) renderSuggestions(control);
+        if (control.options.length) {
+          const offset = event.key === "ArrowDown" ? 1 : -1;
+          const nextIndex = control.activeIndex < 0
+            ? (event.key === "ArrowDown" ? 0 : control.options.length - 1)
+            : control.activeIndex + offset;
+          setActiveOption(control, nextIndex);
+        }
+        return;
+      }
+      if (event.key === "Enter") {
+        event.preventDefault();
+        if (!control.list.hidden && control.activeIndex >= 0) {
+          selectCandidate(control, control.options[control.activeIndex].dataset.value);
+          return;
+        }
+        renderSuggestions(control);
+        const queryKey = normalize(input.value);
+        const exact = control.suggestions.find((candidate) => normalize(candidate.value) === queryKey);
+        if (exact) {
+          selectCandidate(control, exact.value);
+        } else {
+          closeSuggestions(control);
+          announce("추천 목록에서 값을 선택하세요.");
+        }
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeSuggestions(control);
+      } else if (event.key === "Tab") {
+        closeSuggestions(control);
+      }
+    });
+    input.addEventListener("blur", () => {
+      window.setTimeout(() => {
+        if (!control.pointerInteracting) closeSuggestions(control);
+      }, 0);
+    });
+    list.addEventListener("pointerdown", (event) => {
+      const option = event.target.closest("[role='option']");
+      if (!option || !list.contains(option)) return;
+      control.pointerInteracting = true;
+      if (event.pointerType === "mouse") event.preventDefault();
+    });
+    list.addEventListener("pointerup", () => {
+      control.pointerInteracting = false;
+    });
+    list.addEventListener("pointercancel", () => {
+      control.pointerInteracting = false;
+    });
+    list.addEventListener("click", (event) => {
+      const option = event.target.closest("[role='option']");
+      if (!option || !list.contains(option)) return;
+      event.preventDefault();
+      selectCandidate(control, option.dataset.value);
+      input.focus();
+    });
+    return control;
+  };
+
+  makeCombobox("ip", "IP");
+  makeCombobox("port", "포트");
+  if (!controls.ip || !controls.port) return;
+  document.addEventListener("pointerdown", (event) => {
+    for (const control of Object.values(controls)) {
+      if (event.target !== control.input && !control.list.contains(event.target)) {
+        closeSuggestions(control);
+      }
+    }
+  });
+
+  Array.from(indexes.protocol.values())
+    .map((candidate) => candidate.value)
+    .sort(naturalOrder.compare)
+    .forEach((protocol) => {
+      const option = document.createElement("option");
+      option.value = protocol;
+      option.textContent = protocol;
+      protocolSelect.appendChild(option);
+    });
+  protocolSelect.addEventListener("change", () => {
+    state.protocol = protocolSelect.value;
+    invalidateCandidateCaches();
+    closeAllSuggestions();
+    applyFilters(state.protocol ? `프로토콜 ${state.protocol} 필터를 적용했습니다.` : "프로토콜 필터를 해제했습니다.");
+  });
+  const resetFilters = (message) => {
+    state.ip = "";
+    state.port = "";
+    state.protocol = "";
+    invalidateCandidateCaches();
+    controls.ip.input.value = "";
+    controls.port.input.value = "";
+    delete controls.ip.input.dataset.selectedValue;
+    delete controls.port.input.dataset.selectedValue;
+    protocolSelect.value = "";
+    closeAllSuggestions();
+    applyFilters(message);
+  };
+  resetButton.addEventListener("click", () => {
+    resetFilters("모든 필터를 초기화했습니다.");
+  });
+
+  window.addEventListener("pageshow", () => resetFilters());
+  resetFilters();
+  printSummary.hidden = false;
+  filterRoot.hidden = false;
+})();"""
+_FILTER_SCRIPT_SHA256 = base64.b64encode(
+    hashlib.sha256(_FILTER_SCRIPT.encode("utf-8")).digest()
+).decode("ascii")
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +553,6 @@ def _report_chunks(
     flow_groups = _group_observations(latest_source)
     flow_statuses, session_statuses = _lifecycle_statuses(snapshot.lifecycle_events)
     latest_groups = flow_groups[:_LATEST_SESSION_LIMIT]
-
     latest_rows = "".join(
         _observation_row(
             rows[-1],
@@ -113,7 +571,12 @@ def _report_chunks(
         )
     )
     query_direction = "양방향" if bool(run.get("bidirectional")) else "단방향"
-    run_status = _RUN_STATUS_KO.get(str(run.get("status") or "").upper(), "상태 확인 필요")
+    direction_symbol = "↔" if bool(run.get("bidirectional")) else "→"
+    run_status_code = str(run.get("status") or "").upper()
+    run_status = _RUN_STATUS_KO.get(run_status_code, "상태 확인 필요")
+    run_status_class = _RUN_STATUS_CLASS.get(run_status_code, "attention")
+    source_endpoint = _endpoint(run.get("source_ip"), run.get("source_port"))
+    destination_endpoint = _endpoint(run.get("destination_ip"), run.get("destination_port"))
 
     yield f"""<!doctype html>
 <html lang="ko">
@@ -121,121 +584,281 @@ def _report_chunks(
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-{_FILTER_SCRIPT_SHA256}'; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>Aruba Session Tracker 추적 결과</title>
   <style>
-    :root {{ color-scheme:light; --navy:#17324d; --blue:#1769aa; --ink:#243b53;
-      --muted:#627d98; --line:#d9e2ec; --paper:#fff; --bg:#f3f6f9;
-      --ok:#147d64; --warn:#9c6615; --closed:#9b2c2c; }}
+    :root {{ color-scheme:light; --masthead:#102f49; --canvas:#f3f6f9; --surface:#fff;
+      --surface-muted:#e8eef4; --border:#cbd5e1; --border-strong:#aebcca;
+      --text:#0f172a; --text-muted:#475569; --primary:#0b5f9a; --primary-hover:#084f82;
+      --focus:#1976b9; --success:#147d64; --warning:#9c6615; --danger:#b42318;
+      --neutral:#486581; }}
     * {{ box-sizing:border-box; }}
-    body {{ margin:0; overflow-x:hidden; background:var(--bg); color:var(--ink);
+    body {{ margin:0; overflow-x:hidden; background:var(--canvas); color:var(--text);
       font-family:system-ui,-apple-system,"Segoe UI","Malgun Gothic",sans-serif; line-height:1.5; }}
-    .header {{ background:var(--navy); color:#fff; padding:22px; }}
+    .header {{ background:var(--masthead); color:#fff; padding:15px 0 14px;
+      border-bottom:3px solid var(--focus); }}
     .header-inner,.content,.footer {{ width:min(1240px,calc(100% - 32px)); margin:0 auto; }}
-    h1 {{ margin:0; font-size:clamp(1.55rem,3vw,2.25rem); }}
-    .subtitle {{ margin:.35rem 0 0; color:#d9e8f5; }}
-    .content {{ padding:18px 0; }}
-    section,.result-summary {{ min-width:0; background:var(--paper); border:1px solid var(--line);
-      border-radius:12px; padding:20px; margin-bottom:16px; box-shadow:0 5px 18px #102a430d; }}
-    h2 {{ margin:0 0 6px; color:var(--navy); font-size:1.25rem; }}
-    .section-note {{ margin:0 0 14px; color:var(--muted); }}
-    .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:10px; }}
-    .card {{ min-width:0; border:1px solid var(--line); border-radius:9px; padding:12px; background:#fbfdff; }}
-    .label {{ color:var(--muted); font-size:.82rem; }}
-    .value {{ display:block; margin-top:3px; font-weight:700; overflow-wrap:anywhere; }}
-    .table-wrap {{ overflow-x:auto; border:1px solid var(--line); border-radius:9px; }}
-    .table-wrap:focus-visible,summary:focus-visible {{ outline:3px solid #63b3ed; outline-offset:2px; }}
-    table {{ width:100%; min-width:800px; border-collapse:collapse; font-size:.88rem; }}
-    th,td {{ padding:9px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }}
-    th {{ background:#f0f4f8; color:var(--navy); position:sticky; top:0; white-space:nowrap; }}
+    .header-inner {{ display:flex; align-items:center; justify-content:space-between; gap:16px; }}
+    .product-name {{ margin:0 0 1px; color:#d9e8f5; font-size:.75rem; font-weight:700;
+      letter-spacing:.045em; }}
+    h1 {{ margin:0; font-size:clamp(1.4rem,2.4vw,1.7rem); line-height:1.25; }}
+    .content {{ padding:14px 0; }}
+    section {{ min-width:0; background:var(--surface); border:1px solid var(--border);
+      border-radius:8px; padding:16px; margin-bottom:12px; }}
+    h2 {{ margin:0 0 5px; color:var(--text); font-size:1.16rem; }}
+    .section-note {{ margin:0 0 12px; color:var(--text-muted); }}
+    .result-summary {{ overflow:hidden; }}
+    .summary-heading {{ margin-bottom:10px; }}
+    .summary-title {{ margin:0; font-size:1.16rem; }}
+    .flow-panel {{ display:grid; grid-template-columns:minmax(0,1fr) auto minmax(0,1fr); gap:14px;
+      align-items:center; padding:13px 14px; background:#f8fafc; border:1px solid var(--border);
+      border-radius:7px; }}
+    .endpoint {{ min-width:0; }}
+    .endpoint.destination {{ text-align:right; }}
+    .endpoint-label {{ color:var(--text-muted); font-size:.76rem; font-weight:750; }}
+    .endpoint-value {{ display:block; margin-top:3px; color:#17324d; font-size:1rem;
+      font-weight:800; overflow-wrap:anywhere; }}
+    .direction {{ min-width:94px; text-align:center; }}
+    .direction-arrow {{ display:block; color:var(--primary); font-size:1.35rem; line-height:1; font-weight:800; }}
+    .direction-pill {{ display:inline-block; margin-top:7px; padding:3px 9px; border-radius:999px;
+      color:#0b4f82; background:#e8f2fb; border:1px solid #b8d6eb; font-size:.75rem; font-weight:800; }}
+    .summary-stats {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:1px;
+      overflow:hidden; margin:11px 0 0; padding:1px; background:var(--border); border-radius:7px; }}
+    .summary-stat {{ min-width:0; padding:9px 11px; background:var(--surface); }}
+    .summary-stat dt {{ color:var(--text-muted); font-size:.76rem; font-weight:650; }}
+    .summary-stat dd {{ margin:3px 0 0; color:#17324d; font-weight:800; overflow-wrap:anywhere; }}
+    .run-state {{ display:inline-flex; align-items:center; gap:6px; padding:4px 9px; border-radius:999px;
+      background:#edf2f7; color:var(--neutral); border:1px solid #cbd5e1;
+      font-size:.77rem; font-weight:800; white-space:nowrap; }}
+    .run-state::before {{ content:""; width:7px; height:7px; border-radius:50%; background:currentColor; }}
+    .run-state.completed {{ background:#e6fffa; color:var(--success); border-color:#9ae6d3; }}
+    .run-state.running {{ background:#e8f2fb; color:var(--primary); border-color:#b8d6eb; }}
+    .run-state.attention {{ background:#fff8e7; color:var(--warning); border-color:#e7c978; }}
+    .run-state.failed {{ background:#fff1f0; color:var(--danger); border-color:#f3b6b0; }}
+    .filter-panel[hidden] {{ display:none !important; }}
+    .filter-panel {{ position:relative; }}
+    .filter-heading {{ margin:0 0 10px; color:var(--text); font-size:1.16rem; font-weight:750; }}
+    .filter-grid {{ display:grid; grid-template-columns:minmax(190px,1fr) minmax(150px,.65fr)
+      minmax(160px,.75fr) auto; gap:10px; align-items:end; }}
+    .filter-field {{ position:relative; min-width:0; }}
+    .filter-field label {{ display:block; margin-bottom:5px; color:var(--text); font-size:.84rem; font-weight:700; }}
+    .filter-input,.filter-select {{ width:100%; min-height:40px; border:1px solid #9fb3c8;
+      border-radius:7px; padding:8px 10px; background:#fff; color:var(--text); font:inherit; }}
+    .filter-input:focus-visible,.filter-select:focus-visible,.filter-reset:focus-visible,
+    .suggestion-list [role="option"]:focus-visible {{ outline:3px solid var(--focus); outline-offset:2px; }}
+    .suggestion-list {{ position:absolute; z-index:20; left:0; right:0; top:calc(100% + 4px);
+      max-height:260px; overflow-y:auto; margin:0; padding:4px; list-style:none; background:#fff;
+      border:1px solid #9fb3c8; border-radius:8px; box-shadow:0 9px 24px #102a4326;
+      touch-action:pan-y; }}
+    .suggestion-list[hidden] {{ display:none !important; }}
+    .suggestion-list [role="option"] {{ display:flex; justify-content:space-between; gap:12px;
+      padding:8px 9px; border-radius:5px; cursor:pointer; }}
+    .suggestion-list [role="option"][aria-selected="true"],
+    .suggestion-list [role="option"]:hover {{ background:#e8f3fb; color:#17324d; }}
+    .suggestion-value {{ min-width:0; overflow-wrap:anywhere; font-weight:650; }}
+    .suggestion-direction {{ flex:0 0 auto; color:var(--text-muted); font-size:.78rem; }}
+    .filter-reset {{ min-height:40px; border:1px solid #9fb3c8; border-radius:7px; padding:8px 14px;
+      background:#fff; color:var(--primary); font:inherit; font-weight:700; cursor:pointer; white-space:nowrap; }}
+    .filter-reset:hover {{ background:#f0f7fc; }}
+    .filter-help {{ margin:9px 0 0; color:var(--text-muted); font-size:.82rem; }}
+    .filter-meta {{ display:flex; flex-wrap:wrap; align-items:center; gap:8px 16px; margin-top:9px; }}
+    .filter-counts {{ display:flex; flex-wrap:wrap; gap:6px; }}
+    .filter-count {{ display:inline-block; border-radius:999px; padding:3px 9px; background:#edf2f7;
+      color:var(--neutral); font-size:.78rem; font-weight:700; }}
+    .filter-status {{ min-height:1.5em; margin:0; color:var(--text-muted); font-size:.82rem; }}
+    .print-filter-summary {{ display:none; }}
+    .print-filter-summary[hidden] {{ display:none !important; }}
+    tr[hidden],.filter-empty-row[hidden] {{ display:none !important; }}
+    .table-wrap {{ overflow-x:auto; border:1px solid var(--border); border-radius:7px; background:#fff; }}
+    .table-wrap:focus-visible,summary:focus-visible {{ outline:3px solid var(--focus); outline-offset:2px; }}
+    table {{ width:100%; min-width:900px; border-collapse:collapse; font-size:.87rem; }}
+    th,td {{ padding:9px 10px; border-bottom:1px solid var(--border); text-align:left; vertical-align:top; }}
+    th {{ background:var(--surface-muted); color:#17324d; position:sticky; top:0;
+      white-space:nowrap; font-size:.79rem; }}
+    tbody tr:nth-child(even) {{ background:#fbfdff; }}
+    tbody tr:hover {{ background:#f2f8fc; }}
     tr:last-child td {{ border-bottom:0; }}
+    .protocol-cell,.endpoint-cell,.time-cell {{ white-space:nowrap; font-variant-numeric:tabular-nums; }}
+    .protocol-cell,.endpoint-cell {{ color:#17324d; font-weight:700; }}
+    .time-cell,.device-cell {{ color:var(--text-muted); }}
+    .device-cell {{ max-width:240px; overflow-wrap:anywhere; }}
     .badge {{ display:inline-block; border-radius:999px; padding:3px 9px; font-size:.78rem;
-      font-weight:700; background:#e6fffa; color:var(--ok); white-space:nowrap; }}
-    .badge.missed {{ background:#fffaf0; color:var(--warn); }}
-    .badge.closed {{ background:#fff5f5; color:var(--closed); }}
-    .badge.observed {{ background:#edf2f7; color:#486581; }}
+      font-weight:700; background:#e6fffa; color:var(--success); border:1px solid transparent;
+      white-space:nowrap; }}
+    .badge.missed {{ background:#fff8e7; color:var(--warning); }}
+    .badge.closed {{ background:#fff1f0; color:var(--danger); }}
+    .badge.observed {{ background:#edf2f7; color:var(--neutral); }}
     details {{ border:0; }}
-    summary {{ cursor:pointer; color:var(--blue); font-weight:700; padding:6px 0 13px; }}
+    summary {{ cursor:pointer; color:var(--primary); font-weight:700; padding:9px 11px;
+      border:1px solid var(--border); border-radius:7px; background:#f8fafc; }}
+    summary:hover {{ color:var(--primary-hover); background:#f0f7fc; }}
     .history-toggle:not([open]) + .details-body {{ display:none; }}
     .history-toggle[open] + .details-body {{ display:block; }}
     .details-body {{ padding-top:2px; }}
-    .muted {{ color:var(--muted); }}
+    .muted {{ color:var(--text-muted); }}
     .sr-only {{ position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden;
       clip:rect(0,0,0,0); white-space:nowrap; border:0; }}
-    .footer {{ padding:0 0 24px; color:var(--muted); font-size:.82rem; }}
+    .footer {{ padding:0 0 20px; color:var(--text-muted); font-size:.8rem; }}
     @media (max-width:850px) {{
       .header-inner,.content,.footer {{ width:min(100% - 20px,1240px); }}
-      section,.result-summary {{ padding:14px; }}
-      .grid {{ grid-template-columns:repeat(auto-fit,minmax(145px,1fr)); }}
+      section {{ padding:14px; }}
+      .summary-stats {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
+      .filter-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
     }}
-    @media (max-width:520px) {{ .grid {{ grid-template-columns:1fr; }} .header {{ padding:18px 10px; }} }}
+    @media (max-width:720px) {{
+      .header-inner {{ align-items:flex-start; }}
+      .flow-panel {{ grid-template-columns:1fr; gap:9px; padding:12px; }}
+      .endpoint.destination {{ text-align:left; }} .direction {{ text-align:left; min-width:0; }}
+      .direction-arrow {{ transform:rotate(90deg); transform-origin:left center; margin-left:8px; }}
+    }}
+    @media (max-width:520px) {{
+      .header-inner {{ display:block; }} .run-state {{ margin-top:9px; }}
+      .filter-grid {{ grid-template-columns:1fr; }}
+      .filter-reset {{ width:100%; }}
+    }}
+    @media (max-width:360px) {{
+      .summary-stats {{ grid-template-columns:1fr; }}
+    }}
+    @media (forced-colors:active) {{
+      .header {{ border-bottom-color:Highlight; }}
+      .run-state,.direction-pill,.summary-stats,.flow-panel,.filter-input,.filter-select,
+      .filter-reset,.filter-count,.suggestion-list,.table-wrap,.badge,summary {{
+        border:1px solid CanvasText; forced-color-adjust:auto;
+      }}
+      .run-state::before {{ background:Highlight; }}
+      .filter-input:focus-visible,.filter-select:focus-visible,.filter-reset:focus-visible,
+      .suggestion-list [role="option"]:focus-visible,.table-wrap:focus-visible,summary:focus-visible {{
+        outline-color:Highlight;
+      }}
+    }}
     @page {{ size:A4 landscape; margin:10mm; }}
     @media print {{
-      body {{ background:#fff; color:#000; }} .header {{ background:#fff; color:#000; padding:0 0 10px; }}
-      .subtitle {{ color:#333; }} .header-inner,.content,.footer {{ width:100%; }} .content {{ padding:0; }}
-      section,.result-summary {{ box-shadow:none; border:1px solid #bbb; padding:10px; margin-bottom:8px; }}
-      section {{ border:0; border-radius:0; padding:0; }}
+      body {{ background:#fff; color:#000; }} .header {{ background:#fff; color:#000; padding:0 0 10px; border:0; }}
+      .product-name {{ color:#333; }} .header-inner,.content,.footer {{ width:100%; }} .content {{ padding:0; }}
+      section {{ border:0; border-radius:0; padding:0; margin-bottom:8px; }}
+      .flow-panel {{ grid-template-columns:minmax(0,1fr) auto minmax(0,1fr); gap:14px; background:#fff; }}
+      .endpoint.destination {{ text-align:right; }} .direction {{ min-width:94px; text-align:center; }}
+      .direction-arrow {{ transform:none; margin-left:0; }}
       .history-toggle {{ display:none; }} .history-toggle + .details-body {{ display:block !important; }}
+      .filter-panel {{ display:none !important; }} .print-filter-summary {{ display:block; margin:0 0 10px;
+        padding:7px 9px; border:1px solid #bbb; font-size:8.5pt; }}
       .table-wrap {{ overflow:visible; border:0; }} table {{ min-width:0; font-size:7.5pt; }}
       thead {{ display:table-header-group; }} th {{ position:static; }} th,td {{ padding:4px; overflow-wrap:anywhere; }}
-      .card,tr {{ break-inside:avoid; }}
+      .summary-stats,.flow-panel,tr {{ break-inside:avoid; }}
+      tbody tr:nth-child(even),tbody tr:hover {{ background:#fff; }}
     }}
   </style>
 </head>
 <body>
   <header class="header"><div class="header-inner">
-    <h1>세션 추적 결과</h1>
-    <p class="subtitle">저장된 세션 값을 조회 실행별로 정리한 보고서입니다.</p>
+    <div>
+      <p class="product-name">Aruba Session Tracker</p>
+      <h1>세션 추적 결과</h1>
+    </div>
+    <div class="run-state {_e(run_status_class)}">{_e(run_status)}</div>
   </div></header>
   <main class="content">
-    <div class="result-summary" aria-label="조회 결과 정보">
-      <div class="grid">
-        {_card("추적 시작", _format_kst(run.get("started_at")))}
-        {_card("추적 종료", _format_kst(run.get("ended_at")))}
-        {_card("출발지 IP", run.get("source_ip"))}
-        {_card("출발지 포트", run.get("source_port"))}
-        {_card("목적지 IP", run.get("destination_ip"))}
-        {_card("목적지 포트", run.get("destination_port"))}
-        {_card("검색 방향", query_direction)}
-        {_card("전체 관측", f"{_format_integer(snapshot.observation_total)}건")}
-        {_card("고유 세션", f"{_format_integer(total_sessions)}개")}
-        {_card("수집 상태", run_status)}
+    <section class="result-summary" aria-labelledby="query-summary-title">
+      <div class="summary-heading">
+        <h2 id="query-summary-title" class="summary-title">조회 요약</h2>
       </div>
-    </div>
+      <div class="flow-panel">
+        <div class="endpoint">
+          <span class="endpoint-label">조회 출발지</span>
+          <span class="endpoint-value">{_e(source_endpoint)}</span>
+        </div>
+        <div class="direction" aria-label="{_e(query_direction)} 검색">
+          <span class="direction-arrow" aria-hidden="true">{_e(direction_symbol)}</span>
+          <span class="direction-pill">{_e(query_direction)}</span>
+        </div>
+        <div class="endpoint destination">
+          <span class="endpoint-label">조회 목적지</span>
+          <span class="endpoint-value">{_e(destination_endpoint)}</span>
+        </div>
+      </div>
+      <dl class="summary-stats">
+        {_summary_stat("추적 시작", _format_kst(run.get("started_at")))}
+        {_summary_stat("추적 종료", _format_kst(run.get("ended_at")))}
+        {_summary_stat("전체 관측", f"{_format_integer(snapshot.observation_total)}건")}
+        {_summary_stat("고유 세션", f"{_format_integer(total_sessions)}개")}
+      </dl>
+    </section>
+
+    <section id="result-filter" class="filter-panel js-only" aria-labelledby="result-filter-title" hidden>
+      <h2 id="result-filter-title" class="filter-heading">결과 찾기</h2>
+      <div class="filter-grid">
+        <div class="filter-field">
+          <label for="filter-ip">IP 검색</label>
+          <input id="filter-ip" class="filter-input" type="text" role="combobox"
+            autocomplete="off" spellcheck="false" aria-autocomplete="list"
+            aria-controls="filter-ip-list" aria-expanded="false" aria-describedby="filter-help filter-status">
+          <div id="filter-ip-list" class="suggestion-list" role="listbox" aria-label="IP 추천값" hidden></div>
+        </div>
+        <div class="filter-field">
+          <label for="filter-protocol">프로토콜</label>
+          <select id="filter-protocol" class="filter-select" aria-label="프로토콜" aria-describedby="filter-status">
+            <option value="">전체</option>
+          </select>
+        </div>
+        <div class="filter-field">
+          <label for="filter-port">포트 검색</label>
+          <input id="filter-port" class="filter-input" type="text" role="combobox"
+            autocomplete="off" spellcheck="false" aria-autocomplete="list"
+            aria-controls="filter-port-list" aria-expanded="false" aria-describedby="filter-help filter-status">
+          <div id="filter-port-list" class="suggestion-list" role="listbox" aria-label="포트 추천값" hidden></div>
+        </div>
+        <button id="filter-reset" class="filter-reset" type="button">전체 초기화</button>
+      </div>
+      <p id="filter-help" class="filter-help">한 글자 이상 입력하면 최대 12개의 완성값을 추천합니다. 방향키와 Enter 또는 마우스로 선택할 수 있습니다.</p>
+      <div class="filter-meta">
+        <div class="filter-counts" aria-label="필터 결과 건수">
+          <span id="latest-filter-count" class="filter-count" aria-live="polite">최신 {_format_integer(displayed_latest)}/{_format_integer(displayed_latest)}건</span>
+          <span id="history-filter-count" class="filter-count" aria-live="polite">전체 {_format_integer(snapshot.observation_total)}/{_format_integer(snapshot.observation_total)}건</span>
+        </div>
+        <p id="filter-status" class="filter-status" role="status" aria-live="polite"></p>
+      </div>
+    </section>
+    <p id="print-filter-summary" class="print-filter-summary" hidden></p>
 
     <section id="latest-sessions">
       <h2>최신 세션 결과</h2>
       <p class="section-note">{_e(latest_note)}</p>
       <div class="table-wrap" role="region" aria-label="최신 세션 결과 표" tabindex="0"><table>
         <caption class="sr-only">최신 세션 결과</caption>
-        <thead><tr><th scope="col">마지막 확인 시각</th><th scope="col">장비명</th><th scope="col">프로토콜</th><th scope="col">출발지 IP:포트</th><th scope="col">목적지 IP:포트</th><th scope="col">추적 상태</th></tr></thead>
-        <tbody>{latest_rows or _empty_row(6, "관측된 세션이 없습니다.")}</tbody>
+        <thead><tr><th scope="col">프로토콜</th><th scope="col">출발지 IP·포트</th><th scope="col">목적지 IP·포트</th><th scope="col">추적 상태</th><th scope="col">마지막 확인</th><th scope="col">장비</th></tr></thead>
+        <tbody id="latest-results-body">{latest_rows or _empty_row(6, "관측된 세션이 없습니다.")}
+          <tr id="latest-filter-empty" class="filter-empty-row" hidden><td colspan="6" class="muted">선택한 필터와 일치하는 세션이 없습니다.</td></tr>
+        </tbody>
       </table></div>
     </section>
 
     <section id="observation-history">
       <h2>전체 추적 이력</h2>
       <details class="history-toggle">
-        <summary aria-controls="observation-history-body">전체 추적 이력 {_format_integer(snapshot.observation_total)}건 보기</summary>
+        <summary id="history-filter-summary" aria-controls="observation-history-body">전체 추적 이력 {_format_integer(snapshot.observation_total)}/{_format_integer(snapshot.observation_total)}건 보기</summary>
       </details>
       <div class="details-body" id="observation-history-body">
           <p class="section-note">저장된 관측 결과를 시간순으로 모두 표시합니다.</p>
           <div class="table-wrap" role="region" aria-label="전체 추적 이력 표" tabindex="0"><table>
             <caption class="sr-only">전체 추적 이력</caption>
-            <thead><tr><th scope="col">확인 시각</th><th scope="col">장비명</th><th scope="col">프로토콜</th><th scope="col">출발지 IP:포트</th><th scope="col">목적지 IP:포트</th><th scope="col">추적 상태</th></tr></thead>
-            <tbody>"""
+            <thead><tr><th scope="col">프로토콜</th><th scope="col">출발지 IP·포트</th><th scope="col">목적지 IP·포트</th><th scope="col">추적 상태</th><th scope="col">확인 시각</th><th scope="col">장비</th></tr></thead>
+            <tbody id="history-results-body">"""
     history_count = 0
     for row in history:
         history_count += 1
         yield _observation_row(row, "관측됨")
     if history_count == 0:
         yield _empty_row(6, "저장된 관측 이력이 없습니다.")
-    yield """</tbody>
+    yield """<tr id="history-filter-empty" class="filter-empty-row" hidden><td colspan="6" class="muted">선택한 필터와 일치하는 세션이 없습니다.</td></tr>
+            </tbody>
           </table></div>
       </div>
     </section>
   </main>
   <footer class="footer">Aruba Session Tracker 결과 보고서</footer>
+  <script>"""
+    yield _FILTER_SCRIPT
+    yield """</script>
 </body>
 </html>
 """
@@ -296,11 +919,8 @@ def _write_html_chunks_atomic(destination: Path | str, chunks: Iterable[str]) ->
     return path
 
 
-def _card(label: str, value: object) -> str:
-    return (
-        f'<div class="card"><div class="label">{_e(label)}</div>'
-        f'<span class="value">{_e(value)}</span></div>'
-    )
+def _summary_stat(label: str, value: object) -> str:
+    return f'<div class="summary-stat"><dt>{_e(label)}</dt><dd>{_e(value)}</dd></div>'
 
 
 def _group_observations(
@@ -377,14 +997,19 @@ def _lifecycle_status(value: object) -> str | None:
 
 
 def _observation_row(row: ReportRow, status: str) -> str:
+    protocol = _protocol(row.get("protocol"))
     return (
-        "<tr>"
-        f"<td>{_e(_format_kst(row.get('observed_at')))}</td>"
-        f"<td>{_e(row.get('controller_name'))}</td>"
-        f"<td>{_e(_protocol(row.get('protocol')))}</td>"
-        f"<td>{_e(_endpoint(row.get('source_ip'), row.get('source_port')))}</td>"
-        f"<td>{_e(_endpoint(row.get('destination_ip'), row.get('destination_port')))}</td>"
-        f"<td>{_tracking_badge(status)}</td>"
+        f'<tr class="report-row" data-source-ip="{_filter_attribute(row.get("source_ip"))}" '
+        f'data-destination-ip="{_filter_attribute(row.get("destination_ip"))}" '
+        f'data-source-port="{_filter_attribute(row.get("source_port"))}" '
+        f'data-destination-port="{_filter_attribute(row.get("destination_port"))}" '
+        f'data-protocol="{_filter_attribute(protocol)}">'
+        f'<td class="protocol-cell">{_e(protocol)}</td>'
+        f'<td class="endpoint-cell">{_e(_endpoint(row.get("source_ip"), row.get("source_port")))}</td>'
+        f'<td class="endpoint-cell">{_e(_endpoint(row.get("destination_ip"), row.get("destination_port")))}</td>'
+        f'<td class="status-cell">{_tracking_badge(status)}</td>'
+        f'<td class="time-cell">{_e(_format_kst(row.get("observed_at")))}</td>'
+        f'<td class="device-cell">{_e(row.get("controller_name"))}</td>'
         "</tr>"
     )
 
@@ -420,7 +1045,11 @@ def _endpoint(address: object, port: object) -> str:
     if address_text == "-":
         return "-"
     port_text = _plain(port)
-    return address_text if port_text == "-" else f"{address_text}:{port_text}"
+    if port_text == "-":
+        return address_text
+    if ":" in address_text and not (address_text.startswith("[") and address_text.endswith("]")):
+        address_text = f"[{address_text}]"
+    return f"{address_text}:{port_text}"
 
 
 def _protocol(value: object) -> str:
@@ -487,6 +1116,11 @@ def _plain(value: object) -> str:
 
 def _e(value: object) -> str:
     return escape(_plain(value), quote=True)
+
+
+def _filter_attribute(value: object) -> str:
+    text = _plain(value)
+    return "" if text == "-" else escape(text, quote=True)
 
 
 def _empty_row(columns: int, message: str) -> str:

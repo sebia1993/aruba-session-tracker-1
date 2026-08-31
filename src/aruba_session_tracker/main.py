@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import hmac
 import re
 import sys
@@ -13,6 +15,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QEvent, QEventLoop, Qt, QTimer
 from PySide6.QtGui import QKeyEvent
+from PySide6.QtNetwork import QSslSocket
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from aruba_session_tracker import __version__
@@ -51,6 +54,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--gui-smoke-test", action="store_true")
     parser.add_argument("--report-smoke-test", type=Path)
+    parser.add_argument("--tls-backend-smoke", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--loopback-ssh-smoke",
         choices=("success", "auth-failure"),
@@ -68,6 +72,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if options.report_smoke_test is not None:
         return _report_smoke_test(options.report_smoke_test)
+    if options.tls_backend_smoke:
+        return _tls_backend_smoke()
     if options.loopback_ssh_smoke is not None:
         if options.loopback_ssh_port is None or options.loopback_ssh_fingerprint is None:
             parser.error("loopback SSH smoke requires port and fingerprint")
@@ -224,6 +230,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     return exit_code
 
 
+def _tls_backend_smoke() -> int:
+    available = tuple(str(value).casefold() for value in QSslSocket.availableBackends())
+    active = str(QSslSocket.activeBackend()).casefold()
+    if "schannel" not in available or "openssl" in available or active != "schannel":
+        print(
+            "ARUBA_SESSION_TRACKER_TLS_BACKEND_FAILED "
+            f"active={active or '-'} available={','.join(available) or '-'}",
+            file=sys.stderr,
+        )
+        return 1
+    print("ARUBA_SESSION_TRACKER_TLS_BACKEND_OK active=schannel")
+    return 0
+
+
 def _initialize_runtime(paths: AppPaths) -> _RuntimeBundle:
     paths.ensure()
     repository = ConfigRepository(paths.config)
@@ -327,10 +347,23 @@ def _report_smoke_test(destination: Path) -> int:
     text = written.read_text(encoding="utf-8")
     required = (
         "세션 추적 결과",
+        "결과 찾기",
         "최신 세션 결과",
         "전체 추적 이력",
+        "조회 출발지",
+        "출발지 IP·포트",
+        "목적지 IP·포트",
         "KST",
         "한국어-MD",
+        'id="result-filter"',
+        'id="filter-ip"',
+        'id="filter-protocol"',
+        'id="filter-port"',
+        'class="report-row"',
+        'class="flow-panel"',
+        'class="summary-stats"',
+        'class="protocol-cell"',
+        "script-src 'sha256-",
     )
     forbidden = (
         "PACKAGE-RAW-CANARY",
@@ -342,8 +375,16 @@ def _report_smoke_test(destination: Path) -> int:
         "세션별 수치 변화",
         "패킷",
         "바이트",
+        "XMLHttpRequest",
+        "WebSocket",
+        "navigator.clipboard",
+        "localStorage",
+        "sessionStorage",
+        "eval(",
     )
-    section_positions = tuple(text.find(marker) for marker in ("최신 세션 결과", "전체 추적 이력"))
+    section_positions = tuple(
+        text.find(marker) for marker in ("결과 찾기", "최신 세션 결과", "전체 추적 이력")
+    )
     history_markers = (
         '<details class="history-toggle">',
         '<div class="details-body" id="observation-history-body">',
@@ -355,6 +396,7 @@ def _report_smoke_test(destination: Path) -> int:
         or any(marker in text for marker in forbidden)
         or section_positions != tuple(sorted(section_positions))
         or any(marker not in text for marker in history_markers)
+        or not _report_filter_script_is_hash_authorized(text)
         or "<details open" in text
         or "https://" in text.casefold()
         or "http://" in text.casefold()
@@ -363,6 +405,14 @@ def _report_smoke_test(destination: Path) -> int:
         return 1
     print(f"ARUBA_SESSION_TRACKER_REPORT_SMOKE_OK {__version__}")
     return 0
+
+
+def _report_filter_script_is_hash_authorized(text: str) -> bool:
+    scripts = re.findall(r"<script>(.*?)</script>", text, flags=re.IGNORECASE | re.DOTALL)
+    if len(scripts) != 1:
+        return False
+    digest = base64.b64encode(hashlib.sha256(scripts[0].encode("utf-8")).digest()).decode("ascii")
+    return f"script-src 'sha256-{digest}'" in text
 
 
 def _loopback_runtime_smoke(port: int, fingerprint: str, mode: str) -> int:

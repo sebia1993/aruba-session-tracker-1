@@ -17,9 +17,18 @@ from aruba_session_tracker.commands import (
     build_datapath_session_command,
     build_global_user_command,
 )
-from aruba_session_tracker.models import AppConfig, Credentials, DeviceTarget, QueryRequest
+from aruba_session_tracker.models import (
+    AppConfig,
+    Credentials,
+    DeviceTarget,
+    DiagnosticEvent,
+    ErrorCode,
+    QueryRequest,
+    SessionObservation,
+)
 from aruba_session_tracker.paths import AppPaths
-from aruba_session_tracker.runtime import RuntimeExecutor
+from aruba_session_tracker.runtime import RuntimeExecutor, _one_shot_status
+from aruba_session_tracker.services import QueryOutcome
 from aruba_session_tracker.storage import SessionStore
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -244,6 +253,49 @@ def test_runtime_one_shot_cancellation_is_persisted_as_cancelled(tmp_path: Path)
     assert len(runs) == 1
     assert runs[0]["status"] == "CANCELLED"
     assert len(outcome.diagnostics) == 1
+
+
+def test_one_shot_status_is_completed_for_authoritative_empty_result() -> None:
+    assert _one_shot_status(QueryOutcome(authoritative=True)) == "COMPLETED"
+
+
+def test_one_shot_status_is_partial_only_when_positive_evidence_remains() -> None:
+    observation = SessionObservation(
+        controller_name="MD-1",
+        controller_host="198.51.100.11",
+        protocol=6,
+        source_ip="192.0.2.10",
+        destination_ip="203.0.113.20",
+        source_port=54321,
+        destination_port=443,
+    )
+    outcome = QueryOutcome(
+        observations=(observation,),
+        diagnostics=(DiagnosticEvent("MD_QUERY", ErrorCode.MD_UNREACHABLE, "sanitized"),),
+        authoritative=False,
+    )
+
+    assert _one_shot_status(outcome) == "PARTIAL"
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        ErrorCode.PARSE_PARTIAL,
+        ErrorCode.COMMAND_REJECTED,
+        ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+        ErrorCode.MD_UNREACHABLE,
+    ],
+)
+def test_one_shot_status_is_failed_for_zero_observation_technical_failure(
+    code: ErrorCode,
+) -> None:
+    outcome = QueryOutcome(
+        diagnostics=(DiagnosticEvent("QUERY", code, "sanitized"),),
+        authoritative=False,
+    )
+
+    assert _one_shot_status(outcome) == "FAILED"
 
 
 def test_runtime_retries_one_shot_finalization_before_the_next_query(

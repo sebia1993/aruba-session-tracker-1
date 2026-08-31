@@ -132,6 +132,8 @@ class _ActiveSession:
     last_seen: datetime
     miss_count: int
     observation: SessionObservation
+    controller_observations: dict[str, SessionObservation]
+    confirmed_controller_observation: SessionObservation | None
 
     def snapshot(self) -> SessionInstance:
         return SessionInstance(
@@ -290,7 +292,11 @@ class MonitorEngine:
             >= self._service.config.location_interval_seconds
         )
         required_controller_hosts = tuple(
-            dict.fromkeys(item.observation.controller_host for item in active.values())
+            dict.fromkeys(
+                controller_host
+                for item in active.values()
+                for controller_host in item.controller_observations
+            )
         )
         outcome = self._query(
             token,
@@ -333,6 +339,7 @@ class MonitorEngine:
                     last_location_refresh = self._monotonic_clock()
                     fallback_devices = self._matched_fallback_devices(refreshed)
 
+        outcome = _with_controller_overlap_diagnostic(outcome)
         events: list[LifecycleEvent] = []
         observed_flows = {_flow_key(item) for item in outcome.observations}
         prospective_flows = set(active) | observed_flows
@@ -561,13 +568,19 @@ class MonitorEngine:
         *,
         absence_is_authoritative: bool,
     ) -> list[LifecycleEvent]:
-        observed_by_flow = {_flow_key(item): item for item in observations}
+        observed_by_flow = _group_observations_by_flow(observations)
         now = self._wall_clock()
         events: list[LifecycleEvent] = []
 
-        for flow_key, observation in observed_by_flow.items():
+        for flow_key, current_controller_observations in observed_by_flow.items():
             active = active_sessions.get(flow_key)
             if active is None:
+                observation = _representative_observation(current_controller_observations)
+                confirmed = (
+                    observation
+                    if absence_is_authoritative and len(current_controller_observations) == 1
+                    else None
+                )
                 active = _ActiveSession(
                     instance_id=str(uuid.uuid4()),
                     flow_key=flow_key,
@@ -575,6 +588,8 @@ class MonitorEngine:
                     last_seen=now,
                     miss_count=0,
                     observation=observation,
+                    controller_observations=dict(current_controller_observations),
+                    confirmed_controller_observation=confirmed,
                 )
                 active_sessions[flow_key] = active
                 events.append(
@@ -588,7 +603,28 @@ class MonitorEngine:
                 continue
 
             previous = active.observation
+            previous_confirmed = active.confirmed_controller_observation
             previous_miss_count = active.miss_count
+            if absence_is_authoritative:
+                active.controller_observations = dict(current_controller_observations)
+            else:
+                # A failed required-controller query cannot prove that its last
+                # positive observation disappeared.  Retain that controller in
+                # the next poll scope while merging every new positive result.
+                active.controller_observations.update(current_controller_observations)
+
+            preferred_host = (
+                previous_confirmed.controller_host
+                if previous_confirmed is not None
+                and previous_confirmed.controller_host in current_controller_observations
+                else previous.controller_host
+                if previous.controller_host in current_controller_observations
+                else None
+            )
+            observation = _representative_observation(
+                current_controller_observations,
+                preferred_host=preferred_host,
+            )
             active.observation = observation
             active.last_seen = now
             active.miss_count = 0
@@ -602,36 +638,62 @@ class MonitorEngine:
                         occurred_at=now,
                     )
                 )
-            if previous.controller_host != observation.controller_host:
+
+            # Only an authoritative singleton can establish controller
+            # ownership.  An overlap (or any partial poll) remains positive
+            # evidence but must not manufacture a controller transition.
+            confirmed_transition = (
+                previous_confirmed
+                if absence_is_authoritative and len(current_controller_observations) == 1
+                else None
+            )
+            if (
+                confirmed_transition is not None
+                and confirmed_transition.controller_host != observation.controller_host
+            ):
                 events.append(
                     LifecycleEvent(
                         LifecycleEventType.CONTROLLER_CHANGED,
                         active.instance_id,
                         observation,
-                        previous_observation=previous,
+                        previous_observation=confirmed_transition,
                         occurred_at=now,
                     )
                 )
-            if previous.flags != observation.flags:
+            if confirmed_transition is not None and confirmed_transition.flags != observation.flags:
                 events.append(
                     LifecycleEvent(
                         LifecycleEventType.FLAGS_CHANGED,
                         active.instance_id,
                         observation,
-                        previous_observation=previous,
+                        previous_observation=confirmed_transition,
                         occurred_at=now,
                     )
                 )
-            if _counter_reset_or_identity_changed(previous, observation):
+            if confirmed_transition is not None and _counter_reset_or_identity_changed(
+                confirmed_transition, observation
+            ):
                 events.append(
                     LifecycleEvent(
                         LifecycleEventType.COUNTERS_CHANGED,
                         active.instance_id,
                         observation,
-                        previous_observation=previous,
+                        previous_observation=confirmed_transition,
                         occurred_at=now,
                     )
                 )
+
+            if absence_is_authoritative and len(current_controller_observations) == 1:
+                active.confirmed_controller_observation = observation
+            elif (
+                previous_confirmed is not None
+                and previous_confirmed.controller_host in current_controller_observations
+            ):
+                # Refresh the baseline for the previously confirmed owner while
+                # deliberately keeping ownership unresolved during overlap.
+                active.confirmed_controller_observation = current_controller_observations[
+                    previous_confirmed.controller_host
+                ]
 
         for flow_key, active in tuple(active_sessions.items()):
             if flow_key in observed_by_flow:
@@ -673,6 +735,8 @@ def _clone_active(active: dict[str, _ActiveSession]) -> dict[str, _ActiveSession
             last_seen=item.last_seen,
             miss_count=item.miss_count,
             observation=item.observation,
+            controller_observations=dict(item.controller_observations),
+            confirmed_controller_observation=item.confirmed_controller_observation,
         )
         for flow_key, item in active.items()
     }
@@ -708,14 +772,63 @@ def _flow_key(observation: SessionObservation) -> str:
     )
 
 
+def _group_observations_by_flow(
+    observations: tuple[SessionObservation, ...],
+) -> dict[str, dict[str, SessionObservation]]:
+    grouped: dict[str, dict[str, SessionObservation]] = {}
+    for observation in observations:
+        grouped.setdefault(_flow_key(observation), {})[observation.controller_host] = observation
+    return grouped
+
+
+def _representative_observation(
+    controller_observations: dict[str, SessionObservation],
+    *,
+    preferred_host: str | None = None,
+) -> SessionObservation:
+    if preferred_host is not None and preferred_host in controller_observations:
+        return controller_observations[preferred_host]
+    return min(
+        controller_observations.values(),
+        key=lambda item: (item.controller_host, item.controller_name, item.session_key),
+    )
+
+
+def _with_controller_overlap_diagnostic(outcome: QueryOutcome) -> QueryOutcome:
+    overlaps = any(
+        len(controller_observations) > 1
+        for controller_observations in _group_observations_by_flow(outcome.observations).values()
+    )
+    if not overlaps or any(
+        item.code is ErrorCode.DUPLICATE_FLOW_ACROSS_CONTROLLERS for item in outcome.diagnostics
+    ):
+        return outcome
+    return replace(
+        outcome,
+        diagnostics=(
+            *outcome.diagnostics,
+            DiagnosticEvent(
+                stage="MONITOR_STATE",
+                code=ErrorCode.DUPLICATE_FLOW_ACROSS_CONTROLLERS,
+                message=(
+                    "동일 흐름이 여러 MD에서 동시에 관측되어 Controller 변경 확정을 보류했습니다."
+                ),
+            ),
+        ),
+    )
+
+
 def _merge_outcomes(first: QueryOutcome, second: QueryOutcome) -> QueryOutcome:
     """Retain first-pass evidence while the refreshed pass determines authority/data."""
-    observations = {_flow_key(item): item for item in first.observations}
-    second_observations = {_flow_key(item): item for item in second.observations}
+    second_flow_keys = {_flow_key(item) for item in second.observations}
+    observations = {
+        item.session_key: item
+        for item in first.observations
+        if _flow_key(item) not in second_flow_keys
+    }
+    second_observations = {item.session_key: item for item in second.observations}
     superseded_keys = {
-        item.session_key
-        for flow_key, item in observations.items()
-        if flow_key in second_observations
+        item.session_key for item in first.observations if _flow_key(item) in second_flow_keys
     }
     observations.update(second_observations)
     first_remaining = {item.session_key: item for item in first.observations}

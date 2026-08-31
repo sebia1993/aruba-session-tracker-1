@@ -1,0 +1,12 @@
+OpenSSL runtime notice
+======================
+
+This distribution includes unmodified OpenSSL shared libraries supplied with
+the CPython runtime used to build the portable application. The cryptography
+native extension also contains a statically linked OpenSSL implementation.
+
+Copyright The OpenSSL Project Authors. All Rights Reserved.
+
+Licensed under the Apache License 2.0. The exact shared and statically linked
+runtime versions and containing-file hashes are recorded in BUILD_INFO.json,
+THIRD_PARTY_COMPONENTS.json, and sbom.cdx.json.

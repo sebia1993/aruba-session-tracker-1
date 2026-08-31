@@ -22,6 +22,7 @@ from typing import Self
 import paramiko
 import pytest
 
+import aruba_session_tracker.collectors.ssh as ssh_module
 from aruba_session_tracker.collectors import (
     CancellationToken,
     CollectorError,
@@ -395,8 +396,9 @@ def test_loopback_paramiko_server_approves_host_key_and_collects_command(
         target = DeviceTarget("loopback-fixture", _LOOPBACK, server.port)
         credentials = Credentials(server.username, server.password)
         approvals: list[str] = []
+        collector = _collector(server, tmp_path / "known_hosts")
 
-        batch = _collector(server, tmp_path / "known_hosts").collect(
+        batch = collector.collect(
             target,
             credentials,
             ("no paging", "show datapath session table 192.0.2.20"),
@@ -412,6 +414,94 @@ def test_loopback_paramiko_server_approves_host_key_and_collects_command(
         assert "no paging" in server.commands
         assert "show datapath session table 192.0.2.20" in server.commands
         assert True in server.auth_results
+        assert server.accepted_connections == 2
+
+        collector.collect(
+            target,
+            credentials,
+            ("no paging",),
+            host_key_approval=lambda _target, _info: pytest.fail("known host requested approval"),
+            deadline=PollDeadline.after(10),
+        )
+
+        # First trust uses one probe plus one authenticated connection. Once the
+        # target token is known, the actual strict connection is sufficient.
+        assert server.accepted_connections == 3
+        assert server.auth_results.count(True) == 2
+
+
+@pytest.mark.integration
+def test_loopback_known_host_key_change_is_blocked_without_a_probe(tmp_path: Path) -> None:
+    with _LoopbackSshServer() as server:
+        target = DeviceTarget("loopback-fixture", _LOOPBACK, server.port)
+        credentials = Credentials(server.username, server.password)
+        known_hosts = tmp_path / "known_hosts"
+        wrong_key = paramiko.RSAKey.generate(1024)
+        host_keys = paramiko.HostKeys()
+        host_keys.add(f"[{target.host}]:{target.port}", wrong_key.get_name(), wrong_key)
+        host_keys.save(str(known_hosts))
+
+        with pytest.raises(CollectorError) as caught:
+            _collector(server, known_hosts).collect(
+                target,
+                credentials,
+                ("no paging",),
+                host_key_approval=lambda _target, _info: pytest.fail(
+                    "known host requested approval"
+                ),
+                deadline=PollDeadline.after(10),
+            )
+
+        assert caught.value.code is ErrorCode.HOST_KEY_CHANGED
+        assert caught.value.retryable_network is False
+        assert server.accepted_connections == 1
+        assert server.auth_results == []
+
+
+@pytest.mark.integration
+def test_loopback_connection_uses_locked_host_key_snapshot_after_file_replacement(
+    tmp_path: Path,
+) -> None:
+    with _LoopbackSshServer() as server:
+        target = DeviceTarget("loopback-fixture", _LOOPBACK, server.port)
+        credentials = Credentials(server.username, server.password)
+        known_hosts = tmp_path / "known_hosts"
+        originally_trusted_key = paramiko.RSAKey.generate(1024)
+        host_token = f"[{target.host}]:{target.port}"
+        host_keys = paramiko.HostKeys()
+        host_keys.add(host_token, originally_trusted_key.get_name(), originally_trusted_key)
+        host_keys.save(str(known_hosts))
+
+        factory = StrictNetmikoFactory(known_hosts, connect_timeout=3.0)
+        production_connector = ssh_module._connect_read_only_aruba
+
+        def replace_file_then_connect(**kwargs: object) -> object:
+            replacement = paramiko.HostKeys()
+            replacement.add(host_token, server.host_key.get_name(), server.host_key)
+            replacement.save(str(known_hosts))
+            return production_connector(**kwargs)
+
+        # Keep the production strict/single-socket flags while injecting the
+        # replacement at the exact boundary between safe loading and connect.
+        factory._connector = replace_file_then_connect
+        collector = SSHCollector(factory, command_timeout=3.0)
+
+        with pytest.raises(CollectorError) as caught:
+            collector.collect(
+                target,
+                credentials,
+                ("no paging",),
+                host_key_approval=lambda _target, _info: pytest.fail(
+                    "known host requested approval"
+                ),
+                deadline=PollDeadline.after(10),
+            )
+
+        assert caught.value.code is ErrorCode.HOST_KEY_CHANGED
+        assert caught.value.retryable_network is False
+        assert paramiko.HostKeys(str(known_hosts)).check(host_token, server.host_key) is True
+        assert server.accepted_connections == 1
+        assert server.auth_results == []
 
 
 @pytest.mark.integration
@@ -499,9 +589,9 @@ def test_repeated_loopback_ssh_connections_release_threads_and_handles(tmp_path:
     final = result["final"]
 
     assert result["repeats"] == repeats
-    # Each collection has one Paramiko host-key probe and one authenticated
-    # Netmiko session. Hidden reconnects would indicate an unstable boundary.
-    assert result["accepted_connections"] == repeats * 2
+    # Initial trust has one probe and one authenticated session. Every repeated
+    # known-host collection after that has only the strict authenticated session.
+    assert result["accepted_connections"] == repeats + 1
     assert result["authenticated_sessions"] == repeats
     assert result["collected_commands"] == repeats
     assert result["approvals"] == 1

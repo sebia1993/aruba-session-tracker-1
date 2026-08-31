@@ -422,6 +422,7 @@ class TrackerService:
                 if exc.code in {
                     ErrorCode.AUTH_FAILED,
                     ErrorCode.CANCELLED,
+                    ErrorCode.COMMAND_REJECTED,
                     ErrorCode.HOST_KEY_CHANGED,
                     ErrorCode.HOST_KEY_UNKNOWN,
                 }:
@@ -465,7 +466,10 @@ class TrackerService:
                     )
                 )
                 authoritative = False
-                if parse_code is ErrorCode.OUTPUT_LIMIT_EXCEEDED:
+                if parse_code in {
+                    ErrorCode.COMMAND_REJECTED,
+                    ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+                }:
                     break
                 continue
             if not budget.consume_observations(len(parsed)):

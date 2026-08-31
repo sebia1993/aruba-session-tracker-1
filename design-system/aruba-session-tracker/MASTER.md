@@ -111,6 +111,9 @@ Avoid:
 | `danger` | `#B42318` | stop and destructive action |
 | `terminal-bg` | `#111C27` | Raw CLI surface |
 | `terminal-text` | `#DCE7F2` | Raw CLI text |
+| `state-success` | `#0B5D46` | 정상 상태 텍스트 |
+| `state-warning` | `#765000` | 재시도 상태 텍스트 |
+| `state-danger` | `#981B1B` | 확인 필요 상태 텍스트 |
 
 All normal text/background pairs must target at least WCAG AA contrast. Field
 validation on real Windows high-contrast mode remains required because Qt style
@@ -144,10 +147,11 @@ be checked at 100%, 125%, and 150% rather than assumed to be physical pixels.
 
 ### 8.1 Tabs
 
-The three main tabs are peer-level operational destinations. Selected state
-uses text weight, border, and surface change—not color alone. Detail tabs are
-visually subordinate to the main navigation. The setup guide remains the first
-visible recovery path when MM/MD targets have not yet been configured.
+The three main tabs are peer-level operational destinations on a compact navy
+operations bar. Selected state uses text weight, a light underline, and surface
+change—not color alone. Detail tabs are visually subordinate to the main
+navigation. The setup guide remains the first visible recovery path when MM/MD
+targets have not yet been configured.
 
 ### 8.2 Group boxes
 
@@ -177,6 +181,17 @@ Operational actions retain text labels. Hover, pressed, focus, checked, and
 disabled states must remain distinguishable. `지속 모니터링 시작` remains the
 default primary action; `현재 조회` remains a secondary one-time action.
 
+The operator-state label uses a separate presentation-only `stateRole` while
+always retaining the fixed Korean text:
+
+| `stateRole` | Text |
+|---|---|
+| `neutral` | `대기` |
+| `active` | `조회 중` |
+| `success` | `정상` |
+| `warning` | `재시도 중` |
+| `danger` | `확인 필요` |
+
 ### 8.5 Tables
 
 - Use alternating rows and a quiet horizontal separator.
@@ -184,7 +199,9 @@ default primary action; `현재 조회` remains a secondary one-time action.
 - Keep row selection explicit.
 - Do not enable sorting unless selection-to-raw-data mapping is verified.
 - Do not truncate status meaning without a full-value access path.
-- Existing column names and stored values remain unchanged.
+- Existing column order, data, and stored values remain unchanged. User-facing
+  headers use clear Korean labels such as `장비`, `프로토콜`, `출발지 IP`, and
+  `목적지 IP` instead of mixed English abbreviations.
 
 ### 8.6 Raw CLI and diagnostics
 
@@ -208,13 +225,13 @@ messages and safe default buttons remain unchanged.
 ### Session Query
 
 1. Setup guide when required.
-2. Session-only credentials.
-3. Source/destination conditions.
-4. Progressive advanced conditions.
-5. Continuous monitoring, one-time current query, stop, and current state.
-6. MM/MD and result-count summary plus progressive detail controls.
-7. Session table.
-8. Raw CLI and diagnostics when explicitly expanded.
+2. Source/destination conditions and session-only credentials in one compact
+   two-column work area, with the query flow first.
+3. Progressive advanced conditions.
+4. Continuous monitoring, one-time current query, stop, and current state.
+5. MM/MD and result-count summary plus progressive detail controls.
+6. Session table.
+7. Raw CLI and diagnostics when explicitly expanded.
 
 ### Device Settings
 
@@ -225,8 +242,9 @@ messages and safe default buttons remain unchanged.
 
 ### History and Export
 
-1. Refresh/export actions.
-2. Selected and global deletion actions visually separated by danger level.
+1. Refresh/export actions on the left.
+2. Selected and global deletion actions on the right, visually separated by
+   spacing, section labels, and danger level.
 3. Run history table.
 4. plaintext retention warning.
 
@@ -249,8 +267,10 @@ messages and safe default buttons remain unchanged.
 
 The theme is applied after `MainWindow` construction so it supersedes the
 legacy local QSS while preserving all existing widget objects and callbacks.
-Only presentation properties, spacing, placeholders, table display options,
-and object names used solely for QSS are changed.
+Only presentation properties, spacing, placeholders, user-facing table labels,
+display-only status translation, and object names used solely for QSS are
+changed. Stored run status codes remain unchanged and are available from the
+status-cell tooltip.
 
 The following must remain unchanged:
 

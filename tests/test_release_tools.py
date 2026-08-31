@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
+import os
+import subprocess
+import sys
+import tomllib
 import zipfile
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -13,8 +19,10 @@ from tools.check_coverage_policy import (
     check_coverage_policy,
 )
 from tools.check_no_secrets import check
+from tools.check_packaging_environment import INJECTION_VARIABLES
 from tools.check_remote_release import ExpectedAsset, RemoteReleaseError, verify_release
 from tools.check_version import VersionError
+from tools.component_manifest import bundle_pattern_matches, native_bundle_paths
 from tools.continuous_release_state import (
     Action,
     AssetEvidence,
@@ -33,12 +41,16 @@ from tools.continuous_release_state import (
     validate_legacy_files,
     verify_rollback,
 )
+from tools.copy_runtime_licenses import copy_runtime_licenses
+from tools.finalize_sbom import finalize, resolve_component_manifest
 from tools.release_notes import build_release_notes
 from tools.verify_release import (
     ReleaseVerificationError,
     _packaged_environment,
     _safe_member,
+    _verify_native_components,
     _verify_packaged_report_text,
+    _verify_source_offer,
 )
 
 
@@ -68,6 +80,20 @@ def test_release_verifier_rejects_generated_html_report() -> None:
         _safe_member(zipfile.ZipInfo("ArubaSessionTracker/session-report.html"))
 
 
+@pytest.mark.parametrize(
+    "member",
+    (
+        "ArubaSessionTracker/_internal/qopensslbackend.dll.",
+        "ArubaSessionTracker/_internal/QOPENSSLBackend.DLL ",
+        "ArubaSessionTracker/_internal/NUL.dll",
+        "ArubaSessionTracker/_internal/native.dll:stream",
+    ),
+)
+def test_release_verifier_rejects_windows_path_aliases(member: str) -> None:
+    with pytest.raises(ReleaseVerificationError, match="unsafe Windows path alias"):
+        _safe_member(zipfile.ZipInfo(member))
+
+
 def test_packaged_smoke_environment_excludes_development_python(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -75,22 +101,526 @@ def test_packaged_smoke_environment_excludes_development_python(
     monkeypatch.setenv("PATH", r"C:\Python313;C:\Windows\System32")
     monkeypatch.setenv("PYTHONHOME", r"C:\Python313")
     monkeypatch.setenv("VIRTUAL_ENV", r"D:\repo\.venv")
+    monkeypatch.setenv("QT_PLUGIN_PATH", r"D:\host-qt\plugins")
+    monkeypatch.setenv("QML2_IMPORT_PATH", r"D:\host-qt\qml")
 
     environment = _packaged_environment()
 
     assert environment["PATH"] == r"C:\Windows\System32;C:\Windows"
-    assert "PYTHONHOME" not in environment
-    assert "VIRTUAL_ENV" not in environment
+    assert not (set(INJECTION_VARIABLES) & environment.keys())
+
+
+def _write_component_fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
+    bundle = tmp_path / "ArubaSessionTracker"
+    (bundle / "licenses").mkdir(parents=True)
+    (bundle / "native").mkdir()
+    (bundle / "licenses" / "fixture.txt").write_text("fixture license\n", encoding="utf-8")
+    (bundle / "native" / "required.dat").write_bytes(b"required")
+    (bundle / "native" / "runtime.dll").write_bytes(b"native fixture bytes")
+    manifest = tmp_path / "third_party_components.toml"
+    manifest.write_text(
+        """schema_version = 1
+resolved_manifest = "THIRD_PARTY_COMPONENTS.json"
+
+[policy]
+required_bundle_files = ["native/required.dat"]
+forbidden_bundle_globs = ["**/forbidden.dll", "**/qopensslbackend.dll"]
+
+[[components]]
+id = "fixture-runtime"
+name = "Fixture runtime"
+type = "library"
+version = "{python_version}"
+license_name = "Fixture license"
+license_files = ["licenses/fixture.txt"]
+source_urls = ["https://example.invalid/source/{python_version}"]
+files = ["native/runtime.dll"]
+""",
+        encoding="utf-8",
+    )
+    versions = {
+        "cryptography_openssl_version": "4.0.2",
+        "libyaml_version": "0.2.5",
+        "openssl_version": "3.0.15",
+        "pyinstaller_version": "6.22.2",
+        "python_version": "3.13.1",
+        "qt_version": "6.11.0",
+        "sqlite_version": "3.45.3",
+    }
+    return bundle, manifest, versions
+
+
+def test_native_component_manifest_hashes_exact_files_and_fails_on_forbidden(
+    tmp_path: Path,
+) -> None:
+    bundle, manifest, versions = _write_component_fixture(tmp_path)
+
+    resolved = resolve_component_manifest(manifest, bundle, versions=versions)
+
+    components = resolved["components"]
+    assert isinstance(components, list)
+    component = components[0]
+    assert isinstance(component, dict)
+    expected = hashlib.sha256(b"native fixture bytes").hexdigest()
+    assert component["files"] == [{"path": "native/runtime.dll", "sha256": expected}]
+    (bundle / "native" / "rogue.PYD").write_bytes(b"unassigned native")
+    with pytest.raises(ValueError, match="not assigned to a component"):
+        resolve_component_manifest(manifest, bundle, versions=versions)
+    (bundle / "native" / "rogue.PYD").unlink()
+    (bundle / "native" / "forbidden.dll").write_bytes(b"host PATH contamination")
+    with pytest.raises(ValueError, match="forbidden native bundle file"):
+        resolve_component_manifest(manifest, bundle, versions=versions)
+    (bundle / "native" / "forbidden.dll").unlink()
+    (bundle / "native" / "QOpenSSLBackend.DLL").write_bytes(b"case variant")
+    with pytest.raises(ValueError, match="forbidden native bundle file"):
+        resolve_component_manifest(manifest, bundle, versions=versions)
+
+
+def test_optional_native_component_is_omitted_or_fully_inventoried(tmp_path: Path) -> None:
+    bundle, manifest, versions = _write_component_fixture(tmp_path)
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8")
+        + """
+
+[[components]]
+id = "optional-runtime"
+name = "Optional runtime"
+type = "library"
+version = "{python_version}"
+optional = true
+license_name = "Fixture license"
+license_files = ["licenses/fixture.txt"]
+source_urls = ["https://example.invalid/optional/{python_version}"]
+globs = ["native/optional/**/*.dll"]
+""",
+        encoding="utf-8",
+    )
+
+    absent = resolve_component_manifest(manifest, bundle, versions=versions)
+    assert [component["id"] for component in absent["components"]] == ["fixture-runtime"]
+
+    optional = bundle / "native" / "optional" / "nested" / "runtime.DLL"
+    optional.parent.mkdir(parents=True)
+    optional.write_bytes(b"optional native")
+    present = resolve_component_manifest(manifest, bundle, versions=versions)
+    component = next(
+        component for component in present["components"] if component["id"] == "optional-runtime"
+    )
+    assert [entry["path"] for entry in component["files"]] == ["native/optional/nested/runtime.DLL"]
+
+
+def test_shared_native_glob_semantics_are_case_insensitive_and_recursive() -> None:
+    cryptography = "_internal/cryptography/hazmat/bindings/_rust.PYD"
+    qopenssl = "_INTERNAL/PySide6/plugins/tls/QOpenSSLBackend.DLL"
+
+    assert bundle_pattern_matches(cryptography, "_internal/cryptography/hazmat/bindings/*.pyd")
+    assert bundle_pattern_matches(qopenssl, "**/qopensslbackend.dll")
+    assert bundle_pattern_matches("qopensslbackend.dll", "**/qopensslbackend.dll")
+    assert bundle_pattern_matches(
+        "_internal/PySide6/plugins/nested/backend/qfixture.dll",
+        "_internal/PySide6/plugins/**/*.dll",
+    )
+    assert bundle_pattern_matches(
+        "_internal/PySide6/plugins/qfixture.dll",
+        "_internal/PySide6/plugins/**/*.dll",
+    )
+    assert native_bundle_paths(
+        {cryptography, "ArubaSessionTracker.ExE", "licenses/LICENSE.txt"}
+    ) == {cryptography, "ArubaSessionTracker.ExE"}
+
+
+def test_repository_component_contract_uses_complete_casefold_policy() -> None:
+    contract = tomllib.loads(Path("third_party_components.toml").read_text(encoding="utf-8"))
+    policy = contract["policy"]
+    components = {component["id"]: component for component in contract["components"]}
+
+    assert "forbidden_bundle_files" not in policy
+    assert {
+        "**/qopensslbackend.dll",
+        "**/libcrypto-3-x64.dll",
+        "**/libssl-3-x64.dll",
+        "**/api-ms-win-*.dll",
+        "**/ucrtbase.dll",
+        "**/opengl32sw.dll",
+    }.issubset(policy["forbidden_bundle_globs"])
+    assert components["qt-for-python-runtime"]["version"] == "{qt_version}"
+    assert components["cryptography-native-extension"]["files"] == [
+        "_internal/cryptography/hazmat/bindings/_rust.pyd"
+    ]
+    assert components["cryptography-native-extension"]["version"] == (
+        "{cryptography_version}+openssl.{cryptography_openssl_version}"
+    )
+    assert (
+        "licenses/openssl/NOTICE.txt"
+        in components["cryptography-native-extension"]["license_files"]
+    )
+    assert components["pynacl-native-extension"]["version"] == (
+        "{pynacl_version}+libsodium.1.0.20-stable"
+    )
+    assert (
+        "licenses__licenses__LICENSE.libsodium.txt"
+        in components["pynacl-native-extension"]["license_files"][1]
+    )
+    assert components["pyyaml-native-extension"]["version"] == (
+        "{pyyaml_version}+libyaml.{libyaml_version}"
+    )
+    for component in components.values():
+        assert not any(
+            PurePosixPath(pattern).suffix.casefold() in {".dll", ".exe", ".pyd"}
+            for pattern in component.get("globs", [])
+        )
+    exact_native_paths = {
+        path.casefold()
+        for component in components.values()
+        for path in component.get("files", [])
+        if PurePosixPath(path).suffix.casefold() in {".dll", ".exe", ".pyd"}
+    }
+    assert {
+        "_internal/rogue.pyd",
+        "_internal/pyside6/plugins/rogue/evil.dll",
+        "_internal/pyside6/plugins/tls/qopensslbackend-copy.dll",
+    }.isdisjoint(exact_native_paths)
+    assert components["sqlite-runtime"]["source_urls"] == [
+        "https://www.sqlite.org/src/tarball/sqlite.tar.gz?r=version-{sqlite_version}",
+        "https://www.sqlite.org/copyright.html",
+    ]
+    notices = Path("THIRD_PARTY_NOTICES.txt").read_text(encoding="utf-8")
+    assert "SQLite is dedicated to the public domain" in notices
+    assert "microsoft-vc-runtime" in notices
+    assert components["microsoft-vc-runtime"]["license_files"] == ["licenses/cpython/LICENSE.txt"]
+    assert contract["license_fallbacks"] == [
+        {
+            "package": "pyserial",
+            "version": "3.5",
+            "source_file": "licenses/pyserial-BSD-3-Clause.txt",
+            "source_url": "https://raw.githubusercontent.com/pyserial/pyserial/v3.5/LICENSE.txt",
+            "sha256": "f91cb9813de6a5b142b8f7f2dede630b5134160aedaeaf55f4d6a7e2593ca3f3",
+        }
+    ]
+
+
+def test_finalize_sbom_links_native_component_and_writes_resolved_manifest(
+    tmp_path: Path,
+) -> None:
+    bundle, manifest, versions = _write_component_fixture(tmp_path)
+    sbom = tmp_path / "sbom.cdx.json"
+    sbom.write_text(
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "components": [{"bom-ref": "pkg:pypi/demo@1.0", "name": "demo", "version": "1.0"}],
+                "dependencies": [
+                    {"ref": "pkg:pypi/demo@1.0", "dependsOn": []},
+                ],
+                "metadata": {
+                    "component": {
+                        "bom-ref": "app:fixture",
+                        "name": "fixture",
+                        "version": "0.5.4",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "fixture"\nversion = "0.5.4"\ndependencies = ["demo==1.0"]\n',
+        encoding="utf-8",
+    )
+    resolved_path = bundle / "THIRD_PARTY_COMPONENTS.json"
+
+    finalize(
+        sbom,
+        pyproject,
+        manifest,
+        bundle,
+        resolved_path,
+        versions=versions,
+    )
+
+    document = json.loads(sbom.read_text(encoding="utf-8"))
+    native_ref = "native:fixture-runtime@3.13.1"
+    assert any(component.get("bom-ref") == native_ref for component in document["components"])
+    root = next(item for item in document["dependencies"] if item["ref"] == "app:fixture")
+    assert root["dependsOn"] == [native_ref, "pkg:pypi/demo@1.0"]
+    assert json.loads(resolved_path.read_text(encoding="utf-8"))["schema_version"] == 1
+
+
+def _write_locked_components(path: Path, components: tuple[tuple[str, str], ...]) -> None:
+    path.write_text(
+        "".join(
+            f"{name}=={version} --hash=sha256:{index:064x}\n"
+            for index, (name, version) in enumerate(components, start=1)
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_native_release_verifier_detects_file_changed_after_sbom_finalization(
+    tmp_path: Path,
+) -> None:
+    bundle, manifest, versions = _write_component_fixture(tmp_path)
+    (bundle / "licenses" / "cpython").mkdir()
+    (bundle / "licenses" / "openssl").mkdir()
+    (bundle / "licenses" / "cpython" / "LICENSE.txt").write_text(
+        "PYTHON SOFTWARE FOUNDATION LICENSE VERSION 2\n", encoding="utf-8"
+    )
+    (bundle / "licenses" / "openssl" / "LICENSE.txt").write_text(
+        "Apache License\nVersion 2.0\n", encoding="utf-8"
+    )
+    (bundle / "licenses" / "openssl" / "NOTICE.txt").write_text(
+        "Copyright The OpenSSL Project Authors\n", encoding="utf-8"
+    )
+    offer_text = Path("OPEN_SOURCE_SOURCE_OFFER.txt").read_text(encoding="utf-8")
+    (bundle / "OPEN_SOURCE_SOURCE_OFFER.txt").write_bytes(offer_text.encode("utf-8"))
+    (tmp_path / "OPEN_SOURCE_SOURCE_OFFER.txt").write_bytes(offer_text.encode("utf-8"))
+    runtime_lock = tmp_path / "runtime.lock"
+    build_lock = tmp_path / "build.lock"
+    _write_locked_components(
+        runtime_lock,
+        (
+            ("Paramiko", "5.0.0"),
+            ("PySide6-Essentials", "6.11.0"),
+            ("shiboken6", "6.11.0"),
+        ),
+    )
+    _write_locked_components(build_lock, (("PyInstaller", "6.22.2"),))
+    for package, version in (
+        ("paramiko", "5.0.0"),
+        ("pyside6-essentials", "6.11.0"),
+        ("shiboken6", "6.11.0"),
+    ):
+        package_root = bundle / "licenses" / package
+        package_root.mkdir()
+        (package_root / "LICENSE.txt").write_text("fixture license\n", encoding="utf-8")
+        (package_root / "PACKAGE-METADATA.txt").write_text(
+            f"Package: {package}\n"
+            f"Version: {version}\n"
+            "Declared-License: Fixture\n"
+            "Project: https://example.invalid\n"
+            "Wheel-License-Files-Copied: 1\n"
+            "Supplemental-License-Files-Copied: 0\n"
+            "License-Evidence-Files-Copied: 1\n",
+            encoding="utf-8",
+        )
+    sbom = tmp_path / "sbom.cdx.json"
+    sbom.write_text(
+        json.dumps(
+            {
+                "bomFormat": "CycloneDX",
+                "components": [{"bom-ref": "pkg:pypi/demo@1.0", "name": "demo", "version": "1.0"}],
+                "dependencies": [{"ref": "pkg:pypi/demo@1.0", "dependsOn": []}],
+                "metadata": {
+                    "component": {
+                        "bom-ref": "app:fixture",
+                        "name": "fixture",
+                        "version": "0.5.4",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "fixture"\nversion = "0.5.4"\ndependencies = ["demo==1.0"]\n',
+        encoding="utf-8",
+    )
+    finalize(
+        sbom,
+        pyproject,
+        manifest,
+        bundle,
+        bundle / "THIRD_PARTY_COMPONENTS.json",
+        versions=versions,
+    )
+    archive_path = tmp_path / "bundle.zip"
+
+    def write_archive() -> None:
+        with zipfile.ZipFile(archive_path, "w") as output:
+            for path in sorted(item for item in bundle.rglob("*") if item.is_file()):
+                output.write(path, f"ArubaSessionTracker/{path.relative_to(bundle).as_posix()}")
+
+    def verify_archive(sbom_document: dict[str, object] | None = None) -> None:
+        with zipfile.ZipFile(archive_path) as archive:
+            files = {_safe_member(info): info for info in archive.infolist() if not info.is_dir()}
+            relative_names = {PurePosixPath(*member.parts[1:]).as_posix() for member in files}
+            _verify_native_components(
+                archive=archive,
+                files=files,
+                relative_names=relative_names,
+                sbom_document=(
+                    json.loads(sbom.read_text(encoding="utf-8"))
+                    if sbom_document is None
+                    else sbom_document
+                ),
+                build_info={
+                    "cryptographyOpenssl": "4.0.2",
+                    "libyaml": "0.2.5",
+                    "openssl": "3.0.15",
+                    "pyinstaller": "6.22.2",
+                    "python": "3.13.1",
+                    "qt": "6.11.0",
+                    "sqlite": "3.45.3",
+                },
+                component_manifest_path=manifest,
+                runtime_lock=runtime_lock,
+                build_lock=build_lock,
+            )
+
+    write_archive()
+    verify_archive()
+    altered_sbom = json.loads(sbom.read_text(encoding="utf-8"))
+    native_component = next(
+        item
+        for item in altered_sbom["components"]
+        if item.get("bom-ref") == "native:fixture-runtime@3.13.1"
+    )
+    native_component["externalReferences"] = []
+    with pytest.raises(ReleaseVerificationError, match="source references differ"):
+        verify_archive(altered_sbom)
+    (bundle / "native" / "rogue.DLL").write_bytes(b"rogue after finalization")
+    write_archive()
+    with pytest.raises(ReleaseVerificationError, match="not assigned to a component"):
+        verify_archive()
+    (bundle / "native" / "rogue.DLL").unlink()
+    (bundle / "native" / "runtime.dll").write_bytes(b"changed after finalization")
+    write_archive()
+    with pytest.raises(ReleaseVerificationError, match="file hash differs"):
+        verify_archive()
+
+
+def test_lgpl_source_offer_names_exact_locked_versions_and_request_route() -> None:
+    offer = Path("OPEN_SOURCE_SOURCE_OFFER.txt").read_text(encoding="utf-8")
+    runtime_components = {
+        "paramiko": ("5.0.0", set()),
+        "pyside6-essentials": ("6.11.0", set()),
+        "shiboken6": ("6.11.0", set()),
+    }
+
+    _verify_source_offer(offer, runtime_components)
+
+    with pytest.raises(ReleaseVerificationError, match="source offer"):
+        _verify_source_offer(
+            offer.replace("at least three years", "temporarily"), runtime_components
+        )
+    with pytest.raises(ReleaseVerificationError, match="reviewed repository text"):
+        _verify_source_offer(
+            offer + "\nThis offer is not available for at least three years.\n",
+            runtime_components,
+            canonical_text=offer,
+        )
+
+
+def test_pyserial_zero_wheel_license_requires_hashed_explicit_fallback(tmp_path: Path) -> None:
+    lock = tmp_path / "runtime.lock"
+    lock.write_text("pyserial==3.5\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="no license or notice evidence"):
+        copy_runtime_licenses(lock, tmp_path / "without-fallback")
+
+    destination = tmp_path / "with-fallback"
+    copy_runtime_licenses(
+        lock,
+        destination,
+        component_manifest=Path("third_party_components.toml"),
+    )
+    fallback = destination / "pyserial" / "SUPPLEMENTAL__pyserial-BSD-3-Clause.txt"
+    assert fallback.stat().st_size == 1885
+    assert hashlib.sha256(fallback.read_bytes()).hexdigest() == (
+        "f91cb9813de6a5b142b8f7f2dede630b5134160aedaeaf55f4d6a7e2593ca3f3"
+    )
+    metadata = (destination / "pyserial" / "PACKAGE-METADATA.txt").read_text(encoding="utf-8")
+    assert "Wheel-License-Files-Copied: 0" in metadata
+    assert "Supplemental-License-Files-Copied: 1" in metadata
+    assert "License-Evidence-Files-Copied: 1" in metadata
+
+
+def test_packaging_environment_probe_observes_actual_child_environment() -> None:
+    checker = Path("tools/check_packaging_environment.py").resolve()
+    allowed = str(Path(sys.executable).resolve().parent)
+    clean_environment = os.environ.copy()
+    clean_environment["PATH"] = allowed
+    for name in INJECTION_VARIABLES:
+        clean_environment.pop(name, None)
+    arguments = [sys.executable, str(checker), "--allowed-path", allowed]
+
+    clean = subprocess.run(  # noqa: S603
+        arguments,
+        check=False,
+        capture_output=True,
+        env=clean_environment,
+        timeout=30,
+    )
+    assert clean.returncode == 0
+    assert b"PACKAGING_CHILD_ENVIRONMENT_ISOLATED" in clean.stdout
+
+    polluted_environment = clean_environment.copy()
+    polluted_environment["PYTHONPATH"] = str(Path.cwd())
+    polluted = subprocess.run(  # noqa: S603
+        arguments,
+        check=False,
+        capture_output=True,
+        env=polluted_environment,
+        timeout=30,
+    )
+    assert polluted.returncode == 1
+    assert b"PYTHONPATH" in polluted.stderr
+
+
+def test_windows_packaging_isolates_host_path_and_verifies_native_contract() -> None:
+    build = Path("build_windows.ps1").read_text(encoding="utf-8")
+    publish = Path("tools/verify_publish_assets.ps1").read_text(encoding="utf-8")
+
+    assert "$packagingPathBefore = $env:PATH" in build
+    assert "$env:PATH = [string]::Join" in build
+    assert "$env:PATH = $packagingPathBefore" in build
+    assert "tools/check_packaging_environment.py" in build
+    for name in INJECTION_VARIABLES:
+        assert f'"{name}"' in build
+    sanitization_index = build.index("$packagingEnvironmentBefore = @{}")
+    first_python_index = build.index("Invoke-Checked $PythonPath")
+    outer_restore_index = build.rindex("foreach ($environmentName in $packagingInjectionNames)")
+    assert sanitization_index < first_python_index
+    assert build.index("tools/copy_runtime_licenses.py") < outer_restore_index
+    assert build.index("tools/finalize_sbom.py") < outer_restore_index
+    assert '"libcrypto-3-x64.dll", "libssl-3-x64.dll"' in build
+    assert "qopensslbackend.dll" in build
+    assert "qschannelbackend.dll" in build
+    assert "opengl32sw.dll" in build
+    assert '"--runtime-lock"' in build
+    assert '"--qt-version"' in build
+    assert '"--sqlite-version"' in build
+    assert '"--cryptography-openssl-version"' in build
+    assert '"--libyaml-version"' in build
+    assert '"--component-manifest"' in build
+    assert '"--component-manifest"' in build
+    assert '"--build-lock"' in build
+    assert "--component-manifest third_party_components.toml" in publish
+    assert "--build-lock requirements-build.lock" in publish
 
 
 def test_packaged_report_verifier_requires_printable_history_structure() -> None:
-    report = """<!doctype html>
+    script = "document.documentElement.dataset.filterReady = 'true';"
+    digest = base64.b64encode(hashlib.sha256(script.encode("utf-8")).digest()).decode("ascii")
+    csp = f"default-src 'none'; script-src 'sha256-{digest}'"
+    report = f"""<!doctype html>
+    <meta http-equiv="Content-Security-Policy" content="{csp}">
     세션 추적 결과 KST 한국어-MD
+    <div class="flow-panel">조회 출발지</div>
+    <dl class="summary-stats"></dl>
+    결과 찾기
+    <section id="result-filter"></section>
+    <input id="filter-ip"><select id="filter-protocol"></select><input id="filter-port">
     최신 세션 결과
+    <table><thead><tr><th>출발지 IP·포트</th><th>목적지 IP·포트</th></tr></thead>
+    <tbody><tr class="report-row"><td class="protocol-cell">TCP</td></tr></tbody></table>
     전체 추적 이력
     <details class="history-toggle"></details>
     <div class="details-body" id="observation-history-body"></div>
-    <style>.history-toggle + .details-body { display:block !important; }</style>
+    <style>.history-toggle + .details-body {{ display:block !important; }}</style>
+    <script>{script}</script>
     """
 
     _verify_packaged_report_text(report)
@@ -99,6 +629,12 @@ def test_packaged_report_verifier_requires_printable_history_structure() -> None
         _verify_packaged_report_text(
             report.replace('<details class="history-toggle">', "<details>")
         )
+    with pytest.raises(ReleaseVerificationError, match="standalone and complete"):
+        _verify_packaged_report_text(
+            report.replace("script-src 'sha256-", "script-src 'sha256-broken-", 1)
+        )
+    with pytest.raises(ReleaseVerificationError, match="standalone and complete"):
+        _verify_packaged_report_text(f"{report}<script>extra</script>")
 
 
 def test_secret_check_detects_sqlite_magic_without_database_suffix(tmp_path: Path) -> None:
@@ -260,6 +796,8 @@ def test_release_notes_embed_verified_single_zip_download_contract(tmp_path: Pat
     assert f"SHA-256: `{digest}`" in notes
     assert f"Windows 11 x64 실행 파일: `{archive.name}`" in notes
     assert "ArubaSessionTracker/sbom.cdx.json" in notes
+    assert "ArubaSessionTracker/THIRD_PARTY_COMPONENTS.json" in notes
+    assert "ArubaSessionTracker/OPEN_SOURCE_SOURCE_OFFER.txt" in notes
     assert "Source code (zip)" in notes
 
 
@@ -832,3 +1370,14 @@ def test_nightly_workflow_runs_fixture_only_scaled_soak() -> None:
     assert "python -m pytest -m soak" in workflow
     assert "QT_QPA_PLATFORM: offscreen" in workflow
     assert "github.token" not in workflow
+
+
+def test_soak_worker_timeouts_allow_hosted_variance_without_extending_20k_cap() -> None:
+    expected = "timeout=min(3_200, max(900, math.ceil(polls * 0.16)))"
+    for path in ("tests/test_end_to_end_soak.py", "tests/test_storage_soak.py"):
+        source = Path(path).read_text(encoding="utf-8")
+        assert expected in source
+        assert "max(500, math.ceil(polls * 0.16))" not in source
+
+    guidance = Path("AGENTS.md").read_text(encoding="utf-8")
+    assert "between 900 and 3,200 seconds" in guidance

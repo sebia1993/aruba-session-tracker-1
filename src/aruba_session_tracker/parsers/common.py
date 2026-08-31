@@ -24,12 +24,26 @@ _COMMAND_ERROR_PATTERNS = (
     re.compile(r"(?im)^\s*error:\s*(?:invalid|unknown|unsupported)\b"),
 )
 
+_COMMAND_PERMISSION_ERROR_PATTERNS = (
+    re.compile(
+        r"(?im)^\s*(?:%\s*)?(?:error:\s*)?"
+        r"(?:permission denied|insufficient privileges|authorization failed|access denied|"
+        r"command authorization failed|command not allowed)\b"
+    ),
+)
+
 
 def reject_command_errors(output: str) -> None:
     """Reject recognizable CLI errors before any table parsing takes place."""
 
     if not isinstance(output, str):
         raise TypeError("CLI output must be text.")
+    for pattern in _COMMAND_PERMISSION_ERROR_PATTERNS:
+        if pattern.search(output):
+            raise ParseError(
+                "The device rejected the command due to insufficient privileges.",
+                code=ErrorCode.COMMAND_REJECTED,
+            )
     for pattern in _COMMAND_ERROR_PATTERNS:
         if pattern.search(output):
             raise ParseError("The device rejected or did not recognize the command.")

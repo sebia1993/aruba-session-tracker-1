@@ -660,6 +660,65 @@ def test_record_poll_batch_uses_explicit_same_controller_raw_provenance(
     assert f'"observation_keys":["{observation.session_key}"]' in bundle
 
 
+def test_poll_batch_persists_cross_controller_overlap_without_schema_change(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    first = _observation(controller_name="MD-01", controller_host="198.51.100.21")
+    second = _observation(controller_name="MD-02", controller_host="198.51.100.22")
+    outcome = QueryOutcome(
+        observations=(first, second),
+        diagnostics=(
+            DiagnosticEvent(
+                stage="MONITOR_STATE",
+                code=ErrorCode.DUPLICATE_FLOW_ACROSS_CONTROLLERS,
+                message="fixture overlap",
+            ),
+        ),
+        raw_snapshots=(
+            RawSnapshot(
+                "MD-01",
+                "show datapath session table 192.0.2.100",
+                "first controller output",
+                observation_keys=(first.session_key,),
+            ),
+            RawSnapshot(
+                "MD-02",
+                "show datapath session table 192.0.2.100",
+                "second controller output",
+                observation_keys=(second.session_key,),
+            ),
+        ),
+        authoritative=True,
+    )
+
+    store.record_poll_batch(run_id, outcome)
+
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        observations = connection.execute(
+            """
+            SELECT controller_host, session_key, raw_file_id
+            FROM observations WHERE run_id = ? ORDER BY controller_host
+            """,
+            (run_id,),
+        ).fetchall()
+        diagnostic_code = connection.execute(
+            "SELECT code FROM diagnostic_events WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()[0]
+        schema_version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+    assert [row[:2] for row in observations] == [
+        (first.controller_host, first.session_key),
+        (second.controller_host, second.session_key),
+    ]
+    assert observations[0][2] is not None
+    assert observations[1][2] == observations[0][2]
+    assert diagnostic_code == ErrorCode.DUPLICATE_FLOW_ACROSS_CONTROLLERS.value
+    assert schema_version == 2
+
+
 def test_poll_bundle_keeps_csv_references_and_deletes_as_one_file(tmp_path: Path) -> None:
     store = _store(tmp_path)
     run_id = _run(store)
@@ -2441,7 +2500,15 @@ def test_html_export_uses_database_id_order_for_equal_observation_and_lifecycle_
     assert latest is not None and history is not None
     latest_body = latest.group("body")
     history_body = history.group("body")
-    assert latest_body.count("<tbody><tr>") == 1
+    assert (
+        len(
+            re.findall(
+                r'<tbody\b[^>]*>\s*<tr\b(?=[^>]*\bclass="[^"]*\breport-row\b)',
+                latest_body,
+            )
+        )
+        == 1
+    )
     assert "MD-B" in latest_body
     assert ">확인됨<" in latest_body
     assert "session-changes" not in document
@@ -2615,10 +2682,22 @@ def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
     )
     assert history_section is not None
     history_body = history_section.group("body")
-    history_table_body = re.search(r"<tbody>(?P<body>.*?)</tbody>", history_body, re.DOTALL)
+    history_table_body = re.search(
+        r"<tbody\b[^>]*>(?P<body>.*?)</tbody>",
+        history_body,
+        re.DOTALL,
+    )
     assert history_table_body is not None
 
-    assert history_table_body.group("body").count("<tr>") == 2_005
+    assert (
+        len(
+            re.findall(
+                r'<tr\b(?=[^>]*\bclass="[^"]*\breport-row\b)',
+                history_table_body.group("body"),
+            )
+        )
+        == 2_005
+    )
     assert "OLDEST-OBSERVATION-CONTROLLER" in history_body
     assert "OLDEST-LIFECYCLE-INSTANCE" not in document
     assert "OLDEST-CONTROLLER-REASON" not in document
@@ -2627,7 +2706,8 @@ def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
     assert "capture-0000.txt" not in document
     assert "private-raw-body-0" not in document
     assert (
-        '<summary aria-controls="observation-history-body">전체 추적 이력 2,005건 보기</summary>'
+        '<summary id="history-filter-summary" aria-controls="observation-history-body">'
+        "전체 추적 이력 2,005/2,005건 보기</summary>"
     ) in document
     assert "세션별 수치 변화" not in document
     assert "패킷" not in document

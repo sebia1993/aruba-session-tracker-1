@@ -100,6 +100,39 @@ def test_all_table_parsers_reject_cli_errors(parser: object, kwargs: dict[str, s
         parser(fixture("command_rejected.txt"), **kwargs)  # type: ignore[operator]
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Permission denied",
+        "% Insufficient privileges",
+        "Authorization failed",
+        "Error: Access denied",
+        "Command authorization failed.",
+        "Command not allowed",
+    ],
+)
+@pytest.mark.parametrize(
+    ("parser", "kwargs"),
+    [
+        (parse_global_user_table, {"client_ip": "192.0.2.10"}),
+        (parse_show_switches, {}),
+        (
+            parse_datapath_sessions,
+            {"controller_name": "md-document-01", "controller_host": "198.51.100.11"},
+        ),
+    ],
+)
+def test_all_table_parsers_classify_permission_errors_as_command_rejected(
+    parser: object,
+    kwargs: dict[str, str],
+    output: str,
+) -> None:
+    with pytest.raises(ParseError) as caught:
+        parser(output, **kwargs)  # type: ignore[operator]
+
+    assert caught.value.code is ErrorCode.COMMAND_REJECTED
+
+
 def test_show_switches_parser_returns_only_managed_devices() -> None:
     rows = parse_show_switches(fixture("show_switches.txt"))
     assert [(row.ip_address, row.name) for row in rows] == [

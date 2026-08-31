@@ -1,0 +1,73 @@
+Aruba Session Tracker - LGPL Source and Relinking Information
+=============================================================
+
+This distribution contains unmodified components made available under the
+GNU Lesser General Public License (LGPL).  This notice records a practical
+way for a recipient of the Windows bundle to obtain the corresponding source
+and the information used to rebuild or replace those components.  It is a
+distribution notice, not legal advice and not a warranty of legal suitability
+for a particular deployment.
+
+Covered LGPL components
+-----------------------
+
+* PySide6-Essentials 6.11.0, Shiboken6 6.11.0, and the Qt 6.11.0 runtime
+  libraries carried by those wheels (LGPL-3.0-only redistribution option).
+* Paramiko 5.0.0 (LGPL-2.1).
+
+The project does not modify these components.  Exact wheel hashes are recorded
+in sbom.cdx.json and requirements-runtime.lock.  BUILD_INFO.json records the
+application commit and interpreter version used for each Windows bundle.
+
+How to obtain corresponding source
+----------------------------------
+
+For a no-charge machine-readable copy of the complete corresponding source for
+the covered versions above, including the build and installation information
+held for this distribution, open a source request at:
+
+https://github.com/sebia1993/aruba-session-tracker-1/issues/new
+
+Use the title "LGPL source request" and include the Aruba Session Tracker
+version and the BUILD_INFO.json commit.  Do not include credentials, network
+addresses, device output, reports, or logs.  A recipient that cannot use GitHub
+may pass the same request through the person or organization that supplied the
+bundle.
+
+This offer remains available for at least three years after the corresponding
+binary release.  The distributor will provide download or media
+instructions at no charge beyond any reasonable physical transfer cost.
+
+Automated package verification confirms only that this text, the exact
+covered-version references, and the request route are present in a release.
+Keeping the source and request route available and fulfilling requests for the
+full stated period remain distributor operations; a build or test run cannot
+prove that future availability.
+
+Rebuilding and replacement
+--------------------------
+
+The application source, pinned dependency locks, and build_windows.ps1 are in
+the repository at the commit recorded in BUILD_INFO.json.  The package is a
+PyInstaller onedir bundle rather than a one-file executable.  Qt, PySide6, and
+Shiboken shared libraries remain separate under _internal/PySide6 and
+_internal/shiboken6.  A recipient may replace interface-compatible shared
+libraries or rebuild the application with a modified compatible LGPL library.
+The project license does not add a prohibition on reverse engineering needed
+to debug such modifications.
+
+Paramiko is frozen into the packaged Python application.  Recombination is
+therefore performed by rebuilding the exact application commit with the
+replacement Paramiko source and the documented Python 3.13 build procedure.
+
+Upstream reference locations
+----------------------------
+
+These references are convenient upstream locations; the source-request offer
+above does not depend on those locations remaining available.
+
+* Qt 6.11.0: https://code.qt.io/cgit/qt/qt5.git/tag/?h=v6.11.0
+* Qt for Python 6.11.0:
+  https://code.qt.io/cgit/pyside/pyside-setup.git/tag/?h=v6.11.0
+* Paramiko 5.0.0:
+  https://github.com/paramiko/paramiko/tree/5.0.0
