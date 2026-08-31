@@ -1061,7 +1061,7 @@ class SessionStore:
                 try:
                     manifest_payload = {**manifest_payload, "phase": "DB_COMMITTED"}
                     self._replace_manifest(manifest_path, manifest_payload)
-                except Exception as cleanup_error:
+                except Exception as manifest_update_error:
                     result = self._finalize_committed_poll_operation(
                         operation_id,
                         stage_root,
@@ -1072,7 +1072,7 @@ class SessionStore:
                             if inserted
                             else PollPersistenceStatus.ALREADY_COMMITTED
                         ),
-                        prior_cleanup_error=cleanup_error,
+                        prior_cleanup_error=manifest_update_error,
                     )
                     operation_lease = None
                     return result
