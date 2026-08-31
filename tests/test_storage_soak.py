@@ -64,6 +64,9 @@ def test_storage_poll_soak(tmp_path: Path) -> None:
                 connection.execute("SELECT count(*) FROM observations").fetchone()[0]
             ),
             "raw_files": int(connection.execute("SELECT count(*) FROM raw_files").fetchone()[0]),
+            "poll_commits": int(
+                connection.execute("SELECT count(*) FROM poll_commits").fetchone()[0]
+            ),
             "diagnostic_events": int(
                 connection.execute("SELECT count(*) FROM diagnostic_events").fetchone()[0]
             ),
@@ -85,6 +88,7 @@ def test_storage_poll_soak(tmp_path: Path) -> None:
         "runs": 1,
         "observations": polls,
         "raw_files": polls,
+        "poll_commits": polls,
         "diagnostic_events": int(result["expected_diagnostics"]),
     }
     assert len(raw_files) == polls

@@ -72,7 +72,8 @@ def run_storage_soak(root: Path, polls: int) -> dict[str, object]:
                 ),
             )
             expected_diagnostics += 1
-        store.record_poll_batch(
+        poll_id = f"{index:032x}"
+        persistence = store.record_poll_batch(
             run_id,
             QueryOutcome(
                 observations=(observation,),
@@ -88,7 +89,10 @@ def run_storage_soak(root: Path, polls: int) -> dict[str, object]:
                 ),
                 authoritative=True,
             ),
+            poll_id=poll_id,
         )
+        if persistence.poll_id != poll_id:
+            raise AssertionError(f"unexpected poll receipt id at poll {index}")
         if index + 1 == warmup_polls:
             gc.collect()
             baseline_usage = windows_process_usage()

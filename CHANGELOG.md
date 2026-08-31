@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+## 0.5.6 - 2026-09-01
+
+- 활성 Primary/Standby MM의 동일 주소·포트, 활성 MD의 중복 주소·정규화 이름과
+  Current switch 별칭 충돌을 `AppConfig` 생성 단계에서 차단. 꺼 둔 장비
+  placeholder는 기존 구성 호환성을 위해 충돌 검사에서 제외.
+- SQLite schema를 v3로 올리고 각 poll의 ID, 실행 ID와 payload SHA-256을
+  `poll_commits` durable receipt로 같은 transaction의 마지막에 기록. 동일 poll
+  ID와 동일 내용 재시도는 이미 commit된 결과를 반환하고 관측·진단·수명주기
+  이벤트와 Raw 연결을 중복 삽입하지 않으며, 다른 실행이나 내용의 ID 재사용은
+  거부.
+- DB commit 뒤 manifest·staging·lease 정리에 실패한 경우 저장 실패로
+  잘못 처리하지 않고 `COMMITTED_RECOVERY_PENDING`으로 반환. 같은 poll ID
+  재시도와 다음 시작 복구가 receipt 및 Raw 무결성을 대조해 남은 정리를 완료.
+  불확정 poll 재확인 중 추가 오류나 동시 중지가 발생해도 준비 상태와 ID를
+  보존해 새 poll로 중복 저장하지 않고, 확인된 commit만 모니터 상태에 반영.
+  실패했던 실행 종료 상태의 동시 재시도도 직렬화해 완료된 run을 다시 보류하지
+  않도록 함.
+- SQLite `BUSY`와 `LOCKED`에만 제한된 재시도를 적용하고 commit 응답이 불명확한
+  경우 receipt를 다시 확인. receipt까지 읽을 수 없는 상태는 중복 저장을
+  추측하지 않고 동일 poll ID 복구가 필요한 불확정 오류로 중단.
+- 시작 시 delete manifest를 Raw batch manifest보다 먼저 복구해 삭제 staging으로
+  잠시 이동한 정상 Raw를 누락·손상으로 오판하지 않도록 순서를 고정하고,
+  lease 정리 실패 시에도 manifest를 복구 anchor로 유지.
+- 실제 장비에는 접속하지 않음. GitHub-hosted Windows x64 Python 3.13 전체
+  검증과 fixture-only 20,000 poll soak, 패키지·EXE smoke는 사전릴리스 게시 전
+  수행할 검증 범위이며 이 변경 이력 작성 시점에는 결과를 확정하지 않음.
+
 ## 0.5.5 - 2026-09-01
 
 - AOS 8 `show global-user-table list ip`가 열 이름을 가운데 정렬해 출력하는

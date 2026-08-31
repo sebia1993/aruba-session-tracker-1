@@ -18,11 +18,13 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO
 from uuid import uuid4
 
 from aruba_session_tracker.models import (
+    ControllerLocation,
     DiagnosticEvent,
     ErrorCode,
     QueryRequest,
@@ -54,7 +56,7 @@ if TYPE_CHECKING:
     from aruba_session_tracker.services.monitoring import LifecycleEvent
     from aruba_session_tracker.services.tracker import QueryOutcome, RawSnapshot
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _DELETE_PREVIEW_TTL_SECONDS = 300
 _CSV_FETCH_BATCH = 1000
 _HASH_CHUNK_SIZE = 1024 * 1024
@@ -67,6 +69,7 @@ _MAX_POLL_OBSERVATIONS = 20_000
 # therefore need their own bound; reusing the observation limit would make a
 # valid saturated poll fail forever before prepared state can commit.
 _MAX_POLL_LIFECYCLE_EVENTS = _MAX_POLL_OBSERVATIONS * 4
+_POLL_COMMIT_RETRY_DELAYS = (0.0, 0.05, 0.15)
 STORAGE_WARNING_FREE_BYTES = 5 * 1024**3
 STORAGE_HARD_STOP_FREE_BYTES = 1024**3
 _OPERATION_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -230,6 +233,23 @@ CREATE TABLE IF NOT EXISTS external_export_commits (
     byte_size INTEGER NOT NULL CHECK (byte_size >= 0)
 );
 
+CREATE TABLE IF NOT EXISTS poll_commits (
+    poll_id TEXT NOT NULL PRIMARY KEY CHECK (
+        length(poll_id) = 32 AND poll_id NOT GLOB '*[^0-9a-f]*'
+    ),
+    operation_id TEXT NOT NULL UNIQUE CHECK (
+        length(operation_id) = 32
+        AND operation_id NOT GLOB '*[^0-9a-f]*'
+        AND operation_id = poll_id
+    ),
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    payload_sha256 TEXT NOT NULL CHECK (
+        length(payload_sha256) = 64
+        AND payload_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    committed_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS ix_observations_run_time
     ON observations(run_id, observed_at);
 CREATE INDEX IF NOT EXISTS ix_lifecycle_run_time
@@ -244,6 +264,8 @@ CREATE INDEX IF NOT EXISTS ix_raw_files_run_time
     ON raw_files(run_id, captured_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS ix_exports_run_id
     ON exports(run_id, id);
+CREATE INDEX IF NOT EXISTS ix_poll_commits_run_id
+    ON poll_commits(run_id, poll_id);
 """
 
 
@@ -253,6 +275,29 @@ class StorageError(RuntimeError):
     def __init__(self, message: str, *, code: ErrorCode | None = None) -> None:
         super().__init__(message)
         self.code = code
+
+
+class PollPersistenceIndeterminate(StorageError):
+    """A poll may have committed, but its durable receipt could not be read."""
+
+    def __init__(self, message: str, *, poll_id: str) -> None:
+        super().__init__(message)
+        self.poll_id = poll_id
+
+
+class PollPersistenceStatus(StrEnum):
+    """Durable outcome of one idempotent poll persistence attempt."""
+
+    COMMITTED = "COMMITTED"
+    ALREADY_COMMITTED = "ALREADY_COMMITTED"
+    COMMITTED_RECOVERY_PENDING = "COMMITTED_RECOVERY_PENDING"
+
+
+@dataclass(frozen=True, slots=True)
+class PollPersistenceResult:
+    poll_id: str
+    status: PollPersistenceStatus
+    cleanup_error_type: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -432,7 +477,7 @@ class SessionStore:
                 with self._connection(uninitialized=True, configure_wal=True) as connection:
                     _require_quick_check(connection)
                     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-                    if version not in {0, 1, _SCHEMA_VERSION}:
+                    if version not in {0, 1, 2, _SCHEMA_VERSION}:
                         raise StorageError(
                             f"지원하지 않는 데이터베이스 스키마 버전입니다: {version}"
                         )
@@ -846,60 +891,112 @@ class SessionStore:
         outcome: QueryOutcome,
         events: Sequence[LifecycleEvent] = (),
         *,
+        poll_id: str | None = None,
         _raw_kind_overrides: Sequence[str] = (),
-    ) -> None:
-        """Persist one complete query/poll as one recoverable SQLite transaction."""
+    ) -> PollPersistenceResult:
+        """Persist one complete poll with an idempotent durable receipt."""
 
         self._ensure_initialized()
-        self._require_storage_capacity()
         safe_segment(run_id, "run_id")
         self._require_owned_running_run(run_id)
         self._validate_poll_batch_limits(outcome, events)
-        operation_id = uuid4().hex
+        lifecycle_events = tuple(events)
+        raw_kind_overrides = tuple(_raw_kind_overrides)
+        payload_sha256 = _poll_payload_sha256(
+            outcome,
+            lifecycle_events,
+            raw_kind_overrides,
+        )
+        operation_id = _validate_poll_id(poll_id or uuid4().hex)
         stage_root = self.raw_root / f".raw-staging-{operation_id}"
         prepared: tuple[_PreparedRaw, ...] = ()
         manifest_path: Path | None = None
         installed: list[_PreparedRaw] = []
         operation_lease: _RunLease | None = None
-        committed = False
+        rollback_owned = False
+        commit_state_unknown = False
         try:
             with self._lock:
                 self._assert_managed_layout()
                 operation_lease = self._acquire_operation_lease(operation_id)
-                if operation_lease is None:  # pragma: no cover - UUID collision defense
-                    raise StorageError("저장 작업 잠금을 획득할 수 없습니다.")
+                if operation_lease is None:
+                    raise StorageError("같은 poll 저장 작업이 이미 진행 중입니다.")
+
+                existing_manifest = self._manifests_root / f"{operation_id}.json"
+                manifest_disappeared = False
+                if os.path.lexists(existing_manifest):
+                    try:
+                        payload = _read_manifest(existing_manifest, operation_id)
+                    except StorageError as error:
+                        if not isinstance(error.__cause__, FileNotFoundError):
+                            raise
+                        # A committed writer removes its lease immediately
+                        # before the manifest. Receipt verification below
+                        # distinguishes that narrow handoff from corruption.
+                        manifest_disappeared = True
+                    else:
+                        if (
+                            payload.get("kind") != "raw_batch"
+                            or payload.get("poll_id") != operation_id
+                            or payload.get("run_id") != run_id
+                            or payload.get("payload_sha256") != payload_sha256
+                        ):
+                            raise StorageError("poll ID가 다른 저장 작업과 충돌했습니다.")
+                        self._recover_raw_batch_manifest(existing_manifest, payload)
+                        _unlink_regular(existing_manifest, missing_ok=True)
+
+                receipt = self._poll_commit_receipt(operation_id)
+                if receipt is not None:
+                    receipt_run_id, receipt_payload_sha256 = receipt
+                    if receipt_run_id != run_id or receipt_payload_sha256 != payload_sha256:
+                        raise StorageError("poll ID가 다른 poll 내용에 이미 사용되었습니다.")
+                    result = self._finalize_committed_poll_operation(
+                        operation_id,
+                        stage_root,
+                        None,
+                        operation_lease,
+                        base_status=PollPersistenceStatus.ALREADY_COMMITTED,
+                    )
+                    operation_lease = None
+                    return result
+                if manifest_disappeared:
+                    raise StorageError("poll manifest가 receipt 없이 사라졌습니다.")
+
+                self._require_storage_capacity()
                 prepared, remaining = self._prepare_poll_raw_files(
                     run_id,
                     outcome,
                     stage_root,
-                    raw_kind_overrides=tuple(_raw_kind_overrides),
+                    raw_kind_overrides=raw_kind_overrides,
                 )
-                manifest_path = self._write_manifest(
-                    operation_id,
-                    {
-                        "version": _MANIFEST_VERSION,
-                        "kind": "raw_batch",
-                        "operation_id": operation_id,
-                        "run_id": run_id,
-                        "stage_root": stage_root.name,
-                        "files": [
-                            {
-                                "relative_path": item.artifact.relative_path,
-                                "sha256": item.artifact.sha256,
-                                "byte_size": item.artifact.byte_size,
-                                "bundle_sections": [
-                                    {
-                                        "index": section.index,
-                                        "sha256": section.sha256,
-                                        "byte_size": section.byte_size,
-                                    }
-                                    for section in item.bundle_sections
-                                ],
-                            }
-                            for item in prepared
-                        ],
-                    },
-                )
+                manifest_payload: dict[str, object] = {
+                    "version": _MANIFEST_VERSION,
+                    "kind": "raw_batch",
+                    "operation_id": operation_id,
+                    "poll_id": operation_id,
+                    "run_id": run_id,
+                    "payload_sha256": payload_sha256,
+                    "phase": "PREPARED",
+                    "stage_root": stage_root.name,
+                    "files": [
+                        {
+                            "relative_path": item.artifact.relative_path,
+                            "sha256": item.artifact.sha256,
+                            "byte_size": item.artifact.byte_size,
+                            "bundle_sections": [
+                                {
+                                    "index": section.index,
+                                    "sha256": section.sha256,
+                                    "byte_size": section.byte_size,
+                                }
+                                for section in item.bundle_sections
+                            ],
+                        }
+                        for item in prepared
+                    ],
+                }
+                manifest_path = self._write_manifest(operation_id, manifest_payload)
+                rollback_owned = True
                 self._stage_prepared_raw(stage_root, prepared)
                 for item in prepared:
                     item.destination.parent.mkdir(parents=True, exist_ok=True)
@@ -920,48 +1017,255 @@ class SessionStore:
                         expected_size=item.artifact.byte_size,
                     )
                     installed.append(item)
+                manifest_payload = {**manifest_payload, "phase": "INSTALLED"}
+                self._replace_manifest(manifest_path, manifest_payload)
 
-                # Durable Raw file publication is manifest-protected and
-                # complete before taking SQLite's writer lock.  The short
-                # transaction below stores only references and poll rows.
-                with self._connection() as connection:
-                    connection.execute("BEGIN IMMEDIATE")
-                    self._require_run(connection, run_id, require_running=True)
-                    for item in prepared:
-                        raw_file_id = _insert_raw_file(connection, run_id, item)
-                        _insert_observations(connection, run_id, item.observations, raw_file_id)
-                    _insert_observations(connection, run_id, remaining, None)
-                    for diagnostic in outcome.diagnostics:
-                        _insert_diagnostic(connection, run_id, diagnostic)
-                    for event in events:
-                        _insert_lifecycle_event(connection, run_id, event)
-                committed = True
-                self._remove_operation_artifacts(manifest_path, stage_root)
-                _release_run_lease(operation_lease, remove=True)
+                # Raw publication completes before the short SQLite writer
+                # transaction. The receipt is inserted last in that same
+                # transaction, so a repeated poll_id can prove whether every
+                # associated row committed without inserting duplicates.
+                try:
+                    inserted = self._commit_poll_batch_with_retry(
+                        operation_id,
+                        run_id,
+                        payload_sha256,
+                        outcome,
+                        lifecycle_events,
+                        prepared,
+                        remaining,
+                    )
+                except Exception as error:
+                    try:
+                        receipt = self._poll_commit_receipt(operation_id)
+                    except Exception as probe_error:
+                        commit_state_unknown = True
+                        indeterminate = PollPersistenceIndeterminate(
+                            "poll 저장 결과를 확인할 수 없어 동일 poll ID로 복구해야 합니다.",
+                            poll_id=operation_id,
+                        )
+                        indeterminate.add_note(
+                            "poll commit receipt 상태도 확인하지 못했습니다: "
+                            f"{type(probe_error).__name__}"
+                        )
+                        raise indeterminate from error
+                    if receipt is None:
+                        raise
+                    receipt_run_id, receipt_payload_sha256 = receipt
+                    if receipt_run_id != run_id or receipt_payload_sha256 != payload_sha256:
+                        raise StorageError(
+                            "poll ID가 다른 poll 내용에 이미 사용되었습니다."
+                        ) from error
+                    inserted = False
+
+                rollback_owned = False
+                try:
+                    manifest_payload = {**manifest_payload, "phase": "DB_COMMITTED"}
+                    self._replace_manifest(manifest_path, manifest_payload)
+                except Exception as manifest_update_error:
+                    result = self._finalize_committed_poll_operation(
+                        operation_id,
+                        stage_root,
+                        manifest_path,
+                        operation_lease,
+                        base_status=(
+                            PollPersistenceStatus.COMMITTED
+                            if inserted
+                            else PollPersistenceStatus.ALREADY_COMMITTED
+                        ),
+                        prior_cleanup_error=manifest_update_error,
+                    )
+                    operation_lease = None
+                    return result
+                result = self._finalize_committed_poll_operation(
+                    operation_id,
+                    stage_root,
+                    manifest_path,
+                    operation_lease,
+                    base_status=(
+                        PollPersistenceStatus.COMMITTED
+                        if inserted
+                        else PollPersistenceStatus.ALREADY_COMMITTED
+                    ),
+                )
                 operation_lease = None
+                return result
         except StorageError as error:
             cleanup_error = (
-                None
-                if committed
-                else self._cleanup_failed_raw_batch(installed, stage_root, manifest_path)
+                self._cleanup_failed_raw_batch(installed, stage_root, manifest_path)
+                if rollback_owned and not commit_state_unknown
+                else None
             )
             if operation_lease is not None:
-                _release_run_lease(operation_lease, remove=cleanup_error is None)
+                try:
+                    _release_run_lease(
+                        operation_lease,
+                        remove=(
+                            cleanup_error is None
+                            and not os.path.lexists(self._manifests_root / f"{operation_id}.json")
+                        ),
+                    )
+                except Exception as lease_error:
+                    error.add_note(
+                        f"poll 저장 작업 잠금 정리도 실패했습니다: {type(lease_error).__name__}"
+                    )
             if cleanup_error is not None:
                 error.add_note(f"Raw batch 정리도 실패했습니다: {type(cleanup_error).__name__}")
             raise
         except (OSError, sqlite3.Error, UnsafeStoragePath, UnsafeManagedPath, ValueError) as error:
             cleanup_error = (
-                None
-                if committed
-                else self._cleanup_failed_raw_batch(installed, stage_root, manifest_path)
+                self._cleanup_failed_raw_batch(installed, stage_root, manifest_path)
+                if rollback_owned and not commit_state_unknown
+                else None
             )
             if operation_lease is not None:
-                _release_run_lease(operation_lease, remove=cleanup_error is None)
+                try:
+                    _release_run_lease(
+                        operation_lease,
+                        remove=(
+                            cleanup_error is None
+                            and not os.path.lexists(self._manifests_root / f"{operation_id}.json")
+                        ),
+                    )
+                except Exception as lease_error:
+                    error.add_note(
+                        f"poll 저장 작업 잠금 정리도 실패했습니다: {type(lease_error).__name__}"
+                    )
             wrapped = StorageError(f"조회 결과 batch를 기록할 수 없습니다: {error}")
             if cleanup_error is not None:
                 wrapped.add_note(f"Raw batch 정리도 실패했습니다: {type(cleanup_error).__name__}")
             raise wrapped from error
+
+    def _poll_commit_receipt(
+        self,
+        poll_id: str,
+        *,
+        uninitialized: bool = False,
+    ) -> tuple[str, str] | None:
+        with self._connection(uninitialized=uninitialized) as connection:
+            row = connection.execute(
+                """
+                SELECT operation_id, run_id, payload_sha256
+                FROM poll_commits WHERE poll_id = ?
+                """,
+                (poll_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if str(row["operation_id"]) != poll_id:
+            raise StorageError("poll commit receipt의 저장 작업 ID가 일치하지 않습니다.")
+        return str(row["run_id"]), str(row["payload_sha256"])
+
+    def _commit_poll_batch_with_retry(
+        self,
+        poll_id: str,
+        run_id: str,
+        payload_sha256: str,
+        outcome: QueryOutcome,
+        events: tuple[LifecycleEvent, ...],
+        prepared: tuple[_PreparedRaw, ...],
+        remaining: tuple[SessionObservation, ...],
+    ) -> bool:
+        for attempt, delay in enumerate(_POLL_COMMIT_RETRY_DELAYS):
+            if delay:
+                time.sleep(delay)
+            try:
+                return self._commit_poll_batch_once(
+                    poll_id,
+                    run_id,
+                    payload_sha256,
+                    outcome,
+                    events,
+                    prepared,
+                    remaining,
+                )
+            except sqlite3.OperationalError as error:
+                if attempt == len(
+                    _POLL_COMMIT_RETRY_DELAYS
+                ) - 1 or not _retryable_poll_commit_error(error):
+                    raise
+        raise AssertionError("poll commit retry loop did not return")  # pragma: no cover
+
+    def _commit_poll_batch_once(
+        self,
+        poll_id: str,
+        run_id: str,
+        payload_sha256: str,
+        outcome: QueryOutcome,
+        events: tuple[LifecycleEvent, ...],
+        prepared: tuple[_PreparedRaw, ...],
+        remaining: tuple[SessionObservation, ...],
+    ) -> bool:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_run(connection, run_id, require_running=True)
+            receipt = connection.execute(
+                """
+                SELECT operation_id, run_id, payload_sha256
+                FROM poll_commits WHERE poll_id = ?
+                """,
+                (poll_id,),
+            ).fetchone()
+            if receipt is not None:
+                if (
+                    str(receipt["operation_id"]) != poll_id
+                    or str(receipt["run_id"]) != run_id
+                    or str(receipt["payload_sha256"]) != payload_sha256
+                ):
+                    raise StorageError("poll ID가 다른 poll 내용에 이미 사용되었습니다.")
+                return False
+            for item in prepared:
+                raw_file_id = _insert_raw_file(connection, run_id, item)
+                _insert_observations(connection, run_id, item.observations, raw_file_id)
+            _insert_observations(connection, run_id, remaining, None)
+            for diagnostic in outcome.diagnostics:
+                _insert_diagnostic(connection, run_id, diagnostic)
+            for event in events:
+                _insert_lifecycle_event(connection, run_id, event)
+            connection.execute(
+                """
+                INSERT INTO poll_commits (
+                    poll_id, operation_id, run_id, payload_sha256, committed_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (poll_id, poll_id, run_id, payload_sha256, _iso(None)),
+            )
+        return True
+
+    def _finalize_committed_poll_operation(
+        self,
+        poll_id: str,
+        stage_root: Path,
+        manifest_path: Path | None,
+        operation_lease: _RunLease,
+        *,
+        base_status: PollPersistenceStatus,
+        prior_cleanup_error: Exception | None = None,
+    ) -> PollPersistenceResult:
+        cleanup_error = prior_cleanup_error
+        if cleanup_error is None:
+            try:
+                # Keep the manifest as the recovery anchor until staging and
+                # the identity-checked operation lease have both been removed.
+                self._remove_operation_artifacts(None, stage_root)
+            except Exception as error:  # committed data must not be reported as failed
+                cleanup_error = error
+        try:
+            _release_run_lease(operation_lease, remove=cleanup_error is None)
+        except Exception as error:  # the durable receipt still proves success
+            if cleanup_error is None:
+                cleanup_error = error
+        if cleanup_error is None and manifest_path is not None:
+            try:
+                _unlink_regular(manifest_path, missing_ok=True)
+            except Exception as error:  # startup recovery can finish this cleanup
+                cleanup_error = error
+        if cleanup_error is None:
+            return PollPersistenceResult(poll_id, base_status)
+        return PollPersistenceResult(
+            poll_id,
+            PollPersistenceStatus.COMMITTED_RECOVERY_PENDING,
+            type(cleanup_error).__name__,
+        )
 
     @staticmethod
     def _validate_poll_batch_limits(
@@ -2003,39 +2307,98 @@ class SessionStore:
             finally:
                 _release_run_lease(lease, remove=not os.path.lexists(path))
 
+        # Deletion can temporarily move a committed Raw file out of its
+        # canonical path. Restore or finish every delete first so Raw recovery
+        # never mistakes delete staging for missing/corrupt durable data.
         for path in sorted(manifest_paths):
-            operation_id = path.stem
-            lease = self._acquire_operation_lease(operation_id)
-            if lease is None:
-                continue
-            try:
-                payload = _read_manifest(path, operation_id)
-                kind = payload.get("kind")
-                if kind == "raw_batch":
-                    self._recover_raw_batch_manifest(path, payload)
-                elif kind == "delete":
-                    self._recover_delete_manifest(path, payload)
-                elif kind == "export":
-                    self._recover_export_manifest(path, payload)
-                elif kind == "external_export":
-                    try:
-                        self._recover_external_export_manifest(path, payload)
-                    except OSError as error:
-                        if not _external_recovery_target_unavailable(error):
-                            raise
-                        with self._lock:
-                            self._pending_external_recoveries[operation_id] = type(error).__name__
-                else:
-                    raise StorageError("지원하지 않는 저장 작업 manifest 종류입니다.")
-            finally:
-                _release_run_lease(lease, remove=not os.path.lexists(path))
+            self._recover_manifest_path(path, delete_only=True)
+        for path in sorted(manifest_paths):
+            self._recover_manifest_path(path, delete_only=False)
 
         self._recover_orphan_external_export_owners()
         self._recover_orphan_external_export_receipts()
 
+    def _recover_manifest_path(self, path: Path, *, delete_only: bool) -> None:
+        if not os.path.lexists(path):
+            return
+        operation_id = path.stem
+        if delete_only:
+            try:
+                peek = _read_manifest(path, operation_id)
+            except StorageError:
+                # Corrupt/non-delete manifests are handled fail-closed in the
+                # second pass, after every readable delete has been reconciled.
+                return
+            if peek.get("kind") != "delete":
+                return
+        lease = self._acquire_operation_lease(operation_id)
+        if lease is None:
+            return
+        raw_reconciled = False
+        try:
+            try:
+                payload = _read_manifest(path, operation_id)
+            except StorageError as error:
+                if not isinstance(error.__cause__, FileNotFoundError):
+                    raise
+                if self._poll_commit_receipt(operation_id, uninitialized=True) is None:
+                    raise
+                return
+            kind = payload.get("kind")
+            if delete_only:
+                if kind == "delete":
+                    self._recover_delete_manifest(path, payload)
+                return
+            if kind == "delete":
+                return
+            if kind == "raw_batch":
+                self._recover_raw_batch_manifest(path, payload)
+                raw_reconciled = True
+            elif kind == "export":
+                self._recover_export_manifest(path, payload)
+            elif kind == "external_export":
+                try:
+                    self._recover_external_export_manifest(path, payload)
+                except OSError as error:
+                    if not _external_recovery_target_unavailable(error):
+                        raise
+                    with self._lock:
+                        self._pending_external_recoveries[operation_id] = type(error).__name__
+            else:
+                raise StorageError("지원하지 않는 저장 작업 manifest 종류입니다.")
+        finally:
+            if raw_reconciled:
+                # Raw reconciliation is complete, but keep its manifest until
+                # the operation lease has been removed successfully. A failure
+                # therefore always leaves a durable startup-recovery anchor.
+                _release_run_lease(lease, remove=True)
+                _unlink_regular(path, missing_ok=True)
+            else:
+                _release_run_lease(lease, remove=not os.path.lexists(path))
+
     def _recover_raw_batch_manifest(self, path: Path, payload: dict[str, Any]) -> None:
         operation_id = _manifest_text(payload, "operation_id")
         run_id = _manifest_text(payload, "run_id")
+        poll_id_value = payload.get("poll_id")
+        phase_value = payload.get("phase")
+        legacy_manifest = poll_id_value is None and phase_value is None
+        if (poll_id_value is None) != (phase_value is None):
+            raise StorageError("Raw batch manifest의 poll 상태 필드가 불완전합니다.")
+        if legacy_manifest:
+            poll_id = None
+            phase = None
+            payload_sha256 = None
+        else:
+            poll_id = _manifest_text(payload, "poll_id")
+            _validate_poll_id(poll_id)
+            if poll_id != operation_id:
+                raise StorageError("Raw batch manifest의 poll ID가 작업 ID와 일치하지 않습니다.")
+            phase = _manifest_text(payload, "phase")
+            if phase not in {"PREPARED", "INSTALLED", "DB_COMMITTED"}:
+                raise StorageError("Raw batch manifest의 저장 단계가 올바르지 않습니다.")
+            payload_sha256 = _manifest_text(payload, "payload_sha256")
+            if re.fullmatch(r"[0-9a-f]{64}", payload_sha256) is None:
+                raise StorageError("Raw batch manifest의 payload SHA-256이 올바르지 않습니다.")
         try:
             safe_segment(run_id, "run_id")
         except UnsafeStoragePath as error:
@@ -2055,7 +2418,23 @@ class SessionStore:
         if len({item["relative_path"] for item in files}) != len(files):
             raise StorageError("Raw batch manifest에 중복 파일 경로가 있습니다.")
         with self._connection(uninitialized=True) as connection:
+            run_exists = (
+                connection.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone()
+                is not None
+            )
+            receipt = (
+                None
+                if poll_id is None
+                else connection.execute(
+                    """
+                    SELECT operation_id, run_id, payload_sha256 FROM poll_commits
+                    WHERE poll_id = ?
+                    """,
+                    (poll_id,),
+                ).fetchone()
+            )
             states: list[bool] = []
+            mismatched_rows = False
             for item in files:
                 row = connection.execute(
                     """
@@ -2064,16 +2443,44 @@ class SessionStore:
                     """,
                     (run_id, item["relative_path"]),
                 ).fetchone()
-                states.append(
+                matches = bool(
                     row is not None
                     and str(row["sha256"]) == item["sha256"]
                     and int(row["byte_size"]) == item["byte_size"]
                 )
+                states.append(matches)
+                mismatched_rows = mismatched_rows or (row is not None and not matches)
+            if mismatched_rows:
+                raise StorageError("Raw batch manifest와 DB 파일 fingerprint가 일치하지 않습니다.")
             if any(states) and not all(states):
                 raise StorageError(
                     "Raw batch의 DB 기록이 일부만 남아 있어 자동 복구할 수 없습니다."
                 )
-            committed = bool(files) and all(states)
+            if legacy_manifest:
+                committed = bool(files) and all(states)
+            elif receipt is not None:
+                if (
+                    str(receipt["operation_id"]) != operation_id
+                    or str(receipt["run_id"]) != run_id
+                    or str(receipt["payload_sha256"]) != payload_sha256
+                ):
+                    raise StorageError("Raw batch receipt가 manifest와 일치하지 않습니다.")
+                if phase == "PREPARED":
+                    raise StorageError(
+                        "PREPARED Raw batch에 예상하지 못한 commit receipt가 있습니다."
+                    )
+                if files and not all(states):
+                    raise StorageError("commit receipt가 참조하는 Raw DB 기록이 없습니다.")
+                committed = True
+            else:
+                if any(states):
+                    raise StorageError("receipt 없는 Raw batch에 DB 기록이 남아 있습니다.")
+                # A confirmed run deletion cascades its receipt and Raw DB
+                # rows. Delete recovery runs first, so only a marker for a run
+                # that still exists is an impossible/fail-closed state here.
+                if phase == "DB_COMMITTED" and run_exists:
+                    raise StorageError("DB_COMMITTED Raw batch에 commit receipt가 없습니다.")
+                committed = False
             for item in files:
                 relative = item["relative_path"]
                 destination = _managed_file_path(self.raw_root, relative, allow_missing=True)
@@ -2103,7 +2510,7 @@ class SessionStore:
                             if item["bundle_sections"]:
                                 _verify_raw_bundle_file(candidate, item["bundle_sections"])
                             candidate.unlink()
-        self._remove_operation_artifacts(path, stage_root)
+        self._remove_operation_artifacts(None, stage_root)
 
     def _recover_delete_manifest(self, path: Path, payload: dict[str, Any]) -> None:
         operation_id = _manifest_text(payload, "operation_id")
@@ -3717,6 +4124,13 @@ _REQUIRED_SCHEMA_COLUMNS = {
         "sha256",
         "byte_size",
     },
+    "poll_commits": {
+        "poll_id",
+        "operation_id",
+        "run_id",
+        "payload_sha256",
+        "committed_at",
+    },
 }
 _REQUIRED_INDEXES = {
     "ix_observations_run_time",
@@ -3726,6 +4140,7 @@ _REQUIRED_INDEXES = {
     "ix_diagnostic_run_time",
     "ix_raw_files_run_time",
     "ix_exports_run_id",
+    "ix_poll_commits_run_id",
 }
 
 
@@ -3744,6 +4159,79 @@ def _validate_schema(connection: sqlite3.Connection) -> None:
     }
     if not _REQUIRED_INDEXES.issubset(indexes):
         raise StorageError("필수 SQLite 인덱스가 누락되었습니다.")
+    _validate_poll_commit_schema(connection)
+
+
+def _validate_poll_commit_schema(connection: sqlite3.Connection) -> None:
+    columns = {str(row[1]): row for row in connection.execute("PRAGMA table_info(poll_commits)")}
+    if (
+        int(columns["poll_id"][5]) != 1
+        or int(columns["poll_id"][3]) != 1
+        or any(
+            int(columns[name][3]) != 1
+            for name in ("operation_id", "run_id", "payload_sha256", "committed_at")
+        )
+    ):
+        raise StorageError("poll commit receipt의 키 제약이 올바르지 않습니다.")
+
+    unique_column_sets: set[tuple[str, ...]] = set()
+    for row in connection.execute("PRAGMA index_list(poll_commits)"):
+        if int(row[2]) != 1 or int(row[4]) != 0:
+            continue
+        index_name = str(row[1]).replace('"', '""')
+        unique_column_sets.add(
+            tuple(
+                str(index_row[2])
+                for index_row in connection.execute(f'PRAGMA index_info("{index_name}")').fetchall()
+            )
+        )
+    if ("operation_id",) not in unique_column_sets:
+        raise StorageError("poll commit receipt의 operation ID UNIQUE 제약이 없습니다.")
+
+    poll_index = next(
+        (
+            row
+            for row in connection.execute("PRAGMA index_list(poll_commits)")
+            if str(row[1]) == "ix_poll_commits_run_id"
+        ),
+        None,
+    )
+    poll_index_columns = tuple(
+        str(row[2]) for row in connection.execute('PRAGMA index_info("ix_poll_commits_run_id")')
+    )
+    if (
+        poll_index is None
+        or int(poll_index[2]) != 0
+        or int(poll_index[4]) != 0
+        or poll_index_columns != ("run_id", "poll_id")
+    ):
+        raise StorageError("poll commit receipt의 run 조회 인덱스가 올바르지 않습니다.")
+
+    foreign_keys = connection.execute("PRAGMA foreign_key_list(poll_commits)").fetchall()
+    if not any(
+        str(row[2]) == "runs"
+        and str(row[3]) == "run_id"
+        and str(row[4]) == "id"
+        and str(row[6]).upper() == "CASCADE"
+        for row in foreign_keys
+    ):
+        raise StorageError("poll commit receipt의 run 삭제 연계가 올바르지 않습니다.")
+
+    schema_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'poll_commits'"
+    ).fetchone()
+    compact_sql = re.sub(r"\s+", "", str(schema_row[0] if schema_row else "")).upper()
+    required_checks = (
+        "LENGTH(POLL_ID)=32",
+        "POLL_IDNOTGLOB'*[^0-9A-F]*'",
+        "LENGTH(OPERATION_ID)=32",
+        "OPERATION_IDNOTGLOB'*[^0-9A-F]*'",
+        "OPERATION_ID=POLL_ID",
+        "LENGTH(PAYLOAD_SHA256)=64",
+        "PAYLOAD_SHA256NOTGLOB'*[^0-9A-F]*'",
+    )
+    if not all(check in compact_sql for check in required_checks):
+        raise StorageError("poll commit receipt의 형식 제약이 올바르지 않습니다.")
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
@@ -3756,10 +4244,137 @@ def _path_is_within(candidate: Path, root: Path) -> bool:
     return absolute_candidate == absolute_root or absolute_candidate.is_relative_to(absolute_root)
 
 
+def _validate_poll_id(value: object) -> str:
+    if not isinstance(value, str) or _OPERATION_ID.fullmatch(value) is None:
+        raise StorageError("poll ID가 올바르지 않습니다.")
+    return value
+
+
 def _validate_operation_id(value: str) -> str:
     if _OPERATION_ID.fullmatch(value) is None:
         raise StorageError("저장 작업 ID가 올바르지 않습니다.")
     return value
+
+
+def _retryable_poll_commit_error(error: sqlite3.OperationalError) -> bool:
+    code = getattr(error, "sqlite_errorcode", None)
+    if type(code) is not int:
+        return False
+    return (code & 0xFF) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+
+
+def _poll_payload_sha256(
+    outcome: QueryOutcome,
+    events: tuple[LifecycleEvent, ...],
+    raw_kind_overrides: tuple[str, ...],
+) -> str:
+    """Hash the complete logical poll without retaining runtime values."""
+
+    digest = hashlib.sha256()
+
+    def add(value: object) -> None:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+
+    def observation_value(observation: SessionObservation) -> tuple[object, ...]:
+        return (
+            observation.controller_name,
+            observation.controller_host,
+            observation.protocol,
+            observation.source_ip,
+            observation.destination_ip,
+            observation.source_port,
+            observation.destination_port,
+            observation.counter,
+            observation.priority,
+            observation.tos,
+            observation.age,
+            observation.destination,
+            observation.tunnel_age,
+            observation.packets,
+            observation.bytes_count,
+            observation.flags,
+            observation.cpu_id,
+            observation.raw_line,
+            _iso(observation.observed_at),
+        )
+
+    def location_value(location: ControllerLocation | None) -> tuple[object, ...] | None:
+        if location is None:
+            return None
+        return (
+            location.client_ip,
+            location.current_switch,
+            location.mm_name,
+            _iso(location.observed_at),
+        )
+
+    add(
+        {
+            "version": 1,
+            "used_mm": outcome.used_mm,
+            "controllers": outcome.controllers,
+            "source_location": location_value(outcome.source_location),
+            "destination_location": location_value(outcome.destination_location),
+            "full_scan_eligible": outcome.full_scan_eligible,
+            "authoritative": outcome.authoritative,
+            "raw_kind_overrides": raw_kind_overrides,
+            "observation_count": len(outcome.observations),
+            "diagnostic_count": len(outcome.diagnostics),
+            "raw_snapshot_count": len(outcome.raw_snapshots),
+            "lifecycle_event_count": len(events),
+        }
+    )
+    for observation in outcome.observations:
+        add(("observation", observation_value(observation)))
+    for diagnostic in outcome.diagnostics:
+        add(
+            (
+                "diagnostic",
+                diagnostic.stage,
+                diagnostic.code.value if diagnostic.code is not None else None,
+                diagnostic.message,
+                _iso(diagnostic.occurred_at),
+                diagnostic.transient,
+                diagnostic.recovered,
+            )
+        )
+    for snapshot in outcome.raw_snapshots:
+        raw_data = snapshot.output.encode("utf-8")
+        add(
+            (
+                "raw_snapshot",
+                snapshot.device_name,
+                snapshot.command,
+                hashlib.sha256(raw_data).hexdigest(),
+                len(raw_data),
+                _iso(snapshot.observed_at),
+                snapshot.observation_keys,
+            )
+        )
+    for event in events:
+        add(
+            (
+                "lifecycle_event",
+                event.event_type.value,
+                event.instance_id,
+                observation_value(event.observation),
+                (
+                    None
+                    if event.previous_observation is None
+                    else observation_value(event.previous_observation)
+                ),
+                event.miss_count,
+                _iso(event.occurred_at),
+            )
+        )
+    return digest.hexdigest()
 
 
 def _acquire_file_lease(path: Path) -> _RunLease | None:
@@ -4758,6 +5373,7 @@ def _reconcile_deleted_file(
 
 _DELETION_TABLES = (
     "runs",
+    "poll_commits",
     "observations",
     "lifecycle_events",
     "controller_events",

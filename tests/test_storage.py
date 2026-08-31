@@ -28,6 +28,7 @@ from aruba_session_tracker.models import (
     QueryRequest,
     SessionObservation,
 )
+from aruba_session_tracker.services.monitoring import LifecycleEvent, LifecycleEventType
 from aruba_session_tracker.services.tracker import QueryOutcome, RawSnapshot
 from aruba_session_tracker.storage import (
     DeletePreview,
@@ -178,8 +179,9 @@ def test_initialize_creates_required_schema(tmp_path: Path) -> None:
         "diagnostic_events",
         "raw_files",
         "exports",
+        "poll_commits",
     }.issubset(tables)
-    assert version == 2
+    assert version == 3
     assert "instance_id" in lifecycle_columns
 
 
@@ -258,7 +260,107 @@ def test_initialize_migrates_v1_lifecycle_instance_id(tmp_path: Path) -> None:
         instance_id = connection.execute("SELECT instance_id FROM lifecycle_events").fetchone()[0]
         version = connection.execute("PRAGMA user_version").fetchone()[0]
     assert instance_id == "legacy-1"
-    assert version == 2
+    assert version == 3
+
+
+def test_initialize_migrates_v2_history_and_adds_empty_poll_receipts(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    store.record_query(run_id, [_observation()], raw_text="v2 migration raw")
+    store.finish_run(run_id)
+    store.close()
+    with closing(sqlite3.connect(store.db_path)) as connection, connection:
+        connection.execute("DROP TABLE poll_commits")
+        connection.execute("PRAGMA user_version = 2")
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        run = connection.execute("SELECT status FROM runs WHERE id = ?", (run_id,)).fetchone()
+        observation_count = connection.execute(
+            "SELECT count(*) FROM observations WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+        raw_count = connection.execute(
+            "SELECT count(*) FROM raw_files WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+        receipt_count = connection.execute("SELECT count(*) FROM poll_commits").fetchone()[0]
+
+    assert version == 3
+    assert run == ("COMPLETED",)
+    assert observation_count == 1
+    assert raw_count == 1
+    assert receipt_count == 0
+    assert len(tuple(store.raw_root.rglob("*.txt"))) == 1
+
+
+@pytest.mark.parametrize(
+    ("malformation", "expected_message"),
+    [
+        ("primary_key", "키 제약"),
+        ("operation_unique", "UNIQUE"),
+        ("index_columns", "run 조회 인덱스"),
+        ("run_cascade", "run 삭제 연계"),
+        ("format_checks", "형식 제약"),
+    ],
+)
+def test_initialize_rejects_malformed_poll_commit_constraints(
+    tmp_path: Path,
+    malformation: str,
+    expected_message: str,
+) -> None:
+    store = _store(tmp_path)
+    store.close()
+    poll_id_column = (
+        "poll_id TEXT"
+        if malformation == "primary_key"
+        else "poll_id TEXT NOT NULL PRIMARY KEY CHECK ("
+        "length(poll_id) = 32 AND poll_id NOT GLOB '*[^0-9a-f]*')"
+    )
+    operation_id_column = (
+        "operation_id TEXT NOT NULL UNIQUE"
+        if malformation == "format_checks"
+        else "operation_id TEXT NOT NULL "
+        f"{' ' if malformation == 'operation_unique' else 'UNIQUE '}CHECK ("
+        "length(operation_id) = 32 "
+        "AND operation_id NOT GLOB '*[^0-9a-f]*' "
+        "AND operation_id = poll_id)"
+    )
+    run_id_column = (
+        "run_id TEXT NOT NULL REFERENCES runs(id)"
+        if malformation == "run_cascade"
+        else "run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE"
+    )
+    payload_column = (
+        "payload_sha256 TEXT NOT NULL"
+        if malformation == "format_checks"
+        else "payload_sha256 TEXT NOT NULL CHECK ("
+        "length(payload_sha256) = 64 "
+        "AND payload_sha256 NOT GLOB '*[^0-9a-f]*')"
+    )
+    with closing(sqlite3.connect(store.db_path)) as connection, connection:
+        connection.execute("DROP TABLE poll_commits")
+        connection.execute(
+            f"""
+            CREATE TABLE poll_commits (
+                {poll_id_column},
+                {operation_id_column},
+                {run_id_column},
+                {payload_column},
+                committed_at TEXT NOT NULL
+            )
+            """
+        )
+        index_columns = "poll_id, run_id" if malformation == "index_columns" else "run_id, poll_id"
+        connection.execute(f"CREATE INDEX ix_poll_commits_run_id ON poll_commits({index_columns})")
+        connection.execute("PRAGMA user_version = 3")
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    with pytest.raises(StorageError, match=expected_message):
+        reopened.initialize()
 
 
 def test_initialize_fails_closed_on_foreign_key_corruption(tmp_path: Path) -> None:
@@ -487,12 +589,642 @@ def test_record_poll_batch_is_atomic_when_a_late_insert_fails(tmp_path: Path) ->
         store.record_poll_batch(run_id, outcome)
 
     with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM poll_commits").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM raw_files").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM diagnostic_events").fetchone()[0] == 0
     assert not tuple(store.raw_root.rglob("*.txt"))
     assert not tuple((tmp_path / ".operations" / "manifests").glob("*.json"))
     assert not tuple(store.raw_root.glob(".raw-staging-*"))
+
+
+def test_record_poll_batch_is_exactly_once_for_the_same_poll_id(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    poll_id = "1" * 32
+    observation = _observation()
+    outcome = QueryOutcome(
+        observations=(observation,),
+        diagnostics=(
+            DiagnosticEvent(
+                stage="poll",
+                code=ErrorCode.PARSE_PARTIAL,
+                message="sanitized fixture diagnostic",
+            ),
+        ),
+        raw_snapshots=(
+            RawSnapshot(
+                "MD-01",
+                "show datapath session table 192.0.2.100",
+                "exactly-once raw",
+                observation.observed_at,
+                (observation.session_key,),
+            ),
+        ),
+        authoritative=True,
+    )
+    events = (
+        LifecycleEvent(
+            LifecycleEventType.STARTED,
+            "fixture-instance",
+            observation,
+            occurred_at=observation.observed_at,
+        ),
+    )
+
+    first = store.record_poll_batch(run_id, outcome, events, poll_id=poll_id)
+    second = store.record_poll_batch(run_id, outcome, events, poll_id=poll_id)
+
+    assert first.status is session_store_module.PollPersistenceStatus.COMMITTED
+    assert second.status is session_store_module.PollPersistenceStatus.ALREADY_COMMITTED
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        counts = {
+            table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]  # noqa: S608
+            for table in (
+                "poll_commits",
+                "raw_files",
+                "observations",
+                "diagnostic_events",
+                "lifecycle_events",
+            )
+        }
+    assert counts == {
+        "poll_commits": 1,
+        "raw_files": 1,
+        "observations": 1,
+        "diagnostic_events": 1,
+        "lifecycle_events": 1,
+    }
+    assert len(tuple(store.raw_root.rglob("*.txt"))) == 1
+
+
+def test_record_poll_batch_rejects_reused_poll_id_with_different_payload(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    poll_id = "2" * 32
+    observation = _observation()
+    store.record_poll_batch(
+        run_id,
+        QueryOutcome(observations=(observation,), authoritative=True),
+        poll_id=poll_id,
+    )
+
+    with pytest.raises(StorageError, match="다른 poll 내용"):
+        store.record_poll_batch(
+            run_id,
+            QueryOutcome(
+                observations=(replace(observation, packets=observation.packets + 1),),
+                authoritative=True,
+            ),
+            poll_id=poll_id,
+        )
+
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM poll_commits").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 1
+
+
+def test_record_poll_batch_rejects_reused_poll_id_for_another_run(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    first_run_id = _run(store)
+    second_run_id = _run(store)
+    poll_id = "3" * 32
+    outcome = QueryOutcome(observations=(_observation(),), authoritative=True)
+    store.record_poll_batch(first_run_id, outcome, poll_id=poll_id)
+
+    with pytest.raises(StorageError, match="다른 poll 내용"):
+        store.record_poll_batch(second_run_id, outcome, poll_id=poll_id)
+
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        receipt_run_id = connection.execute(
+            "SELECT run_id FROM poll_commits WHERE poll_id = ?", (poll_id,)
+        ).fetchone()[0]
+        first_count = connection.execute(
+            "SELECT count(*) FROM observations WHERE run_id = ?", (first_run_id,)
+        ).fetchone()[0]
+        second_count = connection.execute(
+            "SELECT count(*) FROM observations WHERE run_id = ?", (second_run_id,)
+        ).fetchone()[0]
+    assert receipt_run_id == first_run_id
+    assert first_count == 1
+    assert second_count == 0
+
+
+def test_poll_commit_retries_busy_once_without_duplicate_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    original_commit = SessionStore._commit_poll_batch_once
+    attempts = 0
+    sleeps: list[float] = []
+
+    def fail_busy_once(self: SessionStore, *args: object, **kwargs: object) -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            error = sqlite3.OperationalError("sanitized busy fixture")
+            error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+            raise error
+        return original_commit(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(SessionStore, "_commit_poll_batch_once", fail_busy_once)
+    monkeypatch.setattr(session_store_module.time, "sleep", sleeps.append)
+
+    result = store.record_poll_batch(
+        run_id,
+        QueryOutcome(observations=(_observation(),), authoritative=True),
+        poll_id="4" * 32,
+    )
+
+    assert result.status is session_store_module.PollPersistenceStatus.COMMITTED
+    assert attempts == 2
+    assert sleeps == [session_store_module._POLL_COMMIT_RETRY_DELAYS[1]]
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM poll_commits").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 1
+
+
+def test_poll_commit_does_not_retry_non_lock_operational_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    attempts = 0
+
+    def fail_io(self: SessionStore, *args: object, **kwargs: object) -> bool:
+        del self, args, kwargs
+        nonlocal attempts
+        attempts += 1
+        error = sqlite3.OperationalError("sanitized io fixture")
+        error.sqlite_errorcode = sqlite3.SQLITE_IOERR
+        raise error
+
+    monkeypatch.setattr(SessionStore, "_commit_poll_batch_once", fail_io)
+
+    with pytest.raises(StorageError, match="batch"):
+        store.record_poll_batch(
+            run_id,
+            QueryOutcome(observations=(_observation(),), authoritative=True),
+            poll_id="5" * 32,
+        )
+
+    assert attempts == 1
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM poll_commits").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 0
+
+
+def test_poll_commit_receipt_resolves_lost_commit_acknowledgement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    poll_id = "6" * 32
+    observation = _observation()
+    outcome = QueryOutcome(
+        observations=(observation,),
+        raw_snapshots=(
+            RawSnapshot(
+                "MD-01",
+                "show datapath session table 192.0.2.100",
+                "lost acknowledgement raw",
+                observation.observed_at,
+                (observation.session_key,),
+            ),
+        ),
+        authoritative=True,
+    )
+    original_commit = SessionStore._commit_poll_batch_once
+    attempts = 0
+
+    def commit_then_lose_ack(self: SessionStore, *args: object, **kwargs: object) -> bool:
+        nonlocal attempts
+        attempts += 1
+        original_commit(self, *args, **kwargs)  # type: ignore[arg-type]
+        error = sqlite3.OperationalError("sanitized lost acknowledgement")
+        error.sqlite_errorcode = sqlite3.SQLITE_IOERR
+        raise error
+
+    monkeypatch.setattr(SessionStore, "_commit_poll_batch_once", commit_then_lose_ack)
+
+    result = store.record_poll_batch(run_id, outcome, poll_id=poll_id)
+
+    assert result.status is session_store_module.PollPersistenceStatus.ALREADY_COMMITTED
+    assert attempts == 1
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM poll_commits").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM raw_files").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 1
+    assert len(tuple(store.raw_root.rglob("*.txt"))) == 1
+
+
+def test_indeterminate_poll_commit_keeps_recovery_anchor_and_reuses_poll_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    poll_id = "e" * 32
+    observation = _observation()
+    outcome = QueryOutcome(
+        observations=(observation,),
+        raw_snapshots=(
+            RawSnapshot(
+                "MD-01",
+                "show datapath session table 192.0.2.100",
+                "indeterminate commit raw",
+                observation.observed_at,
+                (observation.session_key,),
+            ),
+        ),
+        authoritative=True,
+    )
+    original_receipt = store._poll_commit_receipt
+    original_commit = store._commit_poll_batch_once
+    commit_attempted = False
+
+    def fail_commit(*_args: object, **_kwargs: object) -> bool:
+        nonlocal commit_attempted
+        commit_attempted = True
+        error = sqlite3.OperationalError("sanitized unknown commit fixture")
+        error.sqlite_errorcode = sqlite3.SQLITE_IOERR
+        raise error
+
+    def fail_receipt_after_commit_attempt(
+        candidate: str,
+        *,
+        uninitialized: bool = False,
+    ) -> tuple[str, str] | None:
+        if commit_attempted:
+            raise sqlite3.OperationalError("sanitized receipt probe fixture")
+        return original_receipt(candidate, uninitialized=uninitialized)
+
+    monkeypatch.setattr(store, "_commit_poll_batch_once", fail_commit)
+    monkeypatch.setattr(store, "_poll_commit_receipt", fail_receipt_after_commit_attempt)
+
+    with pytest.raises(session_store_module.PollPersistenceIndeterminate) as captured:
+        store.record_poll_batch(run_id, outcome, poll_id=poll_id)
+
+    manifest = store._manifests_root / f"{poll_id}.json"
+    assert captured.value.poll_id == poll_id
+    assert manifest.exists()
+    assert json.loads(manifest.read_text(encoding="utf-8"))["phase"] == "INSTALLED"
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM poll_commits").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM raw_files").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 0
+
+    monkeypatch.setattr(store, "_commit_poll_batch_once", original_commit)
+    monkeypatch.setattr(store, "_poll_commit_receipt", original_receipt)
+    result = store.record_poll_batch(run_id, outcome, poll_id=poll_id)
+
+    assert result.status is session_store_module.PollPersistenceStatus.COMMITTED
+    assert not manifest.exists()
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM poll_commits").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM raw_files").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 1
+    assert len(tuple(store.raw_root.rglob("*.txt"))) == 1
+
+
+def test_committed_poll_cleanup_failure_is_pending_and_restart_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    poll_id = "7" * 32
+    observation = _observation()
+    outcome = QueryOutcome(
+        observations=(observation,),
+        raw_snapshots=(
+            RawSnapshot(
+                "MD-01",
+                "show datapath session table 192.0.2.100",
+                "restart recovery raw",
+                observation.observed_at,
+                (observation.session_key,),
+            ),
+        ),
+        authoritative=True,
+    )
+    manifest = store._manifests_root / f"{poll_id}.json"
+    original_unlink = Path.unlink
+    failed = False
+
+    def fail_manifest_cleanup_once(path: Path, *args: object, **kwargs: object) -> None:
+        nonlocal failed
+        if path == manifest and not failed:
+            failed = True
+            raise OSError("sanitized committed cleanup fixture")
+        original_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "unlink", fail_manifest_cleanup_once)
+
+    result = store.record_poll_batch(run_id, outcome, poll_id=poll_id)
+
+    assert result.status is session_store_module.PollPersistenceStatus.COMMITTED_RECOVERY_PENDING
+    assert result.cleanup_error_type == "OSError"
+    assert manifest.exists()
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM poll_commits").fetchone()[0] == 1
+        relative_path = connection.execute(
+            "SELECT relative_path FROM raw_files WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+    assert (store.raw_root / relative_path).exists()
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+
+    assert not manifest.exists()
+    repeated = store.record_poll_batch(run_id, outcome, poll_id=poll_id)
+    assert repeated.status is session_store_module.PollPersistenceStatus.ALREADY_COMMITTED
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM poll_commits").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM raw_files").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 1
+
+
+def test_committed_poll_lease_cleanup_failure_keeps_recovery_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    poll_id = "a" * 32
+    outcome = QueryOutcome(authoritative=True)
+    manifest = store._manifests_root / f"{poll_id}.json"
+    operation_lease_path = store._leases_root / f"operation-{poll_id}.lease"
+    original_remove_lease = session_store_module._remove_released_lease_with_retry
+    failed = False
+
+    def fail_operation_lease_once(lease: session_store_module._RunLease) -> None:
+        nonlocal failed
+        if lease.path == operation_lease_path and not failed:
+            failed = True
+            raise OSError("sanitized operation lease cleanup fixture")
+        original_remove_lease(lease)
+
+    monkeypatch.setattr(
+        session_store_module,
+        "_remove_released_lease_with_retry",
+        fail_operation_lease_once,
+    )
+
+    result = store.record_poll_batch(run_id, outcome, poll_id=poll_id)
+
+    assert result.status is session_store_module.PollPersistenceStatus.COMMITTED_RECOVERY_PENDING
+    assert result.cleanup_error_type == "OSError"
+    assert manifest.exists()
+    assert operation_lease_path.exists()
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM poll_commits").fetchone()[0] == 1
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+
+    assert not manifest.exists()
+    assert not operation_lease_path.exists()
+    repeated = store.record_poll_batch(run_id, outcome, poll_id=poll_id)
+    assert repeated.status is session_store_module.PollPersistenceStatus.ALREADY_COMMITTED
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM poll_commits").fetchone()[0] == 1
+
+
+def test_startup_recovers_committed_poll_receipt_without_raw_files(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    poll_id = "8" * 32
+    outcome = QueryOutcome(authoritative=True)
+    store.record_poll_batch(run_id, outcome, poll_id=poll_id)
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        payload_sha256 = connection.execute(
+            "SELECT payload_sha256 FROM poll_commits WHERE poll_id = ?", (poll_id,)
+        ).fetchone()[0]
+    manifest = store._write_manifest(
+        poll_id,
+        {
+            "version": 1,
+            "kind": "raw_batch",
+            "operation_id": poll_id,
+            "poll_id": poll_id,
+            "run_id": run_id,
+            "payload_sha256": payload_sha256,
+            "phase": "DB_COMMITTED",
+            "stage_root": f".raw-staging-{poll_id}",
+            "files": [],
+        },
+    )
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+
+    assert not manifest.exists()
+    result = store.record_poll_batch(run_id, outcome, poll_id=poll_id)
+    assert result.status is session_store_module.PollPersistenceStatus.ALREADY_COMMITTED
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM poll_commits").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM raw_files").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 0
+
+
+def test_startup_rejects_poll_manifest_with_mismatched_database_fingerprint(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    poll_id = "d" * 32
+    observation = _observation()
+    outcome = QueryOutcome(
+        observations=(observation,),
+        raw_snapshots=(
+            RawSnapshot(
+                "MD-01",
+                "show datapath session table 192.0.2.100",
+                "fingerprint fixture raw",
+                observation.observed_at,
+                (observation.session_key,),
+            ),
+        ),
+        authoritative=True,
+    )
+    store.record_poll_batch(run_id, outcome, poll_id=poll_id)
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        relative_path, _sha256, byte_size = connection.execute(
+            "SELECT relative_path, sha256, byte_size FROM raw_files WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        payload_sha256 = connection.execute(
+            "SELECT payload_sha256 FROM poll_commits WHERE poll_id = ?", (poll_id,)
+        ).fetchone()[0]
+    raw_path = store.raw_root / str(relative_path)
+    original_bytes = raw_path.read_bytes()
+    manifest = store._write_manifest(
+        poll_id,
+        {
+            "version": 1,
+            "kind": "raw_batch",
+            "operation_id": poll_id,
+            "poll_id": poll_id,
+            "run_id": run_id,
+            "payload_sha256": payload_sha256,
+            "phase": "DB_COMMITTED",
+            "stage_root": f".raw-staging-{poll_id}",
+            "files": [
+                {
+                    "relative_path": relative_path,
+                    "sha256": "0" * 64,
+                    "byte_size": byte_size,
+                }
+            ],
+        },
+    )
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    with pytest.raises(StorageError, match="fingerprint"):
+        reopened.initialize()
+
+    assert manifest.exists()
+    assert raw_path.read_bytes() == original_bytes
+
+
+@pytest.mark.parametrize("database_deleted", (False, True))
+def test_startup_recovers_delete_before_older_committed_poll_manifest(
+    tmp_path: Path,
+    database_deleted: bool,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    poll_id = "0" * 32
+    delete_id = "f" * 32
+    observation = _observation()
+    outcome = QueryOutcome(
+        observations=(observation,),
+        raw_snapshots=(
+            RawSnapshot(
+                "MD-01",
+                "show datapath session table 192.0.2.100",
+                "delete ordering raw",
+                observation.observed_at,
+                (observation.session_key,),
+            ),
+        ),
+        authoritative=True,
+    )
+    store.record_poll_batch(run_id, outcome, poll_id=poll_id)
+    store.finish_run(run_id)
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        relative_path, sha256, byte_size = connection.execute(
+            "SELECT relative_path, sha256, byte_size FROM raw_files WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        payload_sha256 = connection.execute(
+            "SELECT payload_sha256 FROM poll_commits WHERE poll_id = ?", (poll_id,)
+        ).fetchone()[0]
+    raw_manifest = store._write_manifest(
+        poll_id,
+        {
+            "version": 1,
+            "kind": "raw_batch",
+            "operation_id": poll_id,
+            "poll_id": poll_id,
+            "run_id": run_id,
+            "payload_sha256": payload_sha256,
+            "phase": "DB_COMMITTED",
+            "stage_root": f".raw-staging-{poll_id}",
+            "files": [
+                {
+                    "relative_path": relative_path,
+                    "sha256": sha256,
+                    "byte_size": byte_size,
+                }
+            ],
+        },
+    )
+    snapshot = store._collect_deletion_snapshot(run_id)
+    delete_manifest = store._write_manifest(
+        delete_id,
+        {
+            "version": 1,
+            "kind": "delete",
+            "operation_id": delete_id,
+            "files": [
+                {
+                    "category": "raw",
+                    "relative_path": item.relative_path,
+                    "sha256": item.sha256,
+                    "byte_size": item.byte_size,
+                    "registered": item.registered,
+                }
+                for item in snapshot.raw_files
+            ],
+        },
+    )
+    staged: list[session_store_module._StagedFile] = []
+    session_store_module._stage_files(
+        store.raw_root,
+        snapshot.raw_files,
+        delete_id,
+        "raw",
+        staged,
+    )
+    raw_path = store.raw_root / str(relative_path)
+    assert not raw_path.exists()
+    if database_deleted:
+        with closing(sqlite3.connect(store.db_path)) as connection, connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    reopened.initialize()
+
+    assert not raw_manifest.exists()
+    assert not delete_manifest.exists()
+    assert not tuple(store.raw_root.glob(".delete-staging-*"))
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        run_count = connection.execute(
+            "SELECT count(*) FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()[0]
+        receipt_count = connection.execute(
+            "SELECT count(*) FROM poll_commits WHERE poll_id = ?", (poll_id,)
+        ).fetchone()[0]
+    assert run_count == int(not database_deleted)
+    assert receipt_count == int(not database_deleted)
+    assert raw_path.exists() is not database_deleted
+
+
+def test_deleting_run_cascades_poll_commit_receipts(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    poll_id = "9" * 32
+    store.record_poll_batch(
+        run_id,
+        QueryOutcome(observations=(_observation(),), authoritative=True),
+        poll_id=poll_id,
+    )
+    store.finish_run(run_id)
+    preview = store.preview_delete(run_id)
+
+    result = store.delete(preview, confirmation_token=preview.confirmation_token)
+
+    assert result.deleted_runs == 1
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert (
+            connection.execute("SELECT count(*) FROM runs WHERE id = ?", (run_id,)).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM poll_commits WHERE poll_id = ?", (poll_id,)
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_raw_file_install_runs_without_sqlite_writer_lock(
@@ -730,7 +1462,7 @@ def test_poll_batch_persists_cross_controller_overlap_without_schema_change(
     assert observations[0][2] is not None
     assert observations[1][2] == observations[0][2]
     assert diagnostic_code == ErrorCode.DUPLICATE_FLOW_ACROSS_CONTROLLERS.value
-    assert schema_version == 2
+    assert schema_version == 3
 
 
 def test_poll_bundle_keeps_csv_references_and_deletes_as_one_file(tmp_path: Path) -> None:

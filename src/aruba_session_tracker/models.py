@@ -103,6 +103,7 @@ class AppConfig:
         enabled = tuple(device for device in self.managed_devices if device.enabled)
         if not enabled:
             raise ValueError("활성 MD를 한 대 이상 등록하십시오.")
+        _validate_enabled_topology(self.mm_primary, self.mm_standby, enabled)
         if not 3 <= self.session_interval_seconds <= 300:
             raise ValueError("세션 조회 주기는 3~300초 범위여야 합니다.")
         if not 10 <= self.location_interval_seconds <= 3600:
@@ -291,3 +292,49 @@ def _strict_boolean(value: object, label: str) -> bool:
     if type(value) is not bool:
         raise ValueError(f"{label}은 boolean이어야 합니다.")
     return value
+
+
+def _validate_enabled_topology(
+    mm_primary: DeviceTarget,
+    mm_standby: DeviceTarget,
+    managed_devices: tuple[DeviceTarget, ...],
+) -> None:
+    if (
+        mm_primary.enabled
+        and mm_standby.enabled
+        and (mm_primary.host, mm_primary.port) == (mm_standby.host, mm_standby.port)
+    ):
+        raise ValueError("활성 Primary MM과 Standby MM은 서로 다른 SSH endpoint여야 합니다.")
+
+    hosts: set[str] = set()
+    normalized_names: set[str] = set()
+    mapping_tokens: set[str] = set()
+    for device in managed_devices:
+        if device.host in hosts:
+            raise ValueError("활성 MD의 주소는 SSH 포트와 관계없이 중복될 수 없습니다.")
+
+        normalized_name = _normalize_switch_token(device.name)
+        if normalized_name in normalized_names:
+            raise ValueError("활성 MD의 정규화된 이름은 중복될 수 없습니다.")
+
+        device_tokens = {
+            token
+            for token in (
+                normalized_name,
+                _normalize_switch_token(device.host),
+                _normalize_switch_token(device.name.split(".", 1)[0]),
+            )
+            if token
+        }
+        if mapping_tokens.intersection(device_tokens):
+            raise ValueError("활성 MD의 Current switch 매핑 토큰은 중복될 수 없습니다.")
+
+        hosts.add(device.host)
+        normalized_names.add(normalized_name)
+        mapping_tokens.update(device_tokens)
+
+
+def _normalize_switch_token(value: str) -> str:
+    """Match the normalization used by current-switch routing."""
+
+    return value.strip().rstrip(".").casefold()

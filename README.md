@@ -19,7 +19,7 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 - 로컬 SQLite 이력, 실행별 Raw TXT, 독립적인 CSV와 HTML 보고서 내보내기
 - 실행할 때마다 꺼진 상태로 시작하는 `F12` 화면 개선 도우미
 
-다음은 v0.5.5 범위에 포함되지 않습니다.
+다음은 v0.5.6 범위에 포함되지 않습니다.
 
 - 장비 설정 변경, 사용자 삭제 또는 쓰기 API
 - 무필터 `show datapath session table` 실행
@@ -31,13 +31,13 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 
 ### 포터블 ZIP
 
-1. GitHub Releases에서 `ArubaSessionTracker_v0.5.5_windows_x64.zip`을
+1. GitHub Releases에서 `ArubaSessionTracker_v0.5.6_windows_x64.zip`을
    받습니다. GitHub의 자동 생성 Source code ZIP/TAR는 실행 프로그램이
    아닙니다.
 2. 릴리스 본문의 SHA-256과 PowerShell 계산 결과를 비교합니다.
 
    ```powershell
-   Get-FileHash -Algorithm SHA256 .\ArubaSessionTracker_v0.5.5_windows_x64.zip
+   Get-FileHash -Algorithm SHA256 .\ArubaSessionTracker_v0.5.6_windows_x64.zip
    ```
 
 3. ZIP을 쓰기 가능한 일반 폴더에 풀고 `ArubaSessionTracker.exe`를
@@ -48,11 +48,12 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 검증한 뒤 같은 ID를 다시 공개합니다. 중단되면 이전 커밋으로 되돌려
 재공개하지 않고 숨겨진 단계 기록에서 다음 실행이 이어집니다. 이 방식은
 GitHub 기본 토큰에 없는 과거 워크플로 수정 권한을 요구하지 않으며, 태그로
-초안을 추측해 중복 릴리스를 만드는 문제도 피합니다. `v0.5.5` 같은 버전
+초안을 추측해 중복 릴리스를 만드는 문제도 피합니다. `v0.5.6` 같은 버전
 태그 릴리스는 자동화가 기존 릴리스 덮어쓰기를 거부하는 1회성
-사전릴리스입니다. 공개 자산은 Windows x64 ZIP 하나이며 SHA-256은 릴리스
-본문에, CycloneDX SBOM은 ZIP 내부 `ArubaSessionTracker/sbom.cdx.json`에
-포함됩니다. Native 파일별 SHA-256과 구성요소 연결은
+사전릴리스입니다. 게시 검증이 성공한 버전 릴리스의 공개 자산은 Windows x64
+ZIP 하나이며 SHA-256은 릴리스 본문에, CycloneDX SBOM은 ZIP 내부
+`ArubaSessionTracker/sbom.cdx.json`에 포함됩니다. Native 파일별 SHA-256과
+구성요소 연결은
 `ArubaSessionTracker/THIRD_PARTY_COMPONENTS.json`, LGPL 소스 요청·재빌드
 안내는 `ArubaSessionTracker/OPEN_SOURCE_SOURCE_OFFER.txt`에 포함됩니다. 두
 게시 runner 모두 고정 runtime lock 설치와 `pip check`를 통과한 뒤 검증
@@ -68,13 +69,32 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m aruba_session_tracker
 ```
 
-## v0.5.5 장시간 안정성과 결과 보고서
+## v0.5.6 저장 안정성과 결과 보고서
 
-v0.5.5는 v0.5.4의 단일 IP 조회, 장시간 수집·종료·내보내기·복구 경계를
-유지하면서, AOS 8 MM의 가운데 정렬된 global-user 헤더를 실제 대시 구분선
-위치로 해석합니다. 빈 Name/Auth가 있어도 Current switch를 정확히 찾고,
-검증되지 않은 열 구조는 MD 조회 전에 안전하게 중단합니다.
+v0.5.6은 v0.5.5의 단일 IP 조회와 MM 출력 해석 경계를 유지하면서, 잘못된
+장비 토폴로지를 실행 전에 차단하고 각 poll의 SQLite 기록을 durable receipt로
+식별합니다. DB commit 뒤 파일 정리가 실패해도 저장 성공 여부를 잃지 않으며,
+같은 poll을 재시도해도 관측·진단·수명주기 이벤트를 중복 기록하지 않습니다.
 
+- 활성 Primary/Standby MM이 같은 주소와 포트를 사용하거나 활성 MD의 주소·
+  이름·Current switch 별칭이 서로 충돌하면 `AppConfig` 생성 단계에서
+  중단합니다. 의도적으로 꺼 둔 장비 placeholder는 이 충돌 검사에서 제외합니다.
+- SQLite schema v3의 `poll_commits`는 poll ID, 실행 ID와 payload SHA-256을 한
+  transaction의 마지막 행으로 기록합니다. 같은 poll ID와 같은 내용은 이미
+  commit된 결과로 확인하고, 실행이나 내용이 다른 ID 재사용은 안전하게
+  거부합니다.
+- DB commit 확인 뒤 manifest·staging·lease 정리가 끝나지 않으면 저장 실패로
+  되돌리지 않고 `COMMITTED_RECOVERY_PENDING`으로 구분합니다. 앱을 다시
+  시작하거나 같은 poll ID로 재시도하면 receipt와 Raw 무결성을 대조한 뒤 남은
+  파일 작업을 마칩니다. 불확정 poll 재확인 중 추가 저장 오류나 동시 중지가
+  발생해도 준비 상태와 ID를 보존하며, 확인된 commit만 모니터 상태에 반영합니다.
+  실패했던 실행 종료 기록의 동시 재시도는 직렬화합니다.
+- SQLite writer의 `BUSY`와 `LOCKED`만 짧고 제한된 횟수로 재시도합니다. commit
+  응답을 확인하지 못한 경우에도 receipt를 다시 읽어 확정하며, receipt 자체를
+  읽을 수 없으면 중복 저장을 추측하지 않고 동일 poll ID 복구가 필요한 상태로
+  중단합니다.
+- 시작 복구는 삭제 manifest를 Raw batch manifest보다 먼저 처리합니다. 삭제
+  staging으로 잠시 옮겨진 정상 Raw를 누락 또는 손상으로 잘못 판단하지 않습니다.
 - MM global-user 출력은 대시 구분선과 헤더 라벨이 같은 열을 가리킬 때만
   승인합니다. 구형 좌측 정렬·연속 구분선 형식은 유지하되, 가운데 정렬
   헤더에 열 경계가 없거나 비정상 헤더가 섞이면 `PARSE_PARTIAL`로 중단합니다.
@@ -397,7 +417,7 @@ GitHub 이슈나 외부 지원 채널에 올리지 말고, 공유가 필요하�
 저장소는 네트워크와 분리된 비식별 fixture 및 메모리 내 SSH 프로토콜
 fake를 기본 검증 경계로 사용합니다. 127.0.0.1에만 바인딩하는 최소
 Paramiko 서버를 통한 실제 Paramiko/Netmiko loopback 통합시험도 포함합니다.
-실제 Aruba 장비 접속과 회사 네트워크 현장 검증은 v0.5.5 검증 범위에
+실제 Aruba 장비 접속과 회사 네트워크 현장 검증은 v0.5.6 검증 범위에
 포함되지 않습니다.
 
 내보내기 복구 시험은 CSV와 HTML 각각 다섯 단계에서 별도 프로세스를
@@ -407,7 +427,7 @@ Paramiko 서버를 통한 실제 Paramiko/Netmiko loopback 통합시험도 포�
 
 ```powershell
 .\tools\validate.ps1 -PythonPath .\.venv\Scripts\python.exe
-.\build_windows.ps1 -PythonPath .\.venv\Scripts\python.exe -Version 0.5.5
+.\build_windows.ps1 -PythonPath .\.venv\Scripts\python.exe -Version 0.5.6
 ```
 
 `validate.ps1`은 Python/아키텍처, 해시 고정 lock 동기화, 의존성, 버전
@@ -462,8 +482,8 @@ smoke와 패키지 검증은 다음을 증명하지 않습니다.
 - Authenticode 서명 또는 조직 보안 제품의 허용
 - 실장비 네트워크 상태나 세션 존재/종료
 
-v0.5.5는 이 한계를 명시한 unsigned 사전릴리스입니다. 사용자가 실제 장비에서
-확인한 결과는 자동 테스트 증거와 구분합니다.
+v0.5.6은 이 한계를 명시한 unsigned 사전릴리스로 준비합니다. 사용자가 실제
+장비에서 확인한 결과는 자동 테스트 증거와 구분합니다.
 
 프로젝트 라이선스는 MIT입니다. 제3자 구성요소 고지는
 [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt), LGPL 구성요소의 소스

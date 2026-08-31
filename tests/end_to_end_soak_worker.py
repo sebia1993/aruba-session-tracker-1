@@ -144,6 +144,9 @@ def run_end_to_end_soak(root: Path, polls: int) -> dict[str, object]:
                 connection.execute("SELECT count(*) FROM observations").fetchone()[0]
             ),
             "raw_files": int(connection.execute("SELECT count(*) FROM raw_files").fetchone()[0]),
+            "poll_commits": int(
+                connection.execute("SELECT count(*) FROM poll_commits").fetchone()[0]
+            ),
             "lifecycle_events": int(
                 connection.execute("SELECT count(*) FROM lifecycle_events").fetchone()[0]
             ),
