@@ -81,6 +81,20 @@ def _run(store: SessionStore) -> str:
     return store.start_run(QueryRequest("192.0.2.100", "203.0.113.80", 53000, 443))
 
 
+def test_single_ip_query_round_trips_without_a_schema_change(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = store.start_run(QueryRequest("", "203.0.113.80", 53000, 443))
+
+    row = store.list_runs()[0]
+    assert row["id"] == run_id
+    assert row["source_ip"] == ""
+    assert row["destination_ip"] == "203.0.113.80"
+    assert row["source_port"] == 53000
+    assert row["destination_port"] == 443
+
+    store.finish_run(run_id)
+
+
 def _run_export_crash(
     store: SessionStore,
     run_id: str,

@@ -520,6 +520,27 @@ def test_report_renders_kst_with_utc_date_rollover_and_missing_values_as_dash() 
     assert "PARTIAL" not in document
 
 
+def test_report_shows_the_wildcard_side_of_a_single_ip_query() -> None:
+    document = render_html_report(
+        _snapshot(
+            run={
+                "id": "not-rendered",
+                "started_at": "2026-08-31T00:00:00Z",
+                "ended_at": "2026-08-31T00:05:00Z",
+                "source_ip": "",
+                "destination_ip": "203.0.113.80",
+                "source_port": 53000,
+                "destination_port": 443,
+                "bidirectional": 1,
+                "status": "COMPLETED",
+            }
+        )
+    )
+
+    assert '<span class="endpoint-value">모든 IP:53000</span>' in document
+    assert '<span class="endpoint-value">203.0.113.80:443</span>' in document
+
+
 def test_summary_prioritizes_query_flow_and_keeps_only_four_core_stats() -> None:
     document = render_html_report(_snapshot())
 

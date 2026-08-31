@@ -45,6 +45,12 @@ remains dominant, and detail panels stay collapsed by default.
 - Password and Enable-secret echo modes remain password-protected.
 - Placeholder examples contain only documentation address ranges.
 - No live addresses or credentials are added to source, tests, or design files.
+- Require at least one of the source or destination IPv4 fields. Treat an empty
+  endpoint as a wildcard during local filtering; an optional port on that side
+  remains an independent constraint.
+- When bidirectional search is enabled, swap the entered IP and port constraints
+  together. Every MM and MD command must still contain an explicitly entered,
+  validated IPv4 filter.
 - Preserve the exact labels `지속 모니터링 시작`, `현재 조회`,
   `고급 조건 보기/숨기기`, and `상세 정보 보기/숨기기`.
-- No new query, polling, or automatic scan behavior is introduced.
+- Do not introduce an unfiltered query or an unapproved automatic scan.

@@ -240,8 +240,14 @@ class TrackerService:
             required_devices.append(matches[0])
         device_candidates: list[tuple[DeviceTarget, str]] = []
 
-        source_device = self._device_for_location(source_location, diagnostics)
-        destination_device = self._device_for_location(destination_location, diagnostics)
+        source_device = (
+            self._device_for_location(source_location, diagnostics) if request.source_ip else None
+        )
+        destination_device = (
+            self._device_for_location(destination_location, diagnostics)
+            if request.destination_ip
+            else None
+        )
         # A known-but-unmapped or ambiguous Current switch means that a
         # negative result from the remaining MD candidates cannot prove the
         # session is absent.  Keep positive evidence, but never advance the
@@ -260,9 +266,9 @@ class TrackerService:
         if destination_device is not None and destination_device != source_device:
             device_candidates.append((destination_device, request.destination_ip))
 
-        # Full scan is permitted only for two explicit NOT_FOUND results.  An
-        # ambiguous, malformed or unmapped location must never be upgraded to
-        # permission to scan every MD.
+        # Full scan is permitted only when every entered address has an
+        # explicit NOT_FOUND result. An ambiguous, malformed or unmapped
+        # location must never be upgraded to permission to scan every MD.
         full_scan = locations.full_scan_eligible
         if full_scan and fallback_devices:
             requested_fallback = tuple(dict.fromkeys((*fallback_devices, *required_devices)))
@@ -285,7 +291,7 @@ class TrackerService:
                     authoritative=False,
                 )
             device_candidates = [
-                (device, request.source_ip) for device in self._rotated_full_scan_devices(fallback)
+                (device, request.filter_ip) for device in self._rotated_full_scan_devices(fallback)
             ]
         elif full_scan and allow_full_scan:
             approval = full_scan_approval or self._callbacks.full_scan_approval
@@ -325,7 +331,8 @@ class TrackerService:
                         stage="MD_SCAN",
                         code=ErrorCode.CLIENT_NOT_FOUND_ON_MM,
                         message=(
-                            "MM에서 두 주소의 위치를 찾지 못해 전체 MD 조회를 실행하지 않았습니다."
+                            "MM에서 입력한 주소의 위치를 찾지 못해 "
+                            "전체 MD 조회를 실행하지 않았습니다."
                         ),
                     )
                 )
@@ -339,7 +346,7 @@ class TrackerService:
                     authoritative=False,
                 )
             device_candidates = [
-                (device, request.source_ip)
+                (device, request.filter_ip)
                 for device in self._rotated_full_scan_devices(enabled_devices)
             ]
         elif full_scan:
@@ -364,7 +371,7 @@ class TrackerService:
             candidate_devices = {device for device, _filter_ip in device_candidates}
             for device in required_devices:
                 if device not in candidate_devices:
-                    device_candidates.append((device, request.source_ip))
+                    device_candidates.append((device, request.filter_ip))
                     candidate_devices.add(device)
 
         if not device_candidates:
@@ -527,11 +534,8 @@ class TrackerService:
     ) -> LocationSnapshot | None:
         commands: tuple[str, ...] = (
             NO_PAGING_COMMAND,
-            build_global_user_command(request.source_ip),
-            build_global_user_command(request.destination_ip),
+            *(build_global_user_command(client_ip) for client_ip in request.client_ips),
         )
-        # Preserve order while avoiding duplicate commands for equal addresses.
-        commands = tuple(dict.fromkeys(commands))
         batch = None
         selected_mm: DeviceTarget | None = None
         selected_index: int | None = None
@@ -588,9 +592,9 @@ class TrackerService:
                 for event in diagnostics
             ]
 
-        resolved: list[ControllerLocation | None] = []
-        not_found: list[bool] = []
-        for client_ip in (request.source_ip, request.destination_ip):
+        resolved: dict[str, ControllerLocation | None] = {}
+        not_found: dict[str, bool] = {}
+        for client_ip in request.client_ips:
             command = build_global_user_command(client_ip)
             output = batch.output_for(command)
             if not budget.consume_raw(output):
@@ -617,14 +621,12 @@ class TrackerService:
                 )
                 return None
             if lookup.status == GlobalUserStatus.FOUND and len(lookup.current_switches) == 1:
-                resolved.append(
-                    ControllerLocation(
-                        client_ip=client_ip,
-                        current_switch=lookup.current_switches[0],
-                        mm_name=selected_mm.name,
-                    )
+                resolved[client_ip] = ControllerLocation(
+                    client_ip=client_ip,
+                    current_switch=lookup.current_switches[0],
+                    mm_name=selected_mm.name,
                 )
-                not_found.append(False)
+                not_found[client_ip] = False
             elif lookup.status == GlobalUserStatus.AMBIGUOUS or len(lookup.current_switches) > 1:
                 diagnostics.append(
                     DiagnosticEvent(
@@ -635,17 +637,17 @@ class TrackerService:
                         ),
                     )
                 )
-                resolved.append(None)
-                not_found.append(False)
+                resolved[client_ip] = None
+                not_found[client_ip] = False
             else:
-                resolved.append(None)
-                not_found.append(True)
+                resolved[client_ip] = None
+                not_found[client_ip] = True
 
         return LocationSnapshot(
-            source=resolved[0],
-            destination=resolved[1],
+            source=resolved.get(request.source_ip) if request.source_ip else None,
+            destination=(resolved.get(request.destination_ip) if request.destination_ip else None),
             used_mm=selected_mm.name,
-            full_scan_eligible=all(not_found),
+            full_scan_eligible=bool(not_found) and all(not_found.values()),
         )
 
     def _device_for_location(

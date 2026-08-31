@@ -575,8 +575,16 @@ def _report_chunks(
     run_status_code = str(run.get("status") or "").upper()
     run_status = _RUN_STATUS_KO.get(run_status_code, "상태 확인 필요")
     run_status_class = _RUN_STATUS_CLASS.get(run_status_code, "attention")
-    source_endpoint = _endpoint(run.get("source_ip"), run.get("source_port"))
-    destination_endpoint = _endpoint(run.get("destination_ip"), run.get("destination_port"))
+    source_endpoint = _query_endpoint(
+        run.get("source_ip"),
+        run.get("source_port"),
+        other_address=run.get("destination_ip"),
+    )
+    destination_endpoint = _query_endpoint(
+        run.get("destination_ip"),
+        run.get("destination_port"),
+        other_address=run.get("source_ip"),
+    )
 
     yield f"""<!doctype html>
 <html lang="ko">
@@ -1050,6 +1058,13 @@ def _endpoint(address: object, port: object) -> str:
     if ":" in address_text and not (address_text.startswith("[") and address_text.endswith("]")):
         address_text = f"[{address_text}]"
     return f"{address_text}:{port_text}"
+
+
+def _query_endpoint(address: object, port: object, *, other_address: object) -> str:
+    if _plain(address) == "-" and _plain(other_address) != "-":
+        port_text = _plain(port)
+        return "모든 IP" if port_text == "-" else f"모든 IP:{port_text}"
+    return _endpoint(address, port)
 
 
 def _protocol(value: object) -> str:
