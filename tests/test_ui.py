@@ -1096,7 +1096,7 @@ def test_query_screen_defaults_to_primary_monitoring_and_progressive_details(
 
     assert window.setup_guide.isVisible()
     assert window.monitor_button.isDefault()
-    assert window.query_group.title() == "조회할 세션 흐름"
+    assert window.query_group.title() == "조회할 세션 흐름 · IP 하나 이상 입력"
     assert window.connection_group.title() == "로그인 정보 · 이번 실행에만 사용"
     assert window.monitor_button.text() == "지속 모니터링 시작"
     assert window.query_button.text() == "현재 조회"
@@ -1169,6 +1169,8 @@ def test_query_progressive_controls_are_keyboard_and_accessibility_ready(
     assert all(control.accessibleDescription() for control in controls)
     assert window.source_ip_edit.accessibleName() == "출발지 IP"
     assert window.destination_ip_edit.accessibleName() == "목적지 IP"
+    assert "하나 이상" in window.source_ip_edit.accessibleDescription()
+    assert "하나 이상" in window.destination_ip_edit.accessibleDescription()
     assert window.source_port_edit.accessibleName() == "출발지 포트"
     assert window.destination_port_edit.accessibleName() == "목적지 포트"
     assert "Source" not in window.bidirectional_check.accessibleDescription()
@@ -1211,6 +1213,36 @@ def test_query_port_validation_uses_the_same_korean_labels_as_the_screen(
     window.source_port_edit.clear()
     window.destination_port_edit.setText("65536")
     with pytest.raises(ValueError, match="목적지 포트"):
+        window._read_query()
+
+    window.close()
+
+
+def test_query_accepts_either_ip_and_rejects_both_blank(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        _EmptyStore(),  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    _configure_valid_query(window)
+
+    window.destination_ip_edit.clear()
+    _config, source_only, _credentials = window._read_query()
+    assert source_only.source_ip == "192.0.2.101"
+    assert source_only.destination_ip == ""
+
+    window.source_ip_edit.clear()
+    window.destination_ip_edit.setText("203.0.113.50")
+    _config, destination_only, _credentials = window._read_query()
+    assert destination_only.source_ip == ""
+    assert destination_only.destination_ip == "203.0.113.50"
+
+    window.destination_ip_edit.clear()
+    with pytest.raises(ValueError, match="하나 이상"):
         window._read_query()
 
     window.close()

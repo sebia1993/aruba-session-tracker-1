@@ -155,13 +155,43 @@ class QueryRequest:
     def __post_init__(self) -> None:
         if type(self.bidirectional) is not bool:
             raise TypeError("bidirectional은 boolean이어야 합니다.")
-        object.__setattr__(self, "source_ip", str(IPv4Address(self.source_ip)))
-        object.__setattr__(self, "destination_ip", str(IPv4Address(self.destination_ip)))
+        for label, value in (
+            ("출발지 IP", self.source_ip),
+            ("목적지 IP", self.destination_ip),
+        ):
+            if type(value) is not str:
+                raise TypeError(f"{label}는 문자열이어야 합니다.")
+        source_ip = self.source_ip.strip()
+        destination_ip = self.destination_ip.strip()
+        if not source_ip and not destination_ip:
+            raise ValueError("출발지 IP 또는 목적지 IP 중 하나 이상을 입력하십시오.")
+        object.__setattr__(
+            self,
+            "source_ip",
+            str(IPv4Address(source_ip)) if source_ip else "",
+        )
+        object.__setattr__(
+            self,
+            "destination_ip",
+            str(IPv4Address(destination_ip)) if destination_ip else "",
+        )
         for label, port in (("SPort", self.source_port), ("DPort", self.destination_port)):
             if port is not None and type(port) is not int:
                 raise TypeError(f"{label}는 정수여야 합니다.")
             if port is not None and not 0 <= port <= 65535:
                 raise ValueError(f"{label}는 0~65535 범위여야 합니다.")
+
+    @property
+    def client_ips(self) -> tuple[str, ...]:
+        """Return the entered client addresses once each, preserving UI order."""
+
+        return tuple(dict.fromkeys(ip for ip in (self.source_ip, self.destination_ip) if ip))
+
+    @property
+    def filter_ip(self) -> str:
+        """Return a validated address that is always safe for a filtered MD query."""
+
+        return self.client_ips[0]
 
     def matches(self, observation: SessionObservation) -> bool:
         direct = self._matches_direction(observation, reverse=False)
@@ -173,8 +203,8 @@ class QueryRequest:
         source_port = self.destination_port if reverse else self.source_port
         destination_port = self.source_port if reverse else self.destination_port
         return (
-            observation.source_ip == source_ip
-            and observation.destination_ip == destination_ip
+            (not source_ip or observation.source_ip == source_ip)
+            and (not destination_ip or observation.destination_ip == destination_ip)
             and (source_port is None or observation.source_port == source_port)
             and (destination_port is None or observation.destination_port == destination_port)
         )

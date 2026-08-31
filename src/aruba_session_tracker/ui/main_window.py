@@ -344,7 +344,7 @@ class ApprovalBridge(QObject):
         targets = "\n".join(f"- {device.name}: {device.host}:{device.port}" for device in devices)
         request = _ApprovalRequest(
             f"MD {len(devices)}대 전수조회 확인",
-            "Source와 Destination을 MM에서 찾지 못했습니다.\n"
+            "입력한 IP를 MM에서 찾지 못했습니다.\n"
             "다음 활성 MD를 한 대씩 순차 조회합니다.\n\n"
             f"{targets}\n\n장비 부하와 조회 권한을 확인한 뒤 진행하십시오.",
             generation,
@@ -676,14 +676,18 @@ class MainWindow(QMainWindow):
         connection_layout.addWidget(QLabel("SSH 암호"), 0, 2)
         connection_layout.addWidget(self.password_edit, 0, 3)
 
-        self.query_group = QGroupBox("조회할 세션 흐름")
+        self.query_group = QGroupBox("조회할 세션 흐름 · IP 하나 이상 입력")
         query_layout = QGridLayout(self.query_group)
         self.source_ip_edit = QLineEdit()
         self.source_ip_edit.setAccessibleName("출발지 IP")
-        self.source_ip_edit.setAccessibleDescription("조회할 출발지 IP 주소입니다.")
+        self.source_ip_edit.setAccessibleDescription(
+            "조회할 출발지 IP 주소입니다. 출발지와 목적지 중 하나 이상 입력합니다."
+        )
         self.destination_ip_edit = QLineEdit()
         self.destination_ip_edit.setAccessibleName("목적지 IP")
-        self.destination_ip_edit.setAccessibleDescription("조회할 목적지 IP 주소입니다.")
+        self.destination_ip_edit.setAccessibleDescription(
+            "조회할 목적지 IP 주소입니다. 출발지와 목적지 중 하나 이상 입력합니다."
+        )
         query_layout.addWidget(QLabel("출발지 IP"), 0, 0)
         query_layout.addWidget(self.source_ip_edit, 0, 1)
         query_layout.addWidget(QLabel("목적지 IP"), 0, 2)
@@ -717,7 +721,7 @@ class MainWindow(QMainWindow):
         self.bidirectional_check = QCheckBox("양방향 검색 (IP와 포트를 함께 교환)")
         self.bidirectional_check.setAccessibleName("양방향 검색")
         self.bidirectional_check.setAccessibleDescription(
-            "출발지와 목적지 IP 및 포트를 서로 바꾼 방향도 함께 검색합니다."
+            "입력한 IP와 포트 조건을 서로 바꾼 반대 방향도 함께 검색합니다."
         )
         self.bidirectional_check.setChecked(True)
         advanced_layout.addWidget(QLabel("Enable 암호 (선택)"), 0, 0)

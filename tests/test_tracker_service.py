@@ -261,6 +261,62 @@ def test_destination_md_is_queried_when_source_md_has_no_match() -> None:
     )
 
 
+def test_source_only_query_uses_only_the_entered_ip_for_mm_and_md() -> None:
+    request = QueryRequest(REQUEST.source_ip, "", REQUEST.source_port, REQUEST.destination_port)
+    source_lookup = build_global_user_command(REQUEST.source_ip)
+    source_filter = build_datapath_session_command(REQUEST.source_ip)
+    factory = FakeFactory(
+        {
+            "MM-Primary": {
+                NO_PAGING_COMMAND: "",
+                source_lookup: _global_output(REQUEST.source_ip, "192.0.2.101"),
+            },
+            "MD-1": {
+                NO_PAGING_COMMAND: "",
+                source_filter: _datapath_output(),
+            },
+        }
+    )
+
+    outcome = TrackerService(_config(), factory).query_once(request, CREDENTIALS)
+
+    assert len(outcome.observations) == 1
+    assert outcome.authoritative is True
+    assert outcome.source_location is not None
+    assert outcome.destination_location is None
+    assert factory.calls == ["MM-Primary", "MD-1"]
+    assert factory.commands_by_device["MM-Primary"] == [NO_PAGING_COMMAND, source_lookup]
+    assert factory.commands_by_device["MD-1"] == [NO_PAGING_COMMAND, source_filter]
+
+
+def test_destination_only_query_uses_only_the_entered_ip_for_mm_and_md() -> None:
+    request = QueryRequest("", REQUEST.destination_ip)
+    destination_lookup = build_global_user_command(REQUEST.destination_ip)
+    destination_filter = build_datapath_session_command(REQUEST.destination_ip)
+    factory = FakeFactory(
+        {
+            "MM-Primary": {
+                NO_PAGING_COMMAND: "",
+                destination_lookup: _global_output(REQUEST.destination_ip, "192.0.2.102"),
+            },
+            "MD-2": {
+                NO_PAGING_COMMAND: "",
+                destination_filter: _datapath_output(),
+            },
+        }
+    )
+
+    outcome = TrackerService(_config(), factory).query_once(request, CREDENTIALS)
+
+    assert len(outcome.observations) == 1
+    assert outcome.authoritative is True
+    assert outcome.source_location is None
+    assert outcome.destination_location is not None
+    assert factory.calls == ["MM-Primary", "MD-2"]
+    assert factory.commands_by_device["MM-Primary"] == [NO_PAGING_COMMAND, destination_lookup]
+    assert factory.commands_by_device["MD-2"] == [NO_PAGING_COMMAND, destination_filter]
+
+
 def test_distinct_source_and_destination_mds_are_both_queried() -> None:
     request = QueryRequest(REQUEST.source_ip, REQUEST.destination_ip)
     outputs = {
@@ -385,6 +441,43 @@ def test_full_scan_requires_explicit_approval_and_queries_all_enabled_mds() -> N
     assert approved.authoritative is True
 
 
+def test_destination_only_full_scan_never_builds_an_unfiltered_md_command() -> None:
+    request = QueryRequest("", REQUEST.destination_ip)
+    destination_lookup = build_global_user_command(REQUEST.destination_ip)
+    destination_filter = build_datapath_session_command(REQUEST.destination_ip)
+    config = _config()
+    outputs: dict[str, dict[str, str]] = {
+        "MM-Primary": {
+            NO_PAGING_COMMAND: "",
+            destination_lookup: _global_output(REQUEST.destination_ip, None),
+        }
+    }
+    for device in config.managed_devices:
+        outputs[device.name] = {
+            NO_PAGING_COMMAND: "",
+            destination_filter: (_datapath_output() if device.name == "MD-2" else DATAPATH_EMPTY),
+        }
+    factory = FakeFactory(outputs)
+
+    outcome = TrackerService(config, factory).query_once(
+        request,
+        CREDENTIALS,
+        full_scan_approval=lambda *_args: True,
+    )
+
+    assert len(outcome.observations) == 1
+    assert outcome.authoritative is True
+    assert outcome.full_scan_eligible is True
+    assert outcome.controllers == ("MD-1", "MD-2", "MD-3", "MD-4")
+    for device in config.managed_devices:
+        assert factory.commands_by_device[device.name] == [NO_PAGING_COMMAND, destination_filter]
+    assert all(
+        command != "show datapath session table"
+        for commands in factory.commands_by_device.values()
+        for command in commands
+    )
+
+
 def test_full_scan_approval_cancellation_takes_precedence_over_denial() -> None:
     config = _config()
     token = CancellationToken()
@@ -450,6 +543,53 @@ def test_full_scan_approval_deadline_prevents_late_scan() -> None:
     assert factory.calls == ["MM-Primary"]
 
 
+def test_destination_only_monitor_reuses_cached_location_without_an_mm_query() -> None:
+    request = QueryRequest("", REQUEST.destination_ip)
+    destination_lookup = build_global_user_command(request.destination_ip)
+    destination_filter = build_datapath_session_command(request.destination_ip)
+    outputs = {
+        "MM-Primary": {
+            NO_PAGING_COMMAND: "",
+            destination_lookup: _global_output(request.destination_ip, "192.0.2.102"),
+        },
+        "MD-2": {
+            NO_PAGING_COMMAND: "",
+            destination_filter: _datapath_output(),
+        },
+    }
+    factory = FakeFactory(outputs)
+    now = [0.0]
+    monitor = MonitorEngine(
+        TrackerService(_config(), factory),
+        request,
+        CREDENTIALS,
+        monotonic_clock=lambda: now[0],
+    )
+
+    first = monitor.poll_once()
+    now[0] = 5.0
+    second = monitor.poll_once()
+
+    assert len(first.observations) == 1
+    assert first.refreshed_location is True
+    assert first.outcome.source_location is None
+    assert first.outcome.destination_location is not None
+    assert len(second.observations) == 1
+    assert second.refreshed_location is False
+    assert second.outcome.source_location is None
+    assert second.outcome.destination_location == first.outcome.destination_location
+    assert factory.calls == ["MM-Primary", "MD-2", "MD-2"]
+    assert factory.commands_by_device == {
+        "MM-Primary": [NO_PAGING_COMMAND, destination_lookup],
+        "MD-2": [
+            NO_PAGING_COMMAND,
+            destination_filter,
+            NO_PAGING_COMMAND,
+            destination_filter,
+        ],
+    }
+
+
 def test_monitor_full_scan_reuses_only_the_md_that_matched_until_mm_refresh() -> None:
     config = _config()
     outputs: dict[str, dict[str, str]] = {"MM-Primary": _mm_outputs(None, None)}
@@ -486,6 +626,66 @@ def test_monitor_full_scan_reuses_only_the_md_that_matched_until_mm_refresh() ->
     assert approvals == 1
     assert calls_after_first == ("MM-Primary", "MD-1", "MD-2", "MD-3", "MD-4")
     assert factory.calls[len(calls_after_first) :] == ["MD-2"]
+
+
+def test_destination_only_monitor_full_scan_reuses_the_filtered_matching_md() -> None:
+    request = QueryRequest("", REQUEST.destination_ip)
+    destination_lookup = build_global_user_command(request.destination_ip)
+    destination_filter = build_datapath_session_command(request.destination_ip)
+    config = _config()
+    outputs: dict[str, dict[str, str]] = {
+        "MM-Primary": {
+            NO_PAGING_COMMAND: "",
+            destination_lookup: _global_output(request.destination_ip, None),
+        }
+    }
+    for device in config.managed_devices:
+        outputs[device.name] = {
+            NO_PAGING_COMMAND: "",
+            destination_filter: (_datapath_output() if device.name == "MD-2" else DATAPATH_EMPTY),
+        }
+    factory = FakeFactory(outputs)
+    approvals = 0
+
+    def approve(*_args: object) -> bool:
+        nonlocal approvals
+        approvals += 1
+        return True
+
+    now = [0.0]
+    monitor = MonitorEngine(
+        TrackerService(config, factory),
+        request,
+        CREDENTIALS,
+        full_scan_approval=approve,
+        monotonic_clock=lambda: now[0],
+    )
+
+    first = monitor.poll_once()
+    calls_after_first = tuple(factory.calls)
+    now[0] = 5.0
+    second = monitor.poll_once()
+
+    assert len(first.observations) == 1
+    assert first.authoritative is True
+    assert first.outcome.full_scan_eligible is True
+    assert len(second.observations) == 1
+    assert second.authoritative is True
+    assert second.refreshed_location is False
+    assert approvals == 1
+    assert calls_after_first == ("MM-Primary", "MD-1", "MD-2", "MD-3", "MD-4")
+    assert factory.calls[len(calls_after_first) :] == ["MD-2"]
+    assert factory.commands_by_device["MM-Primary"] == [NO_PAGING_COMMAND, destination_lookup]
+    for device in config.managed_devices:
+        expected = [NO_PAGING_COMMAND, destination_filter]
+        if device.name == "MD-2":
+            expected *= 2
+        assert factory.commands_by_device[device.name] == expected
+    assert all(
+        not command.startswith("show datapath session table") or command == destination_filter
+        for commands in factory.commands_by_device.values()
+        for command in commands
+    )
 
 
 def test_monitor_empty_full_scan_is_not_repeated_before_the_next_mm_refresh() -> None:
@@ -678,6 +878,45 @@ def test_fallback_scan_also_queries_an_active_controller_missing_from_its_cache(
     assert outcome.authoritative is True
     assert len(outcome.observations) == 2
     assert factory.calls == ["MD-1", "MD-2"]
+
+
+def test_destination_only_fallback_and_required_controller_use_entered_filter() -> None:
+    request = QueryRequest("", REQUEST.destination_ip)
+    destination_filter = build_datapath_session_command(REQUEST.destination_ip)
+    config = _config()
+    outputs = {
+        "MD-1": {
+            NO_PAGING_COMMAND: "",
+            destination_filter: _datapath_output(),
+        },
+        "MD-2": {
+            NO_PAGING_COMMAND: "",
+            destination_filter: _datapath_output(source_port=23456),
+        },
+    }
+    factory = FakeFactory(outputs)
+
+    outcome = TrackerService(config, factory).query_once(
+        request,
+        CREDENTIALS,
+        location_snapshot=LocationSnapshot(
+            source=None,
+            destination=None,
+            used_mm="MM-Primary",
+            full_scan_eligible=True,
+        ),
+        refresh_locations=False,
+        fallback_devices=(config.managed_devices[0],),
+        required_controller_hosts=(config.managed_devices[1].host,),
+    )
+
+    assert outcome.authoritative is True
+    assert len(outcome.observations) == 2
+    assert factory.calls == ["MD-1", "MD-2"]
+    assert factory.commands_by_device == {
+        "MD-1": [NO_PAGING_COMMAND, destination_filter],
+        "MD-2": [NO_PAGING_COMMAND, destination_filter],
+    }
 
 
 def test_tracker_preserves_same_flow_from_two_direct_managed_devices() -> None:
