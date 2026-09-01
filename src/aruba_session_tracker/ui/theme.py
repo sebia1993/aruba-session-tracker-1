@@ -1,7 +1,7 @@
 """Approved Dark NOC Console visual system for the Qt desktop interface.
 
 Operational widgets and their stable Developer Inspector identifiers remain in
-``main_window.py``. This module changes presentation only and installs local,
+``main_window.py``.  This module changes presentation only and installs local,
 derived status/summary widgets through :mod:`noc_console`.
 """
 
@@ -90,6 +90,7 @@ def build_stylesheet() -> str:
         background-color: #101720;
     }
 
+    /* Reused product identity becomes the compact operational header. */
     QFrame#nocHeader {
         background-color: #0A1118;
         border: 0;
@@ -147,6 +148,7 @@ def build_stylesheet() -> str:
         font-weight: 700;
     }
 
+    /* Existing QTabWidget/QTabBar retained and presented as a left rail. */
     QTabWidget#mainTabs {
         background-color: #101720;
     }
@@ -193,6 +195,7 @@ def build_stylesheet() -> str:
         border-left: 3px solid #42B7C8;
     }
 
+    /* Pages and engineering surfaces. */
     QGroupBox {
         margin-top: 12px;
         padding: 16px 12px 11px 12px;
@@ -420,6 +423,7 @@ def build_stylesheet() -> str:
         background-color: transparent;
     }
 
+    /* Derived KPI strip. */
     QFrame#metricStrip {
         background-color: transparent;
         border: 0;
@@ -457,6 +461,7 @@ def build_stylesheet() -> str:
         letter-spacing: .8px;
     }
 
+    /* Input controls. */
     QLineEdit,
     QSpinBox {
         min-height: 32px;
@@ -615,6 +620,7 @@ def build_stylesheet() -> str:
         padding-right: 12px;
     }
 
+    /* Dense operational data grids. */
     QTableWidget {
         color: #DCE6EF;
         background-color: #111A23;
@@ -718,6 +724,7 @@ def build_stylesheet() -> str:
         border: 1px solid #3B556C;
     }
 
+    /* Investigation detail area. */
     QTabWidget#detailsTabs::pane {
         background-color: #0A1118;
         border: 1px solid #2D4154;
@@ -874,6 +881,7 @@ def build_stylesheet() -> str:
         padding: 5px 7px;
     }
 
+    /* Native-palette fallback for Windows high-contrast startup. */
     QMainWindow#mainWindow[themeContrast="high"] {
         color: palette(window-text);
         background-color: palette(window);
@@ -1080,6 +1088,7 @@ def _configure_tables(window: MainWindow) -> None:
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
 
+    # Presentation-only visual order: state and protocol first, then the flow.
     result_header = window.result_table.horizontalHeader()
     desired_logical_order = (14, 1, 2, 3, 4, 5, 0, 12, 13, 15, 6, 7, 8, 9, 10, 11)
     for visual_index, logical_index in enumerate(desired_logical_order):
