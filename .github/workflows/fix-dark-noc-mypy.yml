@@ -1,0 +1,83 @@
+name: Fix Dark NOC mypy compatibility
+
+on:
+  push:
+    branches:
+      - design/dark-noc-console-v1
+    paths:
+      - .github/workflows/fix-dark-noc-mypy.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-latest
+    steps:
+      - name: Check out design branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: design/dark-noc-console-v1
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Apply precise type compatibility patch
+        shell: pwsh
+        run: |
+          $path = "src/aruba_session_tracker/ui/noc_console.py"
+          $text = Get-Content -Raw -Encoding UTF8 $path
+
+          $oldSize = @'
+                  calculated = super().sizeFromContents(content_type, option, size, widget)
+          '@
+          $newSize = @'
+                  calculated = (
+                      super().sizeFromContents(content_type, option, size, widget)
+                      if widget is not None
+                      else super().sizeFromContents(content_type, option, size)
+                  )
+          '@
+          if (-not $text.Contains($oldSize)) {
+            throw "sizeFromContents target block was not found."
+          }
+          $text = $text.Replace($oldSize, $newSize)
+
+          $oldWidget = @'
+                  while header_layout.count():
+                      item = header_layout.takeAt(0)
+                      if item is not None and item.widget() is not None:
+                          item.widget().setParent(window.nav_identity)
+          '@
+          $newWidget = @'
+                  while header_layout.count():
+                      item = header_layout.takeAt(0)
+                      if item is None:
+                          continue
+                      item_widget = item.widget()
+                      if item_widget is not None:
+                          item_widget.setParent(window.nav_identity)
+          '@
+          if (-not $text.Contains($oldWidget)) {
+            throw "layout-item target block was not found."
+          }
+          $text = $text.Replace($oldWidget, $newWidget)
+
+          [System.IO.File]::WriteAllText(
+            (Resolve-Path $path),
+            $text,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          Remove-Item -Force .github/workflows/fix-dark-noc-mypy.yml
+
+      - name: Commit compatibility fix
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { throw "Patch contains whitespace errors." }
+          git commit -m "Fix Dark NOC Qt typing compatibility"
+          if ($LASTEXITCODE -ne 0) { throw "Compatibility commit failed." }
+          git push origin HEAD:design/dark-noc-console-v1
+          if ($LASTEXITCODE -ne 0) { throw "Compatibility push failed." }
