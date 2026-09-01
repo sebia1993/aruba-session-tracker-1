@@ -45,8 +45,8 @@ def test_storage_poll_soak(tmp_path: Path) -> None:
         check=False,
         # Durable writes intentionally fsync each poll. Allow hosted-disk
         # variance with a 900-second default-run floor while keeping both
-        # nightly subprocess ceilings below the outer 120-minute watchdog.
-        timeout=min(3_200, max(900, math.ceil(polls * 0.16))),
+        # nightly subprocess ceilings below the outer 150-minute watchdog.
+        timeout=min(4_000, max(900, math.ceil(polls * 0.20))),
     )
     assert completed.returncode == 0, completed.stderr[-4000:]
     output_lines = tuple(line for line in completed.stdout.splitlines() if line.strip())

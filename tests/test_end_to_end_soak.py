@@ -36,9 +36,9 @@ def test_fixture_ssh_parser_runtime_storage_soak(tmp_path: Path) -> None:
         text=True,
         check=False,
         # Hosted Windows storage can be materially slower than a workstation.
-        # Keep the 20,000-poll ceiling unchanged while giving the default
-        # 2,000-poll CI run enough variance without allowing an infinite wait.
-        timeout=min(3_200, max(900, math.ceil(polls * 0.16))),
+        # Keep the 20,000-poll count unchanged while bounding a slow runner
+        # inside the outer 150-minute workflow watchdog.
+        timeout=min(4_000, max(900, math.ceil(polls * 0.20))),
     )
     assert completed.returncode == 0, completed.stderr[-6000:]
     lines = tuple(line for line in completed.stdout.splitlines() if line.strip())
