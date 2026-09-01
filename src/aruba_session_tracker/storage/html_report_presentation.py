@@ -445,7 +445,7 @@ def _report_chunks(
           <p class="section-kicker">REPORT BASIS</p>
           <dl class="run-facts">
             {_run_fact("수집 상태", run_status)}
-            {_run_fact("검색 방향", query_direction)}
+            {_run_fact("보고서 기준", "저장된 관측")}
             {_run_fact("최신 표시", f"{_base._format_integer(displayed_latest)}개")}
             {_run_fact("전체 이력", f"{_base._format_integer(snapshot.observation_total)}건")}
           </dl>
