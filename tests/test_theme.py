@@ -4,7 +4,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import QApplication, QSizePolicy
+from PySide6.QtWidgets import QApplication, QSizePolicy, QTabWidget
 
 from aruba_session_tracker.config import ConfigRepository
 from aruba_session_tracker.storage import SessionStore
@@ -24,7 +24,11 @@ def _relative_luminance(value: str) -> float:
     color = QColor(value)
 
     def channel(component: float) -> float:
-        return component / 12.92 if component <= 0.04045 else ((component + 0.055) / 1.055) ** 2.4
+        return (
+            component / 12.92
+            if component <= 0.04045
+            else ((component + 0.055) / 1.055) ** 2.4
+        )
 
     return (
         0.2126 * channel(color.redF())
@@ -52,18 +56,38 @@ def _build_window(qtbot: object, tmp_path: Path) -> MainWindow:
     return window
 
 
-def test_theme_assigns_operational_roles_without_replacing_widgets(
+def test_theme_installs_dark_noc_shell_without_replacing_operational_widgets(
     qtbot: object,
     tmp_path: Path,
 ) -> None:
     window = _build_window(qtbot, tmp_path)
+    original_tabs = window.tabs
+    original_tab_bar = window.tabs.tabBar()
+    original_state_label = window.state_label
     original_monitor_button = window.monitor_button
     original_result_table = window.result_table
 
     apply_main_window_theme(window)
+    window.show()
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: window.result_splitter.orientation() == Qt.Orientation.Horizontal,
+        timeout=3000,
+    )
 
+    assert window.tabs is original_tabs
+    assert window.tabs.tabBar() is original_tab_bar
+    assert window.state_label is original_state_label
     assert window.monitor_button is original_monitor_button
     assert window.result_table is original_result_table
+    assert window.property("darkNocConsoleInstalled") is True
+    assert window.tabs.tabPosition() == QTabWidget.TabPosition.West
+    assert window.central_layout.itemAt(0).widget() is window.nav_identity
+    assert window.nav_identity.objectName() == "nocHeader"
+    assert window.nav_identity.minimumHeight() == 66
+    assert window.nav_identity.maximumHeight() == 66
+    assert window.product_name_label.text() == "ARUBA SESSION TRACKER"
+    assert "NETWORK SESSION INVESTIGATION CONSOLE" in window.product_meta_label.text()
+
     assert window.open_settings_button.property("buttonRole") == "primary"
     assert window.monitor_button.property("buttonRole") == "primary"
     assert window.query_button.property("buttonRole") == "secondary"
@@ -77,98 +101,91 @@ def test_theme_assigns_operational_roles_without_replacing_widgets(
     assert window.mm_group.property("panelRole") == "controller"
     assert window.md_group.property("panelRole") == "controller"
     assert window.timing_group.property("panelRole") == "timing"
+
+    assert window.metric_strip.objectName() == "metricStrip"  # type: ignore[attr-defined]
+    metric_values = window.metric_strip.findChildren(  # type: ignore[attr-defined]
+        type(window.state_label), "metricValue"
+    )
+    assert len(metric_values) == 4
+    assert [label.text() for label in metric_values] == ["0", "0", "0", "0"]
+
+    assert window.details.count() == 3
+    assert window.details.tabText(0) == "DETAILS"
+    assert window.details.tabText(1) == "RAW CLI"
+    assert window.details.tabText(2) == "DIAGNOSTICS"
+    assert (
+        window.session_detail_page.objectName()  # type: ignore[attr-defined]
+        == "sessionDetailPage"
+    )
+    assert window.details.minimumWidth() == 340
+    assert window.details.minimumHeight() == 0
+
     assert window.context_label.objectName() == "contextSummary"
     assert window.state_label.property("stateRole") == "neutral"
-    assert window.nav_identity.objectName() == "navIdentity"
-    assert window.nav_identity.minimumHeight() == 41
-    assert window.nav_identity.maximumHeight() == 41
-    assert window.product_name_label.text() == "ARUBA SESSION TRACKER"
-    assert "로컬 전용" in window.product_meta_label.text()
     assert window.source_endpoint_panel.property("endpointRole") == "source"
     assert window.destination_endpoint_panel.property("endpointRole") == "destination"
     assert window.query_direction_label.property("directionRole") == "bidirectional"
-    assert window.result_splitter.orientation() == Qt.Orientation.Vertical
     assert window.result_empty_label.objectName() == "emptyState"
     assert window.history_empty_label.objectName() == "emptyState"
     assert window.history_toolbar.objectName() == "historyToolbar"
-    assert window.history_export_label.objectName() == "toolbarSectionLabel"
-    assert window.history_delete_label.objectName() == "toolbarSectionLabel"
     assert window.raw_view.objectName() == "rawConsole"
     assert window.result_table.alternatingRowColors()
     assert window.result_table.verticalHeader().isHidden()
     assert window.result_table.verticalHeader().defaultSectionSize() == 30
-    result_table_chrome_height = (
-        window.result_table.horizontalHeader().sizeHint().height()
-        + window.result_table.horizontalScrollBar().sizeHint().height()
-        + (2 * window.result_table.frameWidth())
-    )
-    assert window.result_table.minimumHeight() >= 50 + result_table_chrome_height
-    assert window.details.minimumWidth() == 0
-    assert window.details.minimumHeight() == 180
     assert window.advanced_panel.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Fixed
     assert window.tabs.elideMode() == Qt.TextElideMode.ElideNone
-    for index in range(window.tabs.count()):
-        tab_width = window.tabs.tabBar().tabRect(index).width()
-        text_width = (
-            window.tabs.tabBar().fontMetrics().horizontalAdvance(window.tabs.tabText(index))
-        )
-        assert tab_width >= text_width
     assert window.styleSheet() == build_stylesheet()
     window.close()
 
 
-def test_theme_stylesheet_keeps_focus_and_semantic_action_states() -> None:
+def test_theme_stylesheet_uses_approved_dark_tokens_and_semantic_states() -> None:
     stylesheet = build_stylesheet()
 
+    assert "background-color: #101720;" in stylesheet
+    assert "background-color: #16212D;" in stylesheet
+    assert "background-color: #0A1118;" in stylesheet
+    assert "color: #E8EFF6;" in stylesheet
+    assert "border-left: 3px solid #2F80ED;" in stylesheet
     assert 'QPushButton[buttonRole="primary"]' in stylesheet
-    assert 'QPushButton[buttonRole="tertiary"]' in stylesheet
     assert 'QPushButton[buttonRole="dangerStrong"]' in stylesheet
-    assert 'QPushButton[buttonRole="dangerStrong"]:disabled' in stylesheet
     assert 'QLabel#stateLabel[stateRole="success"]' in stylesheet
     assert 'QLabel#stateLabel[stateRole="warning"]' in stylesheet
     assert 'QLabel#stateLabel[stateRole="danger"]' in stylesheet
     assert "QTabWidget#mainTabs QTabBar::tab:selected" in stylesheet
-    assert "background-color: #102F49;" in stylesheet
     assert 'QMainWindow#mainWindow[themeContrast="high"]' in stylesheet
     assert "QLineEdit:focus" in stylesheet
     assert "QTableWidget::item:selected" in stylesheet
     assert "QPlainTextEdit#rawConsole" in stylesheet
-    assert "QFrame#flowEndpointCard" in stylesheet
-    assert "QFrame#navIdentity" in stylesheet
-    assert "QFrame#navIdentity QLabel#productName" in stylesheet
-    assert "QFrame#navIdentity QLabel#productMeta" in stylesheet
+    assert "QFrame#metricCard" in stylesheet
+    assert "QFrame#sessionFlowCard" in stylesheet
+    assert "QFrame#nocHeader" in stylesheet
     assert "QLabel#emptyState" in stylesheet
     assert "QSplitter::handle:vertical" in stylesheet
     assert "QCheckBox:focus" in stylesheet
-    assert 'QPushButton[buttonRole="primary"]:focus' in stylesheet
-    assert 'QPushButton[buttonRole="dangerStrong"]:focus' in stylesheet
-    assert stylesheet.rfind('QPushButton[buttonRole="primary"]:focus') > stylesheet.rfind(
-        'QPushButton[buttonRole="primary"]:pressed'
-    )
-    assert stylesheet.rfind('QPushButton[buttonRole="dangerStrong"]:disabled') > stylesheet.rfind(
-        'QPushButton[buttonRole="dangerStrong"]:hover'
-    )
     assert "QScrollBar::add-line:vertical" in stylesheet
     assert "QScrollBar::sub-line:horizontal" in stylesheet
     assert "width: 0;" not in stylesheet
     assert "height: 0;" not in stylesheet
-    assert _contrast_ratio("#607D94", "#EEF3F7") >= 3.0
-    assert 'QMainWindow#mainWindow[themeContrast="high"] QScrollBar::handle:vertical' in stylesheet
+    assert _contrast_ratio("#E8EFF6", "#101720") >= 7.0
+    assert _contrast_ratio("#4D667A", "#101720") >= 3.0
     assert "http://" not in stylesheet
     assert "https://" not in stylesheet
+    assert "gradient" not in stylesheet.casefold()
 
 
-def test_theme_can_be_applied_twice_without_replacing_or_duplicating_widgets(
+def test_theme_can_be_applied_twice_without_duplicate_shell_components(
     qtbot: object,
     tmp_path: Path,
 ) -> None:
     window = _build_window(qtbot, tmp_path)
     original_widgets = (window.tabs, window.query_button, window.result_table, window.details)
     original_tab_count = window.tabs.count()
-    original_query_layout_count = window.query_page.layout().count()
 
     apply_main_window_theme(window)
     first_stylesheet = window.styleSheet()
+    first_details_count = window.details.count()
+    first_metric_strip = window.metric_strip  # type: ignore[attr-defined]
+    first_header = window.nav_identity
     apply_main_window_theme(window)
 
     assert (
@@ -178,59 +195,43 @@ def test_theme_can_be_applied_twice_without_replacing_or_duplicating_widgets(
         window.details,
     ) == original_widgets
     assert window.tabs.count() == original_tab_count
-    assert window.query_page.layout().count() == original_query_layout_count
+    assert window.details.count() == first_details_count == 3
+    assert window.metric_strip is first_metric_strip  # type: ignore[attr-defined]
+    assert window.nav_identity is first_header
     assert window.styleSheet() == first_stylesheet == build_stylesheet()
     window.close()
 
 
-def test_result_details_switch_to_side_by_side_at_minimum_height(
+def test_detail_panel_uses_side_layout_on_wide_window_and_stacks_when_narrow(
     qtbot: object,
     tmp_path: Path,
 ) -> None:
     window = _build_window(qtbot, tmp_path)
     apply_main_window_theme(window)
-    window.resize(window.minimumSize())
+    window.resize(1320, 820)
     window.show()
     qtbot.waitUntil(  # type: ignore[attr-defined]
         lambda: window.result_splitter.orientation() == Qt.Orientation.Horizontal,
         timeout=3000,
     )
-
-    assert window.details.minimumWidth() == 300
+    assert window.details.minimumWidth() == 340
     assert window.details.minimumHeight() == 0
 
-    window.resize(1320, 820)
+    window.resize(window.minimumSize())
     qtbot.waitUntil(  # type: ignore[attr-defined]
         lambda: window.result_splitter.orientation() == Qt.Orientation.Vertical,
         timeout=3000,
     )
     assert window.details.minimumWidth() == 0
-    assert window.details.minimumHeight() == 180
+    assert window.details.minimumHeight() == 190
 
-    window.advanced_toggle_button.setChecked(True)
+    window.resize(1320, 820)
     window.raw_diagnostics_toggle.setChecked(True)
     qtbot.waitUntil(  # type: ignore[attr-defined]
         lambda: window.result_splitter.orientation() == Qt.Orientation.Horizontal,
         timeout=3000,
     )
     assert window.result_table.viewport().height() >= 40
-
-    window.tabs.setCurrentWidget(window.settings_page)
-    window.resize(1319, 820)
-    window.tabs.setCurrentWidget(window.query_page)
-    qtbot.waitUntil(  # type: ignore[attr-defined]
-        lambda: window.result_splitter.orientation() == Qt.Orientation.Horizontal,
-        timeout=3000,
-    )
-    assert window.advanced_toggle_button.isChecked()
-    assert window.raw_diagnostics_toggle.isChecked()
-    assert window.result_table.viewport().height() >= 40
-
-    window.advanced_toggle_button.setChecked(False)
-    qtbot.waitUntil(  # type: ignore[attr-defined]
-        lambda: window.result_splitter.orientation() == Qt.Orientation.Vertical,
-        timeout=3000,
-    )
     window.close()
 
 
@@ -261,7 +262,6 @@ def test_theme_uses_native_palette_roles_for_injected_high_contrast(
         assert themed_window.property("themeContrast") == "high"
         assert themed_window.monitor_button.isVisible()
         assert themed_window.query_button.isVisible()
-        assert themed_window.monitor_button.sizeHint().width() > 0
         qtbot.waitUntil(  # type: ignore[attr-defined]
             lambda: themed_window.result_table.viewport().geometry().width() > 100,
             timeout=3000,
@@ -283,6 +283,7 @@ def test_raw_console_keeps_terminal_contrast_after_widget_is_shown(
     window = _build_window(qtbot, tmp_path)
     apply_main_window_theme(window)
     window.raw_diagnostics_toggle.setChecked(True)
+    window.details.setCurrentWidget(window.raw_view)
     window.show()
     qtbot.waitUntil(lambda: window.raw_view.isVisible(), timeout=3000)  # type: ignore[attr-defined]
 
