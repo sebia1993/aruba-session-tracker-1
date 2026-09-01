@@ -1,0 +1,53 @@
+name: Format Dark NOC style call
+
+on:
+  push:
+    branches:
+      - design/dark-noc-console-v1
+    paths:
+      - .github/workflows/format-dark-noc-style-call.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-latest
+    steps:
+      - name: Check out design branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: design/dark-noc-console-v1
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Apply canonical Ruff formatting
+        shell: pwsh
+        run: |
+          $path = "src/aruba_session_tracker/ui/noc_console.py"
+          $text = (Get-Content -Raw -Encoding UTF8 $path).Replace("`r`n", "`n")
+          $old = "        calculated = super().sizeFromContents(`n            content_type, option, size, cast(QWidget, widget)`n        )"
+          $new = "        calculated = super().sizeFromContents(content_type, option, size, cast(QWidget, widget))"
+          if (-not $text.Contains($old)) {
+            throw "Canonical formatting target was not found."
+          }
+          $text = $text.Replace($old, $new)
+          [System.IO.File]::WriteAllText(
+            (Resolve-Path $path),
+            $text,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          Remove-Item -Force .github/workflows/format-dark-noc-style-call.yml
+
+      - name: Commit formatting fix
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { throw "Formatting patch contains whitespace errors." }
+          git commit -m "Format Dark NOC style call"
+          if ($LASTEXITCODE -ne 0) { throw "Formatting commit failed." }
+          git push origin HEAD:design/dark-noc-console-v1
+          if ($LASTEXITCODE -ne 0) { throw "Formatting push failed." }
