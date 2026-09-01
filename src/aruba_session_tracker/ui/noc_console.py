@@ -7,7 +7,7 @@ derives every displayed metric from UI state that already exists in memory.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
@@ -46,10 +46,8 @@ class _HorizontalRailTabStyle(QProxyStyle):
         size: QSize,
         widget: QWidget | None = None,
     ) -> QSize:
-        calculated = (
-            super().sizeFromContents(content_type, option, size, widget)
-            if widget is not None
-            else super().sizeFromContents(content_type, option, size)
+        calculated = super().sizeFromContents(
+            content_type, option, size, cast(QWidget, widget)
         )
         if content_type == QStyle.ContentsType.CT_TabBarTab:
             return QSize(184, max(52, calculated.height()))
