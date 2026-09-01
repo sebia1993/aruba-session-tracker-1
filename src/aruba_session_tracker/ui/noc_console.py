@@ -371,7 +371,19 @@ class _NocConsoleController(QObject):
         window.result_splitter.setOrientation(orientation)
         if use_side_panel:
             available = max(window.result_splitter.width(), 720)
-            tab_width = window.details.tabBar().sizeHint().width()
+            tab_bar = window.details.tabBar()
+            tab_bar.ensurePolished()
+            rendered_tab_width = max(
+                (tab_bar.tabRect(index).right() + 1 for index in range(tab_bar.count())),
+                default=0,
+            )
+            # On Windows the selected/native-styled tab can render wider than
+            # QTabBar.sizeHint() after a vertical-to-horizontal transition.
+            tab_width = max(
+                tab_bar.sizeHint().width(),
+                tab_bar.minimumSizeHint().width(),
+                rendered_tab_width,
+            )
             detail_width = min(
                 max(_DETAIL_MIN_WIDTH, tab_width),
                 max(_DETAIL_MIN_WIDTH, available - _RESULT_MIN_WIDTH),
