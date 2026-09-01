@@ -29,7 +29,11 @@ from typing import Any, Protocol, Self
 
 import paramiko
 from netmiko.aruba.aruba_os import ArubaOsSSH
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko.exceptions import (
+    NetmikoAuthenticationException,
+    NetmikoTimeoutException,
+    ReadTimeout,
+)
 from netmiko.session_log import SessionLog
 from paramiko.hostkeys import HostKeyEntry, InvalidHostKey
 
@@ -408,7 +412,7 @@ class SSHCollector:
             raise
         except (NetmikoAuthenticationException, paramiko.AuthenticationException) as exc:
             raise CollectorError(ErrorCode.AUTH_FAILED, "SSH 인증에 실패했습니다.") from exc
-        except (NetmikoTimeoutException, TimeoutError) as exc:
+        except (NetmikoTimeoutException, ReadTimeout, TimeoutError) as exc:
             token.raise_if_cancelled()
             try:
                 poll_deadline.raise_if_expired()

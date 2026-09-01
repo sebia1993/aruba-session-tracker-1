@@ -12,7 +12,13 @@ from .common import ParseError, reject_command_errors
 _COUNTER_RE = re.compile(r"^\d+(?:/\d+)+$")
 _MAC_RE = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 _ENTRY_COUNT_RE = re.compile(r"(?im)^\s*(?:Total\s+)?Entries\s*[:=]\s*(\d+)\s*$")
-_FINAL_PROMPT_RE = re.compile(r"^\s*(?:\([^\r\n()]+\)\s*)?(?:\[[^\r\n\[\]]+\]\s*)?[#>]\s*$")
+_FINAL_PROMPT_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:\([^\r\n()]{1,64}\)\s*(?:(?:\^\*?|\*)\s*)?)?"
+    r"(?:\[[^\r\n\[\]]{1,64}\]\s*)?"
+    r"|[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\s*"
+    r")[#>]\s*$"
+)
 _UNSUPPORTED_COLUMNS = ("NhlIdx", "NhIdx", "NhlNhVer")
 
 

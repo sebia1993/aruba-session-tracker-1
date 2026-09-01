@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.5.8 - 2026-09-01
+
+- `show datapath session table <IP>` 출력에 `Entries: N` footer가 없을 때도
+  마지막 비어 있지 않은 줄이 AOS 8의 정상 enable 프롬프트이면 완료된 출력으로
+  인정. 미저장 설정 `^`, crash 정보 `*`, 결합 상태 `^*`, 길이·문자 집합을
+  제한한 bare-host 프롬프트를 지원해 정상 MD 결과가 `MD_PARSE / PARSE_PARTIAL`로
+  폐기되던 false negative를 수정.
+- 프롬프트는 출력 마지막 줄 전체가 허용 형식과 일치할 때만 완료 표식으로 사용.
+  단독 상태 표식, 임의 표식, 잘못된 순서 `*^`, 중복 표식, config-mode
+  프롬프트와 후행 텍스트는 계속 거부하고, 기존 행 스키마·행 수·출력 한도
+  검증은 유지.
+- 오프라인 tech-support의 명령 echo와 최종 프롬프트에도 같은 AOS 상태 표식
+  계약을 적용하고, Netmiko의 prompt read timeout을 민감한 원문 없이 재시도
+  가능한 수집 오류로 변환.
+- 실제 장비에는 접속하지 않음. 비식별 fixture와 로컬 parser/orchestration
+  검증, GitHub-hosted Windows x64 전체 CI와 fixture-only 20,000 poll soak,
+  패키지·EXE smoke를 사전릴리스 게시 전 수행할 검증 범위로 제한.
+
 ## 0.5.7 - 2026-09-01
 
 - 주 탭 오른쪽에 제품명, 버전, 로컬 전용·읽기 전용 경계를 표시하는 운영

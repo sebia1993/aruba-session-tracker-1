@@ -34,8 +34,11 @@ _SUPPORTED_COMMANDS = frozenset(
     (DATAPATH_INTERNAL_COMMAND, USER_TABLE_VERBOSE_COMMAND, STATION_TABLE_COMMAND)
 )
 _COMMAND_WITH_PROMPT_RE = re.compile(
-    r"^(?:\([^()\r\n]{1,64}\)\s*)?"
-    r"(?:\[[^\[\]\r\n]{1,64}\]\s*)?[#>]\s*"
+    r"^(?:"
+    r"(?:\([^()\r\n]{1,64}\)\s*(?:(?:\^\*?|\*)\s*)?)?"
+    r"(?:\[[^\[\]\r\n]{1,64}\]\s*)?"
+    r"|[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\s*"
+    r")[#>]\s*"
     r"(show [A-Za-z0-9][A-Za-z0-9 _./:|,?=-]{0,240})$",
     re.IGNORECASE,
 )
@@ -53,8 +56,11 @@ _USER_COUNT_RE = re.compile(
 )
 _STATION_COUNT_RE = re.compile(r"^Station Entries\s*:\s*([0-9]+)\s*$", re.IGNORECASE)
 _FINAL_PROMPT_RE = re.compile(
-    r"^(?:\([^()\r\n]{1,64}\)\s*)?"
-    r"(?:\[[^\[\]\r\n]{1,64}\]\s*)?[#>]\s*$"
+    r"^(?:"
+    r"(?:\([^()\r\n]{1,64}\)\s*(?:(?:\^\*?|\*)\s*)?)?"
+    r"(?:\[[^\[\]\r\n]{1,64}\]\s*)?"
+    r"|[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\s*"
+    r")[#>]\s*$"
 )
 _MAC_RE = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 _SAFE_FIELD_RE = re.compile(r"^[^<>\x00-\x08\x0b\x0c\x0e-\x1f\x7f]*$")
