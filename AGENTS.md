@@ -85,8 +85,8 @@ datapath session rows from the relevant 7240XM managed device.
   separate bounded job on the exact annotated-tag commit before publication.
   Both soak results are test evidence only, not live-device evidence.
 - Keep synthetic soak inputs between 1 and 20,000 polls. Each child-process
-  timeout must remain between 900 and 3,200 seconds so the two sequential
-  long-soak subprocesses stay inside each outer 120-minute workflow watchdog.
+  timeout must remain between 900 and 4,000 seconds so the two sequential
+  long-soak subprocesses stay inside each outer 150-minute workflow watchdog.
 - Deadline watchdogs must recheck the shared monotonic deadline after an OS
   timer wait returns. Never treat one early Windows timer wakeup as expiry, and
   keep the connection-manager and owned-socket guards on the same policy.

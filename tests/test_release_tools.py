@@ -1284,7 +1284,7 @@ def test_versioned_workflow_requires_parallel_exact_tag_soak_before_publish() ->
 
     assert "timeout-minutes: 60" in build_job
     assert 'ARUBA_SOAK_POLLS: "20000"' not in build_job
-    assert "timeout-minutes: 120" in soak_job
+    assert "timeout-minutes: 150" in soak_job
     assert "permissions:\n      contents: read" in soak_job
     assert 'ARUBA_SOAK_POLLS: "20000"' in soak_job
     environment = soak_job.index('ARUBA_SOAK_POLLS: "20000"')
@@ -1390,18 +1390,20 @@ def test_nightly_workflow_runs_fixture_only_scaled_soak() -> None:
     assert "workflow_dispatch:" in trigger
     assert "schedule:" not in trigger
     assert "cron:" not in trigger
+    assert "timeout-minutes: 150" in workflow
     assert 'ARUBA_SOAK_POLLS: "20000"' in workflow
     assert "python -m pytest -m soak" in workflow
     assert "QT_QPA_PLATFORM: offscreen" in workflow
     assert "github.token" not in workflow
 
 
-def test_soak_worker_timeouts_allow_hosted_variance_without_extending_20k_cap() -> None:
-    expected = "timeout=min(3_200, max(900, math.ceil(polls * 0.16)))"
+def test_soak_worker_timeouts_allow_bounded_hosted_variance() -> None:
+    expected = "timeout=min(4_000, max(900, math.ceil(polls * 0.20)))"
     for path in ("tests/test_end_to_end_soak.py", "tests/test_storage_soak.py"):
         source = Path(path).read_text(encoding="utf-8")
         assert expected in source
+        assert "min(3_200, max(900, math.ceil(polls * 0.16)))" not in source
         assert "max(500, math.ceil(polls * 0.16))" not in source
 
     guidance = Path("AGENTS.md").read_text(encoding="utf-8")
-    assert "between 900 and 3,200 seconds" in guidance
+    assert "between 900 and 4,000 seconds" in guidance

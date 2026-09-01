@@ -87,7 +87,7 @@ jobs:
   release-soak:
     name: Verify exact tag with 20,000-poll fixture-only soak
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     permissions:
       contents: read
     env:

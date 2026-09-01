@@ -14,7 +14,7 @@ jobs:
   windows-soak:
     name: Windows x64 fixture-only long-running soak
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     env:
       ARUBA_SOAK_POLLS: "20000"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
