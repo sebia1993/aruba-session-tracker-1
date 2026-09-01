@@ -111,5 +111,6 @@ service was introduced by this implementation.
 - Qt high-contrast fallback remains usable.
 - Desktop QSS contains no URL.
 - HTML remains deterministic and self-contained.
+- Pinned Ruff and mypy validation passes against the Windows build environment.
 - Existing security, storage, parser, shutdown, and packaging tests continue to
   pass.
