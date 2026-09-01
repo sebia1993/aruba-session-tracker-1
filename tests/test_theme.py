@@ -289,15 +289,12 @@ def test_detail_panel_preserves_results_viewport_for_wide_and_compact_layouts(
     assert window.details.minimumWidth() == 340
     assert window.details.minimumHeight() == 0
     assert window.result_table.viewport().height() >= 40
-    detail_tab_rects = [
-        window.details.tabBar().tabRect(index) for index in range(window.details.count())
-    ]
-    detail_widths = [rect.width() for rect in detail_tab_rects]
-    assert max(detail_widths) - min(detail_widths) <= 1
+    detail_tab_bar = window.details.tabBar()
+    detail_tab_rects = [detail_tab_bar.tabRect(index) for index in range(window.details.count())]
     for index, rect in enumerate(detail_tab_rects):
-        assert rect.width() >= window.details.tabBar().fontMetrics().horizontalAdvance(
-            window.details.tabText(index)
-        )
+        label_width = detail_tab_bar.fontMetrics().horizontalAdvance(window.details.tabText(index))
+        assert rect.width() >= label_width + 12
+        assert detail_tab_bar.rect().contains(rect)
     window.close()
 
 
