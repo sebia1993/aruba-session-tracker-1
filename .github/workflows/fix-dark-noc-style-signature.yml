@@ -26,34 +26,44 @@ jobs:
         run: |
           $path = "src/aruba_session_tracker/ui/noc_console.py"
           $text = (Get-Content -Raw -Encoding UTF8 $path).Replace("`r`n", "`n")
+          $lines = [System.Collections.Generic.List[string]]::new()
+          foreach ($line in ($text -split "`n")) {
+            [void]$lines.Add($line)
+          }
 
-          $oldImport = "from typing import TYPE_CHECKING"
-          $newImport = "from typing import TYPE_CHECKING, cast"
-          if (-not $text.Contains($oldImport)) {
+          $importIndex = $lines.IndexOf("from typing import TYPE_CHECKING")
+          if ($importIndex -lt 0) {
             throw "typing import target was not found."
           }
-          $text = $text.Replace($oldImport, $newImport)
+          $lines[$importIndex] = "from typing import TYPE_CHECKING, cast"
 
-          $oldBlock = @'
-                  calculated = (
-                      super().sizeFromContents(content_type, option, size, widget)
-                      if widget is not None
-                      else super().sizeFromContents(content_type, option, size)
-                  )
-          '@.TrimEnd()
-          $newBlock = @'
-                  calculated = super().sizeFromContents(
-                      content_type, option, size, cast(QWidget, widget)
-                  )
-          '@.TrimEnd()
-          if (-not $text.Contains($oldBlock)) {
-            throw "sizeFromContents compatibility block was not found."
+          $expected = [string[]]@(
+            "        calculated = (",
+            "            super().sizeFromContents(content_type, option, size, widget)",
+            "            if widget is not None",
+            "            else super().sizeFromContents(content_type, option, size)",
+            "        )"
+          )
+          $calculatedIndex = $lines.IndexOf($expected[0])
+          if ($calculatedIndex -lt 0) {
+            throw "sizeFromContents block start was not found."
           }
-          $text = $text.Replace($oldBlock, $newBlock)
+          for ($offset = 0; $offset -lt $expected.Count; $offset++) {
+            if ($lines[$calculatedIndex + $offset] -ne $expected[$offset]) {
+              throw "sizeFromContents block differs at offset $offset."
+            }
+          }
+          $lines.RemoveRange($calculatedIndex, $expected.Count)
+          $replacement = [string[]]@(
+            "        calculated = super().sizeFromContents(",
+            "            content_type, option, size, cast(QWidget, widget)",
+            "        )"
+          )
+          $lines.InsertRange($calculatedIndex, $replacement)
 
           [System.IO.File]::WriteAllText(
             (Resolve-Path $path),
-            $text,
+            [string]::Join("`n", $lines),
             [System.Text.UTF8Encoding]::new($false)
           )
           Remove-Item -Force .github/workflows/fix-dark-noc-style-signature.yml
