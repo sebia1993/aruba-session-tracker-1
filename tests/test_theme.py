@@ -4,7 +4,14 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import QApplication, QSizePolicy, QTabWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QLabel,
+    QSizePolicy,
+    QTabWidget,
+    QWidget,
+)
 
 from aruba_session_tracker.config import ConfigRepository
 from aruba_session_tracker.storage import SessionStore
@@ -24,11 +31,7 @@ def _relative_luminance(value: str) -> float:
     color = QColor(value)
 
     def channel(component: float) -> float:
-        return (
-            component / 12.92
-            if component <= 0.04045
-            else ((component + 0.055) / 1.055) ** 2.4
-        )
+        return component / 12.92 if component <= 0.04045 else ((component + 0.055) / 1.055) ** 2.4
 
     return (
         0.2126 * channel(color.redF())
@@ -102,10 +105,9 @@ def test_theme_installs_dark_noc_shell_without_replacing_operational_widgets(
     assert window.md_group.property("panelRole") == "controller"
     assert window.timing_group.property("panelRole") == "timing"
 
-    assert window.metric_strip.objectName() == "metricStrip"  # type: ignore[attr-defined]
-    metric_values = window.metric_strip.findChildren(  # type: ignore[attr-defined]
-        type(window.state_label), "metricValue"
-    )
+    metric_strip = window.findChild(QFrame, "metricStrip")
+    assert metric_strip is not None
+    metric_values = metric_strip.findChildren(QLabel, "metricValue")
     assert len(metric_values) == 4
     assert [label.text() for label in metric_values] == ["0", "0", "0", "0"]
 
@@ -113,10 +115,8 @@ def test_theme_installs_dark_noc_shell_without_replacing_operational_widgets(
     assert window.details.tabText(0) == "DETAILS"
     assert window.details.tabText(1) == "RAW CLI"
     assert window.details.tabText(2) == "DIAGNOSTICS"
-    assert (
-        window.session_detail_page.objectName()  # type: ignore[attr-defined]
-        == "sessionDetailPage"
-    )
+    session_detail_page = window.findChild(QWidget, "sessionDetailPage")
+    assert session_detail_page is not None
     assert window.details.minimumWidth() == 340
     assert window.details.minimumHeight() == 0
 
@@ -184,7 +184,8 @@ def test_theme_can_be_applied_twice_without_duplicate_shell_components(
     apply_main_window_theme(window)
     first_stylesheet = window.styleSheet()
     first_details_count = window.details.count()
-    first_metric_strip = window.metric_strip  # type: ignore[attr-defined]
+    first_metric_strip = window.findChild(QFrame, "metricStrip")
+    assert first_metric_strip is not None
     first_header = window.nav_identity
     apply_main_window_theme(window)
 
@@ -196,7 +197,7 @@ def test_theme_can_be_applied_twice_without_duplicate_shell_components(
     ) == original_widgets
     assert window.tabs.count() == original_tab_count
     assert window.details.count() == first_details_count == 3
-    assert window.metric_strip is first_metric_strip  # type: ignore[attr-defined]
+    assert window.findChild(QFrame, "metricStrip") is first_metric_strip
     assert window.nav_identity is first_header
     assert window.styleSheet() == first_stylesheet == build_stylesheet()
     window.close()

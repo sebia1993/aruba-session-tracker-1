@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QBoxLayout,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -57,9 +58,8 @@ class _HorizontalRailTabStyle(QProxyStyle):
         painter: QPainter,
         widget: QWidget | None = None,
     ) -> None:
-        if (
-            element == QStyle.ControlElement.CE_TabBarTabLabel
-            and isinstance(option, QStyleOptionTab)
+        if element == QStyle.ControlElement.CE_TabBarTabLabel and isinstance(
+            option, QStyleOptionTab
         ):
             horizontal = QStyleOptionTab(option)
             horizontal.shape = QTabBar.Shape.RoundedNorth
@@ -122,7 +122,6 @@ class _NocConsoleController(QObject):
         tab_style = _HorizontalRailTabStyle()
         tab_style.setParent(window.tabs.tabBar())
         window.tabs.tabBar().setStyle(tab_style)
-        window._dark_noc_tab_style = tab_style  # type: ignore[attr-defined]
 
         for index, icon_name in enumerate(("query", "settings", "history")):
             window.tabs.setTabIcon(index, _navigation_icon(icon_name))
@@ -131,8 +130,10 @@ class _NocConsoleController(QObject):
         # header. Reparenting removes it from the QTabWidget corner safely.
         window.nav_identity.setParent(window.central_root)
         window.nav_identity.setObjectName("nocHeader")
-        header_layout = window.nav_identity.layout()
-        if header_layout is None:
+        existing_layout = window.nav_identity.layout()
+        if isinstance(existing_layout, QBoxLayout):
+            header_layout = existing_layout
+        else:
             header_layout = QHBoxLayout(window.nav_identity)
         while header_layout.count():
             item = header_layout.takeAt(0)
@@ -185,10 +186,13 @@ class _NocConsoleController(QObject):
 
     def _install_metrics(self) -> None:
         window = self._window
-        result_layout = window.result_table.parentWidget().layout()
-        if result_layout is None:
+        result_parent = window.result_table.parentWidget()
+        if result_parent is None:
             return
-        strip = QFrame(window.result_table.parentWidget())
+        result_layout = result_parent.layout()
+        if not isinstance(result_layout, QBoxLayout):
+            return
+        strip = QFrame(result_parent)
         strip.setObjectName("metricStrip")
         strip_layout = QHBoxLayout(strip)
         strip_layout.setContentsMargins(0, 0, 0, 0)
@@ -220,7 +224,6 @@ class _NocConsoleController(QObject):
         if insertion_index < 0:
             insertion_index = result_layout.indexOf(window.result_table)
         result_layout.insertWidget(max(0, insertion_index), strip)
-        window.metric_strip = strip  # type: ignore[attr-defined]
 
     def _install_detail_summary(self) -> None:
         window = self._window
@@ -233,9 +236,7 @@ class _NocConsoleController(QObject):
         heading_row = QHBoxLayout()
         heading = QLabel("SELECTED SESSION", page)
         heading.setObjectName("detailEyebrow")
-        self._detail_values["hint"] = QLabel(
-            "세션 행을 선택하면 조사 요약을 표시합니다.", page
-        )
+        self._detail_values["hint"] = QLabel("세션 행을 선택하면 조사 요약을 표시합니다.", page)
         self._detail_values["hint"].setObjectName("detailHint")
         heading_row.addWidget(heading)
         heading_row.addStretch(1)
@@ -307,15 +308,15 @@ class _NocConsoleController(QObject):
         window.details.setAccessibleDescription(
             "선택 세션 요약, Raw CLI와 진단 이벤트를 전환합니다."
         )
-        window.session_detail_page = page  # type: ignore[attr-defined]
 
     def _connect_existing_state(self) -> None:
         window = self._window
         model = window.result_table.model()
-        model.rowsInserted.connect(self.schedule_refresh)
-        model.rowsRemoved.connect(self.schedule_refresh)
-        model.modelReset.connect(self.schedule_refresh)
-        model.dataChanged.connect(self.schedule_refresh)
+        if model is not None:
+            model.rowsInserted.connect(self.schedule_refresh)
+            model.rowsRemoved.connect(self.schedule_refresh)
+            model.modelReset.connect(self.schedule_refresh)
+            model.dataChanged.connect(self.schedule_refresh)
         window.result_table.itemSelectionChanged.connect(self.schedule_refresh)
         window.session_interval.valueChanged.connect(self.schedule_refresh)
         window.mm_primary_host.textChanged.connect(self.schedule_refresh)
@@ -330,9 +331,7 @@ class _NocConsoleController(QObject):
     def _apply_detail_orientation(self) -> None:
         window = self._window
         use_side_panel = window.width() >= _SIDE_DETAIL_BREAKPOINT
-        orientation = (
-            Qt.Orientation.Horizontal if use_side_panel else Qt.Orientation.Vertical
-        )
+        orientation = Qt.Orientation.Horizontal if use_side_panel else Qt.Orientation.Vertical
         window.result_splitter.setOrientation(orientation)
         if use_side_panel:
             window.details.setMinimumWidth(340)
@@ -480,13 +479,13 @@ class _NocConsoleController(QObject):
 def install_dark_noc_console(window: MainWindow) -> _NocConsoleController:
     """Install the approved presentation once and return its controller."""
 
-    existing = getattr(window, "_dark_noc_console_controller", None)
-    if isinstance(existing, _NocConsoleController):
+    existing = window.findChild(_NocConsoleController, "darkNocConsoleController")
+    if existing is not None:
         existing.schedule_refresh()
         existing.schedule_layout()
         return existing
     controller = _NocConsoleController(window)
-    window._dark_noc_console_controller = controller  # type: ignore[attr-defined]
+    controller.setObjectName("darkNocConsoleController")
     window.setProperty("darkNocConsoleInstalled", True)
     return controller
 
@@ -570,9 +569,8 @@ def _status_is_inactive(status: str) -> bool:
     return "종료" in status or "미관측" in status or "신뢰 불가" in status
 
 
-def _version_text(window: object) -> str:
-    title_getter = getattr(window, "windowTitle", None)
-    title = str(title_getter()) if callable(title_getter) else ""
+def _version_text(window: QWidget) -> str:
+    title = window.windowTitle()
     return title.rsplit(" ", 1)[-1] if " " in title else title or "—"
 
 
