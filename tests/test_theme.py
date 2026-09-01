@@ -155,7 +155,7 @@ def test_theme_installs_dark_noc_shell_without_replacing_operational_widgets(
     assert window.details.tabText(2) == "DIAGNOSTICS"
     session_detail_page = window.findChild(QWidget, "sessionDetailPage")
     assert session_detail_page is not None
-    assert window.details.minimumWidth() >= 340
+    assert window.details.minimumWidth() >= 380
     assert window.details.minimumHeight() == 0
 
     assert window.context_label.objectName() == "contextSummary"
@@ -262,8 +262,9 @@ def test_detail_panel_preserves_results_viewport_for_wide_and_compact_layouts(
         lambda: window.result_splitter.orientation() == Qt.Orientation.Horizontal,
         timeout=3000,
     )
-    assert window.details.minimumWidth() >= 340
+    assert window.details.minimumWidth() >= 380
     assert window.details.minimumHeight() == 0
+    assert window.result_splitter.widget(0).width() >= 380
 
     window.resize(1100, 820)
     qtbot.waitUntil(  # type: ignore[attr-defined]
@@ -282,7 +283,7 @@ def test_detail_panel_preserves_results_viewport_for_wide_and_compact_layouts(
     qtbot.waitUntil(  # type: ignore[attr-defined]
         lambda: (
             window.result_splitter.orientation() == Qt.Orientation.Horizontal
-            and window.details.minimumWidth() >= 340
+            and window.details.minimumWidth() >= 380
         ),
         timeout=3000,
     )
@@ -293,8 +294,9 @@ def test_detail_panel_preserves_results_viewport_for_wide_and_compact_layouts(
     assert window.context_label.isHidden()
     assert "장비 장애나 통신 성공 판정이 아닙니다" in window.result_table.accessibleDescription()
     assert window.context_label.text() in window.result_table.accessibleDescription()
-    assert window.details.minimumWidth() >= 340
+    assert window.details.minimumWidth() >= 380
     assert window.details.minimumHeight() == 0
+    assert window.result_splitter.widget(0).width() >= 380
     assert window.result_table.viewport().height() >= 40
     metric_values = window.findChildren(QLabel, "metricValue")
     for value in metric_values:
@@ -462,7 +464,7 @@ def test_selected_session_summary_tracks_existing_row_and_preserves_raw_widgets(
     protocol = window.findChild(QLabel, "detailProtocol")
     assert protocol is not None
     qtbot.waitUntil(  # type: ignore[attr-defined]
-        lambda: protocol.text() == "TCP (6)" and window.details.minimumWidth() >= 340,
+        lambda: protocol.text() == "TCP (6)" and window.details.minimumWidth() >= 380,
         timeout=3000,
     )
 

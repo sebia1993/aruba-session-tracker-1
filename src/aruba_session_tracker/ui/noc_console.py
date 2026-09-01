@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 _DASH = "—"
 _SIDE_DETAIL_BREAKPOINT = 1200
 _COMPACT_DETAIL_HEIGHT = 760
-_DETAIL_MIN_WIDTH = 340
+_DETAIL_MIN_WIDTH = 380
 _RESULT_MIN_WIDTH = 380
 
 
@@ -371,19 +371,7 @@ class _NocConsoleController(QObject):
         window.result_splitter.setOrientation(orientation)
         if use_side_panel:
             available = max(window.result_splitter.width(), 720)
-            tab_bar = window.details.tabBar()
-            tab_bar.ensurePolished()
-            rendered_tab_width = max(
-                (tab_bar.tabRect(index).right() + 1 for index in range(tab_bar.count())),
-                default=0,
-            )
-            # On Windows the selected/native-styled tab can render wider than
-            # QTabBar.sizeHint() after a vertical-to-horizontal transition.
-            tab_width = max(
-                tab_bar.sizeHint().width(),
-                tab_bar.minimumSizeHint().width(),
-                rendered_tab_width,
-            )
+            tab_width = window.details.tabBar().sizeHint().width()
             detail_width = min(
                 max(_DETAIL_MIN_WIDTH, tab_width),
                 max(_DETAIL_MIN_WIDTH, available - _RESULT_MIN_WIDTH),
