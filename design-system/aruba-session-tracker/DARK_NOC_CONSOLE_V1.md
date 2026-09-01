@@ -76,6 +76,9 @@ Required information order:
 8. complete observation history
 9. privacy/footer notice
 
+The traffic-flow panel is the single source of truth for query direction; the
+report-basis list must not repeat the same direction fact.
+
 The report may use inline SVG/CSS for a state ring. It must not expose Raw CLI,
 diagnostic messages, support internals, filesystem paths, usernames, passwords,
 host-key details, or inferred topology. Packet/byte values remain excluded from
