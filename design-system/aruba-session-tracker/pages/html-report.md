@@ -11,11 +11,14 @@ IP and port, and tracked state with the least possible scanning effort.
 
 ## Information hierarchy
 
-1. Compact product masthead and collection state.
-2. Query direction plus start/end time and result counts.
-3. Local IP, protocol, and port autocomplete filters.
-4. Latest 50 logical sessions.
-5. Complete stored observation history, collapsed until requested.
+1. Compact product masthead and stored run state.
+2. Query direction, start/end time, duration, and confirmed counts.
+3. Latest-displayed session-state summary and recent stored-fact timeline,
+   with their snapshot scope stated explicitly.
+4. Local IP, protocol, and port autocomplete filters.
+5. Latest 50 logical sessions.
+6. Collection information derived only from report observations.
+7. Complete stored observation history, collapsed until requested.
 
 The filter is a secondary surface rather than another primary dashboard card.
 Each result count sits beside its own section heading, and the latest-results
@@ -31,10 +34,11 @@ so the address/port boundary is unambiguous.
 ## Deliberate exclusions
 
 Do not add packet or byte counters, counter changes, protocol/controller
-distribution charts, timelines, significant-event cards, CLI, Raw, diagnostics,
-logs, file paths, hashes, troubleshooting guidance, or developer information.
-Those values either belong to other export formats or would distract from the
-requested IP/protocol/port result.
+distribution charts, CLI, Raw, diagnostics, logs, file paths, hashes,
+troubleshooting guidance, or developer information. A compact state summary
+and recent-event timeline are allowed only from sanitized facts already present
+in the bounded report snapshot. They must not claim complete event coverage or
+infer health, reachability, failover, outage, cause, or packet path.
 
 ## Offline and accessibility contract
 

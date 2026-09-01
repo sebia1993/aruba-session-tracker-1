@@ -7,7 +7,7 @@ import base64
 import hashlib
 import os
 import tempfile
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from html import escape
@@ -532,364 +532,25 @@ class RunReportSnapshot:
 
 
 def render_html_report(snapshot: RunReportSnapshot) -> str:
-    """Return a concise standalone HTML5 report containing tracked results only."""
+    """Return the approved deterministic standalone HTML5 report."""
 
-    return "".join(_report_chunks(snapshot))
-
-
-def _report_chunks(
-    snapshot: RunReportSnapshot,
-    *,
-    observation_history: Iterable[ReportRow] | None = None,
-    logical_session_total: int | None = None,
-) -> Iterator[str]:
-    """Yield one report in bounded chunks.
-
-    ``observation_history`` is used by :class:`SessionStore` to stream a stable
-    SQLite cursor directly to the atomic destination.  The public renderer
-    keeps its historical behavior by deriving both the latest results and the
-    complete history from the supplied snapshot.
-    """
-
-    run = snapshot.run
-    if observation_history is None:
-        history: Iterable[ReportRow] = snapshot.observation_history or snapshot.observations
-        latest_source = snapshot.observation_history or snapshot.observations
-    else:
-        history = observation_history
-        latest_source = snapshot.observations
-    flow_groups = _group_observations(latest_source)
-    flow_statuses, session_statuses = _lifecycle_statuses(snapshot.lifecycle_events)
-    latest_groups = flow_groups[:_LATEST_SESSION_LIMIT]
-    latest_rows = "".join(
-        _observation_row(
-            rows[-1],
-            _status_for(rows[-1], flow_statuses, session_statuses),
-        )
-        for _flow, rows in latest_groups
-    )
-    total_sessions = len(flow_groups) if logical_session_total is None else logical_session_total
-    displayed_latest = len(latest_groups)
-    latest_note = (
-        f"고유 세션 {_format_integer(total_sessions)}개를 모두 표시합니다."
-        if displayed_latest >= total_sessions
-        else (
-            f"고유 세션 {_format_integer(total_sessions)}개 중 마지막 확인 시각을 기준으로 "
-            f"최근 {_format_integer(displayed_latest)}개를 표시합니다."
-        )
-    )
-    query_direction = "양방향" if bool(run.get("bidirectional")) else "단방향"
-    direction_symbol = "↔" if bool(run.get("bidirectional")) else "→"
-    run_status_code = str(run.get("status") or "").upper()
-    run_status = _RUN_STATUS_KO.get(run_status_code, "상태 확인 필요")
-    run_status_class = _RUN_STATUS_CLASS.get(run_status_code, "attention")
-    source_endpoint = _query_endpoint(
-        run.get("source_ip"),
-        run.get("source_port"),
-        other_address=run.get("destination_ip"),
-    )
-    destination_endpoint = _query_endpoint(
-        run.get("destination_ip"),
-        run.get("destination_port"),
-        other_address=run.get("source_ip"),
+    # Keep the established public import path while avoiding an import cycle:
+    # the presentation module imports this module's proven private helpers.
+    from aruba_session_tracker.storage.html_report_presentation import (
+        render_html_report as render_presentation,
     )
 
-    yield f"""<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="referrer" content="no-referrer">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-{_FILTER_SCRIPT_SHA256}'; object-src 'none'; base-uri 'none'; form-action 'none'">
-  <title>Aruba Session Tracker 추적 결과</title>
-  <style>
-    :root {{ color-scheme:light; --masthead:#102f49; --canvas:#f3f6f9; --surface:#fff;
-      --surface-muted:#e8eef4; --border:#cbd5e1; --border-strong:#aebcca;
-      --text:#0f172a; --text-muted:#475569; --primary:#0b5f9a; --primary-hover:#084f82;
-      --focus:#1976b9; --success:#147d64; --warning:#9c6615; --danger:#b42318;
-      --neutral:#486581; }}
-    * {{ box-sizing:border-box; }}
-    body {{ margin:0; overflow-x:hidden; background:var(--canvas); color:var(--text);
-      font-family:system-ui,-apple-system,"Segoe UI","Malgun Gothic",sans-serif; line-height:1.5; }}
-    .header {{ background:var(--masthead); color:#fff; padding:15px 0 14px;
-      border-bottom:3px solid var(--focus); }}
-    .header-inner,.content,.footer {{ width:min(1240px,calc(100% - 32px)); margin:0 auto; }}
-    .header-inner {{ display:flex; align-items:center; justify-content:space-between; gap:16px; }}
-    .product-name {{ margin:0 0 1px; color:#d9e8f5; font-size:.75rem; font-weight:700;
-      letter-spacing:.045em; }}
-    h1 {{ margin:0; font-size:clamp(1.4rem,2.4vw,1.7rem); line-height:1.25; }}
-    .content {{ padding:14px 0; }}
-    section {{ min-width:0; background:var(--surface); border:1px solid var(--border);
-      border-radius:8px; padding:16px; margin-bottom:12px; }}
-    h2 {{ margin:0 0 5px; color:var(--text); font-size:1.16rem; }}
-    .section-note {{ margin:0 0 12px; color:var(--text-muted); }}
-    .result-summary {{ overflow:hidden; }}
-    .summary-heading {{ margin-bottom:10px; }}
-    .summary-title {{ margin:0; font-size:1.16rem; }}
-    .flow-panel {{ display:grid; grid-template-columns:minmax(0,1fr) auto minmax(0,1fr); gap:14px;
-      align-items:center; padding:13px 14px; background:#f8fafc; border:1px solid var(--border);
-      border-radius:7px; }}
-    .endpoint {{ min-width:0; }}
-    .endpoint.destination {{ text-align:right; }}
-    .endpoint-label {{ color:var(--text-muted); font-size:.76rem; font-weight:750; }}
-    .endpoint-value {{ display:block; margin-top:3px; color:#17324d; font-size:1rem;
-      font-weight:800; overflow-wrap:anywhere; }}
-    .direction {{ min-width:94px; text-align:center; }}
-    .direction-arrow {{ display:block; color:var(--primary); font-size:1.35rem; line-height:1; font-weight:800; }}
-    .direction-pill {{ display:inline-block; margin-top:7px; padding:3px 9px; border-radius:999px;
-      color:#0b4f82; background:#e8f2fb; border:1px solid #b8d6eb; font-size:.75rem; font-weight:800; }}
-    .summary-stats {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:1px;
-      overflow:hidden; margin:11px 0 0; padding:1px; background:var(--border); border-radius:7px; }}
-    .summary-stat {{ min-width:0; padding:9px 11px; background:var(--surface); }}
-    .summary-stat dt {{ color:var(--text-muted); font-size:.76rem; font-weight:650; }}
-    .summary-stat dd {{ margin:3px 0 0; color:#17324d; font-weight:800; overflow-wrap:anywhere; }}
-    .run-state {{ display:inline-flex; align-items:center; gap:6px; padding:4px 9px; border-radius:999px;
-      background:#edf2f7; color:var(--neutral); border:1px solid #cbd5e1;
-      font-size:.77rem; font-weight:800; white-space:nowrap; }}
-    .run-state::before {{ content:""; width:7px; height:7px; border-radius:50%; background:currentColor; }}
-    .run-state.completed {{ background:#e6fffa; color:var(--success); border-color:#9ae6d3; }}
-    .run-state.running {{ background:#e8f2fb; color:var(--primary); border-color:#b8d6eb; }}
-    .run-state.attention {{ background:#fff8e7; color:var(--warning); border-color:#e7c978; }}
-    .run-state.failed {{ background:#fff1f0; color:var(--danger); border-color:#f3b6b0; }}
-    .filter-panel[hidden] {{ display:none !important; }}
-    .filter-panel {{ position:relative; background:#f8fafc; border-color:#b9c9d8; }}
-    .filter-heading {{ margin:0 0 10px; color:var(--text); font-size:1.16rem; font-weight:750; }}
-    .filter-grid {{ display:grid; grid-template-columns:minmax(190px,1fr) minmax(150px,.65fr)
-      minmax(160px,.75fr) auto; gap:10px; align-items:end; }}
-    .filter-field {{ position:relative; min-width:0; }}
-    .filter-field label {{ display:block; margin-bottom:5px; color:var(--text); font-size:.84rem; font-weight:700; }}
-    .filter-input,.filter-select {{ width:100%; min-height:40px; border:1px solid #9fb3c8;
-      border-radius:7px; padding:8px 10px; background:#fff; color:var(--text); font:inherit; }}
-    .filter-input:focus-visible,.filter-select:focus-visible,.filter-reset:focus-visible,
-    .suggestion-list [role="option"]:focus-visible {{ outline:3px solid var(--focus); outline-offset:2px; }}
-    .suggestion-list {{ position:absolute; z-index:20; left:0; right:0; top:calc(100% + 4px);
-      max-height:260px; overflow-y:auto; margin:0; padding:4px; list-style:none; background:#fff;
-      border:1px solid #9fb3c8; border-radius:8px; box-shadow:0 9px 24px #102a4326;
-      touch-action:pan-y; }}
-    .suggestion-list[hidden] {{ display:none !important; }}
-    .suggestion-list [role="option"] {{ display:flex; justify-content:space-between; gap:12px;
-      padding:8px 9px; border-radius:5px; cursor:pointer; }}
-    .suggestion-list [role="option"][aria-selected="true"],
-    .suggestion-list [role="option"]:hover {{ background:#e8f3fb; color:#17324d; }}
-    .suggestion-value {{ min-width:0; overflow-wrap:anywhere; font-weight:650; }}
-    .suggestion-direction {{ flex:0 0 auto; color:var(--text-muted); font-size:.78rem; }}
-    .filter-reset {{ min-height:40px; border:1px solid #9fb3c8; border-radius:7px; padding:8px 14px;
-      background:#fff; color:var(--primary); font:inherit; font-weight:700; cursor:pointer; white-space:nowrap; }}
-    .filter-reset:hover {{ background:#f0f7fc; }}
-    .filter-help {{ margin:9px 0 0; color:var(--text-muted); font-size:.82rem; }}
-    .filter-meta {{ margin-top:9px; }}
-    .section-heading-row {{ display:flex; align-items:baseline; justify-content:space-between;
-      gap:12px; margin-bottom:5px; }}
-    .section-heading-row h2 {{ margin:0; }}
-    .filter-count {{ display:inline-block; border-radius:999px; padding:3px 9px; background:#edf2f7;
-      color:var(--neutral); font-size:.78rem; font-weight:700; }}
-    .filter-status {{ min-height:1.5em; margin:0; color:var(--text-muted); font-size:.82rem; }}
-    .print-filter-summary {{ display:none; }}
-    .print-filter-summary[hidden] {{ display:none !important; }}
-    tr[hidden],.filter-empty-row[hidden] {{ display:none !important; }}
-    .table-wrap {{ overflow-x:auto; border:1px solid var(--border); border-radius:7px; background:#fff; }}
-    .table-wrap:focus-visible,summary:focus-visible {{ outline:3px solid var(--focus); outline-offset:2px; }}
-    table {{ width:100%; min-width:900px; border-collapse:collapse; font-size:.87rem; }}
-    th,td {{ padding:9px 10px; border-bottom:1px solid var(--border); text-align:left; vertical-align:top; }}
-    th {{ background:var(--surface-muted); color:#17324d; position:sticky; top:0;
-      white-space:nowrap; font-size:.79rem; }}
-    tbody tr:nth-child(even) {{ background:#fbfdff; }}
-    tbody tr:hover {{ background:#f2f8fc; }}
-    tr:last-child td {{ border-bottom:0; }}
-    .protocol-cell,.endpoint-cell,.time-cell {{ white-space:nowrap; font-variant-numeric:tabular-nums; }}
-    .protocol-cell,.endpoint-cell {{ color:#17324d; font-weight:700; }}
-    .time-cell,.device-cell {{ color:var(--text-muted); }}
-    .device-cell {{ max-width:240px; overflow-wrap:anywhere; }}
-    .badge {{ display:inline-block; border-radius:999px; padding:3px 9px; font-size:.78rem;
-      font-weight:700; background:#e6fffa; color:var(--success); border:1px solid #9ae6d3;
-      white-space:nowrap; }}
-    .badge.missed {{ background:#fff8e7; color:var(--warning); border-color:#e7c978; }}
-    .badge.closed {{ background:#fff1f0; color:var(--danger); border-color:#f3b6b0; }}
-    .badge.observed {{ background:#edf2f7; color:var(--neutral); border-color:#cbd5e1; }}
-    details {{ border:0; }}
-    summary {{ cursor:pointer; color:var(--primary); font-weight:700; padding:9px 11px;
-      border:1px solid var(--border); border-radius:7px; background:#f8fafc; }}
-    summary:hover {{ color:var(--primary-hover); background:#f0f7fc; }}
-    .history-toggle:not([open]) + .details-body {{ display:none; }}
-    .history-toggle[open] + .details-body {{ display:block; }}
-    .details-body {{ padding-top:2px; }}
-    .muted {{ color:var(--text-muted); text-align:center; padding:24px 12px; }}
-    .sr-only {{ position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden;
-      clip:rect(0,0,0,0); white-space:nowrap; border:0; }}
-    .footer {{ padding:0 0 20px; color:var(--text-muted); font-size:.8rem; }}
-    @media (max-width:850px) {{
-      .header-inner,.content,.footer {{ width:min(100% - 20px,1240px); }}
-      section {{ padding:14px; }}
-      .summary-stats {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
-      .filter-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
-    }}
-    @media (max-width:720px) {{
-      .header-inner {{ align-items:flex-start; }}
-      .flow-panel {{ grid-template-columns:1fr; gap:9px; padding:12px; }}
-      .endpoint.destination {{ text-align:left; }} .direction {{ text-align:left; min-width:0; }}
-      .direction-arrow {{ transform:rotate(90deg); transform-origin:left center; margin-left:8px; }}
-    }}
-    @media (max-width:520px) {{
-      .header-inner {{ display:block; }} .run-state {{ margin-top:9px; }}
-      .filter-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
-      .filter-field:first-child,.filter-reset {{ grid-column:1 / -1; }}
-      .filter-reset {{ width:100%; }}
-    }}
-    @media (max-width:360px) {{
-      .summary-stats,.filter-grid {{ grid-template-columns:1fr; }}
-    }}
-    @media (forced-colors:active) {{
-      .header {{ border-bottom-color:Highlight; }}
-      .run-state,.direction-pill,.summary-stats,.flow-panel,.filter-input,.filter-select,
-      .filter-reset,.filter-count,.suggestion-list,.table-wrap,.badge,summary {{
-        border:1px solid CanvasText; forced-color-adjust:auto;
-      }}
-      .run-state::before {{ background:Highlight; }}
-      .filter-input:focus-visible,.filter-select:focus-visible,.filter-reset:focus-visible,
-      .suggestion-list [role="option"]:focus-visible,.table-wrap:focus-visible,summary:focus-visible {{
-        outline-color:Highlight;
-      }}
-    }}
-    @page {{ size:A4 landscape; margin:10mm; }}
-    @media print {{
-      body {{ background:#fff; color:#000; }} .header {{ background:#fff; color:#000; padding:0 0 10px; border:0; }}
-      .product-name {{ color:#333; }} .header-inner,.content,.footer {{ width:100%; }} .content {{ padding:0; }}
-      section {{ border:0; border-radius:0; padding:0; margin-bottom:8px; }}
-      .flow-panel {{ grid-template-columns:minmax(0,1fr) auto minmax(0,1fr); gap:14px; background:#fff; }}
-      .endpoint.destination {{ text-align:right; }} .direction {{ min-width:94px; text-align:center; }}
-      .direction-arrow {{ transform:none; margin-left:0; }}
-      .history-toggle {{ display:none; }} .history-toggle + .details-body {{ display:block !important; }}
-      .filter-panel {{ display:none !important; }} .print-filter-summary {{ display:block; margin:0 0 10px;
-        padding:7px 9px; border:1px solid #bbb; font-size:8.5pt; }}
-      .table-wrap {{ overflow:visible; border:0; }} table {{ min-width:0; font-size:7.5pt; }}
-      thead {{ display:table-header-group; }} th {{ position:static; }} th,td {{ padding:4px; overflow-wrap:anywhere; }}
-      .muted {{ padding:8px 4px; }}
-      .summary-stats,.flow-panel,tr {{ break-inside:avoid; }}
-      tbody tr:nth-child(even),tbody tr:hover {{ background:#fff; }}
-    }}
-  </style>
-</head>
-<body>
-  <header class="header"><div class="header-inner">
-    <div>
-      <p class="product-name">Aruba Session Tracker</p>
-      <h1>세션 추적 결과</h1>
-    </div>
-    <div class="run-state {_e(run_status_class)}">{_e(run_status)}</div>
-  </div></header>
-  <main class="content">
-    <section class="result-summary" aria-labelledby="query-summary-title">
-      <div class="summary-heading">
-        <h2 id="query-summary-title" class="summary-title">조회 요약</h2>
-      </div>
-      <div class="flow-panel">
-        <div class="endpoint">
-          <span class="endpoint-label">조회 출발지</span>
-          <span class="endpoint-value">{_e(source_endpoint)}</span>
-        </div>
-        <div class="direction" aria-label="{_e(query_direction)} 검색">
-          <span class="direction-arrow" aria-hidden="true">{_e(direction_symbol)}</span>
-          <span class="direction-pill">{_e(query_direction)}</span>
-        </div>
-        <div class="endpoint destination">
-          <span class="endpoint-label">조회 목적지</span>
-          <span class="endpoint-value">{_e(destination_endpoint)}</span>
-        </div>
-      </div>
-      <dl class="summary-stats">
-        {_summary_stat("추적 시작", _format_kst(run.get("started_at")))}
-        {_summary_stat("추적 종료", _format_kst(run.get("ended_at")))}
-        {_summary_stat("전체 관측", f"{_format_integer(snapshot.observation_total)}건")}
-        {_summary_stat("고유 세션", f"{_format_integer(total_sessions)}개")}
-      </dl>
-    </section>
-
-    <section id="result-filter" class="filter-panel js-only" aria-labelledby="result-filter-title" hidden>
-      <h2 id="result-filter-title" class="filter-heading">결과 찾기</h2>
-      <div class="filter-grid">
-        <div class="filter-field">
-          <label for="filter-ip">IP 검색</label>
-          <input id="filter-ip" class="filter-input" type="text" role="combobox"
-            autocomplete="off" spellcheck="false" aria-autocomplete="list"
-            aria-controls="filter-ip-list" aria-expanded="false" aria-describedby="filter-help filter-status">
-          <div id="filter-ip-list" class="suggestion-list" role="listbox" aria-label="IP 추천값" hidden></div>
-        </div>
-        <div class="filter-field">
-          <label for="filter-protocol">프로토콜</label>
-          <select id="filter-protocol" class="filter-select" aria-label="프로토콜" aria-describedby="filter-status">
-            <option value="">전체</option>
-          </select>
-        </div>
-        <div class="filter-field">
-          <label for="filter-port">포트 검색</label>
-          <input id="filter-port" class="filter-input" type="text" role="combobox"
-            autocomplete="off" spellcheck="false" aria-autocomplete="list"
-            aria-controls="filter-port-list" aria-expanded="false" aria-describedby="filter-help filter-status">
-          <div id="filter-port-list" class="suggestion-list" role="listbox" aria-label="포트 추천값" hidden></div>
-        </div>
-        <button id="filter-reset" class="filter-reset" type="button">전체 초기화</button>
-      </div>
-      <p id="filter-help" class="filter-help">한 글자 이상 입력하면 최대 12개의 완성값을 추천합니다. 방향키와 Enter 또는 마우스로 선택할 수 있습니다.</p>
-      <div class="filter-meta">
-        <p id="filter-status" class="filter-status" role="status" aria-live="polite"></p>
-      </div>
-    </section>
-    <p id="print-filter-summary" class="print-filter-summary" hidden></p>
-
-    <section id="latest-sessions">
-      <div class="section-heading-row">
-        <h2>최신 세션 결과</h2>
-        <span id="latest-filter-count" class="filter-count" aria-live="polite">최신 {_format_integer(displayed_latest)}/{_format_integer(displayed_latest)}건</span>
-      </div>
-      <p id="latest-result-note" class="section-note">{_e(latest_note)}</p>
-      <div class="table-wrap" role="region" aria-label="최신 세션 결과 표" tabindex="0"><table>
-        <caption class="sr-only">최신 세션 결과</caption>
-        <thead><tr><th scope="col">프로토콜</th><th scope="col">출발지 IP·포트</th><th scope="col">목적지 IP·포트</th><th scope="col">추적 상태</th><th scope="col">마지막 확인</th><th scope="col">장비</th></tr></thead>
-        <tbody id="latest-results-body">{latest_rows or _empty_row(6, "관측된 세션이 없습니다.")}
-          <tr id="latest-filter-empty" class="filter-empty-row" hidden><td colspan="6" class="muted">선택한 필터와 일치하는 세션이 없습니다.</td></tr>
-        </tbody>
-      </table></div>
-    </section>
-
-    <section id="observation-history">
-      <div class="section-heading-row">
-        <h2>전체 추적 이력</h2>
-        <span id="history-filter-count" class="filter-count" aria-live="polite">전체 {_format_integer(snapshot.observation_total)}/{_format_integer(snapshot.observation_total)}건</span>
-      </div>
-      <details class="history-toggle">
-        <summary id="history-filter-summary" aria-controls="observation-history-body">전체 추적 이력 {_format_integer(snapshot.observation_total)}/{_format_integer(snapshot.observation_total)}건 보기</summary>
-      </details>
-      <div class="details-body" id="observation-history-body">
-          <p class="section-note">저장된 관측 결과를 시간순으로 모두 표시합니다.</p>
-          <div class="table-wrap" role="region" aria-label="전체 추적 이력 표" tabindex="0"><table>
-            <caption class="sr-only">전체 추적 이력</caption>
-            <thead><tr><th scope="col">프로토콜</th><th scope="col">출발지 IP·포트</th><th scope="col">목적지 IP·포트</th><th scope="col">추적 상태</th><th scope="col">확인 시각</th><th scope="col">장비</th></tr></thead>
-            <tbody id="history-results-body">"""
-    history_count = 0
-    for row in history:
-        history_count += 1
-        yield _observation_row(row, "관측됨")
-    if history_count == 0:
-        yield _empty_row(6, "저장된 관측 이력이 없습니다.")
-    yield """<tr id="history-filter-empty" class="filter-empty-row" hidden><td colspan="6" class="muted">선택한 필터와 일치하는 세션이 없습니다.</td></tr>
-            </tbody>
-          </table></div>
-      </div>
-    </section>
-  </main>
-  <footer class="footer">Aruba Session Tracker 결과 보고서</footer>
-  <script>"""
-    yield _FILTER_SCRIPT
-    yield """</script>
-</body>
-</html>
-"""
+    return render_presentation(snapshot)
 
 
 def write_html_report_atomic(destination: Path | str, snapshot: RunReportSnapshot) -> Path:
-    """Atomically write one deterministic UTF-8 report."""
+    """Atomically write one approved deterministic UTF-8 report."""
 
-    return _write_html_chunks_atomic(destination, _report_chunks(snapshot))
+    from aruba_session_tracker.storage.html_report_presentation import (
+        write_html_report_atomic as write_presentation,
+    )
+
+    return write_presentation(destination, snapshot)
 
 
 def write_html_report_stream_atomic(
@@ -899,15 +560,17 @@ def write_html_report_stream_atomic(
     *,
     logical_session_total: int,
 ) -> Path:
-    """Atomically write a report while consuming history rows incrementally."""
+    """Write an approved report while consuming history rows incrementally."""
 
-    return _write_html_chunks_atomic(
+    from aruba_session_tracker.storage.html_report_presentation import (
+        write_html_report_stream_atomic as write_presentation_stream,
+    )
+
+    return write_presentation_stream(
         destination,
-        _report_chunks(
-            snapshot,
-            observation_history=observation_history,
-            logical_session_total=logical_session_total,
-        ),
+        snapshot,
+        observation_history,
+        logical_session_total=logical_session_total,
     )
 
 

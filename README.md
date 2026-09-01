@@ -19,7 +19,7 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 - 로컬 SQLite 이력, 실행별 Raw TXT, 독립적인 CSV와 HTML 보고서 내보내기
 - 실행할 때마다 꺼진 상태로 시작하는 `F12` 화면 개선 도우미
 
-다음은 v0.5.9 범위에 포함되지 않습니다.
+다음은 v0.6.0 범위에 포함되지 않습니다.
 
 - 장비 설정 변경, 사용자 삭제 또는 쓰기 API
 - 무필터 `show datapath session table` 실행
@@ -32,14 +32,14 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 ### 포터블 ZIP
 
 1. 최신 `main` 검증본은 GitHub Releases의 `continuous`에서
-   `ArubaSessionTracker_v0.5.9_windows_x64.zip`을 받습니다. 파일명의 버전은
-   빌드된 프로그램 버전이며 변경 불가 `v0.5.9` 태그 릴리스가 게시되었다는
+   `ArubaSessionTracker_v0.6.0_windows_x64.zip`을 받습니다. 파일명의 버전은
+   빌드된 프로그램 버전이며 변경 불가 `v0.6.0` 태그 릴리스가 게시되었다는
    뜻은 아닙니다. GitHub의 자동 생성 Source code ZIP/TAR는 실행 프로그램이
    아닙니다.
 2. 릴리스 본문의 SHA-256과 PowerShell 계산 결과를 비교합니다.
 
    ```powershell
-   Get-FileHash -Algorithm SHA256 .\ArubaSessionTracker_v0.5.9_windows_x64.zip
+   Get-FileHash -Algorithm SHA256 .\ArubaSessionTracker_v0.6.0_windows_x64.zip
    ```
 
 3. ZIP을 쓰기 가능한 일반 폴더에 풀고 `ArubaSessionTracker.exe`를
@@ -50,7 +50,7 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 검증한 뒤 같은 ID를 다시 공개합니다. 중단되면 이전 커밋으로 되돌려
 재공개하지 않고 숨겨진 단계 기록에서 다음 실행이 이어집니다. 이 방식은
 GitHub 기본 토큰에 없는 과거 워크플로 수정 권한을 요구하지 않으며, 태그로
-초안을 추측해 중복 릴리스를 만드는 문제도 피합니다. `v0.5.9` 같은 버전
+초안을 추측해 중복 릴리스를 만드는 문제도 피합니다. `vMAJOR.MINOR.PATCH` 버전
 태그 릴리스는 자동화가 기존 릴리스 덮어쓰기를 거부하는 1회성
 사전릴리스입니다. 게시 검증이 성공한 버전 릴리스의 공개 자산은 Windows x64
 ZIP 하나이며 SHA-256은 릴리스 본문에, CycloneDX SBOM은 ZIP 내부
@@ -70,6 +70,21 @@ py -3.13 -m venv .venv
   --check-build-dependencies -e .
 .\.venv\Scripts\python.exe -m aruba_session_tracker
 ```
+
+## v0.6.0 다크 NOC 콘솔과 조사 보고서
+
+v0.6.0은 기존 읽기 전용 조회·저장 동작과 61개 화면 개선 도우미 ID를
+유지하면서 세션 조회, 장비 설정, 기록 및 내보내기를 다크 NOC 운영 화면으로
+재구성합니다. 상단에는 설정된 MM·MD 수, poll 간격, 최근 관측 시각과 현재
+운영 상태를 표시하고, 결과 영역에는 현재 화면에서 확정적으로 계산한 지표와
+선택 세션의 `DETAILS`를 제공합니다. 기존 원문과 진단 위젯은 각각
+`RAW CLI`, `DIAGNOSTICS`로 유지합니다.
+
+HTML 내보내기는 밝고 인쇄 가능한 조사 보고서 형식을 사용합니다. 상태 요약과
+변화 목록은 보고서 스냅샷에 포함된 최신 표시 세션과 저장 사실로 범위를
+명시하며, 전체 장비 상태나 장애 원인을 추정하지 않습니다. 정확값 필터,
+단일 CSP-hash 스크립트, 값 escaping, 외부 리소스·네트워크 요청 금지 및 전체
+관측 이력 보존 계약은 그대로 유지합니다.
 
 ## v0.5.9 모니터링 연결과 결과 상태
 
@@ -469,7 +484,7 @@ GitHub 이슈나 외부 지원 채널에 올리지 말고, 공유가 필요하�
 저장소는 네트워크와 분리된 비식별 fixture 및 메모리 내 SSH 프로토콜
 fake를 기본 검증 경계로 사용합니다. 127.0.0.1에만 바인딩하는 최소
 Paramiko 서버를 통한 실제 Paramiko/Netmiko loopback 통합시험도 포함합니다.
-실제 Aruba 장비 접속과 회사 네트워크 현장 검증은 v0.5.9 검증 범위에
+실제 Aruba 장비 접속과 회사 네트워크 현장 검증은 v0.6.0 검증 범위에
 포함되지 않습니다.
 
 내보내기 복구 시험은 CSV와 HTML 각각 다섯 단계에서 별도 프로세스를
@@ -479,7 +494,7 @@ Paramiko 서버를 통한 실제 Paramiko/Netmiko loopback 통합시험도 포�
 
 ```powershell
 .\tools\validate.ps1 -PythonPath .\.venv\Scripts\python.exe
-.\build_windows.ps1 -PythonPath .\.venv\Scripts\python.exe -Version 0.5.9
+.\build_windows.ps1 -PythonPath .\.venv\Scripts\python.exe -Version 0.6.0
 ```
 
 `validate.ps1`은 Python/아키텍처, 해시 고정 lock 동기화, 의존성, 버전
@@ -538,8 +553,8 @@ smoke와 패키지 검증은 다음을 증명하지 않습니다.
 - Authenticode 서명 또는 조직 보안 제품의 허용
 - 실장비 네트워크 상태나 세션 존재/종료
 
-v0.5.9 소스의 최신 `main` 검증본은 이 한계를 명시한 unsigned `continuous`
-사전릴리스로 준비합니다. 변경 불가 `v0.5.9` 태그 릴리스는 별도로 요청한
+v0.6.0 소스의 최신 `main` 검증본은 이 한계를 명시한 unsigned `continuous`
+사전릴리스로 준비합니다. 변경 불가 `v0.6.0` 태그 릴리스는 별도로 요청한
 20,000 poll 검증을 통과한 경우에만 게시합니다. 사용자가 실제 장비에서 확인한
 결과는 자동 테스트 증거와 구분합니다.
 

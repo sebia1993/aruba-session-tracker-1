@@ -14,6 +14,11 @@ productivity tool, and developer/operations console. Repository safety rules,
 read-only Aruba behavior, credential handling, and the exact Developer
 Inspector catalog always take precedence over visual guidance.
 
+`DARK_NOC_CONSOLE_V1.md` is the current presentation authority. Its dark
+desktop tokens and light investigation-report hierarchy supersede the older
+light-canvas color examples below; the interaction, accessibility, action
+hierarchy, widget-identity, and safety rules in this document remain active.
+
 ## 2. Product character
 
 **Product type:** internal network operations and troubleshooting tool  
