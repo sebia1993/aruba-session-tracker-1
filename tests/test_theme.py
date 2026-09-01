@@ -102,7 +102,7 @@ def test_theme_assigns_operational_roles_without_replacing_widgets(
         + window.result_table.horizontalScrollBar().sizeHint().height()
         + (2 * window.result_table.frameWidth())
     )
-    assert window.result_table.minimumHeight() >= 40 + result_table_chrome_height
+    assert window.result_table.minimumHeight() >= 50 + result_table_chrome_height
     assert window.details.minimumWidth() == 0
     assert window.details.minimumHeight() == 180
     assert window.advanced_panel.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Fixed

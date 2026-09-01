@@ -62,7 +62,7 @@ def apply_main_window_theme(window: MainWindow) -> None:
         + window.result_table.horizontalScrollBar().sizeHint().height()
         + (2 * window.result_table.frameWidth())
     )
-    window.result_table.setMinimumHeight(40 + result_table_chrome_height)
+    window.result_table.setMinimumHeight(50 + result_table_chrome_height)
     # QSS minimum heights do not participate in QTabWidget's initial corner
     # geometry calculation on every Qt platform. Apply the exact height after
     # the stylesheet so the identity strip aligns with the tab bar.
