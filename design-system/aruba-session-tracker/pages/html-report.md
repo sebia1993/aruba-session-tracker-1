@@ -17,6 +17,13 @@ IP and port, and tracked state with the least possible scanning effort.
 4. Latest 50 logical sessions.
 5. Complete stored observation history, collapsed until requested.
 
+The filter is a secondary surface rather than another primary dashboard card.
+Each result count sits beside its own section heading, and the latest-results
+note updates when filters are active, including a clear no-match state. Between
+361 and 520 CSS pixels the controls use two columns with full-width IP and reset
+rows; at 360 pixels and below they use one column. Status badges retain text and
+visible boundaries in addition to color.
+
 Protocol and endpoint columns carry the strongest table emphasis. Device and
 time remain present but visually secondary. IPv6 endpoints use `[address]:port`
 so the address/port boundary is unambiguous.

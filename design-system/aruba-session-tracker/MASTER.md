@@ -149,7 +149,9 @@ be checked at 100%, 125%, and 150% rather than assumed to be physical pixels.
 
 The three main tabs are peer-level operational destinations on a compact navy
 operations bar. Selected state uses text weight, a light underline, and surface
-change—not color alone. Detail tabs are visually subordinate to the main
+change—not color alone. The right side carries the product name, current
+version, local-only boundary, and read-only-query boundary without adding a
+second navigation row. Detail tabs are visually subordinate to the main
 navigation. The setup guide remains the first visible recovery path when MM/MD
 targets have not yet been configured.
 
@@ -226,12 +228,19 @@ messages and safe default buttons remain unchanged.
 
 1. Setup guide when required.
 2. Source/destination conditions and session-only credentials in one compact
-   two-column work area, with the query flow first.
+   two-column work area. Source and destination use separate endpoint cards
+   with an explicit direction label between them.
 3. Progressive advanced conditions.
 4. Continuous monitoring, one-time current query, stop, and current state.
 5. MM/MD and result-count summary plus progressive detail controls.
 6. Session table.
 7. Raw CLI and diagnostics when explicitly expanded.
+
+At the default 1320×820 workspace, expanded evidence sits below the result
+table. Below 760 logical pixels of window height, or while advanced conditions
+are expanded, it moves beside the result table so the supported 1080×680
+workspace retains a usable grid. When evidence is open, its diagnostics replace
+the redundant empty-state banner rather than collapsing the table viewport.
 
 ### Device Settings
 
@@ -240,6 +249,9 @@ messages and safe default buttons remain unchanged.
 3. Monitoring timing.
 4. Save action and credential-storage notice.
 
+The credential-storage notice spans the page below the save action so its text
+does not collapse into a narrow corner.
+
 ### History and Export
 
 1. Refresh/export actions on the left.
@@ -247,6 +259,10 @@ messages and safe default buttons remain unchanged.
    spacing, section labels, and danger level.
 3. Run history table.
 4. plaintext retention warning.
+
+Export and selected-delete actions remain disabled until a row is selected;
+delete-all remains disabled when no rows exist. Empty history uses a concise
+instructional state instead of an unexplained blank grid.
 
 ## 10. Accessibility and resilience checklist
 

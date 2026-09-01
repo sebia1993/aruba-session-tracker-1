@@ -134,6 +134,103 @@ def test_main_window_runs_query_and_renders_korean_flag_status(
     window.close()
 
 
+def test_presentation_tracks_query_direction_and_empty_states(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(tmp_path / "tracker.db", tmp_path / "raw", tmp_path / "exports")
+    store.initialize()
+    window = MainWindow(ConfigRepository(tmp_path / "config.json"), store, _Executor())
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    window.show()
+    qtbot.waitUntil(lambda: not window._history_task_running, timeout=3000)  # type: ignore[attr-defined]
+
+    assert window.result_empty_label.isVisible()
+    assert not window.history_empty_label.isHidden()
+    assert window.history_empty_label.text().startswith("저장된 실행 기록이 없습니다")
+    assert not window.export_button.isEnabled()
+    assert not window.html_export_button.isEnabled()
+    assert not window.delete_button.isEnabled()
+    assert not window.delete_all_button.isEnabled()
+    assert window.query_direction_label.text() == "양방향 조회"
+    assert window.query_direction_label.property("directionRole") == "bidirectional"
+
+    window.raw_diagnostics_toggle.setChecked(True)
+    assert window.result_empty_label.isHidden()
+    window.tabs.setCurrentWidget(window.settings_page)
+    window._display_outcome(
+        QueryOutcome(
+            observations=(),
+            used_mm="MM-Conductor",
+            controllers=("MD-01",),
+            authoritative=True,
+        )
+    )
+    window.tabs.setCurrentWidget(window.query_page)
+    assert window.details.isVisible()
+    assert window.result_empty_label.isHidden()
+    window.raw_diagnostics_toggle.setChecked(False)
+    assert window.result_empty_label.isVisible()
+
+    window.bidirectional_check.setChecked(False)
+    assert window.query_direction_label.text() == "입력 방향 조회"
+    assert window.query_direction_label.property("directionRole") == "forward"
+
+    _configure_valid_query(window)
+    qtbot.mouseClick(window.query_button, Qt.MouseButton.LeftButton)  # type: ignore[attr-defined]
+    qtbot.waitUntil(lambda: window.result_table.rowCount() == 1, timeout=3000)  # type: ignore[attr-defined]
+    assert not window.result_empty_label.isVisible()
+
+    window._render_history(
+        (
+            {
+                "id": "presentation-run",
+                "started_at": "2026-08-31T01:00:00Z",
+                "ended_at": "2026-08-31T01:00:05Z",
+                "status": "COMPLETED",
+                "observation_count": 1,
+            },
+        ),
+        None,
+    )
+    assert not window.history_empty_label.isVisible()
+    assert window.delete_all_button.isEnabled()
+    assert not window.export_button.isEnabled()
+    window.history_table.selectRow(0)
+    assert window.export_button.isEnabled()
+    assert window.html_export_button.isEnabled()
+    assert window.delete_button.isEnabled()
+    window.history_table.clearSelection()
+    assert window._selected_run_id() is None
+    assert not window.export_button.isEnabled()
+    assert not window.html_export_button.isEnabled()
+    assert not window.delete_button.isEnabled()
+    assert window.delete_all_button.isEnabled()
+    for control in (
+        window.tabs,
+        window.result_table,
+        window.details,
+        window.raw_view,
+        window.diagnostics_list,
+        window.mm_primary_name,
+        window.mm_primary_host,
+        window.mm_primary_port,
+        window.mm_standby_name,
+        window.mm_standby_host,
+        window.mm_standby_port,
+        window.md_table,
+        window.save_config_button,
+        window.refresh_history_button,
+        window.export_button,
+        window.html_export_button,
+        window.delete_button,
+        window.delete_all_button,
+        window.history_table,
+    ):
+        assert control.accessibleName()
+    window.close()
+
+
 def test_counter_delta_is_only_shown_for_monotonic_samples() -> None:
     assert _counter_delta(15, 10) == "+5"
     assert _counter_delta(10, 10) == "+0"
@@ -940,6 +1037,33 @@ class _DelayedHistoryStore(_EmptyStore):
         )
 
 
+def test_history_empty_state_distinguishes_loading_from_read_failure(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    store = _DelayedHistoryStore(fail=True)
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        store,  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    window.show()
+    assert store.started.wait(timeout=3)
+    assert window.history_empty_label.text() == "기록을 불러오는 중입니다."
+    assert not window.history_empty_label.isHidden()
+
+    store.release.set()
+    qtbot.waitUntil(lambda: not window._history_task_running, timeout=5000)  # type: ignore[attr-defined]
+
+    assert window.history_table.rowCount() == 0
+    assert window.history_empty_label.text().startswith("기록을 확인하지 못했습니다")
+    assert not window.history_empty_label.isHidden()
+    assert not window.export_button.isEnabled()
+    assert not window.delete_all_button.isEnabled()
+    window.close()
+
+
 class _ApprovalExecutor(_Executor):
     def __init__(self) -> None:
         super().__init__()
@@ -1078,6 +1202,7 @@ def test_cancelled_query_failure_remains_stopped_without_warning(
     qtbot.waitUntil(lambda: not window._query_running, timeout=3000)  # type: ignore[attr-defined]
 
     assert window.state_label.text() == "대기"
+    assert window.result_empty_label.text().startswith("조회가 취소되었습니다")
     assert warnings == []
     window.close()
 

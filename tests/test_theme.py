@@ -79,13 +79,26 @@ def test_theme_assigns_operational_roles_without_replacing_widgets(
     assert window.timing_group.property("panelRole") == "timing"
     assert window.context_label.objectName() == "contextSummary"
     assert window.state_label.property("stateRole") == "neutral"
+    assert window.nav_identity.objectName() == "navIdentity"
+    assert window.nav_identity.minimumHeight() == 41
+    assert window.nav_identity.maximumHeight() == 41
+    assert window.product_name_label.text() == "ARUBA SESSION TRACKER"
+    assert "로컬 전용" in window.product_meta_label.text()
+    assert window.source_endpoint_panel.property("endpointRole") == "source"
+    assert window.destination_endpoint_panel.property("endpointRole") == "destination"
+    assert window.query_direction_label.property("directionRole") == "bidirectional"
+    assert window.result_splitter.orientation() == Qt.Orientation.Vertical
+    assert window.result_empty_label.objectName() == "emptyState"
+    assert window.history_empty_label.objectName() == "emptyState"
+    assert window.history_toolbar.objectName() == "historyToolbar"
     assert window.history_export_label.objectName() == "toolbarSectionLabel"
     assert window.history_delete_label.objectName() == "toolbarSectionLabel"
     assert window.raw_view.objectName() == "rawConsole"
     assert window.result_table.alternatingRowColors()
     assert window.result_table.verticalHeader().isHidden()
     assert window.result_table.verticalHeader().defaultSectionSize() == 30
-    assert window.details.minimumWidth() == 300
+    assert window.details.minimumWidth() == 0
+    assert window.details.minimumHeight() == 180
     assert window.advanced_panel.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Fixed
     assert window.tabs.elideMode() == Qt.TextElideMode.ElideNone
     for index in range(window.tabs.count()):
@@ -104,6 +117,7 @@ def test_theme_stylesheet_keeps_focus_and_semantic_action_states() -> None:
     assert 'QPushButton[buttonRole="primary"]' in stylesheet
     assert 'QPushButton[buttonRole="tertiary"]' in stylesheet
     assert 'QPushButton[buttonRole="dangerStrong"]' in stylesheet
+    assert 'QPushButton[buttonRole="dangerStrong"]:disabled' in stylesheet
     assert 'QLabel#stateLabel[stateRole="success"]' in stylesheet
     assert 'QLabel#stateLabel[stateRole="warning"]' in stylesheet
     assert 'QLabel#stateLabel[stateRole="danger"]' in stylesheet
@@ -113,10 +127,20 @@ def test_theme_stylesheet_keeps_focus_and_semantic_action_states() -> None:
     assert "QLineEdit:focus" in stylesheet
     assert "QTableWidget::item:selected" in stylesheet
     assert "QPlainTextEdit#rawConsole" in stylesheet
+    assert "QFrame#flowEndpointCard" in stylesheet
+    assert "QFrame#navIdentity" in stylesheet
+    assert "QFrame#navIdentity QLabel#productName" in stylesheet
+    assert "QFrame#navIdentity QLabel#productMeta" in stylesheet
+    assert "QLabel#emptyState" in stylesheet
+    assert "QSplitter::handle:vertical" in stylesheet
+    assert "QCheckBox:focus" in stylesheet
     assert 'QPushButton[buttonRole="primary"]:focus' in stylesheet
     assert 'QPushButton[buttonRole="dangerStrong"]:focus' in stylesheet
     assert stylesheet.rfind('QPushButton[buttonRole="primary"]:focus') > stylesheet.rfind(
         'QPushButton[buttonRole="primary"]:pressed'
+    )
+    assert stylesheet.rfind('QPushButton[buttonRole="dangerStrong"]:disabled') > stylesheet.rfind(
+        'QPushButton[buttonRole="dangerStrong"]:hover'
     )
     assert "QScrollBar::add-line:vertical" in stylesheet
     assert "QScrollBar::sub-line:horizontal" in stylesheet
@@ -150,6 +174,57 @@ def test_theme_can_be_applied_twice_without_replacing_or_duplicating_widgets(
     assert window.tabs.count() == original_tab_count
     assert window.query_page.layout().count() == original_query_layout_count
     assert window.styleSheet() == first_stylesheet == build_stylesheet()
+    window.close()
+
+
+def test_result_details_switch_to_side_by_side_at_minimum_height(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = _build_window(qtbot, tmp_path)
+    apply_main_window_theme(window)
+    window.resize(window.minimumSize())
+    window.show()
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: window.result_splitter.orientation() == Qt.Orientation.Horizontal,
+        timeout=3000,
+    )
+
+    assert window.details.minimumWidth() == 300
+    assert window.details.minimumHeight() == 0
+
+    window.resize(1320, 820)
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: window.result_splitter.orientation() == Qt.Orientation.Vertical,
+        timeout=3000,
+    )
+    assert window.details.minimumWidth() == 0
+    assert window.details.minimumHeight() == 180
+
+    window.advanced_toggle_button.setChecked(True)
+    window.raw_diagnostics_toggle.setChecked(True)
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: window.result_splitter.orientation() == Qt.Orientation.Horizontal,
+        timeout=3000,
+    )
+    assert window.result_table.viewport().height() >= 40
+
+    window.tabs.setCurrentWidget(window.settings_page)
+    window.resize(1319, 820)
+    window.tabs.setCurrentWidget(window.query_page)
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: window.result_splitter.orientation() == Qt.Orientation.Horizontal,
+        timeout=3000,
+    )
+    assert window.advanced_toggle_button.isChecked()
+    assert window.raw_diagnostics_toggle.isChecked()
+    assert window.result_table.viewport().height() >= 40
+
+    window.advanced_toggle_button.setChecked(False)
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: window.result_splitter.orientation() == Qt.Orientation.Vertical,
+        timeout=3000,
+    )
     window.close()
 
 

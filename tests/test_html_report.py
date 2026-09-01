@@ -356,6 +356,39 @@ def test_filter_controls_are_hidden_until_initialized_and_keyboard_accessible() 
     _element_start_tag(document, "summary", "history-filter-summary")
 
 
+def test_filter_counts_are_anchored_to_their_result_sections() -> None:
+    document = render_html_report(_snapshot())
+    filter_section = _section(document, "result-filter")
+    latest_section = _section(document, "latest-sessions")
+    history_section = _section(document, "observation-history")
+
+    assert 'id="latest-filter-count"' not in filter_section
+    assert 'id="history-filter-count"' not in filter_section
+    latest_count = _element_start_tag(latest_section, "span", "latest-filter-count")
+    history_count = _element_start_tag(history_section, "span", "history-filter-count")
+    assert 'aria-live="polite"' in latest_count
+    assert 'aria-live="polite"' in history_count
+    assert "최신 1/1건" in latest_section
+    assert "전체 1/1건" in history_section
+    assert latest_section.count('class="section-heading-row"') == 1
+    assert history_section.count('class="section-heading-row"') == 1
+
+
+def test_latest_result_note_tracks_active_filters_and_restores_default() -> None:
+    document = render_html_report(_snapshot())
+    latest_section = _section(document, "latest-sessions")
+    script = _inline_scripts(document)[0]
+
+    assert 'id="latest-result-note"' in latest_section
+    assert 'const latestNote = document.getElementById("latest-result-note");' in script
+    assert "const defaultLatestNote = latestNote.textContent;" in script
+    assert "const hasActiveFilters = Boolean(state.ip || state.port || state.protocol);" in script
+    assert "선택한 조건과 일치하는 최신 세션이 없습니다." in script
+    assert "선택한 조건과 일치하는 최신 세션 ${integerFormat.format(latestVisible)}개" in script
+    assert ": defaultLatestNote;" in script
+    assert 'window.addEventListener("pageshow", () => resetFilters());' in script
+
+
 def test_filter_rows_have_escaped_exact_match_data_and_print_markers() -> None:
     row = _observation(
         protocol=17,
@@ -589,6 +622,38 @@ def test_report_includes_forced_color_boundaries_and_focus_styles() -> None:
     assert "@media (forced-colors:active)" in document
     assert "border:1px solid CanvasText" in document
     assert "outline-color:Highlight" in document
+
+
+def test_report_uses_compact_filter_surface_mobile_grid_and_bordered_states() -> None:
+    document = render_html_report(_snapshot())
+    mobile = document.split("@media (max-width:520px) {", maxsplit=1)[1].split(
+        "@media (max-width:360px) {", maxsplit=1
+    )[0]
+    narrow = document.split("@media (max-width:360px) {", maxsplit=1)[1].split(
+        "@media (forced-colors:active) {", maxsplit=1
+    )[0]
+
+    assert (
+        ".filter-panel { position:relative; background:#f8fafc; border-color:#b9c9d8; }" in document
+    )
+    assert ".filter-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }" in mobile
+    assert ".filter-field:first-child,.filter-reset { grid-column:1 / -1; }" in mobile
+    assert ".summary-stats,.filter-grid { grid-template-columns:1fr; }" in narrow
+    assert "border:1px solid #9ae6d3" in document
+    assert (
+        ".badge.missed { background:#fff8e7; color:var(--warning); border-color:#e7c978; }"
+        in document
+    )
+    assert (
+        ".badge.closed { background:#fff1f0; color:var(--danger); border-color:#f3b6b0; }"
+        in document
+    )
+    assert (
+        ".badge.observed { background:#edf2f7; color:var(--neutral); border-color:#cbd5e1; }"
+        in document
+    )
+    assert ".muted { color:var(--text-muted); text-align:center; padding:24px 12px; }" in document
+    assert ".muted { padding:8px 4px; }" in document
 
 
 def test_muted_report_text_meets_normal_text_contrast_on_used_backgrounds() -> None:

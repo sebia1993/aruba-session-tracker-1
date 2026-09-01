@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 _DEFAULT_FONT_FAMILY = "Malgun Gothic"
 _DEFAULT_FONT_SIZE = 9
+_NAV_BAR_HEIGHT = 41
 
 
 def apply_main_window_theme(window: MainWindow) -> None:
@@ -52,6 +53,11 @@ def apply_main_window_theme(window: MainWindow) -> None:
     # MainWindow applies a legacy local stylesheet during construction. Set the
     # complete theme last so one source of truth controls all presentation.
     window.setStyleSheet(build_stylesheet())
+    # QSS minimum heights do not participate in QTabWidget's initial corner
+    # geometry calculation on every Qt platform. Apply the exact height after
+    # the stylesheet so the identity strip aligns with the tab bar.
+    window.nav_identity.setFixedHeight(_NAV_BAR_HEIGHT)
+    window.nav_identity.updateGeometry()
 
 
 def build_stylesheet() -> str:
@@ -110,6 +116,29 @@ def build_stylesheet() -> str:
     QTabWidget#mainTabs QTabBar::tab:focus {
         border: 2px solid #FFC857;
         border-bottom: 3px solid #FFC857;
+    }
+
+    QFrame#navIdentity {
+        background-color: #102F49;
+        border: 0;
+    }
+
+    QFrame#navIdentity QLabel#productName {
+        color: #FFFFFF;
+        background-color: transparent;
+        font-size: 10pt;
+        font-weight: 800;
+        letter-spacing: 1px;
+    }
+
+    QFrame#navIdentity QLabel#productMeta {
+        padding: 3px 9px;
+        color: #C8D7E5;
+        background-color: #173E5E;
+        border: 1px solid #315977;
+        border-radius: 10px;
+        font-size: 9pt;
+        font-weight: 600;
     }
 
     /* Progressive detail panel remains visually subordinate to the main table. */
@@ -185,6 +214,109 @@ def build_stylesheet() -> str:
 
     QGroupBox[panelRole="timing"] {
         border-left: 4px solid #6D7F90;
+    }
+
+    QFrame#flowEndpointCard {
+        min-height: 72px;
+        background-color: #F8FBFE;
+        border: 1px solid #BFD0DE;
+        border-radius: 8px;
+    }
+
+    QFrame#flowEndpointCard[endpointRole="source"] {
+        border-top: 3px solid #1976B9;
+    }
+
+    QFrame#flowEndpointCard[endpointRole="destination"] {
+        border-top: 3px solid #4B7F9E;
+    }
+
+    QLabel#flowEyebrow {
+        color: #60758A;
+        font-size: 9pt;
+        font-weight: 800;
+        letter-spacing: 1px;
+    }
+
+    QLabel#flowFieldLabel {
+        color: #17324D;
+        font-size: 9pt;
+        font-weight: 700;
+    }
+
+    QFrame#flowDirectionPanel {
+        min-width: 118px;
+        background-color: transparent;
+        border: 0;
+    }
+
+    QLabel#flowDirectionCaption {
+        color: #60758A;
+        font-size: 9pt;
+        font-weight: 650;
+    }
+
+    QLabel#flowDirectionLabel {
+        min-height: 27px;
+        padding: 1px 10px;
+        color: #0B4F82;
+        background-color: #E4F1FA;
+        border: 1px solid #9EC4E4;
+        border-radius: 13px;
+        font-weight: 750;
+    }
+
+    QLabel#flowDirectionLabel[directionRole="forward"] {
+        color: #425A70;
+        background-color: #EDF2F6;
+        border-color: #BCC9D4;
+    }
+
+    QFrame#queryActionBar,
+    QFrame#historyToolbar {
+        background-color: #F8FBFD;
+        border: 1px solid #D1DDE7;
+        border-radius: 8px;
+    }
+
+    QFrame#resultsHeader {
+        background-color: transparent;
+        border: 0;
+    }
+
+    QLabel#sectionTitle {
+        color: #102A43;
+        font-size: 11pt;
+        font-weight: 800;
+    }
+
+    QLabel#sectionHint {
+        color: #60758A;
+        font-size: 9pt;
+    }
+
+    QLabel#stateCaption {
+        color: #60758A;
+        font-size: 9pt;
+        font-weight: 700;
+    }
+
+    QLabel#emptyState {
+        min-height: 34px;
+        padding: 8px 12px;
+        color: #526B80;
+        background-color: #F8FAFC;
+        border: 1px dashed #B8C8D6;
+        border-radius: 7px;
+    }
+
+    QLabel#storageStatus {
+        min-height: 24px;
+        padding: 3px 9px;
+        color: #425A70;
+        background-color: #EAF1F6;
+        border-left: 3px solid #6C8CA5;
+        border-radius: 4px;
     }
 
     QLabel {
@@ -391,6 +523,17 @@ def build_stylesheet() -> str:
         border-color: #8F1C14;
     }
 
+    QPushButton[buttonRole="primary"]:disabled,
+    QPushButton[buttonRole="secondary"]:disabled,
+    QPushButton[buttonRole="tertiary"]:disabled,
+    QPushButton[buttonRole="danger"]:disabled,
+    QPushButton[buttonRole="dangerStrong"]:disabled {
+        color: #8996A3;
+        background-color: #E9EEF3;
+        border-color: #D3DCE5;
+        font-weight: 600;
+    }
+
     QPushButton[buttonRole="primary"]:focus,
     QPushButton[buttonRole="dangerStrong"]:focus {
         border: 3px solid #FFC857;
@@ -428,6 +571,17 @@ def build_stylesheet() -> str:
 
     QTableWidget::item:focus {
         border: 1px solid #1976B9;
+    }
+
+    QTableWidget:focus,
+    QListWidget:focus,
+    QPlainTextEdit:focus {
+        border: 2px solid #1976B9;
+    }
+
+    QCheckBox:focus {
+        border: 2px solid #1976B9;
+        border-radius: 4px;
     }
 
     QHeaderView::section {
@@ -513,6 +667,11 @@ def build_stylesheet() -> str:
         outline: 0;
     }
 
+    QMainWindow#mainWindow QPlainTextEdit#rawConsole:focus,
+    QMainWindow#mainWindow QListWidget#diagnosticsList:focus {
+        border: 2px solid #1976B9;
+    }
+
     QListWidget#diagnosticsList::item {
         min-height: 29px;
         padding: 5px 9px;
@@ -531,6 +690,11 @@ def build_stylesheet() -> str:
     QSplitter::handle:horizontal {
         width: 7px;
         margin: 2px 1px;
+    }
+
+    QSplitter::handle:vertical {
+        height: 7px;
+        margin: 1px 2px;
     }
 
     QSplitter::handle:hover {
@@ -568,11 +732,20 @@ def build_stylesheet() -> str:
     }
 
     QMainWindow#mainWindow[themeContrast="high"] QFrame#setupGuide,
+    QMainWindow#mainWindow[themeContrast="high"] QFrame#navIdentity,
+    QMainWindow#mainWindow[themeContrast="high"] QFrame#flowEndpointCard,
+    QMainWindow#mainWindow[themeContrast="high"] QFrame#queryActionBar,
+    QMainWindow#mainWindow[themeContrast="high"] QFrame#historyToolbar,
     QMainWindow#mainWindow[themeContrast="high"] QGroupBox,
     QMainWindow#mainWindow[themeContrast="high"] QGroupBox::title,
     QMainWindow#mainWindow[themeContrast="high"] QLabel#contextSummary,
     QMainWindow#mainWindow[themeContrast="high"] QLabel#stateLabel,
     QMainWindow#mainWindow[themeContrast="high"] QLabel#privacyNotice,
+    QMainWindow#mainWindow[themeContrast="high"] QLabel#emptyState,
+    QMainWindow#mainWindow[themeContrast="high"] QLabel#storageStatus,
+    QMainWindow#mainWindow[themeContrast="high"] QLabel#flowDirectionLabel,
+    QMainWindow#mainWindow[themeContrast="high"] QLabel#productName,
+    QMainWindow#mainWindow[themeContrast="high"] QLabel#productMeta,
     QMainWindow#mainWindow[themeContrast="high"] QTabWidget#mainTabs::pane,
     QMainWindow#mainWindow[themeContrast="high"] QTabWidget#detailsTabs::pane {
         color: palette(window-text);
@@ -648,6 +821,10 @@ def build_stylesheet() -> str:
     QMainWindow#mainWindow[themeContrast="high"] QPushButton:focus,
     QMainWindow#mainWindow[themeContrast="high"] QLineEdit:focus,
     QMainWindow#mainWindow[themeContrast="high"] QSpinBox:focus,
+    QMainWindow#mainWindow[themeContrast="high"] QCheckBox:focus,
+    QMainWindow#mainWindow[themeContrast="high"] QTableWidget:focus,
+    QMainWindow#mainWindow[themeContrast="high"] QListWidget:focus,
+    QMainWindow#mainWindow[themeContrast="high"] QPlainTextEdit:focus,
     QMainWindow#mainWindow[themeContrast="high"] QTabBar::tab:focus {
         border: 2px solid palette(highlight);
     }
@@ -673,7 +850,8 @@ def _configure_layout_density(window: MainWindow) -> None:
     window.tabs.setElideMode(Qt.TextElideMode.ElideNone)
     window.details.setObjectName("detailsTabs")
     window.details.setDocumentMode(True)
-    window.details.setMinimumWidth(300)
+    window.details.setMinimumWidth(0)
+    window.details.setMinimumHeight(180)
     window.advanced_panel.setSizePolicy(
         QSizePolicy.Policy.Preferred,
         QSizePolicy.Policy.Fixed,

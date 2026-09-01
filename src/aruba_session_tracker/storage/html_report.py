@@ -64,12 +64,13 @@ _FILTER_SCRIPT = r"""(() => {
   const filterStatus = document.getElementById("filter-status");
   const latestCount = document.getElementById("latest-filter-count");
   const historyCount = document.getElementById("history-filter-count");
+  const latestNote = document.getElementById("latest-result-note");
   const historySummary = document.getElementById("history-filter-summary");
   const printSummary = document.getElementById("print-filter-summary");
   const latestEmpty = document.getElementById("latest-filter-empty");
   const historyEmpty = document.getElementById("history-filter-empty");
   if (!filterRoot || !latestBody || !historyBody || !protocolSelect || !resetButton ||
-      !filterStatus || !latestCount || !historyCount || !historySummary || !printSummary ||
+      !filterStatus || !latestCount || !historyCount || !latestNote || !historySummary || !printSummary ||
       !latestEmpty || !historyEmpty) {
     return;
   }
@@ -97,6 +98,7 @@ _FILTER_SCRIPT = r"""(() => {
   // The DOM is read once. All later matching uses these small record objects.
   const latestRecords = Array.from(latestBody.querySelectorAll("tr.report-row")).map(toRecord);
   const historyRecords = Array.from(historyBody.querySelectorAll("tr.report-row")).map(toRecord);
+  const defaultLatestNote = latestNote.textContent;
   const indexes = {ip: new Map(), port: new Map(), protocol: new Map()};
   const addDirectionalIndex = (kind, key, value, direction, rowId) => {
     const cleanValue = String(value || "").trim();
@@ -178,6 +180,12 @@ _FILTER_SCRIPT = r"""(() => {
     historyEmpty.hidden = historyRecords.length === 0 || historyVisible !== 0;
     latestCount.textContent = `최신 ${integerFormat.format(latestVisible)}/${integerFormat.format(latestRecords.length)}건`;
     historyCount.textContent = `전체 ${integerFormat.format(historyVisible)}/${integerFormat.format(historyRecords.length)}건`;
+    const hasActiveFilters = Boolean(state.ip || state.port || state.protocol);
+    latestNote.textContent = hasActiveFilters
+      ? (latestVisible === 0
+        ? "선택한 조건과 일치하는 최신 세션이 없습니다."
+        : `선택한 조건과 일치하는 최신 세션 ${integerFormat.format(latestVisible)}개를 표시합니다.`)
+      : defaultLatestNote;
     historySummary.textContent = `전체 추적 이력 ${integerFormat.format(historyVisible)}/${integerFormat.format(historyRecords.length)}건 보기`;
     printSummary.textContent = `적용 필터: ${activeDescription()} · 최신 ${integerFormat.format(latestVisible)}/${integerFormat.format(latestRecords.length)}건 · 전체 ${integerFormat.format(historyVisible)}/${integerFormat.format(historyRecords.length)}건`;
 
@@ -644,7 +652,7 @@ def _report_chunks(
     .run-state.attention {{ background:#fff8e7; color:var(--warning); border-color:#e7c978; }}
     .run-state.failed {{ background:#fff1f0; color:var(--danger); border-color:#f3b6b0; }}
     .filter-panel[hidden] {{ display:none !important; }}
-    .filter-panel {{ position:relative; }}
+    .filter-panel {{ position:relative; background:#f8fafc; border-color:#b9c9d8; }}
     .filter-heading {{ margin:0 0 10px; color:var(--text); font-size:1.16rem; font-weight:750; }}
     .filter-grid {{ display:grid; grid-template-columns:minmax(190px,1fr) minmax(150px,.65fr)
       minmax(160px,.75fr) auto; gap:10px; align-items:end; }}
@@ -669,8 +677,10 @@ def _report_chunks(
       background:#fff; color:var(--primary); font:inherit; font-weight:700; cursor:pointer; white-space:nowrap; }}
     .filter-reset:hover {{ background:#f0f7fc; }}
     .filter-help {{ margin:9px 0 0; color:var(--text-muted); font-size:.82rem; }}
-    .filter-meta {{ display:flex; flex-wrap:wrap; align-items:center; gap:8px 16px; margin-top:9px; }}
-    .filter-counts {{ display:flex; flex-wrap:wrap; gap:6px; }}
+    .filter-meta {{ margin-top:9px; }}
+    .section-heading-row {{ display:flex; align-items:baseline; justify-content:space-between;
+      gap:12px; margin-bottom:5px; }}
+    .section-heading-row h2 {{ margin:0; }}
     .filter-count {{ display:inline-block; border-radius:999px; padding:3px 9px; background:#edf2f7;
       color:var(--neutral); font-size:.78rem; font-weight:700; }}
     .filter-status {{ min-height:1.5em; margin:0; color:var(--text-muted); font-size:.82rem; }}
@@ -691,11 +701,11 @@ def _report_chunks(
     .time-cell,.device-cell {{ color:var(--text-muted); }}
     .device-cell {{ max-width:240px; overflow-wrap:anywhere; }}
     .badge {{ display:inline-block; border-radius:999px; padding:3px 9px; font-size:.78rem;
-      font-weight:700; background:#e6fffa; color:var(--success); border:1px solid transparent;
+      font-weight:700; background:#e6fffa; color:var(--success); border:1px solid #9ae6d3;
       white-space:nowrap; }}
-    .badge.missed {{ background:#fff8e7; color:var(--warning); }}
-    .badge.closed {{ background:#fff1f0; color:var(--danger); }}
-    .badge.observed {{ background:#edf2f7; color:var(--neutral); }}
+    .badge.missed {{ background:#fff8e7; color:var(--warning); border-color:#e7c978; }}
+    .badge.closed {{ background:#fff1f0; color:var(--danger); border-color:#f3b6b0; }}
+    .badge.observed {{ background:#edf2f7; color:var(--neutral); border-color:#cbd5e1; }}
     details {{ border:0; }}
     summary {{ cursor:pointer; color:var(--primary); font-weight:700; padding:9px 11px;
       border:1px solid var(--border); border-radius:7px; background:#f8fafc; }}
@@ -703,7 +713,7 @@ def _report_chunks(
     .history-toggle:not([open]) + .details-body {{ display:none; }}
     .history-toggle[open] + .details-body {{ display:block; }}
     .details-body {{ padding-top:2px; }}
-    .muted {{ color:var(--text-muted); }}
+    .muted {{ color:var(--text-muted); text-align:center; padding:24px 12px; }}
     .sr-only {{ position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden;
       clip:rect(0,0,0,0); white-space:nowrap; border:0; }}
     .footer {{ padding:0 0 20px; color:var(--text-muted); font-size:.8rem; }}
@@ -721,11 +731,12 @@ def _report_chunks(
     }}
     @media (max-width:520px) {{
       .header-inner {{ display:block; }} .run-state {{ margin-top:9px; }}
-      .filter-grid {{ grid-template-columns:1fr; }}
+      .filter-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
+      .filter-field:first-child,.filter-reset {{ grid-column:1 / -1; }}
       .filter-reset {{ width:100%; }}
     }}
     @media (max-width:360px) {{
-      .summary-stats {{ grid-template-columns:1fr; }}
+      .summary-stats,.filter-grid {{ grid-template-columns:1fr; }}
     }}
     @media (forced-colors:active) {{
       .header {{ border-bottom-color:Highlight; }}
@@ -752,6 +763,7 @@ def _report_chunks(
         padding:7px 9px; border:1px solid #bbb; font-size:8.5pt; }}
       .table-wrap {{ overflow:visible; border:0; }} table {{ min-width:0; font-size:7.5pt; }}
       thead {{ display:table-header-group; }} th {{ position:static; }} th,td {{ padding:4px; overflow-wrap:anywhere; }}
+      .muted {{ padding:8px 4px; }}
       .summary-stats,.flow-panel,tr {{ break-inside:avoid; }}
       tbody tr:nth-child(even),tbody tr:hover {{ background:#fff; }}
     }}
@@ -819,18 +831,17 @@ def _report_chunks(
       </div>
       <p id="filter-help" class="filter-help">한 글자 이상 입력하면 최대 12개의 완성값을 추천합니다. 방향키와 Enter 또는 마우스로 선택할 수 있습니다.</p>
       <div class="filter-meta">
-        <div class="filter-counts" aria-label="필터 결과 건수">
-          <span id="latest-filter-count" class="filter-count" aria-live="polite">최신 {_format_integer(displayed_latest)}/{_format_integer(displayed_latest)}건</span>
-          <span id="history-filter-count" class="filter-count" aria-live="polite">전체 {_format_integer(snapshot.observation_total)}/{_format_integer(snapshot.observation_total)}건</span>
-        </div>
         <p id="filter-status" class="filter-status" role="status" aria-live="polite"></p>
       </div>
     </section>
     <p id="print-filter-summary" class="print-filter-summary" hidden></p>
 
     <section id="latest-sessions">
-      <h2>최신 세션 결과</h2>
-      <p class="section-note">{_e(latest_note)}</p>
+      <div class="section-heading-row">
+        <h2>최신 세션 결과</h2>
+        <span id="latest-filter-count" class="filter-count" aria-live="polite">최신 {_format_integer(displayed_latest)}/{_format_integer(displayed_latest)}건</span>
+      </div>
+      <p id="latest-result-note" class="section-note">{_e(latest_note)}</p>
       <div class="table-wrap" role="region" aria-label="최신 세션 결과 표" tabindex="0"><table>
         <caption class="sr-only">최신 세션 결과</caption>
         <thead><tr><th scope="col">프로토콜</th><th scope="col">출발지 IP·포트</th><th scope="col">목적지 IP·포트</th><th scope="col">추적 상태</th><th scope="col">마지막 확인</th><th scope="col">장비</th></tr></thead>
@@ -841,7 +852,10 @@ def _report_chunks(
     </section>
 
     <section id="observation-history">
-      <h2>전체 추적 이력</h2>
+      <div class="section-heading-row">
+        <h2>전체 추적 이력</h2>
+        <span id="history-filter-count" class="filter-count" aria-live="polite">전체 {_format_integer(snapshot.observation_total)}/{_format_integer(snapshot.observation_total)}건</span>
+      </div>
       <details class="history-toggle">
         <summary id="history-filter-summary" aria-controls="observation-history-body">전체 추적 이력 {_format_integer(snapshot.observation_total)}/{_format_integer(snapshot.observation_total)}건 보기</summary>
       </details>

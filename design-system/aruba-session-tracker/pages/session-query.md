@@ -24,10 +24,20 @@ green, amber, and red styling respectively, but the text never disappears.
 
 The setup guide appears first only when MM/MD configuration is incomplete. The
 source/destination flow and current-run login information share one compact
-horizontal work area, with the flow shown first. Advanced conditions, detail
-columns, Raw CLI, and diagnostics remain progressive disclosure. The
-controller/result summary appears immediately above the table. The table
-remains dominant, and detail panels stay collapsed by default.
+horizontal work area, with the flow shown first. Separate SOURCE and DESTINATION
+cards retain visible Korean labels, and the center cue changes between
+`양방향 조회` and `입력 방향 조회` with the existing bidirectional setting.
+Advanced conditions, detail columns, Raw CLI, and diagnostics remain
+progressive disclosure. The controller/result summary appears immediately above
+the table. The table remains dominant, and detail panels stay collapsed by
+default.
+
+The empty result state explains the next action. It is hidden while the Raw or
+diagnostic panel is open because that panel becomes the active evidence surface.
+Expanded evidence stacks below the table in the standard workspace and switches
+to a side-by-side splitter below 760 logical pixels of window height or whenever
+advanced conditions are expanded, so the supported minimum workspace preserves
+at least a usable table viewport.
 
 ## Table behavior
 
