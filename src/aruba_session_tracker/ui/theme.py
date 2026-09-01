@@ -53,6 +53,16 @@ def apply_main_window_theme(window: MainWindow) -> None:
     # MainWindow applies a legacy local stylesheet during construction. Set the
     # complete theme last so one source of truth controls all presentation.
     window.setStyleSheet(build_stylesheet())
+    # Preserve a usable result viewport even when Windows font metrics make the
+    # compact header taller. Include native table chrome instead of assuming a
+    # fixed header or scrollbar size across themes and DPI settings.
+    window.result_table.ensurePolished()
+    result_table_chrome_height = (
+        window.result_table.horizontalHeader().sizeHint().height()
+        + window.result_table.horizontalScrollBar().sizeHint().height()
+        + (2 * window.result_table.frameWidth())
+    )
+    window.result_table.setMinimumHeight(40 + result_table_chrome_height)
     # QSS minimum heights do not participate in QTabWidget's initial corner
     # geometry calculation on every Qt platform. Apply the exact height after
     # the stylesheet so the identity strip aligns with the tab bar.

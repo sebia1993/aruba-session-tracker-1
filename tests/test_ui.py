@@ -1484,6 +1484,7 @@ assert window.monitor_button.geometry().width() > 0
 assert window.result_table.viewport().geometry().width() > 100
 assert window.monitor_button.accessibleName()
 assert window.advanced_toggle_button.accessibleDescription()
+assert window.result_status_guide.isVisible()
 assert window.advanced_panel.isHidden()
 assert window.details.isHidden()
 assert all(window.result_table.isColumnHidden(column) for column in (*range(5, 12), 13))

@@ -868,10 +868,22 @@ class MainWindow(QMainWindow):
         result_title_block.setSpacing(1)
         self.results_title_label = QLabel("세션 조회 결과")
         self.results_title_label.setObjectName("sectionTitle")
-        self.results_hint_label = QLabel("결과 행을 선택하면 Raw 근거를 확인할 수 있습니다.")
-        self.results_hint_label.setObjectName("sectionHint")
+        self.result_status_guide = QLabel(
+            "관측 상태=세션 표시 여부(장비 장애·통신 성공 판정 아님) · 특이사항=Flags 풀이"
+        )
+        self.result_status_guide.setObjectName("sectionHint")
+        self.result_status_guide.setAccessibleName("결과 상태 안내")
+        self.result_status_guide.setAccessibleDescription(
+            "관측 상태는 이번 조회에서 세션이 보였는지를 뜻하며 장비 장애나 "
+            "통신 성공 판정이 아닙니다. 세션 특이사항은 장비 Flags의 참고용 풀이입니다."
+        )
+        self.result_status_guide.setToolTip(
+            "관측 상태는 이번 조회에서 세션이 보였는지를 뜻하며 장비 장애나 "
+            "통신 성공 판정이 아닙니다.\n"
+            "세션 특이사항은 장비 Flags의 참고용 풀이입니다."
+        )
         result_title_block.addWidget(self.results_title_label)
-        result_title_block.addWidget(self.results_hint_label)
+        result_title_block.addWidget(self.result_status_guide)
         result_options.addLayout(result_title_block, 1)
         self.context_label = QLabel("MM/MD: 아직 조회하지 않음")
         self.detail_columns_toggle = QCheckBox("상세 열 보기")
@@ -889,14 +901,6 @@ class MainWindow(QMainWindow):
         result_options.addWidget(self.raw_diagnostics_toggle)
         results_header_layout.addLayout(result_options)
         results_header_layout.addWidget(self.context_label)
-        self.result_status_guide = QLabel(
-            "관측 상태는 이번 조회에서 세션이 보였는지를 뜻하며 장비 장애나 "
-            "통신 성공 판정이 아닙니다. 세션 특이사항은 장비 Flags의 참고용 풀이입니다."
-        )
-        self.result_status_guide.setObjectName("sectionHint")
-        self.result_status_guide.setAccessibleName("결과 상태 안내")
-        self.result_status_guide.setWordWrap(True)
-        result_options.insertWidget(1, self.result_status_guide, 2)
         self.result_table = QTableWidget(0, 16)
         self.result_table.setAccessibleName("세션 조회 결과 표")
         self.result_table.setAccessibleDescription(
