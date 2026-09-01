@@ -32,6 +32,8 @@ quiet, and operational rather than decorative.
 8. Keep the table as the visual center and retain every result column; visual
    reordering and progressive disclosure are allowed.
 9. Use no runtime styling dependency beyond PySide6.
+10. Keep Qt virtual-method overrides compatible with the pinned PySide6 type
+    stubs as well as the runtime's optional widget arguments.
 
 ### Desktop tokens
 
