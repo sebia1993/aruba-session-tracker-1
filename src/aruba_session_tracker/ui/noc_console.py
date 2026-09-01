@@ -47,8 +47,13 @@ class _NocConsoleController(QObject):
         self._layout_timer.setSingleShot(True)
         self._layout_timer.timeout.connect(self._apply_detail_orientation)
         self._metric_values: dict[str, QLabel] = {}
+        self._metric_layouts: list[QBoxLayout] = []
+        self._metric_pairs: list[tuple[QLabel, QLabel]] = []
         self._detail_values: dict[str, QLabel] = {}
         self._header_values: dict[str, QLabel] = {}
+        self._result_layout: QBoxLayout | None = None
+        self._result_layout_margins = (0, 0, 0, 0)
+        self._result_layout_spacing = 0
 
         self._install_shell()
         self._install_metrics()
@@ -75,6 +80,8 @@ class _NocConsoleController(QObject):
         self._refresh_header()
         self._refresh_metrics()
         self._refresh_detail()
+        self._refresh_accessibility_context()
+        self.schedule_layout()
 
     def _install_shell(self) -> None:
         window = self._window
@@ -154,6 +161,15 @@ class _NocConsoleController(QObject):
         result_layout = result_parent.layout()
         if not isinstance(result_layout, QBoxLayout):
             return
+        self._result_layout = result_layout
+        margins = result_layout.contentsMargins()
+        self._result_layout_margins = (
+            margins.left(),
+            margins.top(),
+            margins.right(),
+            margins.bottom(),
+        )
+        self._result_layout_spacing = result_layout.spacing()
         strip = QFrame(result_parent)
         strip.setObjectName("metricStrip")
         strip_layout = QHBoxLayout(strip)
@@ -181,6 +197,8 @@ class _NocConsoleController(QObject):
             card_layout.addWidget(caption)
             strip_layout.addWidget(card, 1)
             self._metric_values[key] = value_label
+            self._metric_layouts.append(card_layout)
+            self._metric_pairs.append((value_label, caption))
 
         insertion_index = result_layout.indexOf(window.result_empty_label)
         if insertion_index < 0:
@@ -320,6 +338,34 @@ class _NocConsoleController(QObject):
 
     def _apply_detail_orientation(self) -> None:
         window = self._window
+        condensed_results = (
+            window.height() < _COMPACT_DETAIL_HEIGHT
+            and window.advanced_toggle_button.isChecked()
+            and window.raw_diagnostics_toggle.isChecked()
+        )
+        for widget in (
+            window.results_title_label,
+            window.result_status_guide,
+            window.context_label,
+        ):
+            widget.setVisible(not condensed_results)
+        if self._result_layout is not None:
+            margins = (0, 0, 0, 0) if condensed_results else self._result_layout_margins
+            self._result_layout.setContentsMargins(*margins)
+            self._result_layout.setSpacing(4 if condensed_results else self._result_layout_spacing)
+        for layout in self._metric_layouts:
+            layout.setDirection(
+                QBoxLayout.Direction.LeftToRight
+                if condensed_results
+                else QBoxLayout.Direction.TopToBottom
+            )
+            layout.setContentsMargins(*(6, 3, 6, 3) if condensed_results else (12, 8, 12, 8))
+            layout.setSpacing(6 if condensed_results else 0)
+        for value, caption in self._metric_pairs:
+            value.setMinimumWidth(value.sizeHint().width() if condensed_results else 0)
+            caption.setMinimumWidth(caption.sizeHint().width() if condensed_results else 0)
+        self._refresh_accessibility_context()
+
         use_side_panel = (
             window.width() >= _SIDE_DETAIL_BREAKPOINT
             or window.height() < _COMPACT_DETAIL_HEIGHT
@@ -406,6 +452,9 @@ class _NocConsoleController(QObject):
         self._set_metric("rows", table.rowCount())
         self._set_metric("changes", len(changed_flows))
         self._set_metric("controllers", len(controllers))
+
+    def _refresh_accessibility_context(self) -> None:
+        self._window._sync_result_accessibility_context()
 
     def _refresh_detail(self) -> None:
         table = self._window.result_table

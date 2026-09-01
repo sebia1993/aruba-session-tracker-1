@@ -96,6 +96,12 @@ _HISTORY_STATUS_LABELS = {
 }
 _RESULT_RENDER_CHUNK_SIZE = 200
 _COMPACT_RESULT_LAYOUT_HEIGHT = 760
+_RESULT_TABLE_ACCESSIBLE_DESCRIPTION = (
+    "조회된 세션의 장비, 프로토콜, 출발지와 목적지, 관측 상태와 장비 Flags를 "
+    "풀어 쓴 세션 특이사항을 표시합니다. 관측 상태는 이번 조회에서 세션이 "
+    "보였는지를 뜻하며 장비 장애나 통신 성공 판정이 아닙니다. 세션 특이사항은 "
+    "장비 Flags의 참고용 풀이입니다."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -903,10 +909,7 @@ class MainWindow(QMainWindow):
         results_header_layout.addWidget(self.context_label)
         self.result_table = QTableWidget(0, 16)
         self.result_table.setAccessibleName("세션 조회 결과 표")
-        self.result_table.setAccessibleDescription(
-            "조회된 세션의 장비, 프로토콜, 출발지와 목적지, 관측 상태와 "
-            "장비 Flags를 풀어 쓴 세션 특이사항을 표시합니다."
-        )
+        self.result_table.setAccessibleDescription(_RESULT_TABLE_ACCESSIBLE_DESCRIPTION)
         self.result_table.setHorizontalHeaderLabels(
             [
                 "장비",
@@ -2022,6 +2025,17 @@ class MainWindow(QMainWindow):
             and self._task_generation == generation
         )
 
+    def _set_result_context(self, text: str) -> None:
+        self.context_label.setText(text)
+        self._sync_result_accessibility_context()
+
+    def _sync_result_accessibility_context(self) -> None:
+        context = self.context_label.text().strip()
+        suffix = f" 현재 조회 범위: {context}." if context else ""
+        self.result_table.setAccessibleDescription(
+            f"{_RESULT_TABLE_ACCESSIBLE_DESCRIPTION}{suffix}"
+        )
+
     @Slot(object)
     def _display_outcome(self, outcome: object) -> None:
         prepared = (
@@ -2055,7 +2069,7 @@ class MainWindow(QMainWindow):
         self._last_counters = prepared.next_counters if self._monitoring else {}
         used_mm = getattr(outcome, "used_mm", None) or "-"
         controllers = ", ".join(getattr(outcome, "controllers", ())) or "-"
-        self.context_label.setText(
+        self._set_result_context(
             f"MM: {used_mm}   |   조회 MD: {controllers}   |   "
             f"현재 일치: {len(observations)}   |   "
             f"화면 표시: {len(prepared.visible_rows)}/{prepared.total_rows}"

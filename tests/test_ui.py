@@ -1435,7 +1435,8 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication, QLabel
 
 from aruba_session_tracker.config import ConfigRepository
 from aruba_session_tracker.models import AppConfig, DeviceTarget
@@ -1453,10 +1454,15 @@ class Executor:
         return None
 
 
+def report_phase(name):
+    print(f"phase={name}", flush=True)
+
+
 app = QApplication([])
 root = Path(sys.argv[1])
 store = SessionStore(root / "세션.db", root / "원본", root / "내보내기")
 store.initialize()
+report_phase("storage-ready")
 repository = ConfigRepository(root / "설정.json")
 repository.save(
     AppConfig(
@@ -1465,7 +1471,13 @@ repository.save(
         managed_devices=(DeviceTarget("MD-01", "198.51.100.21"),),
     )
 )
-window = MainWindow(repository, store, Executor())
+window = MainWindow(
+    repository,
+    store,
+    Executor(),
+    shutdown_grace_milliseconds=5_000,
+    close_grace_milliseconds=5_000,
+)
 apply_main_window_theme(window)
 window.resize(window.minimumSize())
 window.show()
@@ -1475,6 +1487,7 @@ while window._history_task_running and time.monotonic() < deadline:
     time.sleep(0.01)
 app.processEvents()
 assert not window._history_task_running
+report_phase("history-ready")
 assert window.width() >= window.minimumWidth()
 assert window.height() >= window.minimumHeight()
 assert window.monitor_button.isVisible()
@@ -1490,9 +1503,18 @@ assert window.details.isHidden()
 assert all(window.result_table.isColumnHidden(column) for column in (*range(5, 12), 13))
 window.advanced_toggle_button.setChecked(True)
 window.raw_diagnostics_toggle.setChecked(True)
+deadline = time.monotonic() + 3
+while not window.results_title_label.isHidden() and time.monotonic() < deadline:
+    app.processEvents()
+    time.sleep(0.01)
 app.processEvents()
 assert window.advanced_panel.isVisible()
 assert window.details.isVisible()
+assert window.results_title_label.isHidden()
+assert window.result_status_guide.isHidden()
+assert window.context_label.isHidden()
+assert "장비 장애나 통신 성공 판정이 아닙니다" in window.result_table.accessibleDescription()
+assert window.context_label.text() in window.result_table.accessibleDescription()
 assert window.advanced_panel.height() >= window.advanced_panel.sizeHint().height()
 for control in (
     window.enable_edit,
@@ -1505,22 +1527,105 @@ for control in (
     assert window.advanced_panel.rect().contains(control.geometry().topLeft())
     assert window.advanced_panel.rect().contains(control.geometry().bottomRight())
 assert window.result_table.viewport().geometry().height() >= 40
+assert (
+    window.result_table.viewport().visibleRegion().boundingRect().height()
+    >= window.result_table.verticalHeader().defaultSectionSize()
+)
 assert window.details.width() >= 300
-window.close()
-app.processEvents()
+metric_values = window.findChildren(QLabel, "metricValue")
+for value in metric_values:
+    value.setText("2,000")
+window.resize(1081, 680)
+window.resize(1080, 680)
+
+
+def compact_layout_is_ready():
+    metric_labels = window.findChildren(QLabel, "metricLabel")
+    if len(metric_values) != 4 or len(metric_labels) != 4:
+        return False
+    if not all(value.width() >= value.sizeHint().width() for value in metric_values):
+        return False
+    for label in metric_labels:
+        parent = label.parentWidget()
+        if (
+            parent is None
+            or not label.isVisible()
+            or not parent.rect().contains(label.geometry())
+            or label.width() < label.sizeHint().width()
+            or label.height() < label.sizeHint().height()
+        ):
+            return False
+    detail_tab_bar = window.details.tabBar()
+    for index in range(window.details.count()):
+        rect = detail_tab_bar.tabRect(index)
+        label_width = detail_tab_bar.fontMetrics().horizontalAdvance(
+            window.details.tabText(index)
+        )
+        if rect.width() < label_width + 12 or not detail_tab_bar.rect().contains(rect):
+            return False
+    return True
+
+
+deadline = time.monotonic() + 3
+while time.monotonic() < deadline:
+    app.processEvents()
+    if compact_layout_is_ready():
+        break
+    time.sleep(0.01)
+metric_labels = window.findChildren(QLabel, "metricLabel")
+assert compact_layout_is_ready()
+assert len(metric_values) == 4
+assert len(metric_labels) == 4
+assert all(value.text() == "2,000" for value in metric_values)
+assert all(value.width() >= value.sizeHint().width() for value in metric_values)
+for label in metric_labels:
+    assert label.isVisible()
+    assert label.parentWidget().rect().contains(label.geometry())
+    assert label.width() >= label.sizeHint().width()
+    assert label.height() >= label.sizeHint().height()
+detail_tab_bar = window.details.tabBar()
+for index in range(window.details.count()):
+    rect = detail_tab_bar.tabRect(index)
+    label_width = detail_tab_bar.fontMetrics().horizontalAdvance(window.details.tabText(index))
+    assert rect.width() >= label_width + 12
+    assert detail_tab_bar.rect().contains(rect)
+report_phase("layout-verified")
+QTimer.singleShot(0, window.close)
+exit_code = app.exec()
+report_phase("window-closed")
+assert exit_code == 0
+assert window.clean_shutdown_completed
+store.close()
+report_phase("storage-closed")
 """
     environment = os.environ.copy()
     environment["QT_QPA_PLATFORM"] = "offscreen"
     environment["QT_SCALE_FACTOR"] = scale_factor
-    completed = subprocess.run(  # noqa: S603 - fixed interpreter and static smoke script.
-        [sys.executable, "-c", script, str(fixture_root)],
-        cwd=Path(__file__).resolve().parents[1],
-        env=environment,
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed interpreter/static smoke script.
+            [sys.executable, "-c", script, str(fixture_root)],
+            cwd=Path(__file__).resolve().parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = (
+            exc.stdout.decode(errors="replace")
+            if isinstance(exc.stdout, bytes)
+            else exc.stdout or ""
+        )
+        stderr = (
+            exc.stderr.decode(errors="replace")
+            if isinstance(exc.stderr, bytes)
+            else exc.stderr or ""
+        )
+        pytest.fail(
+            f"isolated UI smoke timed out at scale {scale_factor}\n{stdout}{stderr}",
+            pytrace=False,
+        )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
