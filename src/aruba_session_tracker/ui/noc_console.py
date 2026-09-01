@@ -312,7 +312,9 @@ class _NocConsoleController(QObject):
         window.details.setTabText(1, "RAW CLI")
         window.details.setTabText(2, "DIAGNOSTICS")
         window.details.setUsesScrollButtons(False)
-        window.details.tabBar().setExpanding(True)
+        detail_tab_bar = window.details.tabBar()
+        detail_tab_bar.setExpanding(True)
+        detail_tab_bar.setMinimumWidth(_DETAIL_MIN_WIDTH)
         window.details.setAccessibleDescription(
             "선택 세션 요약, Raw CLI와 진단 이벤트를 전환합니다."
         )

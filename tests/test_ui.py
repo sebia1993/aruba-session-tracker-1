@@ -1435,7 +1435,7 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QApplication, QLabel
 
 from aruba_session_tracker.config import ConfigRepository
@@ -1488,6 +1488,18 @@ while window._history_task_running and time.monotonic() < deadline:
 app.processEvents()
 assert not window._history_task_running
 report_phase("history-ready")
+for width, height, orientation in (
+    (1320, 820, Qt.Orientation.Horizontal),
+    (1100, 820, Qt.Orientation.Vertical),
+    (1080, 680, Qt.Orientation.Horizontal),
+):
+    window.resize(width, height)
+    deadline = time.monotonic() + 3
+    while window.result_splitter.orientation() != orientation and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    app.processEvents()
+    assert window.result_splitter.orientation() == orientation
 assert window.width() >= window.minimumWidth()
 assert window.height() >= window.minimumHeight()
 assert window.monitor_button.isVisible()
@@ -1539,6 +1551,23 @@ window.resize(1081, 680)
 window.resize(1080, 680)
 
 
+def detail_tabs_are_contained():
+    detail_tab_bar = window.details.tabBar()
+    if (
+        detail_tab_bar.width() < 380
+        or not window.details.rect().contains(detail_tab_bar.geometry())
+    ):
+        return False
+    for index in range(window.details.count()):
+        rect = detail_tab_bar.tabRect(index)
+        label_width = detail_tab_bar.fontMetrics().horizontalAdvance(
+            window.details.tabText(index)
+        )
+        if rect.width() < label_width + 12 or not detail_tab_bar.rect().contains(rect):
+            return False
+    return True
+
+
 def compact_layout_is_ready():
     metric_labels = window.findChildren(QLabel, "metricLabel")
     if len(metric_values) != 4 or len(metric_labels) != 4:
@@ -1555,15 +1584,7 @@ def compact_layout_is_ready():
             or label.height() < label.sizeHint().height()
         ):
             return False
-    detail_tab_bar = window.details.tabBar()
-    for index in range(window.details.count()):
-        rect = detail_tab_bar.tabRect(index)
-        label_width = detail_tab_bar.fontMetrics().horizontalAdvance(
-            window.details.tabText(index)
-        )
-        if rect.width() < label_width + 12 or not detail_tab_bar.rect().contains(rect):
-            return False
-    return True
+    return detail_tabs_are_contained()
 
 
 deadline = time.monotonic() + 3
@@ -1584,11 +1605,20 @@ for label in metric_labels:
     assert label.width() >= label.sizeHint().width()
     assert label.height() >= label.sizeHint().height()
 detail_tab_bar = window.details.tabBar()
-for index in range(window.details.count()):
-    rect = detail_tab_bar.tabRect(index)
-    label_width = detail_tab_bar.fontMetrics().horizontalAdvance(window.details.tabText(index))
-    assert rect.width() >= label_width + 12
-    assert detail_tab_bar.rect().contains(rect)
+assert detail_tab_bar.minimumWidth() >= 380
+for current_index in range(window.details.count()):
+    window.details.setCurrentIndex(current_index)
+    deadline = time.monotonic() + 3
+    while not detail_tabs_are_contained() and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    app.processEvents()
+    assert detail_tabs_are_contained()
+    for index in range(window.details.count()):
+        rect = detail_tab_bar.tabRect(index)
+        label_width = detail_tab_bar.fontMetrics().horizontalAdvance(window.details.tabText(index))
+        assert rect.width() >= label_width + 12
+        assert detail_tab_bar.rect().contains(rect)
 report_phase("layout-verified")
 QTimer.singleShot(0, window.close)
 exit_code = app.exec()

@@ -156,6 +156,7 @@ def test_theme_installs_dark_noc_shell_without_replacing_operational_widgets(
     session_detail_page = window.findChild(QWidget, "sessionDetailPage")
     assert session_detail_page is not None
     assert window.details.minimumWidth() >= 380
+    assert window.details.tabBar().minimumWidth() >= 380
     assert window.details.minimumHeight() == 0
 
     assert window.context_label.objectName() == "contextSummary"
@@ -328,11 +329,25 @@ def test_detail_panel_preserves_results_viewport_for_wide_and_compact_layouts(
     assert all(label.width() >= label.sizeHint().width() for label in metric_labels)
     assert all(label.height() >= label.sizeHint().height() for label in metric_labels)
     detail_tab_bar = window.details.tabBar()
-    detail_tab_rects = [detail_tab_bar.tabRect(index) for index in range(window.details.count())]
-    for index, rect in enumerate(detail_tab_rects):
-        label_width = detail_tab_bar.fontMetrics().horizontalAdvance(window.details.tabText(index))
-        assert rect.width() >= label_width + 12
-        assert detail_tab_bar.rect().contains(rect)
+    assert detail_tab_bar.minimumWidth() >= 380
+
+    def detail_tabs_fit() -> bool:
+        return (
+            detail_tab_bar.width() >= 380
+            and window.details.rect().contains(detail_tab_bar.geometry())
+            and all(
+                (rect := detail_tab_bar.tabRect(index)).width()
+                >= detail_tab_bar.fontMetrics().horizontalAdvance(window.details.tabText(index))
+                + 12
+                and detail_tab_bar.rect().contains(rect)
+                for index in range(window.details.count())
+            )
+        )
+
+    for current_index in range(window.details.count()):
+        window.details.setCurrentIndex(current_index)
+        qtbot.waitUntil(detail_tabs_fit, timeout=3000)  # type: ignore[attr-defined]
+        assert detail_tabs_fit()
     window.close()
 
 
