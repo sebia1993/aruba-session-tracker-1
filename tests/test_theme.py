@@ -153,7 +153,7 @@ def test_theme_installs_dark_noc_shell_without_replacing_operational_widgets(
     assert window.details.tabText(2) == "DIAGNOSTICS"
     session_detail_page = window.findChild(QWidget, "sessionDetailPage")
     assert session_detail_page is not None
-    assert window.details.minimumWidth() == 340
+    assert window.details.minimumWidth() >= 340
     assert window.details.minimumHeight() == 0
 
     assert window.context_label.objectName() == "contextSummary"
@@ -260,7 +260,7 @@ def test_detail_panel_preserves_results_viewport_for_wide_and_compact_layouts(
         lambda: window.result_splitter.orientation() == Qt.Orientation.Horizontal,
         timeout=3000,
     )
-    assert window.details.minimumWidth() == 340
+    assert window.details.minimumWidth() >= 340
     assert window.details.minimumHeight() == 0
 
     window.resize(1100, 820)
@@ -280,13 +280,13 @@ def test_detail_panel_preserves_results_viewport_for_wide_and_compact_layouts(
     qtbot.waitUntil(  # type: ignore[attr-defined]
         lambda: (
             window.result_splitter.orientation() == Qt.Orientation.Horizontal
-            and window.details.minimumWidth() == 340
+            and window.details.minimumWidth() >= 340
         ),
         timeout=3000,
     )
     assert window.advanced_panel.isVisible()
     assert window.details.isVisible()
-    assert window.details.minimumWidth() == 340
+    assert window.details.minimumWidth() >= 340
     assert window.details.minimumHeight() == 0
     assert window.result_table.viewport().height() >= 40
     detail_tab_bar = window.details.tabBar()
@@ -426,7 +426,7 @@ def test_selected_session_summary_tracks_existing_row_and_preserves_raw_widgets(
     protocol = window.findChild(QLabel, "detailProtocol")
     assert protocol is not None
     qtbot.waitUntil(  # type: ignore[attr-defined]
-        lambda: protocol.text() == "TCP (6)" and window.details.minimumWidth() == 340,
+        lambda: protocol.text() == "TCP (6)" and window.details.minimumWidth() >= 340,
         timeout=3000,
     )
 

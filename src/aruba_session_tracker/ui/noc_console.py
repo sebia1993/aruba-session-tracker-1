@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 _DASH = "—"
 _SIDE_DETAIL_BREAKPOINT = 1200
 _COMPACT_DETAIL_HEIGHT = 760
+_DETAIL_MIN_WIDTH = 340
+_RESULT_MIN_WIDTH = 380
 
 
 class _NocConsoleController(QObject):
@@ -326,10 +328,17 @@ class _NocConsoleController(QObject):
         orientation = Qt.Orientation.Horizontal if use_side_panel else Qt.Orientation.Vertical
         window.result_splitter.setOrientation(orientation)
         if use_side_panel:
-            window.details.setMinimumWidth(340)
-            window.details.setMinimumHeight(0)
             available = max(window.result_splitter.width(), 720)
-            window.result_splitter.setSizes([max(380, available - 360), 360])
+            tab_width = window.details.tabBar().sizeHint().width()
+            detail_width = min(
+                max(_DETAIL_MIN_WIDTH, tab_width),
+                max(_DETAIL_MIN_WIDTH, available - _RESULT_MIN_WIDTH),
+            )
+            window.details.setMinimumWidth(detail_width)
+            window.details.setMinimumHeight(0)
+            window.result_splitter.setSizes(
+                [max(_RESULT_MIN_WIDTH, available - detail_width), detail_width]
+            )
         else:
             window.details.setMinimumWidth(0)
             window.details.setMinimumHeight(190)
