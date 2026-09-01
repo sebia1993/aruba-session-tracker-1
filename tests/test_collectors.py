@@ -966,6 +966,7 @@ def test_factory_deadline_watchdog_closes_owned_socket_during_blocked_connect(
     key = paramiko.RSAKey.generate(1024)
     connector_started = Event()
     socket_closed = Event()
+    now = [0.0]
 
     class FakeSocket:
         def settimeout(self, _timeout: float) -> None:
@@ -990,6 +991,7 @@ def test_factory_deadline_watchdog_closes_owned_socket_during_blocked_connect(
 
     def blocked_connector(**kwargs: object) -> object:
         connector_started.set()
+        now[0] = 1.0
         assert kwargs["sock"] is fake_socket
         assert socket_closed.wait(timeout=2)
         raise OSError("fixture connector released by owned socket close")
@@ -997,7 +999,6 @@ def test_factory_deadline_watchdog_closes_owned_socket_during_blocked_connect(
     # Preserve the production owned-socket path while substituting a connector
     # that cannot return until that socket is force-closed.
     factory._connector = blocked_connector
-    started_at = time.monotonic()
 
     with pytest.raises(CollectorError) as caught:
         factory.connect(
@@ -1005,12 +1006,11 @@ def test_factory_deadline_watchdog_closes_owned_socket_during_blocked_connect(
             CREDENTIALS,
             host_key_approval=lambda *_args: True,
             cancel_token=CancellationToken(),
-            deadline=PollDeadline.after(0.1),
+            deadline=PollDeadline(0.1, lambda: now[0]),
         )
 
     assert connector_started.is_set()
     assert socket_closed.is_set()
-    assert time.monotonic() - started_at < 1.0
     assert caught.value.code is ErrorCode.POLL_DEADLINE_EXCEEDED
     assert not any(
         thread.name == "aruba-ssh-connect-watchdog" and thread.is_alive()

@@ -430,7 +430,7 @@ def build_stylesheet() -> str:
     }
 
     QFrame#metricCard {
-        min-height: 58px;
+        min-height: 42px;
         background-color: #16212D;
         border: 1px solid #2D4154;
         border-radius: 7px;

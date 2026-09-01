@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication,
+    QBoxLayout,
     QFrame,
     QLabel,
     QScrollArea,
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from aruba_session_tracker.config import ConfigRepository
 from aruba_session_tracker.models import SessionObservation
+from aruba_session_tracker.services import QueryOutcome
 from aruba_session_tracker.storage import SessionStore
 from aruba_session_tracker.ui import MainWindow
 from aruba_session_tracker.ui.theme import apply_main_window_theme, build_stylesheet
@@ -153,7 +155,8 @@ def test_theme_installs_dark_noc_shell_without_replacing_operational_widgets(
     assert window.details.tabText(2) == "DIAGNOSTICS"
     session_detail_page = window.findChild(QWidget, "sessionDetailPage")
     assert session_detail_page is not None
-    assert window.details.minimumWidth() >= 340
+    assert window.details.minimumWidth() >= 380
+    assert window.details.tabBar().minimumWidth() >= 380
     assert window.details.minimumHeight() == 0
 
     assert window.context_label.objectName() == "contextSummary"
@@ -260,8 +263,9 @@ def test_detail_panel_preserves_results_viewport_for_wide_and_compact_layouts(
         lambda: window.result_splitter.orientation() == Qt.Orientation.Horizontal,
         timeout=3000,
     )
-    assert window.details.minimumWidth() >= 340
+    assert window.details.minimumWidth() >= 380
     assert window.details.minimumHeight() == 0
+    assert window.result_splitter.widget(0).width() >= 380
 
     window.resize(1100, 820)
     qtbot.waitUntil(  # type: ignore[attr-defined]
@@ -280,21 +284,70 @@ def test_detail_panel_preserves_results_viewport_for_wide_and_compact_layouts(
     qtbot.waitUntil(  # type: ignore[attr-defined]
         lambda: (
             window.result_splitter.orientation() == Qt.Orientation.Horizontal
-            and window.details.minimumWidth() >= 340
+            and window.details.minimumWidth() >= 380
         ),
         timeout=3000,
     )
     assert window.advanced_panel.isVisible()
     assert window.details.isVisible()
-    assert window.details.minimumWidth() >= 340
+    assert window.results_title_label.isHidden()
+    assert window.result_status_guide.isHidden()
+    assert window.context_label.isHidden()
+    assert "장비 장애나 통신 성공 판정이 아닙니다" in window.result_table.accessibleDescription()
+    assert window.context_label.text() in window.result_table.accessibleDescription()
+    assert window.details.minimumWidth() >= 380
     assert window.details.minimumHeight() == 0
+    assert window.result_splitter.widget(0).width() >= 380
     assert window.result_table.viewport().height() >= 40
+    metric_values = window.findChildren(QLabel, "metricValue")
+    for value in metric_values:
+        value.setText("2,000")
+    window.resize(1081, 680)
+    window.resize(1080, 680)
+    metric_labels = window.findChildren(QLabel, "metricLabel")
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: (
+            len(metric_values) == 4
+            and len(metric_labels) == 4
+            and all(value.width() >= value.sizeHint().width() for value in metric_values)
+            and all(
+                label.isVisible()
+                and label.parentWidget().rect().contains(label.geometry())
+                and label.width() >= label.sizeHint().width()
+                and label.height() >= label.sizeHint().height()
+                for label in metric_labels
+            )
+        ),
+        timeout=3000,
+    )
+    assert len(metric_values) == 4
+    assert len(metric_labels) == 4
+    assert all(value.text() == "2,000" for value in metric_values)
+    assert all(value.width() >= value.sizeHint().width() for value in metric_values)
+    assert all(label.isVisible() for label in metric_labels)
+    assert all(label.parentWidget().rect().contains(label.geometry()) for label in metric_labels)
+    assert all(label.width() >= label.sizeHint().width() for label in metric_labels)
+    assert all(label.height() >= label.sizeHint().height() for label in metric_labels)
     detail_tab_bar = window.details.tabBar()
-    detail_tab_rects = [detail_tab_bar.tabRect(index) for index in range(window.details.count())]
-    for index, rect in enumerate(detail_tab_rects):
-        label_width = detail_tab_bar.fontMetrics().horizontalAdvance(window.details.tabText(index))
-        assert rect.width() >= label_width + 12
-        assert detail_tab_bar.rect().contains(rect)
+    assert detail_tab_bar.minimumWidth() >= 380
+
+    def detail_tabs_fit() -> bool:
+        return (
+            detail_tab_bar.width() >= 380
+            and window.details.rect().contains(detail_tab_bar.geometry())
+            and all(
+                (rect := detail_tab_bar.tabRect(index)).width()
+                >= detail_tab_bar.fontMetrics().horizontalAdvance(window.details.tabText(index))
+                + 12
+                and detail_tab_bar.rect().contains(rect)
+                for index in range(window.details.count())
+            )
+        )
+
+    for current_index in range(window.details.count()):
+        window.details.setCurrentIndex(current_index)
+        qtbot.waitUntil(detail_tabs_fit, timeout=3000)  # type: ignore[attr-defined]
+        assert detail_tabs_fit()
     window.close()
 
 
@@ -426,7 +479,7 @@ def test_selected_session_summary_tracks_existing_row_and_preserves_raw_widgets(
     protocol = window.findChild(QLabel, "detailProtocol")
     assert protocol is not None
     qtbot.waitUntil(  # type: ignore[attr-defined]
-        lambda: protocol.text() == "TCP (6)" and window.details.minimumWidth() >= 340,
+        lambda: protocol.text() == "TCP (6)" and window.details.minimumWidth() >= 380,
         timeout=3000,
     )
 
@@ -435,6 +488,10 @@ def test_selected_session_summary_tracks_existing_row_and_preserves_raw_widgets(
     assert window.raw_view.toPlainText() == "sanitized raw row"
     assert window.result_splitter.orientation() == Qt.Orientation.Horizontal
     assert window.result_table.viewport().height() >= 40
+    assert (
+        window.result_table.viewport().visibleRegion().boundingRect().height()
+        >= window.result_table.verticalHeader().defaultSectionSize()
+    )
     assert protocol.wordWrap()
     assert "─" not in protocol.text()
     assert "▶" not in protocol.text()
@@ -512,16 +569,34 @@ def test_compact_advanced_layout_keeps_selected_session_details_scrollable(
     apply_main_window_theme(window)
     window._append_observation(_observation())
     window.resize(window.minimumSize())
+    window.show()
     window.advanced_toggle_button.setChecked(True)
     window.raw_diagnostics_toggle.setChecked(True)
     window.result_table.selectRow(0)
     window.details.setCurrentIndex(0)
-    window.show()
+    window.resize(window.minimumSize())
 
     scroll = window.findChild(QScrollArea, "sessionDetailScroll")
     assert scroll is not None
     qtbot.waitUntil(  # type: ignore[attr-defined]
         lambda: scroll.isVisible() and scroll.verticalScrollBar().maximum() > 0,
+        timeout=3000,
+    )
+    metric_labels = window.findChildren(QLabel, "metricLabel")
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: (
+            window.results_title_label.isHidden()
+            and window.result_status_guide.isHidden()
+            and window.context_label.isHidden()
+            and len(metric_labels) == 4
+            and all(label.isVisible() for label in metric_labels)
+            and all(
+                label.parentWidget().rect().contains(label.geometry())
+                and label.width() >= label.sizeHint().width()
+                and label.height() >= label.sizeHint().height()
+                for label in metric_labels
+            )
+        ),
         timeout=3000,
     )
 
@@ -531,4 +606,89 @@ def test_compact_advanced_layout_keeps_selected_session_details_scrollable(
     assert scroll.viewport().height() > 0
     assert scroll.widget() is not None
     assert scroll.widget().height() > scroll.viewport().height()
+    assert window.results_title_label.isHidden()
+    assert window.result_status_guide.isHidden()
+    assert window.context_label.isHidden()
+    assert len(metric_labels) == 4
+    assert all(label.isVisible() for label in metric_labels)
+    assert all(label.parentWidget().rect().contains(label.geometry()) for label in metric_labels)
+    assert all(label.width() >= label.sizeHint().width() for label in metric_labels)
+    assert all(label.height() >= label.sizeHint().height() for label in metric_labels)
+
+    window.resize(1080, 820)
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: (
+            window.results_title_label.isVisible()
+            and window.result_status_guide.isVisible()
+            and window.context_label.isVisible()
+        ),
+        timeout=3000,
+    )
+    window.resize(window.minimumSize())
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: window.results_title_label.isHidden(),
+        timeout=3000,
+    )
+    window.raw_diagnostics_toggle.setChecked(False)
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: (
+            window.results_title_label.isVisible()
+            and window.result_status_guide.isVisible()
+            and window.context_label.isVisible()
+        ),
+        timeout=3000,
+    )
+    window.raw_diagnostics_toggle.setChecked(True)
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: window.results_title_label.isHidden(),
+        timeout=3000,
+    )
+    window.advanced_toggle_button.setChecked(False)
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: (
+            window.results_title_label.isVisible()
+            and window.result_status_guide.isVisible()
+            and window.context_label.isVisible()
+            and all(
+                isinstance(label.parentWidget().layout(), QBoxLayout)
+                and label.parentWidget().layout().direction() == QBoxLayout.Direction.TopToBottom
+                for label in metric_labels
+            )
+        ),
+        timeout=3000,
+    )
+    window.close()
+
+
+def test_result_accessibility_tracks_consecutive_empty_query_contexts(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = _build_window(qtbot, tmp_path)
+    apply_main_window_theme(window)
+
+    window._display_outcome(
+        QueryOutcome(
+            used_mm="MM-A",
+            controllers=("MD-A",),
+            authoritative=True,
+        )
+    )
+    first_description = window.result_table.accessibleDescription()
+    assert "MM-A" in first_description
+    assert "MD-A" in first_description
+    assert "장비 장애나 통신 성공 판정이 아닙니다" in first_description
+
+    window._display_outcome(
+        QueryOutcome(
+            used_mm="MM-B",
+            controllers=("MD-B",),
+            authoritative=True,
+        )
+    )
+    second_description = window.result_table.accessibleDescription()
+    assert "MM-B" in second_description
+    assert "MD-B" in second_description
+    assert "MM-A" not in second_description
+    assert "MD-A" not in second_description
     window.close()
