@@ -354,13 +354,9 @@ class _NocConsoleController(QObject):
             self._result_layout.setContentsMargins(*margins)
             self._result_layout.setSpacing(4 if condensed_results else self._result_layout_spacing)
         for layout in self._metric_layouts:
-            layout.setDirection(
-                QBoxLayout.Direction.LeftToRight
-                if condensed_results
-                else QBoxLayout.Direction.TopToBottom
-            )
-            layout.setContentsMargins(*(6, 3, 6, 3) if condensed_results else (12, 8, 12, 8))
-            layout.setSpacing(6 if condensed_results else 0)
+            layout.setDirection(QBoxLayout.Direction.TopToBottom)
+            layout.setContentsMargins(*(6, 1, 6, 1) if condensed_results else (12, 8, 12, 8))
+            layout.setSpacing(0)
         for value, caption in self._metric_pairs:
             value.setMinimumWidth(value.sizeHint().width() if condensed_results else 0)
             caption.setMinimumWidth(caption.sizeHint().width() if condensed_results else 0)
