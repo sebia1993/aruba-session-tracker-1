@@ -62,7 +62,9 @@ def test_fixture_ssh_parser_runtime_storage_soak(tmp_path: Path) -> None:
         "poll_commits": polls,
         "lifecycle_events": 2,
     }
-    assert result["connections"] >= polls + 1
+    # Monitoring deliberately keeps one MM and one MD connection alive across
+    # polls; reconnecting for every poll would be a regression.
+    assert result["connections"] == 2
     assert result["raw_files_on_disk"] == polls
     assert result["quick_check"] == ["ok"]
     assert result["foreign_key_check"] == []
