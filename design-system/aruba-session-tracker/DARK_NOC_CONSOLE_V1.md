@@ -111,6 +111,7 @@ service was introduced by this implementation.
 - Qt high-contrast fallback remains usable.
 - Desktop QSS contains no URL.
 - HTML remains deterministic and self-contained.
+- Source files are stored in canonical Ruff format before CI validation.
 - Pinned Ruff and mypy validation passes against the Windows build environment.
 - Existing security, storage, parser, shutdown, and packaging tests continue to
   pass.
