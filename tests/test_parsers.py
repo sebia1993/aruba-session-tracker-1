@@ -259,8 +259,22 @@ def test_datapath_parser_rejects_output_without_completion_marker(output: str) -
         )
 
 
-def test_datapath_parser_accepts_prompt_as_completion_marker() -> None:
-    output = fixture("datapath_empty.txt").replace("Entries: 0", "(md-document-01) #")
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "(md-document-01) #",
+        "(md-document-01)^[mynode]#",
+        "(md-document-01)*[mynode]#",
+        "(md-document-01)^*[mynode]#",
+        "(md-document-01) ^[mynode] #",
+        "(md-document-01) ^ [mynode] #",
+        "(md-document-01) *#",
+        "(md-document-01) * [mynode] #",
+        "md-document-01#",
+    ],
+)
+def test_datapath_parser_accepts_safe_prompt_as_completion_marker(prompt: str) -> None:
+    output = fixture("datapath_empty.txt").replace("Entries: 0", prompt)
     assert (
         parse_datapath_sessions(
             output,
@@ -269,6 +283,28 @@ def test_datapath_parser_accepts_prompt_as_completion_marker() -> None:
         )
         == ()
     )
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "(md-document-01) ![mynode] #",
+        "^[mynode] #",
+        "(md-document-01) **#",
+        "(md-document-01) *^[mynode] #",
+        "(md-document-01) [mynode] (config) #",
+        "(md-document-01) ^[mynode] # trailing",
+    ],
+)
+def test_datapath_parser_rejects_untrusted_prompt_variants(prompt: str) -> None:
+    output = fixture("datapath_empty.txt").replace("Entries: 0", prompt)
+
+    with pytest.raises(ParseError, match="completion marker"):
+        parse_datapath_sessions(
+            output,
+            controller_name="md-document-01",
+            controller_host="198.51.100.11",
+        )
 
 
 def test_datapath_parser_rejects_unverified_next_hop_schema() -> None:

@@ -245,6 +245,52 @@ def test_exact_command_extraction_accepts_crlf_and_safe_aruba_prompt() -> None:
     assert block.lines[0] == "Datapath Session Table Entries"
 
 
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "(document-host)^[node]#",
+        "(document-host)*[node]#",
+        "(document-host)^*[node]#",
+        "(document-host) ^[node] #",
+        "(document-host) * [node] #",
+        "document-host#",
+    ],
+)
+def test_exact_command_extraction_accepts_safe_status_prompt(prompt: str) -> None:
+    text = fixture().replace(
+        DATAPATH_INTERNAL_COMMAND,
+        f"{prompt}{DATAPATH_INTERNAL_COMMAND}",
+        1,
+    )
+
+    block = extract_exact_command_block(text, DATAPATH_INTERNAL_COMMAND)
+
+    assert block.command == DATAPATH_INTERNAL_COMMAND
+    assert block.terminated_by_command is True
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "(document-host) ![node] #",
+        "^[node] #",
+        "(document-host) **#",
+        "(document-host) *^[node] #",
+        "(document-host) [node] (config) #",
+        "(document-host) ^[node] # trailing",
+    ],
+)
+def test_exact_command_extraction_rejects_untrusted_status_prompt(prompt: str) -> None:
+    text = fixture().replace(
+        DATAPATH_INTERNAL_COMMAND,
+        f"{prompt}{DATAPATH_INTERNAL_COMMAND}",
+        1,
+    )
+
+    with pytest.raises(ParseError, match="not found"):
+        extract_exact_command_block(text, DATAPATH_INTERNAL_COMMAND)
+
+
 def test_lf_and_crlf_inputs_produce_identical_results() -> None:
     lf_result = parse_offline_tech_support(fixture())
     crlf_result = parse_offline_tech_support(fixture().replace("\n", "\r\n"))
@@ -321,9 +367,39 @@ def test_offline_parser_accepts_empty_counted_table() -> None:
     assert parse_offline_tech_support(text).sessions == ()
 
 
-def test_offline_parser_accepts_safe_final_prompt_as_completion() -> None:
-    text = f"{_datapath_only(include_count=False)}\n(document-host) [node] #"
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "(document-host) [node] #",
+        "(document-host)^[node]#",
+        "(document-host)*[node]#",
+        "(document-host)^*[node]#",
+        "(document-host) ^[node] #",
+        "(document-host) * [node] #",
+        "document-host#",
+    ],
+)
+def test_offline_parser_accepts_safe_final_prompt_as_completion(prompt: str) -> None:
+    text = f"{_datapath_only(include_count=False)}\n{prompt}"
     assert len(parse_offline_tech_support(text).sessions) == 2
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "(document-host) ![node] #",
+        "^[node] #",
+        "(document-host) **#",
+        "(document-host) *^[node] #",
+        "(document-host) [node] (config) #",
+        "(document-host) ^[node] # trailing",
+    ],
+)
+def test_offline_parser_rejects_untrusted_final_prompt(prompt: str) -> None:
+    text = f"{_datapath_only(include_count=False)}\n{prompt}"
+
+    with pytest.raises(ParseError):
+        parse_offline_tech_support(text)
 
 
 def test_offline_parser_rejects_duplicate_marker_or_data_after_completion() -> None:

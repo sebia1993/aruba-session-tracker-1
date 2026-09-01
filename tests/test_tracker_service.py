@@ -430,6 +430,34 @@ def test_destination_only_query_uses_only_the_entered_ip_for_mm_and_md() -> None
     assert factory.commands_by_device["MD-2"] == [NO_PAGING_COMMAND, destination_filter]
 
 
+def test_md_status_prompt_completes_output_without_entry_count() -> None:
+    request = QueryRequest("", REQUEST.destination_ip)
+    destination_lookup = build_global_user_command(REQUEST.destination_ip)
+    destination_filter = build_datapath_session_command(REQUEST.destination_ip)
+    datapath_output = _datapath_output().replace(
+        "Entries: 1",
+        "(MD-2)^*[mynode]#",
+    )
+    factory = FakeFactory(
+        {
+            "MM-Primary": {
+                NO_PAGING_COMMAND: "",
+                destination_lookup: _global_output(REQUEST.destination_ip, "192.0.2.102"),
+            },
+            "MD-2": {
+                NO_PAGING_COMMAND: "",
+                destination_filter: datapath_output,
+            },
+        }
+    )
+
+    outcome = TrackerService(_config(), factory).query_once(request, CREDENTIALS)
+
+    assert len(outcome.observations) == 1
+    assert outcome.authoritative is True
+    assert all(event.stage != "MD_PARSE" for event in outcome.diagnostics)
+
+
 def test_distinct_source_and_destination_mds_are_both_queried() -> None:
     request = QueryRequest(REQUEST.source_ip, REQUEST.destination_ip)
     outputs = {

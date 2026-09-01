@@ -11,7 +11,11 @@ from typing import Self
 
 import paramiko
 import pytest
-from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko.exceptions import (
+    NetmikoAuthenticationException,
+    NetmikoTimeoutException,
+    ReadTimeout,
+)
 
 import aruba_session_tracker.collectors.ssh as ssh_module
 from aruba_session_tracker.collectors import (
@@ -201,6 +205,24 @@ def test_command_timeout_at_poll_deadline_uses_deadline_error_code() -> None:
 
     assert caught.value.code is ErrorCode.POLL_DEADLINE_EXCEEDED
     assert caught.value.retryable_network is True
+
+
+def test_netmiko_read_timeout_is_sanitized_as_retryable_network_failure() -> None:
+    class PromptReadTimeout(FakeConnection):
+        def send_command(self, command: str, *, read_timeout: float) -> str:
+            del command, read_timeout
+            raise ReadTimeout("raw prompt and command output")
+
+    with pytest.raises(CollectorError) as caught:
+        SSHCollector(FakeFactory(PromptReadTimeout({}))).collect(
+            TARGET,
+            CREDENTIALS,
+            ("no paging",),
+        )
+
+    assert caught.value.code is ErrorCode.MM_UNREACHABLE
+    assert caught.value.retryable_network is True
+    assert "raw prompt" not in str(caught.value)
 
 
 def test_cancellation_callback_is_idempotent() -> None:
