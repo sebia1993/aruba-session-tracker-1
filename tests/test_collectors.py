@@ -896,6 +896,7 @@ def test_factory_deadline_watchdog_aborts_blocked_enable(tmp_path: Path) -> None
     key = paramiko.RSAKey.generate(1024)
     enable_started = Event()
     transport_closed = Event()
+    now = [0.0]
 
     class BlockingEnableNetmiko(FakeNetmiko):
         remote_conn = None
@@ -908,6 +909,7 @@ def test_factory_deadline_watchdog_aborts_blocked_enable(tmp_path: Path) -> None
 
         def enable(self) -> None:
             enable_started.set()
+            now[0] = 1.0
             assert transport_closed.wait(timeout=2)
 
         def close(self) -> None:
@@ -925,7 +927,7 @@ def test_factory_deadline_watchdog_aborts_blocked_enable(tmp_path: Path) -> None
             Credentials("operator", "secret", "enable-secret"),
             host_key_approval=lambda *_args: True,
             cancel_token=CancellationToken(),
-            deadline=PollDeadline.after(0.1),
+            deadline=PollDeadline(0.1, lambda: now[0]),
         )
 
     assert enable_started.is_set()
