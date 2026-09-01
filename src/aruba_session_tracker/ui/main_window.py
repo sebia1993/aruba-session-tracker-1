@@ -2194,8 +2194,13 @@ class MainWindow(QMainWindow):
                     item.setToolTip(
                         f"포트 번호 기준 대표 서비스 후보: {service.label} ({service.port})"
                     )
-            if column in (13, 15):
-                item.setForeground(_severity_color(severity.name))
+            if column in (13, 15) and self.property("themeContrast") != "high":
+                item.setForeground(
+                    _severity_color(
+                        severity.name,
+                        dark=self.property("darkNocConsoleInstalled") is True,
+                    )
+                )
             if column == 14:
                 item.setToolTip(
                     f"{observation_status}\n이 값은 장비 장애나 통신 성공 판정이 아닙니다."
@@ -3323,7 +3328,13 @@ def _raw_data_role() -> int:
     return int(Qt.ItemDataRole.UserRole)
 
 
-def _severity_color(severity: str) -> QColor:
+def _severity_color(severity: str, *, dark: bool = False) -> QColor:
+    if dark:
+        return {
+            "CRITICAL": QColor("#E05C65"),
+            "WARNING": QColor("#E4A83C"),
+            "CHECK": QColor("#E4A83C"),
+        }.get(severity.upper(), QColor("#B9CBD8"))
     return {
         "CRITICAL": QColor("#b42318"),
         "WARNING": QColor("#b54708"),

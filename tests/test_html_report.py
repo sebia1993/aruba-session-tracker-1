@@ -12,9 +12,11 @@ import pytest
 from aruba_session_tracker.storage import (
     RunReportSnapshot,
     html_report,
+    html_report_presentation,
     render_html_report,
     write_html_report_atomic,
 )
+from aruba_session_tracker.storage import session_store as session_store_module
 
 
 def _html_contrast_ratio(foreground: str, background: str) -> float:
@@ -71,6 +73,7 @@ def _snapshot(
     observations: tuple[dict[str, object], ...] | None = None,
     observation_history: tuple[dict[str, object], ...] | None = None,
     lifecycle_events: tuple[dict[str, object], ...] | None = None,
+    controller_events: tuple[dict[str, object], ...] | None = None,
     diagnostics: tuple[dict[str, object], ...] | None = None,
     observation_total: int | None = None,
 ) -> RunReportSnapshot:
@@ -146,14 +149,18 @@ def _snapshot(
         lifecycle_total=len(lifecycle_rows),
         lifecycle_counts=(("STARTED", 1),) if lifecycle_rows else (),
         controller_events=(
-            {
-                "occurred_at": "2026-08-28T08:02:00.000Z",
-                "previous_controller": "서울-MD-01",
-                "current_controller": "서울-MD-02",
-                "reason": "CURRENT_SWITCH_CHANGED",
-            },
+            (
+                {
+                    "occurred_at": "2026-08-28T08:02:00.000Z",
+                    "previous_controller": "서울-MD-01",
+                    "current_controller": "서울-MD-02",
+                    "reason": "CURRENT_SWITCH_CHANGED",
+                },
+            )
+            if controller_events is None
+            else controller_events
         ),
-        controller_total=1,
+        controller_total=1 if controller_events is None else len(controller_events),
         diagnostics=diagnostic_rows,
         diagnostic_total=len(diagnostic_rows),
         raw_files=raw_rows,
@@ -245,10 +252,10 @@ def test_report_is_concise_standalone_result_only_html5() -> None:
     assert not re.search(r"\b(?:src|href)=[\"'](?:https?:)?//", lowered)
     assert "<nav" not in lowered
 
-    headings = ("조회 요약", "결과 찾기", "최신 세션 결과", "전체 추적 이력")
+    headings = ("조회 요약", "결과 찾기", "최신 세션 결과", "수집 정보", "전체 추적 이력")
     positions = [document.index(heading) for heading in headings]
     assert positions == sorted(positions)
-    assert document.count("<h2") == 4
+    assert document.count("<h2") == 5
     assert re.findall(r'<th scope="col">([^<]+)</th>', _section(document, "latest-sessions")) == [
         "프로토콜",
         "출발지 IP·포트",
@@ -470,6 +477,29 @@ def test_public_html_report_interfaces_remain_compatible() -> None:
     assert tuple(signature(render_html_report).parameters) == ("snapshot",)
     assert tuple(signature(write_html_report_atomic).parameters) == ("destination", "snapshot")
     assert "observation_history" in RunReportSnapshot.__dataclass_fields__
+    assert render_html_report is html_report.render_html_report
+    assert write_html_report_atomic is html_report.write_html_report_atomic
+    assert (
+        session_store_module.write_html_report_stream_atomic
+        is html_report.write_html_report_stream_atomic
+    )
+    assert not hasattr(html_report, "_report_chunks")
+
+
+def test_public_renderer_delegates_explicitly_without_import_time_monkeypatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = _snapshot()
+    calls: list[RunReportSnapshot] = []
+
+    def replacement(value: RunReportSnapshot) -> str:
+        calls.append(value)
+        return "delegated-report"
+
+    monkeypatch.setattr(html_report_presentation, "render_html_report", replacement)
+
+    assert html_report.render_html_report(snapshot) == "delegated-report"
+    assert calls == [snapshot]
 
 
 def test_history_disclosure_keeps_screen_collapsed_but_prints_outside_details() -> None:
@@ -591,6 +621,234 @@ def test_summary_prioritizes_query_flow_and_keeps_only_four_core_stats() -> None
     assert "장비별 최신 세션" not in document
     assert 'class="insights"' not in document
     assert ".direction-arrow { transform:none; margin-left:0; }" in document
+
+
+def test_investigation_sections_keep_the_approved_evidence_order() -> None:
+    document = render_html_report(_snapshot())
+    markers = (
+        "조회 요약",
+        'id="session-state"',
+        'id="significant-events"',
+        'id="latest-sessions"',
+        'id="collection-information"',
+        'id="observation-history"',
+    )
+
+    positions = [document.index(marker) for marker in markers]
+    assert positions == sorted(positions)
+    assert "Network Session Investigation Report" in document
+    assert "보고서 스냅샷에 포함된 저장 사실" in document
+    assert "전체 이벤트 이력을 의미하지 않습니다." in document
+
+
+@pytest.mark.parametrize(
+    ("started_at", "ended_at", "expected"),
+    (
+        ("2026-08-28T08:00:00Z", "2026-08-28T08:05:00Z", "5분 0초"),
+        ("2026-08-28T08:00:00Z", "2026-08-28T10:02:03Z", "2시간 2분 3초"),
+        ("2026-08-28T08:00:00Z", "2026-08-29T09:02:03Z", "1일 1시간 2분 3초"),
+        ("2026-08-28T08:00:00", "2026-08-28T08:05:00Z", "-"),
+        ("2026-08-28T08:05:00Z", "2026-08-28T08:00:00Z", "-"),
+    ),
+)
+def test_duration_uses_only_valid_stored_start_and_end_times(
+    started_at: str,
+    ended_at: str,
+    expected: str,
+) -> None:
+    run = dict(_snapshot().run)
+    run.update(started_at=started_at, ended_at=ended_at)
+
+    document = render_html_report(_snapshot(run=run))
+
+    assert f'<div class="run-fact"><dt>추적 시간</dt><dd>{expected}</dd></div>' in document
+
+
+def test_collection_information_uses_only_latest_observed_controller_names() -> None:
+    old = _observation(
+        observed_at="2026-08-28T08:01:00Z",
+        controller_name="OLD-MD",
+        controller_host="198.51.100.21",
+    )
+    latest = _observation(
+        observed_at="2026-08-28T08:03:00Z",
+        controller_name="NEW-MD",
+        controller_host="198.51.100.22",
+    )
+    other = _observation(
+        observed_at="2026-08-28T08:02:00Z",
+        controller_name="MD-Z & <검증>",
+        controller_host="198.51.100.23",
+        source_port=53001,
+    )
+    document = render_html_report(
+        _snapshot(
+            observations=(latest, other),
+            observation_history=(old, other, latest),
+            lifecycle_events=(),
+            controller_events=(),
+            observation_total=3,
+        )
+    )
+    collection = _section(document, "collection-information")
+    history = _section(document, "observation-history")
+
+    assert "NEW-MD" in collection
+    assert "MD-Z &amp; &lt;검증&gt;" in collection
+    assert "OLD-MD" not in collection
+    assert "OLD-MD" in history
+    assert "장비 도달성이나 상태를 의미하지 않습니다." in collection
+    for unsupported_claim in ("HEALTHY", "REACHABLE", "4/4", "정상 장비"):
+        assert unsupported_claim not in collection
+
+
+def test_collection_information_uses_dash_when_no_session_has_a_controller() -> None:
+    document = render_html_report(
+        _snapshot(
+            observations=(),
+            observation_history=(),
+            lifecycle_events=(),
+            controller_events=(),
+            observation_total=0,
+        )
+    )
+
+    collection = _section(document, "collection-information")
+    assert "<dt>최근 세션 관측 장비</dt><dd>—</dd>" in collection
+
+
+def test_timeline_prefers_controller_fact_and_omits_private_event_fields() -> None:
+    observation = _observation(controller_name="MD-B", controller_host="198.51.100.77")
+    lifecycle = (
+        {
+            "occurred_at": "2026-08-28T08:03:00Z",
+            "session_key": observation["session_key"],
+            "event_type": "CONTROLLER_CHANGED",
+            "controller_name": "MD-B &",
+            "details_json": '{"password":"LIFECYCLE-SECRET"}',
+        },
+        {
+            "occurred_at": "2026-08-28T08:04:00Z",
+            "session_key": observation["session_key"],
+            "event_type": "OBSERVED",
+            "details_json": '{"reason":"PRIVATE-RECOVERY"}',
+        },
+        {
+            "occurred_at": "2026-08-28T08:05:00Z",
+            "session_key": observation["session_key"],
+            "event_type": "COUNTERS_CHANGED",
+            "details_json": '{"packet_delta":987654321}',
+        },
+    )
+    controller_events = (
+        {
+            "occurred_at": "2026-08-28T08:03:00Z",
+            "previous_controller": "<MD-A>",
+            "current_controller": "MD-B &",
+            "reason": "password=CONTROLLER-SECRET",
+        },
+    )
+
+    document = render_html_report(
+        _snapshot(
+            observations=(observation,),
+            observation_history=(observation,),
+            lifecycle_events=lifecycle,
+            controller_events=controller_events,
+        )
+    )
+    timeline = _section(document, "significant-events")
+
+    assert timeline.count("관측 MD 변경 확인") == 1
+    assert "&lt;MD-A&gt; → MD-B &amp;" in timeline
+    assert "세션 다시 확인" in timeline
+    assert "세션 수치 기준 변경 확인" in timeline
+    for private_value in (
+        "LIFECYCLE-SECRET",
+        "PRIVATE-RECOVERY",
+        "987654321",
+        "CONTROLLER-SECRET",
+        "details_json",
+        "reason",
+        "198.51.100.77",
+    ):
+        assert private_value not in timeline
+
+
+def test_timeline_keeps_distinct_controller_changes_with_the_same_timestamp() -> None:
+    first = _observation(
+        controller_name="MD-B",
+        source_ip="192.0.2.10",
+        destination_ip="203.0.113.20",
+    )
+    second = _observation(
+        controller_name="MD-C",
+        source_ip="192.0.2.11",
+        destination_ip="203.0.113.21",
+    )
+    occurred_at = "2026-08-28T08:03:00Z"
+    lifecycle = (
+        {
+            "occurred_at": occurred_at,
+            "session_key": first["session_key"],
+            "event_type": "CONTROLLER_CHANGED",
+            "controller_name": "MD-B",
+        },
+        {
+            "occurred_at": occurred_at,
+            "session_key": second["session_key"],
+            "event_type": "CONTROLLER_CHANGED",
+            "controller_name": "MD-C",
+        },
+    )
+    controller_events = (
+        {
+            "occurred_at": occurred_at,
+            "previous_controller": "MD-A",
+            "current_controller": "MD-B",
+        },
+    )
+
+    document = render_html_report(
+        _snapshot(
+            observations=(first, second),
+            observation_history=(first, second),
+            lifecycle_events=lifecycle,
+            controller_events=controller_events,
+        )
+    )
+    timeline = _section(document, "significant-events")
+
+    assert timeline.count("관측 MD 변경 확인") == 2
+    assert "MD-A → MD-B" in timeline
+    assert "192.0.2.11:53000 → 203.0.113.21:443" in timeline
+
+
+def test_timeline_is_bounded_to_twelve_recent_snapshot_facts() -> None:
+    observation = _observation()
+    lifecycle = tuple(
+        {
+            "occurred_at": f"2026-08-28T09:10:{index:02d}Z",
+            "session_key": observation["session_key"],
+            "event_type": "MISSED",
+        }
+        for index in range(13)
+    )
+    document = render_html_report(_snapshot(lifecycle_events=lifecycle, controller_events=()))
+    timeline = _section(document, "significant-events")
+
+    assert timeline.count('class="event-item"') == 12
+    assert "2026-08-28 18:10:00 KST" not in timeline
+    assert "2026-08-28 18:10:01 KST" in timeline
+    assert "2026-08-28 18:10:12 KST" in timeline
+
+
+def test_empty_timeline_describes_only_the_report_snapshot() -> None:
+    document = render_html_report(_snapshot(lifecycle_events=(), controller_events=()))
+
+    timeline = _section(document, "significant-events")
+    assert "보고서 스냅샷에 표시할 저장 사실이 없습니다." in timeline
+    assert "변화가 발생하지 않았습니다" not in timeline
 
 
 @pytest.mark.parametrize(
@@ -1116,6 +1374,9 @@ def test_only_latest_table_is_limited_to_fifty_logical_flows() -> None:
     assert "고유 세션 55개 중 마지막 확인 시각을 기준으로 최근 50개" in latest
     assert "192.0.2.100:53000" not in _table_body(latest)
     assert "192.0.2.100:53000" in _table_body(history)
+    assert 'aria-label="최신 표시 50/55개 상태 분포"' in document
+    assert ">LATEST 50/55</text>" in document
+    assert "최신 결과에 표시된 50/55개 논리 세션만 집계합니다." in document
 
 
 def test_full_history_preserves_all_2005_rows_beyond_ui_limit() -> None:
@@ -1217,6 +1478,8 @@ def test_empty_result_has_clear_rows_and_no_false_session_state() -> None:
     assert len(_report_rows(document)) == 0
     assert document.count('class="filter-empty-row" hidden') == 2
     assert document.count("선택한 필터와 일치하는 세션이 없습니다.") == 2
+    assert "최신 표시 0/0개 범위에 집계할 세션이 없습니다." in document
+    assert '<svg class="state-ring"' not in document
 
 
 def test_initial_filter_counts_distinguish_latest_limit_from_complete_history() -> None:

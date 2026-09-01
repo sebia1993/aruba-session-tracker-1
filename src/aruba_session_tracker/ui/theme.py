@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QFont, QPalette
+from PySide6.QtGui import QBrush, QColor, QFont, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QGroupBox,
@@ -41,6 +41,8 @@ def apply_main_window_theme(window: MainWindow) -> None:
         "themeContrast",
         "high" if _uses_high_contrast_palette(palette) else "normal",
     )
+    if window.property("themeContrast") == "high":
+        _clear_explicit_result_foregrounds(window)
 
     _configure_layout_density(window)
     _configure_component_roles(window)
@@ -148,7 +150,7 @@ def build_stylesheet() -> str:
         font-weight: 700;
     }
 
-    /* Existing QTabWidget/QTabBar retained and presented as a left rail. */
+    /* Existing QTabWidget/QTabBar retained as compact horizontal navigation. */
     QTabWidget#mainTabs {
         background-color: #101720;
     }
@@ -156,43 +158,41 @@ def build_stylesheet() -> str:
     QTabWidget#mainTabs::pane {
         background-color: #101720;
         border: 0;
-        left: -1px;
+        top: -1px;
     }
 
-    QTabWidget#mainTabs QTabBar {
+    QTabBar#mainNavigationTabs {
         background-color: #0D141C;
-        border-right: 1px solid #2D4154;
+        border-bottom: 1px solid #2D4154;
     }
 
-    QTabWidget#mainTabs QTabBar::tab {
-        width: 184px;
-        min-height: 52px;
-        padding: 0 14px;
+    QTabBar#mainNavigationTabs::tab {
+        width: 176px;
+        min-height: 40px;
+        padding: 0 16px;
         margin: 0;
         color: #91A5B8;
         background-color: #0D141C;
-        border: 0;
-        border-left: 3px solid transparent;
-        border-bottom: 1px solid #182532;
-        text-align: left;
+        border: 2px solid transparent;
+        border-bottom: 3px solid transparent;
         font-weight: 650;
     }
 
-    QTabWidget#mainTabs QTabBar::tab:selected {
+    QTabBar#mainNavigationTabs::tab:selected {
         color: #FFFFFF;
         background-color: #1C2937;
-        border-left: 3px solid #2F80ED;
+        border-bottom: 3px solid #2F80ED;
         font-weight: 800;
     }
 
-    QTabWidget#mainTabs QTabBar::tab:hover:!selected {
+    QTabBar#mainNavigationTabs::tab:hover:!selected {
         color: #E8EFF6;
         background-color: #16212D;
     }
 
-    QTabWidget#mainTabs QTabBar::tab:focus {
+    QTabBar#mainNavigationTabs::tab:focus {
         border: 2px solid #42B7C8;
-        border-left: 3px solid #42B7C8;
+        border-bottom: 3px solid #42B7C8;
     }
 
     /* Pages and engineering surfaces. */
@@ -732,7 +732,7 @@ def build_stylesheet() -> str:
         top: -1px;
     }
 
-    QTabWidget#detailsTabs QTabBar::tab {
+    QTabBar#detailsNavigationTabs::tab {
         min-height: 31px;
         padding: 0 14px;
         color: #91A5B8;
@@ -742,15 +742,18 @@ def build_stylesheet() -> str:
         font-size: 8pt;
     }
 
-    QTabWidget#detailsTabs QTabBar::tab:selected {
+    QTabBar#detailsNavigationTabs::tab:selected {
         color: #FFFFFF;
         background-color: #0A1118;
         border-color: #3B556C;
         font-weight: 800;
     }
 
-    QWidget#sessionDetailPage {
+    QWidget#sessionDetailPage,
+    QScrollArea#sessionDetailScroll,
+    QWidget#sessionDetailContent {
         background-color: #0A1118;
+        border: 0;
     }
 
     QLabel#detailEyebrow {
@@ -786,14 +789,15 @@ def build_stylesheet() -> str:
 
     QLabel#detailEndpointValue {
         color: #E8EFF6;
-        font-size: 10pt;
+        font-size: 8pt;
         font-weight: 750;
     }
 
     QLabel#detailProtocol {
-        min-width: 110px;
+        min-width: 48px;
+        max-width: 60px;
         color: #7DD5E0;
-        font-size: 9pt;
+        font-size: 8pt;
         font-weight: 800;
     }
 
@@ -803,7 +807,7 @@ def build_stylesheet() -> str:
     }
 
     QFrame#detailFact {
-        min-height: 48px;
+        min-height: 44px;
         background-color: #101A24;
         border: 1px solid #263A4B;
         border-radius: 6px;
@@ -811,7 +815,7 @@ def build_stylesheet() -> str:
 
     QLabel#detailFactValue {
         color: #D8E4EE;
-        font-size: 9pt;
+        font-size: 8pt;
         font-weight: 700;
     }
 
@@ -893,6 +897,11 @@ def build_stylesheet() -> str:
         selection-color: palette(highlighted-text);
     }
 
+    QMainWindow#mainWindow[themeContrast="high"] QFrame#nocHeader QLabel#productName,
+    QMainWindow#mainWindow[themeContrast="high"] QFrame#nocHeader QLabel#productMeta {
+        color: palette(window-text);
+    }
+
     QMainWindow#mainWindow[themeContrast="high"] QFrame#nocHeader,
     QMainWindow#mainWindow[themeContrast="high"] QFrame#headerChip,
     QMainWindow#mainWindow[themeContrast="high"] QFrame#setupGuide,
@@ -918,7 +927,7 @@ def build_stylesheet() -> str:
     }
 
     QMainWindow#mainWindow[themeContrast="high"] QTabWidget#mainTabs,
-    QMainWindow#mainWindow[themeContrast="high"] QTabWidget#mainTabs QTabBar {
+    QMainWindow#mainWindow[themeContrast="high"] QTabBar#mainNavigationTabs {
         background-color: palette(window);
     }
 
@@ -1006,9 +1015,11 @@ def _configure_layout_density(window: MainWindow) -> None:
         _configure_group_layout(group)
 
     window.tabs.setObjectName("mainTabs")
+    window.tabs.tabBar().setObjectName("mainNavigationTabs")
     window.tabs.setDocumentMode(True)
     window.tabs.setElideMode(Qt.TextElideMode.ElideNone)
     window.details.setObjectName("detailsTabs")
+    window.details.tabBar().setObjectName("detailsNavigationTabs")
     window.details.setDocumentMode(True)
     window.details.setMinimumWidth(0)
     window.details.setMinimumHeight(180)
@@ -1095,6 +1106,16 @@ def _configure_tables(window: MainWindow) -> None:
         current = result_header.visualIndex(logical_index)
         if current != visual_index:
             result_header.moveSection(current, visual_index)
+
+
+def _clear_explicit_result_foregrounds(window: MainWindow) -> None:
+    """Let the native high-contrast palette own all result-cell text colors."""
+
+    for row in range(window.result_table.rowCount()):
+        for column in (13, 14, 15):
+            item = window.result_table.item(row, column)
+            if item is not None:
+                item.setForeground(QBrush())
 
 
 def _uses_high_contrast_palette(palette: QPalette) -> bool:

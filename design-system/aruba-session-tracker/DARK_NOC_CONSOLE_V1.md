@@ -7,7 +7,9 @@ Where older presentation guidance conflicts with this document, this document wi
 visual design only. All read-only Aruba, SSH, credential, storage, recovery, Inspector,
 and data-protection rules remain mandatory.
 
-Reference image: `references/dark-noc-console-v1-reference.jpg`.
+The original conversation reference image is not present in this repository.
+The tokens, hierarchy, behavior, and acceptance criteria in this document are
+therefore the reproducible visual authority.
 
 ## Product character
 

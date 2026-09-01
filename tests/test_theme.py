@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -8,12 +9,14 @@ from PySide6.QtWidgets import (
     QApplication,
     QFrame,
     QLabel,
+    QScrollArea,
     QSizePolicy,
     QTabWidget,
     QWidget,
 )
 
 from aruba_session_tracker.config import ConfigRepository
+from aruba_session_tracker.models import SessionObservation
 from aruba_session_tracker.storage import SessionStore
 from aruba_session_tracker.ui import MainWindow
 from aruba_session_tracker.ui.theme import apply_main_window_theme, build_stylesheet
@@ -59,6 +62,25 @@ def _build_window(qtbot: object, tmp_path: Path) -> MainWindow:
     return window
 
 
+def _observation(*, flags: str = "D", raw_line: str = "sanitized raw row") -> SessionObservation:
+    return SessionObservation(
+        controller_name="MD-01",
+        controller_host="198.51.100.21",
+        protocol=6,
+        source_ip="192.0.2.10",
+        destination_ip="198.51.100.20",
+        source_port=50000,
+        destination_port=443,
+        packets=10,
+        bytes_count=2048,
+        age=18,
+        flags=flags,
+        cpu_id=1,
+        raw_line=raw_line,
+        observed_at=datetime(2026, 9, 1, 3, 0, tzinfo=UTC),
+    )
+
+
 def test_theme_installs_dark_noc_shell_without_replacing_operational_widgets(
     qtbot: object,
     tmp_path: Path,
@@ -83,8 +105,22 @@ def test_theme_installs_dark_noc_shell_without_replacing_operational_widgets(
     assert window.monitor_button is original_monitor_button
     assert window.result_table is original_result_table
     assert window.property("darkNocConsoleInstalled") is True
-    assert window.tabs.tabPosition() == QTabWidget.TabPosition.West
+    assert window.tabs.tabPosition() == QTabWidget.TabPosition.North
+    assert window.tabs.cornerWidget(Qt.Corner.TopRightCorner) is None
+    assert all(window.tabs.tabIcon(index).isNull() for index in range(window.tabs.count()))
+    window.tabs.tabBar().setFocus()
+    QApplication.processEvents()
+    tab_rects = [window.tabs.tabBar().tabRect(index) for index in range(window.tabs.count())]
+    assert len({rect.width() for rect in tab_rects}) == 1
+    assert len({rect.height() for rect in tab_rects}) == 1
+    for index, rect in enumerate(tab_rects):
+        label_width = (
+            window.tabs.tabBar().fontMetrics().horizontalAdvance(window.tabs.tabText(index))
+        )
+        assert rect.width() >= label_width + 24
+        assert rect.height() >= window.tabs.tabBar().fontMetrics().height()
     assert window.central_layout.itemAt(0).widget() is window.nav_identity
+    assert window.nav_identity.isVisible()
     assert window.nav_identity.objectName() == "nocHeader"
     assert window.nav_identity.minimumHeight() == 66
     assert window.nav_identity.maximumHeight() == 66
@@ -145,13 +181,18 @@ def test_theme_stylesheet_uses_approved_dark_tokens_and_semantic_states() -> Non
     assert "background-color: #16212D;" in stylesheet
     assert "background-color: #0A1118;" in stylesheet
     assert "color: #E8EFF6;" in stylesheet
-    assert "border-left: 3px solid #2F80ED;" in stylesheet
+    assert "border-bottom: 3px solid #2F80ED;" in stylesheet
+    assert "width: 176px;" in stylesheet
+    assert "border-bottom: 3px solid transparent;" in stylesheet
+    assert "#2DBE78" in stylesheet
+    assert "#E4A83C" in stylesheet
+    assert "#E05C65" in stylesheet
     assert 'QPushButton[buttonRole="primary"]' in stylesheet
     assert 'QPushButton[buttonRole="dangerStrong"]' in stylesheet
     assert 'QLabel#stateLabel[stateRole="success"]' in stylesheet
     assert 'QLabel#stateLabel[stateRole="warning"]' in stylesheet
     assert 'QLabel#stateLabel[stateRole="danger"]' in stylesheet
-    assert "QTabWidget#mainTabs QTabBar::tab:selected" in stylesheet
+    assert "QTabBar#mainNavigationTabs::tab:selected" in stylesheet
     assert 'QMainWindow#mainWindow[themeContrast="high"]' in stylesheet
     assert "QLineEdit:focus" in stylesheet
     assert "QTableWidget::item:selected" in stylesheet
@@ -179,6 +220,7 @@ def test_theme_can_be_applied_twice_without_duplicate_shell_components(
 ) -> None:
     window = _build_window(qtbot, tmp_path)
     original_widgets = (window.tabs, window.query_button, window.result_table, window.details)
+    original_tab_bar = window.tabs.tabBar()
     original_tab_count = window.tabs.count()
 
     apply_main_window_theme(window)
@@ -196,6 +238,9 @@ def test_theme_can_be_applied_twice_without_duplicate_shell_components(
         window.details,
     ) == original_widgets
     assert window.tabs.count() == original_tab_count
+    assert window.tabs.tabBar() is original_tab_bar
+    assert window.tabs.cornerWidget(Qt.Corner.TopRightCorner) is None
+    assert all(window.tabs.tabIcon(index).isNull() for index in range(window.tabs.count()))
     assert window.details.count() == first_details_count == 3
     assert window.findChild(QFrame, "metricStrip") is first_metric_strip
     assert window.nav_identity is first_header
@@ -203,7 +248,7 @@ def test_theme_can_be_applied_twice_without_duplicate_shell_components(
     window.close()
 
 
-def test_detail_panel_uses_side_layout_on_wide_window_and_stacks_when_narrow(
+def test_detail_panel_preserves_results_viewport_for_wide_and_compact_layouts(
     qtbot: object,
     tmp_path: Path,
 ) -> None:
@@ -218,21 +263,41 @@ def test_detail_panel_uses_side_layout_on_wide_window_and_stacks_when_narrow(
     assert window.details.minimumWidth() == 340
     assert window.details.minimumHeight() == 0
 
-    window.resize(window.minimumSize())
+    window.resize(1100, 820)
     qtbot.waitUntil(  # type: ignore[attr-defined]
-        lambda: window.result_splitter.orientation() == Qt.Orientation.Vertical,
+        lambda: (
+            window.result_splitter.orientation() == Qt.Orientation.Vertical
+            and window.details.minimumHeight() == 190
+        ),
         timeout=3000,
     )
     assert window.details.minimumWidth() == 0
     assert window.details.minimumHeight() == 190
 
-    window.resize(1320, 820)
+    window.resize(1080, 680)
+    window.advanced_toggle_button.setChecked(True)
     window.raw_diagnostics_toggle.setChecked(True)
     qtbot.waitUntil(  # type: ignore[attr-defined]
-        lambda: window.result_splitter.orientation() == Qt.Orientation.Horizontal,
+        lambda: (
+            window.result_splitter.orientation() == Qt.Orientation.Horizontal
+            and window.details.minimumWidth() == 340
+        ),
         timeout=3000,
     )
+    assert window.advanced_panel.isVisible()
+    assert window.details.isVisible()
+    assert window.details.minimumWidth() == 340
+    assert window.details.minimumHeight() == 0
     assert window.result_table.viewport().height() >= 40
+    detail_tab_rects = [
+        window.details.tabBar().tabRect(index) for index in range(window.details.count())
+    ]
+    detail_widths = [rect.width() for rect in detail_tab_rects]
+    assert max(detail_widths) - min(detail_widths) <= 1
+    for index, rect in enumerate(detail_tab_rects):
+        assert rect.width() >= window.details.tabBar().fontMetrics().horizontalAdvance(
+            window.details.tabText(index)
+        )
     window.close()
 
 
@@ -257,7 +322,10 @@ def test_theme_uses_native_palette_roles_for_injected_high_contrast(
     try:
         themed_window = _build_window(qtbot, tmp_path)
         window = themed_window
+        themed_window._append_observation(_observation())
+        assert themed_window.result_table.item(0, 13).foreground().style() != Qt.BrushStyle.NoBrush
         apply_main_window_theme(themed_window)
+        themed_window._append_observation(_observation(raw_line="second sanitized row"))
         themed_window.show()
 
         assert themed_window.property("themeContrast") == "high"
@@ -271,6 +339,54 @@ def test_theme_uses_native_palette_roles_for_injected_high_contrast(
         assert line_palette.color(QPalette.ColorRole.Base) != line_palette.color(
             QPalette.ColorRole.Text
         )
+        for row in range(themed_window.result_table.rowCount()):
+            for column in (13, 14, 15):
+                assert (
+                    themed_window.result_table.item(row, column).foreground().style()
+                    == Qt.BrushStyle.NoBrush
+                )
+    finally:
+        if window is not None:
+            window.close()
+        application.setPalette(original_palette)
+
+
+def test_theme_keeps_header_text_visible_in_light_high_contrast(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    application = QApplication.instance()
+    assert isinstance(application, QApplication)
+    original_palette = application.palette()
+    palette = QPalette(original_palette)
+    palette.setColor(QPalette.ColorRole.Window, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    application.setPalette(palette)
+    window: MainWindow | None = None
+    try:
+        themed_window = _build_window(qtbot, tmp_path)
+        window = themed_window
+        apply_main_window_theme(themed_window)
+        themed_window.show()
+        qtbot.waitUntil(  # type: ignore[attr-defined]
+            lambda: themed_window.product_name_label.isVisible(),
+            timeout=3000,
+        )
+
+        assert themed_window.property("themeContrast") == "high"
+        for label in (themed_window.product_name_label, themed_window.product_meta_label):
+            foreground = label.palette().color(label.foregroundRole()).name()
+            background = (
+                themed_window.nav_identity.palette().color(QPalette.ColorRole.Window).name()
+            )
+            assert foreground == "#000000"
+            assert _contrast_ratio(foreground, background) >= 7.0
     finally:
         if window is not None:
             window.close()
@@ -292,4 +408,130 @@ def test_raw_console_keeps_terminal_contrast_after_widget_is_shown(
     text = palette.color(QPalette.ColorRole.Text).name()
     base = palette.color(QPalette.ColorRole.Base).name()
     assert _contrast_ratio(text, base) >= 4.5
+    window.close()
+
+
+def test_selected_session_summary_tracks_existing_row_and_preserves_raw_widgets(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = _build_window(qtbot, tmp_path)
+    original_raw = window.raw_view
+    original_diagnostics = window.diagnostics_list
+    apply_main_window_theme(window)
+    window._append_observation(_observation())
+    window.resize(1320, 820)
+    window.raw_diagnostics_toggle.setChecked(True)
+    window.result_table.selectRow(0)
+    window.details.setCurrentIndex(0)
+    window.show()
+
+    protocol = window.findChild(QLabel, "detailProtocol")
+    assert protocol is not None
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: protocol.text() == "TCP (6)" and window.details.minimumWidth() == 340,
+        timeout=3000,
+    )
+
+    assert window.details.widget(1) is original_raw
+    assert window.details.widget(2) is original_diagnostics
+    assert window.raw_view.toPlainText() == "sanitized raw row"
+    assert window.result_splitter.orientation() == Qt.Orientation.Horizontal
+    assert window.result_table.viewport().height() >= 40
+    assert protocol.wordWrap()
+    assert "─" not in protocol.text()
+    assert "▶" not in protocol.text()
+
+    endpoint_values = window.findChildren(QLabel, "detailEndpointValue")
+    assert [label.text() for label in endpoint_values] == [
+        "192.0.2.10:50000",
+        "198.51.100.20:443",
+    ]
+    assert all(label.wordWrap() for label in endpoint_values)
+    assert all(
+        label.width() >= label.fontMetrics().horizontalAdvance(label.text())
+        for label in endpoint_values
+    )
+
+    fact_values: dict[str, QLabel] = {}
+    for frame in window.findChildren(QFrame, "detailFact"):
+        caption = frame.findChild(QLabel, "detailFactLabel")
+        value = frame.findChild(QLabel, "detailFactValue")
+        assert caption is not None
+        assert value is not None
+        assert value.wordWrap()
+        assert (
+            value.width() >= value.fontMetrics().horizontalAdvance(value.text())
+            or value.height() >= value.sizeHint().height()
+        )
+        fact_values[caption.text()] = value
+    assert fact_values["STATUS"].text() == "현재 관측됨"
+    assert fact_values["CONTROLLER"].text() == "MD-01"
+    assert fact_values["FLAGS"].text() == "D"
+    assert fact_values["LAST SEEN"].text() == window.result_table.item(0, 12).text()
+    assert fact_values["PACKETS"].text() == "10"
+    assert fact_values["BYTES"].text() == "2,048"
+    assert fact_values["AGE"].text() == "18"
+    assert fact_values["CPU"].text() == "1"
+
+    metric_values: dict[str, str] = {}
+    for frame in window.findChildren(QFrame, "metricCard"):
+        caption = frame.findChild(QLabel, "metricLabel")
+        value = frame.findChild(QLabel, "metricValue")
+        assert caption is not None
+        assert value is not None
+        metric_values[caption.text()] = value.text()
+    assert metric_values == {
+        "ACTIVE FLOWS": "1",
+        "VISIBLE ROWS": "1",
+        "CHANGED FLOWS": "0",
+        "CONTROLLERS": "1",
+    }
+
+    status_item = window.result_table.item(0, 14)
+    assert status_item.foreground().style() == Qt.BrushStyle.NoBrush
+    assert window.result_table.item(0, 13).foreground().color().name() == "#e05c65"
+    assert window.result_table.item(0, 15).foreground().color().name() == "#e05c65"
+
+    window.details.setCurrentWidget(original_raw)
+    assert window.raw_view.toPlainText() == "sanitized raw row"
+    window.resize(1080, 680)
+    window.advanced_toggle_button.setChecked(True)
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: (
+            window.result_splitter.orientation() == Qt.Orientation.Horizontal
+            and window.result_table.viewport().height() >= 40
+        ),
+        timeout=3000,
+    )
+    window.close()
+
+
+def test_compact_advanced_layout_keeps_selected_session_details_scrollable(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = _build_window(qtbot, tmp_path)
+    apply_main_window_theme(window)
+    window._append_observation(_observation())
+    window.resize(window.minimumSize())
+    window.advanced_toggle_button.setChecked(True)
+    window.raw_diagnostics_toggle.setChecked(True)
+    window.result_table.selectRow(0)
+    window.details.setCurrentIndex(0)
+    window.show()
+
+    scroll = window.findChild(QScrollArea, "sessionDetailScroll")
+    assert scroll is not None
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: scroll.isVisible() and scroll.verticalScrollBar().maximum() > 0,
+        timeout=3000,
+    )
+
+    assert window.result_splitter.orientation() == Qt.Orientation.Horizontal
+    assert window.result_table.viewport().height() >= 40
+    assert window.details.width() >= 300
+    assert scroll.viewport().height() > 0
+    assert scroll.widget() is not None
+    assert scroll.widget().height() > scroll.viewport().height()
     window.close()

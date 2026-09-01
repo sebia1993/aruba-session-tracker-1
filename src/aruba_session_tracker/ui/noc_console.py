@@ -9,19 +9,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer
 from PySide6.QtWidgets import (
     QBoxLayout,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
-    QProxyStyle,
-    QStyle,
-    QStyleOption,
-    QStyleOptionTab,
-    QTabBar,
+    QScrollArea,
     QTableWidget,
     QTabWidget,
     QVBoxLayout,
@@ -34,38 +29,7 @@ if TYPE_CHECKING:
 
 _DASH = "—"
 _SIDE_DETAIL_BREAKPOINT = 1200
-
-
-class _HorizontalRailTabStyle(QProxyStyle):
-    """Keep labels horizontal while the existing QTabBar is on the west side."""
-
-    def sizeFromContents(
-        self,
-        content_type: QStyle.ContentsType,
-        option: QStyleOption,
-        size: QSize,
-        widget: QWidget | None = None,
-    ) -> QSize:
-        calculated = super().sizeFromContents(content_type, option, size, widget)
-        if content_type == QStyle.ContentsType.CT_TabBarTab:
-            return QSize(184, max(52, calculated.height()))
-        return calculated
-
-    def drawControl(
-        self,
-        element: QStyle.ControlElement,
-        option: QStyleOption,
-        painter: QPainter,
-        widget: QWidget | None = None,
-    ) -> None:
-        if element == QStyle.ControlElement.CE_TabBarTabLabel and isinstance(
-            option, QStyleOptionTab
-        ):
-            horizontal = QStyleOptionTab(option)
-            horizontal.shape = QTabBar.Shape.RoundedNorth
-            super().drawControl(element, horizontal, painter, widget)
-            return
-        super().drawControl(element, option, painter, widget)
+_COMPACT_DETAIL_HEIGHT = 760
 
 
 class _NocConsoleController(QObject):
@@ -109,26 +73,19 @@ class _NocConsoleController(QObject):
         self._refresh_header()
         self._refresh_metrics()
         self._refresh_detail()
-        self._refresh_status_cells()
 
     def _install_shell(self) -> None:
         window = self._window
-        window.tabs.setTabPosition(QTabWidget.TabPosition.West)
+        window.tabs.setTabPosition(QTabWidget.TabPosition.North)
         window.tabs.setUsesScrollButtons(False)
         window.tabs.tabBar().setExpanding(False)
         window.tabs.tabBar().setDrawBase(False)
-        window.tabs.tabBar().setIconSize(QSize(18, 18))
-
-        tab_style = _HorizontalRailTabStyle()
-        tab_style.setParent(window.tabs.tabBar())
-        window.tabs.tabBar().setStyle(tab_style)
-
-        for index, icon_name in enumerate(("query", "settings", "history")):
-            window.tabs.setTabIcon(index, _navigation_icon(icon_name))
-
         # Reuse the existing identity frame instead of creating a second product
-        # header. Reparenting removes it from the QTabWidget corner safely.
+        # header. Explicitly release the registered corner before reparenting it.
+        # Qt accepts a null widget to release the corner; PySide's stub omits it.
+        window.tabs.setCornerWidget(None, Qt.Corner.TopRightCorner)  # type: ignore[arg-type]
         window.nav_identity.setParent(window.central_root)
+        window.nav_identity.setVisible(True)
         window.nav_identity.setObjectName("nocHeader")
         existing_layout = window.nav_identity.layout()
         if isinstance(existing_layout, QBoxLayout):
@@ -137,8 +94,11 @@ class _NocConsoleController(QObject):
             header_layout = QHBoxLayout(window.nav_identity)
         while header_layout.count():
             item = header_layout.takeAt(0)
-            if item is not None and item.widget() is not None:
-                item.widget().setParent(window.nav_identity)
+            if item is None:
+                continue
+            child = item.widget()
+            if child is not None:
+                child.setParent(window.nav_identity)
         header_layout.setContentsMargins(18, 9, 18, 9)
         header_layout.setSpacing(10)
 
@@ -229,25 +189,38 @@ class _NocConsoleController(QObject):
         window = self._window
         page = QWidget(window.details)
         page.setObjectName("sessionDetailPage")
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(10)
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
 
-        heading_row = QHBoxLayout()
+        scroll = QScrollArea(page)
+        scroll.setObjectName("sessionDetailScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget(scroll)
+        content.setObjectName("sessionDetailContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+
+        heading_row = QVBoxLayout()
+        heading_row.setSpacing(2)
         heading = QLabel("SELECTED SESSION", page)
         heading.setObjectName("detailEyebrow")
         self._detail_values["hint"] = QLabel("세션 행을 선택하면 조사 요약을 표시합니다.", page)
         self._detail_values["hint"].setObjectName("detailHint")
+        self._detail_values["hint"].setWordWrap(True)
         heading_row.addWidget(heading)
-        heading_row.addStretch(1)
         heading_row.addWidget(self._detail_values["hint"])
         layout.addLayout(heading_row)
 
         flow = QFrame(page)
         flow.setObjectName("sessionFlowCard")
-        flow_layout = QHBoxLayout(flow)
-        flow_layout.setContentsMargins(14, 12, 14, 12)
-        flow_layout.setSpacing(12)
+        flow_layout = QGridLayout(flow)
+        flow_layout.setContentsMargins(9, 8, 9, 8)
+        flow_layout.setHorizontalSpacing(8)
+        flow_layout.setVerticalSpacing(4)
 
         source_block = _detail_endpoint("SOURCE", page)
         destination_block = _detail_endpoint("DESTINATION", page)
@@ -261,11 +234,21 @@ class _NocConsoleController(QObject):
         protocol = QLabel(_DASH, page)
         protocol.setObjectName("detailProtocol")
         protocol.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        protocol.setWordWrap(True)
         self._detail_values["protocol"] = protocol
 
-        flow_layout.addWidget(source_block, 1)
-        flow_layout.addWidget(protocol)
-        flow_layout.addWidget(destination_block, 1)
+        flow_layout.addWidget(source_block, 0, 0)
+        flow_layout.addWidget(destination_block, 0, 1)
+        flow_layout.addWidget(
+            protocol,
+            1,
+            0,
+            1,
+            2,
+            Qt.AlignmentFlag.AlignHCenter,
+        )
+        flow_layout.setColumnStretch(0, 1)
+        flow_layout.setColumnStretch(1, 1)
         layout.addWidget(flow)
 
         facts = QFrame(page)
@@ -273,7 +256,7 @@ class _NocConsoleController(QObject):
         facts_layout = QGridLayout(facts)
         facts_layout.setContentsMargins(0, 0, 0, 0)
         facts_layout.setHorizontalSpacing(8)
-        facts_layout.setVerticalSpacing(8)
+        facts_layout.setVerticalSpacing(6)
         fields = (
             ("status", "STATUS"),
             ("controller", "CONTROLLER"),
@@ -288,23 +271,28 @@ class _NocConsoleController(QObject):
             fact = QFrame(facts)
             fact.setObjectName("detailFact")
             fact_layout = QVBoxLayout(fact)
-            fact_layout.setContentsMargins(10, 7, 10, 7)
+            fact_layout.setContentsMargins(9, 5, 9, 5)
             fact_layout.setSpacing(1)
             caption = QLabel(label, fact)
             caption.setObjectName("detailFactLabel")
             value = QLabel(_DASH, fact)
             value.setObjectName("detailFactValue")
             value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            value.setWordWrap(True)
             fact_layout.addWidget(caption)
             fact_layout.addWidget(value)
-            facts_layout.addWidget(fact, index // 4, index % 4)
+            facts_layout.addWidget(fact, index // 2, index % 2)
             self._detail_values[key] = value
         layout.addWidget(facts)
         layout.addStretch(1)
+        scroll.setWidget(content)
+        page_layout.addWidget(scroll)
 
         window.details.insertTab(0, page, "DETAILS")
         window.details.setTabText(1, "RAW CLI")
         window.details.setTabText(2, "DIAGNOSTICS")
+        window.details.setUsesScrollButtons(False)
+        window.details.tabBar().setExpanding(True)
         window.details.setAccessibleDescription(
             "선택 세션 요약, Raw CLI와 진단 이벤트를 전환합니다."
         )
@@ -330,7 +318,11 @@ class _NocConsoleController(QObject):
 
     def _apply_detail_orientation(self) -> None:
         window = self._window
-        use_side_panel = window.width() >= _SIDE_DETAIL_BREAKPOINT
+        use_side_panel = (
+            window.width() >= _SIDE_DETAIL_BREAKPOINT
+            or window.height() < _COMPACT_DETAIL_HEIGHT
+            or window.advanced_toggle_button.isChecked()
+        )
         orientation = Qt.Orientation.Horizontal if use_side_panel else Qt.Orientation.Vertical
         window.result_splitter.setOrientation(orientation)
         if use_side_panel:
@@ -433,7 +425,7 @@ class _NocConsoleController(QObject):
         self._set_detail("hint", f"결과 행 {row + 1:,}")
         self._set_detail("source", source)
         self._set_detail("destination", destination)
-        self._set_detail("protocol", f"── {protocol} ──▶")
+        self._set_detail("protocol", protocol)
         self._set_detail("status", _item_text(table, row, 14) or _DASH)
         self._set_detail("controller", _item_text(table, row, 0) or _DASH)
         self._set_detail("flags", _item_text(table, row, 13) or _DASH)
@@ -442,23 +434,6 @@ class _NocConsoleController(QObject):
         self._set_detail("bytes", _item_text(table, row, 7) or _DASH)
         self._set_detail("age", _item_text(table, row, 10) or _DASH)
         self._set_detail("cpu", _item_text(table, row, 11) or _DASH)
-
-    def _refresh_status_cells(self) -> None:
-        if self._window.property("themeContrast") == "high":
-            return
-        table = self._window.result_table
-        for row in range(table.rowCount()):
-            status_item = table.item(row, 14)
-            if status_item is None:
-                continue
-            status = status_item.text()
-            if "종료" in status:
-                color = QColor("#E05C65")
-            elif "미관측" in status or "신뢰 불가" in status:
-                color = QColor("#E4A83C")
-            else:
-                color = QColor("#2DBE78")
-            status_item.setForeground(color)
 
     def _set_metric(self, key: str, value: int) -> None:
         label = self._metric_values.get(key)
@@ -517,39 +492,12 @@ def _detail_endpoint(label: str, parent: QWidget) -> QFrame:
     caption.setObjectName("detailEndpointLabel")
     value = QLabel(_DASH, block)
     value.setObjectName("detailEndpointValue")
+    value.setMinimumWidth(0)
     value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
     value.setWordWrap(True)
     layout.addWidget(caption)
     layout.addWidget(value)
     return block
-
-
-def _navigation_icon(name: str) -> QIcon:
-    pixmap = QPixmap(22, 22)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    pen = QPen(QColor("#B9C9D8"), 1.7)
-    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-    painter.setPen(pen)
-    painter.setBrush(Qt.BrushStyle.NoBrush)
-
-    if name == "query":
-        painter.drawEllipse(QRectF(3.5, 3.5, 10.5, 10.5))
-        painter.drawLine(QPointF(12.2, 12.2), QPointF(18.3, 18.3))
-        painter.drawLine(QPointF(5.8, 17.5), QPointF(10.0, 17.5))
-    elif name == "settings":
-        painter.drawRoundedRect(QRectF(3.0, 4.0, 16.0, 14.0), 2.0, 2.0)
-        painter.drawLine(QPointF(6.0, 8.0), QPointF(16.0, 8.0))
-        painter.drawLine(QPointF(6.0, 12.0), QPointF(16.0, 12.0))
-        painter.drawLine(QPointF(6.0, 16.0), QPointF(13.0, 16.0))
-    else:
-        painter.drawEllipse(QRectF(3.0, 3.0, 16.0, 16.0))
-        painter.drawLine(QPointF(11.0, 6.0), QPointF(11.0, 11.0))
-        painter.drawLine(QPointF(11.0, 11.0), QPointF(15.0, 13.0))
-    painter.end()
-    return QIcon(pixmap)
 
 
 def _item_text(table: QTableWidget, row: int, column: int) -> str:

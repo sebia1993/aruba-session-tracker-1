@@ -21,11 +21,14 @@ FlowKey = tuple[str, str, str, str, str]
 _EVENT_LABELS = {
     "STARTED": "세션 확인 시작",
     "OPENED": "세션 확인 시작",
+    "OBSERVED": "세션 다시 확인",
     "CLOSED": "세션 종료 확인",
     "MISSED": "세션 일시 미확인",
     "CONTROLLER_CHANGED": "관측 MD 변경 확인",
-    "FLAGS_CHANGED": "Flags 변경 확인",
+    "FLAGS_CHANGED": "세션 특이사항 변경 확인",
+    "COUNTERS_CHANGED": "세션 수치 기준 변경 확인",
 }
+_TIMELINE_LIMIT = 12
 _STATE_ORDER = ("확인됨", "관측됨", "잠시 미확인", "종료 확인")
 _STATE_LABELS = {
     "확인됨": "확인됨",
@@ -98,6 +101,7 @@ def _report_chunks(
     )
     total_sessions = len(flow_groups) if logical_session_total is None else logical_session_total
     displayed_latest = len(latest_groups)
+    latest_observations = tuple(rows[-1] for _flow, rows in latest_groups)
     latest_note = (
         f"고유 세션 {_base._format_integer(total_sessions)}개를 모두 표시합니다."
         if displayed_latest >= total_sessions
@@ -122,8 +126,11 @@ def _report_chunks(
         run.get("destination_port"),
         other_address=run.get("source_ip"),
     )
-    state_counts = _state_counts(flow_groups, flow_statuses, session_statuses)
+    state_counts = _state_counts(latest_groups, flow_statuses, session_statuses)
     timeline = _timeline_markup(snapshot)
+    duration = _format_duration(run.get("started_at"), run.get("ended_at"))
+    observed_controllers = _observed_controllers(latest_observations)
+    observed_controller_text = " · ".join(observed_controllers) if observed_controllers else "—"
 
     yield f"""<!doctype html>
 <html lang="ko">
@@ -201,6 +208,13 @@ def _report_chunks(
     .run-fact:last-child {{ border-bottom:0; }}
     .run-fact dt {{ color:var(--text-muted); font-size:.76rem; font-weight:750; }}
     .run-fact dd {{ margin:0; color:#17324d; font-size:.84rem; font-weight:750;
+      overflow-wrap:anywhere; }}
+    .collection-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:9px;
+      margin:11px 0 0; }}
+    .collection-fact {{ min-width:0; padding:10px 11px; border:1px solid var(--border);
+      border-radius:7px; background:#f8fafc; }}
+    .collection-fact dt {{ color:var(--text-muted); font-size:.74rem; font-weight:700; }}
+    .collection-fact dd {{ margin:3px 0 0; color:#17324d; font-weight:800;
       overflow-wrap:anywhere; }}
 
     .insight-grid {{ display:grid; grid-template-columns:minmax(310px,.72fr) minmax(0,1.28fr);
@@ -333,6 +347,7 @@ def _report_chunks(
       .filter-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
       .state-content {{ grid-template-columns:130px minmax(0,1fr); }}
       .state-ring {{ width:126px; height:126px; }}
+      .collection-grid {{ grid-template-columns:1fr; }}
     }}
     @media (max-width:720px) {{
       .report-header-inner {{ align-items:flex-start; }}
@@ -395,7 +410,7 @@ def _report_chunks(
       th {{ position:static; }}
       th,td {{ padding:4px; overflow-wrap:anywhere; }}
       .muted {{ padding:8px 4px; }}
-      .summary-stats,.flow-panel,.state-content,.event-item,tr {{ break-inside:avoid; }}
+      .summary-stats,.flow-panel,.state-content,.event-item,.collection-fact,tr {{ break-inside:avoid; }}
       tbody tr:nth-child(even),tbody tr:hover {{ background:#fff; }}
     }}
   </style>
@@ -444,9 +459,8 @@ def _report_chunks(
         <aside class="hero-side" aria-label="보고서 기준">
           <p class="section-kicker">REPORT BASIS</p>
           <dl class="run-facts">
-            {_run_fact("수집 상태", run_status)}
-            {_run_fact("검색 방향", query_direction)}
-            {_run_fact("최신 표시", f"{_base._format_integer(displayed_latest)}개")}
+            {_run_fact("추적 시간", duration)}
+            {_run_fact("최신 표시", f"{_base._format_integer(displayed_latest)}/{_base._format_integer(total_sessions)}개")}
             {_run_fact("전체 이력", f"{_base._format_integer(snapshot.observation_total)}건")}
           </dl>
         </aside>
@@ -456,15 +470,15 @@ def _report_chunks(
     <div class="insight-grid">
       <section id="session-state" aria-labelledby="session-state-title">
         <p class="section-kicker">SESSION STATE</p>
-        <h3 id="session-state-title">세션 상태 요약</h3>
-        <p class="section-note">저장된 최신 수명주기 사실을 논리 세션 단위로 집계합니다.</p>
-        {_state_summary_markup(state_counts)}
+        <h3 id="session-state-title">최신 표시 세션 상태</h3>
+        <p class="section-note">최신 결과에 표시된 {_base._format_integer(displayed_latest)}/{_base._format_integer(total_sessions)}개 논리 세션만 집계합니다.</p>
+        {_state_summary_markup(state_counts, displayed_latest=displayed_latest, total_sessions=total_sessions)}
       </section>
 
       <section id="significant-events" aria-labelledby="significant-events-title">
         <p class="section-kicker">SIGNIFICANT EVENTS</p>
         <h3 id="significant-events-title">주요 세션 변화</h3>
-        <p class="section-note">저장된 수명주기 및 관측 MD 변경 사실 중 최근 항목입니다.</p>
+        <p class="section-note">보고서 스냅샷에 포함된 저장 사실 중 최근 최대 {_TIMELINE_LIMIT}개입니다. 원인이나 전체 이벤트 이력을 의미하지 않습니다.</p>
         {timeline}
       </section>
     </div>
@@ -524,6 +538,17 @@ def _report_chunks(
       </table></div>
     </section>
 
+    <section id="collection-information" aria-labelledby="collection-information-title">
+      <p class="section-kicker">COLLECTION INFORMATION</p>
+      <h2 id="collection-information-title">수집 정보</h2>
+      <p class="section-note">최신 세션 결과에 실제로 기록된 장비 이름만 표시하며 장비 도달성이나 상태를 의미하지 않습니다.</p>
+      <dl class="collection-grid">
+        {_collection_fact("최근 세션 관측 장비", observed_controller_text)}
+        {_collection_fact("최신 세션 표시 범위", f"{_base._format_integer(displayed_latest)}/{_base._format_integer(total_sessions)}개")}
+        {_collection_fact("저장된 전체 관측", f"{_base._format_integer(snapshot.observation_total)}건")}
+      </dl>
+    </section>
+
     <section id="observation-history">
       <div class="section-heading-row">
         <div>
@@ -577,10 +602,19 @@ def _state_counts(
     return counts
 
 
-def _state_summary_markup(counts: dict[str, int]) -> str:
+def _state_summary_markup(
+    counts: dict[str, int],
+    *,
+    displayed_latest: int,
+    total_sessions: int,
+) -> str:
     total = sum(counts.values())
     if total == 0:
-        return '<p class="muted">상태를 집계할 논리 세션이 없습니다.</p>'
+        return (
+            '<p class="muted">최신 표시 '
+            f"{_base._format_integer(displayed_latest)}/"
+            f"{_base._format_integer(total_sessions)}개 범위에 집계할 세션이 없습니다.</p>"
+        )
     offset = 0.0
     segments: list[str] = []
     for status in _STATE_ORDER:
@@ -607,11 +641,13 @@ def _state_summary_markup(counts: dict[str, int]) -> str:
     return (
         '<div class="state-content">'
         '<svg class="state-ring" viewBox="0 0 120 120" role="img" '
-        f'aria-label="논리 세션 {_base._format_integer(total)}개 상태 분포">'
+        f'aria-label="최신 표시 {_base._format_integer(total)}/'
+        f'{_base._format_integer(total_sessions)}개 상태 분포">'
         '<circle class="state-ring-base" cx="60" cy="60" r="44"></circle>'
         f"{ring}"
         f'<text class="state-total" x="60" y="59">{_base._format_integer(total)}</text>'
-        '<text class="state-caption" x="60" y="74">LOGICAL SESSIONS</text>'
+        f'<text class="state-caption" x="60" y="74">LATEST '
+        f"{_base._format_integer(total)}/{_base._format_integer(total_sessions)}</text>"
         "</svg>"
         f'<div class="state-list">{rows}</div>'
         "</div>"
@@ -620,23 +656,9 @@ def _state_summary_markup(counts: dict[str, int]) -> str:
 
 def _timeline_markup(snapshot: RunReportSnapshot) -> str:
     entries: list[tuple[datetime, int, str, str, str]] = []
-    for index, row in enumerate(snapshot.lifecycle_events):
-        event_type = str(row.get("event_type") or "").upper()
-        label = _EVENT_LABELS.get(event_type)
-        parsed = _base._parse_datetime(row.get("occurred_at"))
-        if label is None or parsed is None:
-            continue
-        entries.append(
-            (
-                parsed,
-                index,
-                _base._format_kst(row.get("occurred_at")),
-                label,
-                _session_key_context(row.get("session_key")),
-            )
-        )
+    controller_entries: list[tuple[datetime, int, str, str, str]] = []
+    controller_fact_counts: dict[tuple[datetime, str], int] = {}
 
-    base_index = len(entries)
     for index, row in enumerate(snapshot.controller_events):
         parsed = _base._parse_datetime(row.get("occurred_at"))
         if parsed is None:
@@ -648,24 +670,54 @@ def _timeline_markup(snapshot: RunReportSnapshot) -> str:
             if previous != "-" or current != "-"
             else "관측 MD 정보가 변경되었습니다."
         )
-        entries.append(
+        fact_key = (parsed, current)
+        controller_fact_counts[fact_key] = controller_fact_counts.get(fact_key, 0) + 1
+        controller_entries.append(
             (
                 parsed,
-                base_index + index,
+                len(snapshot.lifecycle_events) + index,
                 _base._format_kst(row.get("occurred_at")),
                 "관측 MD 변경 확인",
                 detail,
             )
         )
 
+    for index, row in enumerate(snapshot.lifecycle_events):
+        event_type = str(row.get("event_type") or "").upper()
+        label = _EVENT_LABELS.get(event_type)
+        parsed = _base._parse_datetime(row.get("occurred_at"))
+        if label is None or parsed is None:
+            continue
+        # The normal persistence path records a confirmed controller move in
+        # both lifecycle_events and controller_events. Suppress only one
+        # lifecycle row for a controller fact with the same timestamp and
+        # current controller; a timestamp alone is not a safe correlation key.
+        if event_type == "CONTROLLER_CHANGED":
+            fact_key = (parsed, _base._plain(row.get("controller_name")))
+            remaining = controller_fact_counts.get(fact_key, 0)
+            if remaining > 0:
+                controller_fact_counts[fact_key] = remaining - 1
+                continue
+        entries.append(
+            (
+                parsed,
+                index,
+                _base._format_kst(row.get("occurred_at")),
+                label,
+                _session_key_context(row.get("session_key")),
+            )
+        )
+
+    entries.extend(controller_entries)
+
     deduplicated: dict[tuple[str, str, str], tuple[datetime, int, str, str, str]] = {}
     for entry in entries:
         key = (entry[2], entry[3], entry[4])
         deduplicated.setdefault(key, entry)
     ordered = sorted(deduplicated.values(), key=lambda item: (item[0], item[1]))
-    ordered = ordered[-12:]
+    ordered = ordered[-_TIMELINE_LIMIT:]
     if not ordered:
-        return '<p class="muted">기록된 주요 세션 변화가 없습니다.</p>'
+        return '<p class="muted">보고서 스냅샷에 표시할 저장 사실이 없습니다.</p>'
     return (
         '<ol class="event-list">'
         + "".join(
@@ -693,8 +745,35 @@ def _session_key_context(value: object) -> str:
     return f"{protocol} · {source} → {destination}"
 
 
+def _format_duration(started_at: object, ended_at: object) -> str:
+    started = _base._parse_datetime(started_at)
+    ended = _base._parse_datetime(ended_at)
+    if started is None or ended is None or ended < started:
+        return "-"
+    total_seconds = int((ended - started).total_seconds())
+    days, remaining = divmod(total_seconds, 86_400)
+    hours, remaining = divmod(remaining, 3_600)
+    minutes, seconds = divmod(remaining, 60)
+    if days:
+        return f"{days}일 {hours}시간 {minutes}분 {seconds}초"
+    if hours:
+        return f"{hours}시간 {minutes}분 {seconds}초"
+    return f"{minutes}분 {seconds}초"
+
+
+def _observed_controllers(rows: tuple[ReportRow, ...]) -> tuple[str, ...]:
+    values = {value for row in rows if (value := _base._plain(row.get("controller_name"))) != "-"}
+    return tuple(sorted(values, key=lambda value: (value.casefold(), value)))
+
+
 def _run_fact(label: str, value: object) -> str:
     return f'<div class="run-fact"><dt>{_base._e(label)}</dt><dd>{_base._e(value)}</dd></div>'
+
+
+def _collection_fact(label: str, value: object) -> str:
+    return (
+        f'<div class="collection-fact"><dt>{_base._e(label)}</dt><dd>{_base._e(value)}</dd></div>'
+    )
 
 
 __all__ = [

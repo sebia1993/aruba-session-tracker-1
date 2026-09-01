@@ -3,7 +3,7 @@ param(
     [string]$PythonPath = "python",
 
     [ValidatePattern("^\d+\.\d+\.\d+$")]
-    [string]$Version = "0.5.9",
+    [string]$Version = "0.6.0",
 
     [switch]$SkipValidation,
     [switch]$UseCurrentEnvironment,
