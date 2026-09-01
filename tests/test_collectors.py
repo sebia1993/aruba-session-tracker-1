@@ -21,8 +21,11 @@ import aruba_session_tracker.collectors.ssh as ssh_module
 from aruba_session_tracker.collectors import (
     CancellationToken,
     CollectorError,
+    CollectorPhase,
+    CommandBatch,
     CommandConnection,
     HostKeyInfo,
+    MonitoringSSHConnectionFactory,
     PollDeadline,
     SSHCollector,
     StrictNetmikoFactory,
@@ -72,8 +75,76 @@ class FakeFactory:
         return self.connection
 
 
+class _ReusableConnection(FakeConnection):
+    def __init__(self, outputs: dict[str, str]) -> None:
+        super().__init__(outputs)
+        self.alive = True
+        self.close_count = 0
+        self.fail_next: dict[str, BaseException] = {}
+
+    def send_command(self, command: str, *, read_timeout: float) -> str:
+        del read_timeout
+        self.commands.append(command)
+        failure = self.fail_next.pop(command, None)
+        if failure is not None:
+            self.alive = False
+            raise failure
+        return self.outputs[command]
+
+    def is_alive(self) -> bool:
+        return self.alive and not self.closed
+
+    def close(self) -> None:
+        self.close_count += 1
+        self.alive = False
+        self.closed = True
+
+
+class _ReusableFactory:
+    def __init__(self) -> None:
+        self.connections: list[_ReusableConnection] = []
+        self.reuse_tokens: dict[tuple[str, int], bytes] = {}
+
+    def connect(
+        self,
+        target: DeviceTarget,
+        credentials: Credentials,
+        **kwargs: object,
+    ) -> _ReusableConnection:
+        del credentials, kwargs
+        connection = _ReusableConnection(
+            {
+                "no paging": "",
+                "show datapath session table 192.0.2.20": "ok",
+            }
+        )
+        self.connections.append(connection)
+        self.reuse_tokens.setdefault((target.host, target.port), b"trusted-key-one")
+        return connection
+
+    def connection_reuse_token(
+        self,
+        target: DeviceTarget,
+        **kwargs: object,
+    ) -> bytes:
+        del kwargs
+        return self.reuse_tokens[(target.host, target.port)]
+
+
 TARGET = DeviceTarget("MM", "192.0.2.10")
 CREDENTIALS = Credentials("operator", "secret")
+
+
+def _collect_datapath(
+    factory: MonitoringSSHConnectionFactory,
+    *,
+    target: DeviceTarget = TARGET,
+) -> CommandBatch:
+    return SSHCollector(factory).collect(
+        target,
+        CREDENTIALS,
+        ("no paging", "show datapath session table 192.0.2.20"),
+    )
 
 
 def test_collector_allows_only_filtered_read_commands() -> None:
@@ -93,6 +164,258 @@ def test_collector_allows_only_filtered_read_commands() -> None:
         SSHCollector(factory).collect(TARGET, CREDENTIALS, ("show datapath session table",))
     assert caught.value.code is ErrorCode.COMMAND_REJECTED
     assert factory.connect_count == 1
+
+
+def test_monitor_factory_reuses_endpoint_until_explicit_close() -> None:
+    base_factory = _ReusableFactory()
+    pool = MonitoringSSHConnectionFactory(base_factory, CREDENTIALS)
+
+    first = _collect_datapath(pool)
+    second = _collect_datapath(pool)
+
+    assert first.outputs == second.outputs
+    assert len(base_factory.connections) == 1
+    connection = base_factory.connections[0]
+    assert connection.commands == [
+        "no paging",
+        "show datapath session table 192.0.2.20",
+        "no paging",
+        "show datapath session table 192.0.2.20",
+    ]
+    assert connection.closed is False
+
+    pool.close()
+
+    assert connection.closed is True
+    assert pool._credentials is None
+
+
+def test_monitor_factory_reconnects_once_for_dead_reused_paging_transport() -> None:
+    base_factory = _ReusableFactory()
+    pool = MonitoringSSHConnectionFactory(base_factory, CREDENTIALS)
+    _collect_datapath(pool)
+    first = base_factory.connections[0]
+    first.fail_next["no paging"] = OSError("fixture dead transport")
+
+    batch = _collect_datapath(pool)
+
+    assert batch.output_for("show datapath session table 192.0.2.20") == "ok"
+    assert len(base_factory.connections) == 2
+    assert first.closed is True
+    assert base_factory.connections[1].commands == [
+        "no paging",
+        "show datapath session table 192.0.2.20",
+    ]
+    pool.close()
+
+
+def test_monitor_factory_never_retries_authentication_or_data_command_failure() -> None:
+    base_factory = _ReusableFactory()
+    pool = MonitoringSSHConnectionFactory(base_factory, CREDENTIALS)
+    _collect_datapath(pool)
+    first = base_factory.connections[0]
+    first.fail_next["no paging"] = paramiko.AuthenticationException("fixture auth")
+
+    with pytest.raises(CollectorError) as auth_error:
+        _collect_datapath(pool)
+
+    assert auth_error.value.code is ErrorCode.AUTH_FAILED
+    assert auth_error.value.phase is CollectorPhase.LOGIN
+    assert len(base_factory.connections) == 1
+
+    _collect_datapath(pool)
+    second = base_factory.connections[1]
+    second.fail_next["show datapath session table 192.0.2.20"] = OSError(
+        "fixture data transport failure"
+    )
+
+    with pytest.raises(CollectorError) as data_error:
+        _collect_datapath(pool)
+
+    assert data_error.value.code is ErrorCode.MM_UNREACHABLE
+    assert data_error.value.retryable_network is True
+    assert len(base_factory.connections) == 2
+    pool.close()
+
+
+def test_monitor_factory_reconnects_before_reuse_when_local_host_token_changes() -> None:
+    base_factory = _ReusableFactory()
+    pool = MonitoringSSHConnectionFactory(base_factory, CREDENTIALS)
+    _collect_datapath(pool)
+    first = base_factory.connections[0]
+    base_factory.reuse_tokens[(TARGET.host, TARGET.port)] = b"trusted-key-two"
+
+    _collect_datapath(pool)
+
+    assert first.closed is True
+    assert len(base_factory.connections) == 2
+    pool.close()
+
+
+def test_monitor_factory_never_retries_a_host_key_read_failure() -> None:
+    base_factory = _ReusableFactory()
+    pool = MonitoringSSHConnectionFactory(base_factory, CREDENTIALS)
+    _collect_datapath(pool)
+    first = base_factory.connections[0]
+
+    def fail_host_key_read(target: DeviceTarget, **kwargs: object) -> bytes:
+        del target, kwargs
+        raise CollectorError(ErrorCode.HOST_KEY_CHANGED, "sanitized host key failure")
+
+    base_factory.connection_reuse_token = fail_host_key_read  # type: ignore[method-assign]
+    with pytest.raises(CollectorError) as caught:
+        _collect_datapath(pool)
+
+    assert caught.value.code is ErrorCode.HOST_KEY_CHANGED
+    assert len(base_factory.connections) == 1
+    assert first.closed is True
+    pool.close()
+
+
+def test_monitor_factory_bounds_endpoints_and_rejects_changed_credentials() -> None:
+    base_factory = _ReusableFactory()
+    pool = MonitoringSSHConnectionFactory(base_factory, CREDENTIALS)
+    for index in range(6):
+        _collect_datapath(pool, target=DeviceTarget(f"device-{index}", f"192.0.2.{index + 1}"))
+
+    with pytest.raises(CollectorError) as limit_error:
+        _collect_datapath(pool, target=DeviceTarget("device-7", "192.0.2.7"))
+    assert limit_error.value.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
+
+    with pytest.raises(CollectorError) as credential_error:
+        SSHCollector(pool).collect(
+            TARGET,
+            Credentials("operator", "changed"),
+            ("no paging",),
+        )
+    assert credential_error.value.code is ErrorCode.AUTH_FAILED
+    assert credential_error.value.phase is CollectorPhase.LOGIN
+    assert "changed" not in str(credential_error.value)
+    pool.close()
+
+
+def test_monitor_factory_serializes_leases_for_the_same_endpoint() -> None:
+    base_factory = _ReusableFactory()
+    pool = MonitoringSSHConnectionFactory(base_factory, CREDENTIALS)
+    first_entered = Event()
+    release_first = Event()
+    second_entered = Event()
+
+    def first_lease() -> None:
+        with pool.connect(
+            TARGET,
+            CREDENTIALS,
+            host_key_approval=None,
+            cancel_token=CancellationToken(),
+            deadline=PollDeadline.after(5),
+        ):
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+
+    def second_lease() -> None:
+        assert first_entered.wait(timeout=5)
+        with pool.connect(
+            TARGET,
+            CREDENTIALS,
+            host_key_approval=None,
+            cancel_token=CancellationToken(),
+            deadline=PollDeadline.after(5),
+        ):
+            second_entered.set()
+
+    first_worker = Thread(target=first_lease)
+    second_worker = Thread(target=second_lease)
+    first_worker.start()
+    second_worker.start()
+    assert first_entered.wait(timeout=5)
+    assert not second_entered.wait(timeout=0.05)
+    release_first.set()
+    first_worker.join(timeout=5)
+    second_worker.join(timeout=5)
+
+    assert not first_worker.is_alive()
+    assert not second_worker.is_alive()
+    assert second_entered.is_set()
+    assert len(base_factory.connections) == 1
+    pool.close()
+
+
+@pytest.mark.parametrize(
+    ("paging_result", "max_output_bytes", "expected_code"),
+    [
+        ("% Invalid input", 1024, ErrorCode.COMMAND_VARIANT_UNVERIFIED),
+        ("x" * 11, 10, ErrorCode.OUTPUT_LIMIT_EXCEEDED),
+    ],
+)
+def test_monitor_factory_does_not_reconnect_for_paging_command_or_output_failure(
+    paging_result: str,
+    max_output_bytes: int,
+    expected_code: ErrorCode,
+) -> None:
+    base_factory = _ReusableFactory()
+    pool = MonitoringSSHConnectionFactory(base_factory, CREDENTIALS)
+    _collect_datapath(pool)
+    base_factory.connections[0].outputs["no paging"] = paging_result
+
+    with pytest.raises(CollectorError) as caught:
+        SSHCollector(pool, max_output_bytes=max_output_bytes).collect(
+            TARGET,
+            CREDENTIALS,
+            ("no paging", "show datapath session table 192.0.2.20"),
+        )
+
+    assert caught.value.code is expected_code
+    assert len(base_factory.connections) == 1
+    pool.close()
+
+
+def test_monitor_factory_cancel_and_deadline_never_trigger_reconnect() -> None:
+    base_factory = _ReusableFactory()
+    pool = MonitoringSSHConnectionFactory(base_factory, CREDENTIALS)
+    _collect_datapath(pool)
+    first = base_factory.connections[0]
+    token = CancellationToken()
+
+    def cancel_then_timeout(command: str, *, read_timeout: float) -> str:
+        del command, read_timeout
+        first.alive = False
+        token.cancel()
+        raise TimeoutError("fixture cancelled transport")
+
+    first.send_command = cancel_then_timeout  # type: ignore[method-assign]
+    with pytest.raises(CollectorError) as cancelled:
+        SSHCollector(pool).collect(
+            TARGET,
+            CREDENTIALS,
+            ("no paging",),
+            cancel_token=token,
+        )
+
+    assert cancelled.value.code is ErrorCode.CANCELLED
+    assert len(base_factory.connections) == 1
+
+    _collect_datapath(pool)
+    second = base_factory.connections[1]
+    now = [0.0]
+
+    def expire_then_timeout(command: str, *, read_timeout: float) -> str:
+        del command, read_timeout
+        second.alive = False
+        now[0] = 1.0
+        raise TimeoutError("fixture expired transport")
+
+    second.send_command = expire_then_timeout  # type: ignore[method-assign]
+    with pytest.raises(CollectorError) as expired:
+        SSHCollector(pool).collect(
+            TARGET,
+            CREDENTIALS,
+            ("no paging",),
+            deadline=PollDeadline(1.0, lambda: now[0]),
+        )
+
+    assert expired.value.code is ErrorCode.POLL_DEADLINE_EXCEEDED
+    assert len(base_factory.connections) == 2
+    pool.close()
 
 
 def test_collector_checks_cancellation_and_output_limits() -> None:
@@ -470,7 +793,11 @@ def test_cancellation_does_not_hide_an_authentication_failure() -> None:
         def connect(self, *args: object, **kwargs: object) -> FakeConnection:
             del args, kwargs
             token.cancel()
-            raise CollectorError(ErrorCode.AUTH_FAILED, "authentication failed")
+            raise CollectorError(
+                ErrorCode.AUTH_FAILED,
+                "authentication failed",
+                phase=CollectorPhase.LOGIN,
+            )
 
     with pytest.raises(CollectorError) as caught:
         SSHCollector(CancelThenAuthenticationFailure()).collect(  # type: ignore[arg-type]
@@ -481,6 +808,7 @@ def test_cancellation_does_not_hide_an_authentication_failure() -> None:
         )
 
     assert caught.value.code is ErrorCode.AUTH_FAILED
+    assert caught.value.phase is CollectorPhase.LOGIN
 
 
 def test_primary_collector_error_is_not_masked_by_cleanup_failure() -> None:
@@ -536,12 +864,39 @@ def test_factory_cancellation_does_not_hide_connector_authentication_failure(
         )
 
     assert caught.value.code is ErrorCode.AUTH_FAILED
+    assert caught.value.phase is CollectorPhase.LOGIN
+
+
+def test_factory_marks_enable_authentication_phase(tmp_path: Path) -> None:
+    key = paramiko.RSAKey.generate(1024)
+
+    class RejectEnable(FakeNetmiko):
+        def enable(self) -> None:
+            raise NetmikoAuthenticationException("fixture enable authentication failure")
+
+    factory = StrictNetmikoFactory(
+        tmp_path / "known_hosts",
+        key_probe=lambda *_args: key,
+        connector=lambda **_kwargs: RejectEnable(),
+    )
+
+    with pytest.raises(CollectorError) as caught:
+        factory.connect(
+            TARGET,
+            Credentials("operator", "secret", "enable-secret"),
+            host_key_approval=lambda *_args: True,
+            cancel_token=CancellationToken(),
+        )
+
+    assert caught.value.code is ErrorCode.AUTH_FAILED
+    assert caught.value.phase is CollectorPhase.ENABLE
 
 
 def test_factory_deadline_watchdog_aborts_blocked_enable(tmp_path: Path) -> None:
     key = paramiko.RSAKey.generate(1024)
     enable_started = Event()
     transport_closed = Event()
+    now = [0.0]
 
     class BlockingEnableNetmiko(FakeNetmiko):
         remote_conn = None
@@ -554,6 +909,7 @@ def test_factory_deadline_watchdog_aborts_blocked_enable(tmp_path: Path) -> None
 
         def enable(self) -> None:
             enable_started.set()
+            now[0] = 1.0
             assert transport_closed.wait(timeout=2)
 
         def close(self) -> None:
@@ -571,7 +927,7 @@ def test_factory_deadline_watchdog_aborts_blocked_enable(tmp_path: Path) -> None
             Credentials("operator", "secret", "enable-secret"),
             host_key_approval=lambda *_args: True,
             cancel_token=CancellationToken(),
-            deadline=PollDeadline.after(0.1),
+            deadline=PollDeadline(0.1, lambda: now[0]),
         )
 
     assert enable_started.is_set()

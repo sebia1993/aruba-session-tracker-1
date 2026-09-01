@@ -35,6 +35,7 @@ from aruba_session_tracker.paths import AppPaths, UnsafeManagedPath
 from aruba_session_tracker.runtime import RuntimeExecutor
 from aruba_session_tracker.single_instance import SingleInstanceGuard
 from aruba_session_tracker.storage import SessionStore, StorageError
+from aruba_session_tracker.support_codes import UiFailureKey, support_code_for_ui_failure
 from aruba_session_tracker.ui import DeveloperInspectorController, MainWindow
 from aruba_session_tracker.ui.startup import StartupCoordinator, StartupWindow
 from aruba_session_tracker.ui.theme import apply_main_window_theme
@@ -89,6 +90,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     application.setApplicationName("Aruba Session Tracker")
     application.setApplicationVersion(__version__)
+    startup_support_code = support_code_for_ui_failure(UiFailureKey.STARTUP_FAILED).value
     paths = AppPaths.default()
     instance_guard = SingleInstanceGuard(str(paths.root))
     try:
@@ -98,7 +100,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             None,
             "Aruba Session Tracker 시작 실패",
             "프로그램 실행 상태를 확인할 수 없습니다. LocalAppData 권한을 "
-            f"확인하십시오.\n\n오류 유형: {type(exc).__name__}",
+            f"확인하십시오.\n\n오류 유형: {type(exc).__name__}"
+            f"\n전달 코드: {startup_support_code}",
         )
         return 1
     if not acquired:
@@ -138,7 +141,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             None,
             "Aruba Session Tracker 시작 실패",
             "로컬 저장소를 초기화할 수 없습니다. 디스크 공간과 LocalAppData 권한을 "
-            f"확인하십시오.\n\n오류 유형: {exception_type}",
+            f"확인하십시오.\n\n오류 유형: {exception_type}"
+            f"\n전달 코드: {startup_support_code}",
         )
         instance_guard.release()
         return 1
@@ -153,7 +157,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             None,
             "Aruba Session Tracker 시작 실패",
             "로컬 실행 상태 기록을 안전하게 준비할 수 없습니다. LocalAppData 권한을 "
-            f"확인하십시오.\n\n오류 유형: {type(exc).__name__}",
+            f"확인하십시오.\n\n오류 유형: {type(exc).__name__}"
+            f"\n전달 코드: {startup_support_code}",
         )
         instance_guard.release()
         return 1

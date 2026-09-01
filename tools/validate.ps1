@@ -39,7 +39,7 @@ try {
     Invoke-Checked $PythonPath @("-m", "ruff", "format", "--check", ".")
     Invoke-Checked $PythonPath @("-m", "mypy", "src")
 
-    $pytestArguments = @("-m", "pytest")
+    $pytestArguments = @("-m", "pytest", "-m", "not soak")
     if (-not $SkipCoverage) {
         $coveragePath = Join-Path $repoRoot "artifacts\coverage.xml"
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $coveragePath) | Out-Null

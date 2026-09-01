@@ -19,7 +19,7 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 - 로컬 SQLite 이력, 실행별 Raw TXT, 독립적인 CSV와 HTML 보고서 내보내기
 - 실행할 때마다 꺼진 상태로 시작하는 `F12` 화면 개선 도우미
 
-다음은 v0.5.8 범위에 포함되지 않습니다.
+다음은 v0.5.9 범위에 포함되지 않습니다.
 
 - 장비 설정 변경, 사용자 삭제 또는 쓰기 API
 - 무필터 `show datapath session table` 실행
@@ -31,13 +31,15 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 
 ### 포터블 ZIP
 
-1. GitHub Releases에서 `ArubaSessionTracker_v0.5.8_windows_x64.zip`을
-   받습니다. GitHub의 자동 생성 Source code ZIP/TAR는 실행 프로그램이
+1. 최신 `main` 검증본은 GitHub Releases의 `continuous`에서
+   `ArubaSessionTracker_v0.5.9_windows_x64.zip`을 받습니다. 파일명의 버전은
+   빌드된 프로그램 버전이며 변경 불가 `v0.5.9` 태그 릴리스가 게시되었다는
+   뜻은 아닙니다. GitHub의 자동 생성 Source code ZIP/TAR는 실행 프로그램이
    아닙니다.
 2. 릴리스 본문의 SHA-256과 PowerShell 계산 결과를 비교합니다.
 
    ```powershell
-   Get-FileHash -Algorithm SHA256 .\ArubaSessionTracker_v0.5.8_windows_x64.zip
+   Get-FileHash -Algorithm SHA256 .\ArubaSessionTracker_v0.5.9_windows_x64.zip
    ```
 
 3. ZIP을 쓰기 가능한 일반 폴더에 풀고 `ArubaSessionTracker.exe`를
@@ -48,7 +50,7 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 검증한 뒤 같은 ID를 다시 공개합니다. 중단되면 이전 커밋으로 되돌려
 재공개하지 않고 숨겨진 단계 기록에서 다음 실행이 이어집니다. 이 방식은
 GitHub 기본 토큰에 없는 과거 워크플로 수정 권한을 요구하지 않으며, 태그로
-초안을 추측해 중복 릴리스를 만드는 문제도 피합니다. `v0.5.8` 같은 버전
+초안을 추측해 중복 릴리스를 만드는 문제도 피합니다. `v0.5.9` 같은 버전
 태그 릴리스는 자동화가 기존 릴리스 덮어쓰기를 거부하는 1회성
 사전릴리스입니다. 게시 검증이 성공한 버전 릴리스의 공개 자산은 Windows x64
 ZIP 하나이며 SHA-256은 릴리스 본문에, CycloneDX SBOM은 ZIP 내부
@@ -68,6 +70,22 @@ py -3.13 -m venv .venv
   --check-build-dependencies -e .
 .\.venv\Scripts\python.exe -m aruba_session_tracker
 ```
+
+## v0.5.9 모니터링 연결과 결과 상태
+
+지속 모니터링은 같은 장비의 인증된 SSH 연결을 poll 사이에 재사용합니다.
+사용자가 모니터링을 중지하거나 연결이 끊기거나 장비 설정, 이번 실행의
+자격증명 또는 네트워크 상태가 바뀌면 기존 연결을 닫고 다음 조회에서 새로
+연결합니다. 시간이나 poll 횟수만을 이유로 주기적인 재인증을 하지는 않습니다.
+새 연결의 `AUTH_FAILED`는 계속 자동 재시도하거나 Standby로 우회하지 않는
+확인 필요 오류입니다.
+
+진단 목록과 오류창에는 민감정보가 없는 `ASxx` 전달 코드가 표시되고, 실행
+이력의 `최근 전달 코드` 열에도 남습니다. 기존 운영 상태 다섯 값은 그대로
+유지됩니다. 결과 표는 수명주기 의미인 `관측 상태`와 장비 Flags의 참고 풀이인
+`세션 특이사항`을 별도 열로 구분합니다. Raw Flags 원문은
+`상세 열 보기`를 연 경우에만 표시합니다. 이 변경은 화면 표현과 진단 식별
+방식에 한정되며 SQLite schema, CSV·HTML·Raw 저장 형식은 변경하지 않습니다.
 
 ## v0.5.8 MD 완료 프롬프트 호환성
 
@@ -262,6 +280,9 @@ RFC 5737 문서용 주소로만 제공됩니다.
 나중에 바뀌면 연결을 차단합니다. 인증 실패와 호스트 키 불일치는
 Standby 우회 조건이 아닙니다. 승인 뒤에는 별도 지문 확인 연결을 반복하지
 않고 실제 strict SSH 연결 한 번에서 저장된 키를 검증합니다.
+지속 모니터링 중에는 인증된 장비별 연결을 poll 사이에 재사용하며, 중지,
+연결 단절, 장비 설정·실행 자격증명·네트워크 변경 때만 다시 연결합니다.
+주기적인 재인증은 하지 않고 새 연결의 인증 실패도 자동 재시도하지 않습니다.
 
 ## 조회 흐름
 
@@ -307,13 +328,15 @@ show datapath session table <IPv4>
 간격으로 자동 재시도하고, 성공하면 사용자가 설정한 정상 주기로 돌아갑니다.
 인증, 호스트 키, 명령 정책과 저장 실패는 자동으로 우회하지 않습니다.
 상태 표시는 `대기`, `조회 중`, `정상`, `재시도 중`, `확인 필요` 다섯
-값만 사용하고 자세한 단계와 오류 코드는 상태 표시줄과 진단에 남깁니다.
+값만 사용합니다. 진단 목록과 오류창에는 자세한 단계, 오류 코드와 `ASxx`
+전달 코드를 표시하고, 실행 이력에는 `최근 전달 코드`를 남깁니다.
 `현재 조회`의 실행 기록은 권위 있는 정상 결과를 `COMPLETED`, 일부 양성
 관측만 남은 비권위 결과를 `PARTIAL`, 관측이 없는 비권위 기술 실패를
 `FAILED`로 구분합니다.
 
 결과에는 사용한 MM/MD, 마지막 관측 시각, Protocol, Source/Destination,
-포트, Packets/Bytes와 증분, Age, CPU, Raw Flags, 해석 상태가 표시됩니다.
+포트, Packets/Bytes와 증분, Age, CPU, `관측 상태`, `세션 특이사항`이
+표시됩니다. Raw Flags 원문은 `상세 열 보기`에서만 확인할 수 있습니다.
 세션 키는 `Controller + Protocol + SRC + DST + SPort + DPort`이며 Flags는
 키에 포함되지 않고 변화 이벤트로 남습니다.
 
@@ -446,7 +469,7 @@ GitHub 이슈나 외부 지원 채널에 올리지 말고, 공유가 필요하�
 저장소는 네트워크와 분리된 비식별 fixture 및 메모리 내 SSH 프로토콜
 fake를 기본 검증 경계로 사용합니다. 127.0.0.1에만 바인딩하는 최소
 Paramiko 서버를 통한 실제 Paramiko/Netmiko loopback 통합시험도 포함합니다.
-실제 Aruba 장비 접속과 회사 네트워크 현장 검증은 v0.5.8 검증 범위에
+실제 Aruba 장비 접속과 회사 네트워크 현장 검증은 v0.5.9 검증 범위에
 포함되지 않습니다.
 
 내보내기 복구 시험은 CSV와 HTML 각각 다섯 단계에서 별도 프로세스를
@@ -456,11 +479,12 @@ Paramiko 서버를 통한 실제 Paramiko/Netmiko loopback 통합시험도 포�
 
 ```powershell
 .\tools\validate.ps1 -PythonPath .\.venv\Scripts\python.exe
-.\build_windows.ps1 -PythonPath .\.venv\Scripts\python.exe -Version 0.5.8
+.\build_windows.ps1 -PythonPath .\.venv\Scripts\python.exe -Version 0.5.9
 ```
 
 `validate.ps1`은 Python/아키텍처, 해시 고정 lock 동기화, 의존성, 버전
-동기화, 비밀/런타임 파일, Ruff, 포맷, strict mypy, pytest/branch coverage,
+동기화, 비밀/런타임 파일, Ruff, 포맷, strict mypy,
+`pytest -m 'not soak'`와 branch coverage,
 전역 line 83%·핵심 모듈 branch 65% 정책과 runtime 및 build/development
 의존성 `pip-audit`를 확인합니다.
 `build_windows.ps1`은 깨끗한 Git 커밋에서 PyInstaller onedir ZIP을 만들고
@@ -486,7 +510,10 @@ ZIP에는 wheel이 제공한 라이선스 증거와, 원문이 빠진 pyserial 3
 않습니다. 실장비 문제는 사용자가 민감정보를 제거한 증상과 오류 코드를
 제공한 뒤 별도 수정합니다.
 
-PR과 `main`은 GitHub-hosted Windows x64 CI를 통과해야 합니다. `main`
+PR과 `main`은 GitHub-hosted Windows x64 CI를 통과해야 합니다. 일반 CI와
+`continuous`는 `pytest -m 'not soak'`만 실행하며, fixture-only 20,000 poll
+nightly는 예약 없이 `workflow_dispatch`로 명시적으로 시작할 때만 실행합니다.
+`main`
 변경은 현재 main과 빌드 commit을 다시 비교한 뒤 기존 release를 지우지
 않고 고정된 릴리스 ID에서 `continuous` tag, 메타데이터와 자산을
 전진식으로 갱신합니다.
@@ -511,8 +538,10 @@ smoke와 패키지 검증은 다음을 증명하지 않습니다.
 - Authenticode 서명 또는 조직 보안 제품의 허용
 - 실장비 네트워크 상태나 세션 존재/종료
 
-v0.5.8은 이 한계를 명시한 unsigned 사전릴리스로 준비합니다. 사용자가 실제
-장비에서 확인한 결과는 자동 테스트 증거와 구분합니다.
+v0.5.9 소스의 최신 `main` 검증본은 이 한계를 명시한 unsigned `continuous`
+사전릴리스로 준비합니다. 변경 불가 `v0.5.9` 태그 릴리스는 별도로 요청한
+20,000 poll 검증을 통과한 경우에만 게시합니다. 사용자가 실제 장비에서 확인한
+결과는 자동 테스트 증거와 구분합니다.
 
 프로젝트 라이선스는 MIT입니다. 제3자 구성요소 고지는
 [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt), LGPL 구성요소의 소스

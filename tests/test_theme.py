@@ -97,6 +97,12 @@ def test_theme_assigns_operational_roles_without_replacing_widgets(
     assert window.result_table.alternatingRowColors()
     assert window.result_table.verticalHeader().isHidden()
     assert window.result_table.verticalHeader().defaultSectionSize() == 30
+    result_table_chrome_height = (
+        window.result_table.horizontalHeader().sizeHint().height()
+        + window.result_table.horizontalScrollBar().sizeHint().height()
+        + (2 * window.result_table.frameWidth())
+    )
+    assert window.result_table.minimumHeight() >= 50 + result_table_chrome_height
     assert window.details.minimumWidth() == 0
     assert window.details.minimumHeight() == 180
     assert window.advanced_panel.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Fixed

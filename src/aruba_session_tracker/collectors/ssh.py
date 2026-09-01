@@ -23,6 +23,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Protocol, Self
@@ -51,6 +52,7 @@ from aruba_session_tracker.paths import (
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_OUTPUT_LINES = 50_000
 POLL_DEADLINE_SECONDS = 300.0
+MONITOR_CONNECTION_LIMIT = 6
 KNOWN_HOSTS_LOCK_TIMEOUT_SECONDS = 10.0
 MAX_KNOWN_HOSTS_BYTES = 1024 * 1024
 
@@ -185,13 +187,28 @@ HostKeyApproval = (
 )
 
 
+class CollectorPhase(StrEnum):
+    """Authentication boundary that produced a sanitized collector error."""
+
+    LOGIN = "LOGIN"
+    ENABLE = "ENABLE"
+
+
 class CollectorError(RuntimeError):
     """Sanitized collection failure with explicit failover eligibility."""
 
-    def __init__(self, code: ErrorCode, message: str, *, retryable_network: bool = False) -> None:
+    def __init__(
+        self,
+        code: ErrorCode,
+        message: str,
+        *,
+        retryable_network: bool = False,
+        phase: CollectorPhase | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.retryable_network = retryable_network
+        self.phase = phase
 
 
 @dataclass(slots=True)
@@ -411,7 +428,11 @@ class SSHCollector:
                     raise deadline_exc from exc
             raise
         except (NetmikoAuthenticationException, paramiko.AuthenticationException) as exc:
-            raise CollectorError(ErrorCode.AUTH_FAILED, "SSH 인증에 실패했습니다.") from exc
+            raise CollectorError(
+                ErrorCode.AUTH_FAILED,
+                "SSH 인증에 실패했습니다.",
+                phase=CollectorPhase.LOGIN,
+            ) from exc
         except (NetmikoTimeoutException, ReadTimeout, TimeoutError) as exc:
             token.raise_if_cancelled()
             try:
@@ -423,7 +444,7 @@ class SSHCollector:
                 "SSH 연결 또는 명령 시간이 초과되었습니다.",
                 retryable_network=True,
             ) from exc
-        except (OSError, paramiko.SSHException) as exc:
+        except (EOFError, OSError, paramiko.SSHException) as exc:
             token.raise_if_cancelled()
             try:
                 poll_deadline.raise_if_expired()
@@ -444,11 +465,13 @@ class _NetmikoConnectionManager(AbstractContextManager[CommandConnection]):
         *,
         deadline: PollDeadline | None = None,
         bounded_session_log: _BoundedSessionLog | None = None,
+        reuse_token: bytes | None = None,
     ) -> None:
         self._connection: Any | None = connection
         self._closing_connection: Any | None = None
         self._lock = threading.Lock()
         self._bounded_session_log = bounded_session_log
+        self._reuse_token = reuse_token
         self._deadline = deadline
         self._deadline_stop = threading.Event()
         self._deadline_thread: threading.Thread | None = None
@@ -526,6 +549,73 @@ class _NetmikoConnectionManager(AbstractContextManager[CommandConnection]):
             raise
         finally:
             session_log.end_command()
+
+    @property
+    def reuse_token(self) -> bytes | None:
+        """Return the local trust token used to authenticate this connection."""
+
+        return self._reuse_token
+
+    def is_alive(self) -> bool:
+        """Check transport liveness without sending a CLI command."""
+
+        with self._lock:
+            connection = self._connection
+        if connection is None:
+            return False
+        checker = getattr(connection, "is_alive", None)
+        if callable(checker):
+            try:
+                result = checker()
+            except Exception:
+                return False
+            if isinstance(result, dict):
+                return bool(result.get("is_alive", False))
+            return bool(result)
+
+        remote_channel = getattr(connection, "remote_conn", None)
+        remote_client = getattr(connection, "remote_conn_pre", None)
+        transport = getattr(remote_channel, "transport", None)
+        if transport is None and remote_client is not None:
+            get_transport = getattr(remote_client, "get_transport", None)
+            if callable(get_transport):
+                with suppress(Exception):
+                    transport = get_transport()
+        active = getattr(transport, "is_active", None)
+        if callable(active):
+            with suppress(Exception):
+                return bool(active())
+        # A custom connector without a liveness API is not enough evidence to
+        # discard an otherwise usable session. Command failures still evict it.
+        return True
+
+    def rearm_deadline(self, deadline: PollDeadline) -> None:
+        """Attach a fresh poll deadline to a retained monitor connection."""
+
+        deadline.raise_if_expired()
+        self._stop_deadline_watchdog()
+        with self._lock:
+            if self._connection is None:
+                raise CollectorError(
+                    ErrorCode.MM_UNREACHABLE,
+                    "SSH 연결이 이미 종료되었습니다.",
+                    retryable_network=True,
+                )
+            self._deadline = deadline
+            self._deadline_stop = threading.Event()
+            deadline_thread = threading.Thread(
+                target=self._watch_deadline,
+                name="aruba-ssh-deadline-watchdog",
+                daemon=True,
+            )
+            self._deadline_thread = deadline_thread
+        deadline_thread.start()
+
+    def disarm_deadline(self) -> None:
+        """Remove the completed poll's watchdog without closing the transport."""
+
+        self._stop_deadline_watchdog()
+        self._deadline = None
 
     def close(self) -> None:
         with self._lock:
@@ -824,6 +914,7 @@ class StrictNetmikoFactory:
         poll_deadline = deadline or PollDeadline.after()
         cancel_token.raise_if_cancelled()
         poll_deadline.raise_if_expired()
+        verified_host_keys: paramiko.HostKeys | None = None
         host_keys_snapshot = (
             self._known_host_keys_snapshot(target, cancel_token, poll_deadline)
             if self._connector_enforces_strict_host_keys
@@ -896,7 +987,11 @@ class StrictNetmikoFactory:
                 if connector_guard is not None:
                     connector_guard.stop()
         except (NetmikoAuthenticationException, paramiko.AuthenticationException) as exc:
-            raise CollectorError(ErrorCode.AUTH_FAILED, "SSH 인증에 실패했습니다.") from exc
+            raise CollectorError(
+                ErrorCode.AUTH_FAILED,
+                "SSH 인증에 실패했습니다.",
+                phase=CollectorPhase.LOGIN,
+            ) from exc
         except paramiko.BadHostKeyException as exc:
             raise CollectorError(
                 ErrorCode.HOST_KEY_CHANGED,
@@ -918,7 +1013,7 @@ class StrictNetmikoFactory:
                 "SSH 연결 시간이 초과되었거나 장비에 연결할 수 없습니다.",
                 retryable_network=True,
             ) from exc
-        except (TimeoutError, OSError) as exc:
+        except (EOFError, TimeoutError, OSError) as exc:
             cancel_token.raise_if_cancelled()
             try:
                 poll_deadline.raise_if_expired()
@@ -952,10 +1047,21 @@ class StrictNetmikoFactory:
                 retryable_network=True,
             ) from exc
 
+        reuse_token = _host_keys_reuse_token(
+            host_keys_snapshot or verified_host_keys,
+            target,
+        )
+        if reuse_token is None:
+            _abort_netmiko_connection(connection, cleanup=True)
+            raise CollectorError(
+                ErrorCode.HOST_KEY_UNKNOWN,
+                "SSH 호스트 키 신뢰 정보를 안전하게 유지하지 못했습니다.",
+            )
         manager = _NetmikoConnectionManager(
             connection,
             deadline=poll_deadline,
             bounded_session_log=bounded_session_log,
+            reuse_token=reuse_token,
         )
         if cancel_token.is_cancelled:
             with suppress(Exception):
@@ -980,8 +1086,15 @@ class StrictNetmikoFactory:
                 raise CollectorError(
                     ErrorCode.AUTH_FAILED,
                     "SSH Enable 인증에 실패했습니다.",
+                    phase=CollectorPhase.ENABLE,
                 ) from exc
-            except (NetmikoTimeoutException, TimeoutError, OSError, paramiko.SSHException) as exc:
+            except (
+                EOFError,
+                NetmikoTimeoutException,
+                TimeoutError,
+                OSError,
+                paramiko.SSHException,
+            ) as exc:
                 if cancel_token.is_cancelled:
                     with suppress(Exception):
                         manager.close()
@@ -1004,6 +1117,20 @@ class StrictNetmikoFactory:
                     manager.close()
                 cancel_token.raise_if_cancelled()
         return manager
+
+    def connection_reuse_token(
+        self,
+        target: DeviceTarget,
+        *,
+        cancel_token: CancellationToken,
+        deadline: PollDeadline,
+    ) -> bytes | None:
+        """Safely reload the local trust token for a pooled endpoint."""
+
+        cancel_token.raise_if_cancelled()
+        deadline.raise_if_expired()
+        with self._locked_host_keys(cancel_token, deadline) as host_keys:
+            return _host_keys_reuse_token(host_keys, target)
 
     def _known_host_keys_snapshot(
         self,
@@ -1216,6 +1343,560 @@ class StrictNetmikoFactory:
             ) from exc
 
 
+_UNAVAILABLE_REUSE_TOKEN = object()
+
+
+@dataclass(slots=True)
+class _ManagedMonitorConnection:
+    manager: AbstractContextManager[CommandConnection]
+    connection: CommandConnection
+    reuse_token: object
+
+    def is_alive(self) -> bool:
+        for candidate in (self.manager, self.connection):
+            checker = getattr(candidate, "is_alive", None)
+            if not callable(checker):
+                continue
+            try:
+                result = checker()
+            except Exception:
+                return False
+            if isinstance(result, dict):
+                return bool(result.get("is_alive", False))
+            return bool(result)
+        closed = getattr(self.connection, "closed", None)
+        return not closed if isinstance(closed, bool) else True
+
+    def arm(self, deadline: PollDeadline) -> None:
+        rearm = getattr(self.manager, "rearm_deadline", None)
+        if callable(rearm):
+            rearm(deadline)
+
+    def disarm(self) -> None:
+        disarm = getattr(self.manager, "disarm_deadline", None)
+        if callable(disarm):
+            disarm()
+
+    def abort(self) -> None:
+        abort = getattr(self.manager, "abort", None)
+        if callable(abort):
+            abort()
+            return
+        self.connection.close()
+
+    def close(self) -> None:
+        self.manager.__exit__(None, None, None)
+
+
+@dataclass(slots=True)
+class _MonitorPoolEntry:
+    operation_lock: threading.Lock = field(default_factory=threading.Lock)
+    state_lock: threading.Lock = field(default_factory=threading.Lock)
+    managed: _ManagedMonitorConnection | None = None
+
+    def snapshot(self) -> _ManagedMonitorConnection | None:
+        with self.state_lock:
+            return self.managed
+
+    def take(
+        self,
+        expected: _ManagedMonitorConnection | None = None,
+    ) -> _ManagedMonitorConnection | None:
+        with self.state_lock:
+            if expected is not None and self.managed is not expected:
+                return None
+            managed = self.managed
+            self.managed = None
+            return managed
+
+
+class _MonitorLeaseDeadlineGuard:
+    """Abort one leased connection when its current poll deadline expires."""
+
+    def __init__(self, abort: Callable[[], None], deadline: PollDeadline) -> None:
+        self._abort = abort
+        self._deadline = deadline
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._watch,
+            name="aruba-monitor-ssh-deadline-watchdog",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=1.0)
+
+    def _watch(self) -> None:
+        if _deadline_elapsed_before_stop(self._deadline, self._stop):
+            with suppress(Exception):
+                self._abort()
+
+
+class MonitoringSSHConnectionFactory:
+    """Retain bounded SSH sessions for one in-memory monitoring identity.
+
+    This wrapper is intentionally created per monitor run. It never writes
+    credentials, never evicts healthy sessions by age, and never changes the
+    one-shot collector's connect/close behavior.
+    """
+
+    def __init__(
+        self,
+        factory: SSHConnectionFactory,
+        credentials: Credentials,
+        *,
+        max_connections: int = MONITOR_CONNECTION_LIMIT,
+    ) -> None:
+        if type(max_connections) is not int or not 1 <= max_connections <= MONITOR_CONNECTION_LIMIT:
+            raise ValueError(
+                f"monitor connection limit must be between 1 and {MONITOR_CONNECTION_LIMIT}"
+            )
+        self._factory = factory
+        self._credentials: Credentials | None = credentials
+        self._max_connections = max_connections
+        self._lock = threading.Lock()
+        self._entries: dict[tuple[str, int], _MonitorPoolEntry] = {}
+        self._closed = False
+
+    def connect(
+        self,
+        target: DeviceTarget,
+        credentials: Credentials,
+        *,
+        host_key_approval: HostKeyApproval | None,
+        cancel_token: CancellationToken,
+        deadline: PollDeadline,
+    ) -> AbstractContextManager[CommandConnection]:
+        if credentials != self._credentials:
+            raise CollectorError(
+                ErrorCode.AUTH_FAILED,
+                "모니터링 자격증명이 변경되어 SSH 연결을 재사용할 수 없습니다.",
+                phase=CollectorPhase.LOGIN,
+            )
+        endpoint = (target.host, target.port)
+        with self._lock:
+            if self._closed:
+                raise CollectorError(
+                    ErrorCode.MM_UNREACHABLE,
+                    "모니터링 SSH 연결 풀이 종료되었습니다.",
+                )
+            entry = self._entries.get(endpoint)
+            if entry is None:
+                if len(self._entries) >= self._max_connections:
+                    raise CollectorError(
+                        ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+                        "모니터링 SSH 연결 한도를 초과했습니다.",
+                    )
+                entry = _MonitorPoolEntry()
+                self._entries[endpoint] = entry
+        return _MonitoringConnectionLease(
+            self,
+            endpoint,
+            entry,
+            target,
+            credentials,
+            host_key_approval,
+            cancel_token,
+            deadline,
+        )
+
+    def invalidate(self) -> None:
+        """Close current sessions while allowing the monitor to reconnect."""
+
+        with self._lock:
+            entries = tuple(self._entries.values())
+            self._entries.clear()
+        self._close_entries(entries)
+
+    def close(self) -> None:
+        """Permanently close the pool and release its in-memory identity."""
+
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._credentials = None
+            entries = tuple(self._entries.values())
+            self._entries.clear()
+        self._close_entries(entries)
+
+    def _open(
+        self,
+        endpoint: tuple[str, int],
+        entry: _MonitorPoolEntry,
+        target: DeviceTarget,
+        credentials: Credentials,
+        host_key_approval: HostKeyApproval | None,
+        cancel_token: CancellationToken,
+        deadline: PollDeadline,
+    ) -> _ManagedMonitorConnection:
+        manager = self._factory.connect(
+            target,
+            credentials,
+            host_key_approval=host_key_approval,
+            cancel_token=cancel_token,
+            deadline=deadline,
+        )
+        try:
+            connection = manager.__enter__()
+        except BaseException as exc:
+            with suppress(Exception):
+                manager.__exit__(type(exc), exc, exc.__traceback__)
+            raise
+
+        reuse_token = getattr(manager, "reuse_token", _UNAVAILABLE_REUSE_TOKEN)
+        if reuse_token is _UNAVAILABLE_REUSE_TOKEN:
+            try:
+                reuse_token = self._current_reuse_token(target, cancel_token, deadline)
+            except BaseException:
+                with suppress(Exception):
+                    manager.__exit__(None, None, None)
+                raise
+        managed = _ManagedMonitorConnection(manager, connection, reuse_token)
+        with self._lock:
+            current_entry = self._entries.get(endpoint)
+            if self._closed or current_entry is not entry:
+                accepted = False
+            else:
+                with entry.state_lock:
+                    accepted = entry.managed is None
+                    if accepted:
+                        entry.managed = managed
+        if not accepted:
+            with suppress(Exception):
+                managed.close()
+            cancel_token.raise_if_cancelled()
+            deadline.raise_if_expired()
+            raise CollectorError(
+                ErrorCode.MM_UNREACHABLE,
+                "모니터링 SSH 연결 상태가 변경되었습니다.",
+                retryable_network=True,
+            )
+        return managed
+
+    def _current_reuse_token(
+        self,
+        target: DeviceTarget,
+        cancel_token: CancellationToken,
+        deadline: PollDeadline,
+    ) -> object:
+        reader = getattr(self._factory, "connection_reuse_token", None)
+        if not callable(reader):
+            return _UNAVAILABLE_REUSE_TOKEN
+        return reader(
+            target,
+            cancel_token=cancel_token,
+            deadline=deadline,
+        )
+
+    def _remove_empty_entry(
+        self,
+        endpoint: tuple[str, int],
+        entry: _MonitorPoolEntry,
+    ) -> None:
+        with self._lock:
+            if self._entries.get(endpoint) is not entry:
+                return
+            with entry.state_lock:
+                if entry.managed is None:
+                    self._entries.pop(endpoint, None)
+
+    @staticmethod
+    def _close_entries(entries: Iterable[_MonitorPoolEntry]) -> None:
+        managed_connections = tuple(
+            managed for entry in entries if (managed := entry.take()) is not None
+        )
+        # Network cleanup deliberately happens after all pool/state locks have
+        # been released, so a blocked custom connector cannot deadlock control.
+        for managed in managed_connections:
+            with suppress(Exception):
+                managed.abort()
+            with suppress(Exception):
+                managed.close()
+
+
+class _MonitoringConnectionLease(AbstractContextManager[CommandConnection]):
+    def __init__(
+        self,
+        pool: MonitoringSSHConnectionFactory,
+        endpoint: tuple[str, int],
+        entry: _MonitorPoolEntry,
+        target: DeviceTarget,
+        credentials: Credentials,
+        host_key_approval: HostKeyApproval | None,
+        cancel_token: CancellationToken,
+        deadline: PollDeadline,
+    ) -> None:
+        self._pool = pool
+        self._endpoint = endpoint
+        self._entry = entry
+        self._target = target
+        self._credentials: Credentials | None = credentials
+        self._host_key_approval = host_key_approval
+        self._cancel_token = cancel_token
+        self._deadline = deadline
+        self._managed: _ManagedMonitorConnection | None = None
+        self._reused = False
+        self._command_count = 0
+        self._retry_attempted = False
+        self._lock_held = False
+        self._pending_close = False
+        self._deadline_guard: _MonitorLeaseDeadlineGuard | None = None
+
+    def __enter__(self) -> Self:
+        _acquire_monitor_operation_lock(
+            self._entry.operation_lock,
+            self._cancel_token,
+            self._deadline,
+        )
+        self._lock_held = True
+        try:
+            managed = self._entry.snapshot()
+            if managed is not None:
+                try:
+                    current_token = self._pool._current_reuse_token(
+                        self._target,
+                        self._cancel_token,
+                        self._deadline,
+                    )
+                except BaseException:
+                    stale = self._entry.take(managed)
+                    if stale is not None:
+                        self._close_now(stale)
+                    raise
+                if not managed.is_alive() or current_token != managed.reuse_token:
+                    stale = self._entry.take(managed)
+                    if stale is not None:
+                        self._close_now(stale)
+                    managed = None
+                else:
+                    self._reused = True
+            if managed is None:
+                managed = self._pool._open(
+                    self._endpoint,
+                    self._entry,
+                    self._target,
+                    self._require_credentials(),
+                    self._host_key_approval,
+                    self._cancel_token,
+                    self._deadline,
+                )
+                self._reused = False
+            self._managed = managed
+            managed.arm(self._deadline)
+            self._deadline_guard = _MonitorLeaseDeadlineGuard(self.abort, self._deadline)
+            return self
+        except BaseException:
+            self._pool._remove_empty_entry(self._endpoint, self._entry)
+            self._release_operation_lock()
+            raise
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_value, traceback
+        deadline_guard = self._deadline_guard
+        self._deadline_guard = None
+        if deadline_guard is not None:
+            deadline_guard.stop()
+        managed = self._managed
+        if managed is not None:
+            if exc_type is not None:
+                if self._entry.take(managed) is not None:
+                    self._pending_close = True
+            else:
+                with suppress(Exception):
+                    managed.disarm()
+        self._release_operation_lock()
+        if self._pending_close and managed is not None:
+            with suppress(Exception):
+                managed.close()
+        self._managed = None
+        self._credentials = None
+
+    def send_command(self, command: str, *, read_timeout: float) -> str:
+        return self._send(
+            command,
+            lambda connection: connection.send_command(command, read_timeout=read_timeout),
+        )
+
+    def send_command_bounded(
+        self,
+        command: str,
+        *,
+        read_timeout: float,
+        max_output_bytes: int,
+        max_output_lines: int,
+    ) -> str:
+        def send(connection: CommandConnection) -> str:
+            bounded_sender = getattr(connection, "send_command_bounded", None)
+            if callable(bounded_sender):
+                return str(
+                    bounded_sender(
+                        command,
+                        read_timeout=read_timeout,
+                        max_output_bytes=max_output_bytes,
+                        max_output_lines=max_output_lines,
+                    )
+                )
+            return connection.send_command(command, read_timeout=read_timeout)
+
+        return self._send(command, send)
+
+    def abort(self) -> None:
+        managed = self._managed
+        if managed is None:
+            return
+        if self._entry.take(managed) is not None:
+            self._pending_close = True
+            with suppress(Exception):
+                managed.abort()
+
+    def close(self) -> None:
+        self.abort()
+
+    def _send(
+        self,
+        command: str,
+        sender: Callable[[CommandConnection], str],
+    ) -> str:
+        managed = self._require_managed()
+        first_command = self._command_count == 0
+        self._command_count += 1
+        try:
+            return str(sender(managed.connection))
+        except BaseException as exc:
+            if self._can_retry_dead_paging(
+                exc,
+                managed,
+                command=command,
+                first_command=first_command,
+            ):
+                self._retry_attempted = True
+                self._entry.take(managed)
+                self._close_now(managed)
+                replacement = self._pool._open(
+                    self._endpoint,
+                    self._entry,
+                    self._target,
+                    self._require_credentials(),
+                    self._host_key_approval,
+                    self._cancel_token,
+                    self._deadline,
+                )
+                self._managed = replacement
+                replacement.arm(self._deadline)
+                try:
+                    return str(sender(replacement.connection))
+                except BaseException:
+                    if self._entry.take(replacement) is not None:
+                        self._pending_close = True
+                    raise
+            if self._entry.take(managed) is not None:
+                self._pending_close = True
+            raise
+
+    def _can_retry_dead_paging(
+        self,
+        error: BaseException,
+        managed: _ManagedMonitorConnection,
+        *,
+        command: str,
+        first_command: bool,
+    ) -> bool:
+        if not self._reused or self._retry_attempted or not first_command or command != "no paging":
+            return False
+        if isinstance(error, CollectorError):
+            transient = (
+                error.code is ErrorCode.MM_UNREACHABLE
+                and error.retryable_network
+                and error.phase is None
+            )
+        elif isinstance(
+            error,
+            (
+                NetmikoAuthenticationException,
+                paramiko.AuthenticationException,
+                paramiko.BadHostKeyException,
+            ),
+        ):
+            transient = False
+        else:
+            transient = isinstance(
+                error,
+                (
+                    EOFError,
+                    NetmikoTimeoutException,
+                    ReadTimeout,
+                    TimeoutError,
+                    OSError,
+                    paramiko.SSHException,
+                ),
+            )
+        if not transient:
+            return False
+        self._cancel_token.raise_if_cancelled()
+        self._deadline.raise_if_expired()
+        return not managed.is_alive()
+
+    def _require_managed(self) -> _ManagedMonitorConnection:
+        managed = self._managed
+        if managed is None:
+            raise CollectorError(
+                ErrorCode.MM_UNREACHABLE,
+                "모니터링 SSH 연결이 종료되었습니다.",
+                retryable_network=True,
+            )
+        return managed
+
+    def _require_credentials(self) -> Credentials:
+        credentials = self._credentials
+        if credentials is None:
+            raise CollectorError(
+                ErrorCode.AUTH_FAILED,
+                "모니터링 SSH 연결 임대가 종료되었습니다.",
+                phase=CollectorPhase.LOGIN,
+            )
+        return credentials
+
+    def _close_now(self, managed: _ManagedMonitorConnection) -> None:
+        with suppress(Exception):
+            managed.abort()
+        with suppress(Exception):
+            managed.close()
+        if self._managed is managed:
+            self._managed = None
+
+    def _release_operation_lock(self) -> None:
+        if self._lock_held:
+            self._lock_held = False
+            self._entry.operation_lock.release()
+
+
+def _acquire_monitor_operation_lock(
+    lock: threading.Lock,
+    cancel_token: CancellationToken,
+    deadline: PollDeadline,
+) -> None:
+    acquired = False
+    while not acquired:
+        cancel_token.raise_if_cancelled()
+        deadline.raise_if_expired()
+        acquired = lock.acquire(timeout=min(0.05, deadline.remaining_seconds))
+    try:
+        cancel_token.raise_if_cancelled()
+        deadline.raise_if_expired()
+    except BaseException:
+        lock.release()
+        raise
+
+
 def _known_hosts_thread_lock(path: Path) -> threading.Lock:
     key = os.path.normcase(os.path.abspath(path))
     with _KNOWN_HOSTS_LOCKS_GUARD:
@@ -1330,6 +2011,26 @@ def _known_key_matches(
     if expected is not None and expected == offered_key:
         return True
     raise CollectorError(ErrorCode.HOST_KEY_CHANGED, "SSH 호스트 키가 변경되었습니다.")
+
+
+def _host_keys_reuse_token(
+    host_keys: paramiko.HostKeys | None,
+    target: DeviceTarget,
+) -> bytes | None:
+    """Build a stable, non-secret token for one safely loaded host-key entry."""
+
+    if host_keys is None:
+        return None
+    known = host_keys.lookup(_known_hosts_token(target))
+    if known is None:
+        return None
+    digest = hashlib.sha256()
+    for algorithm, key in sorted(known.items()):
+        digest.update(algorithm.encode("ascii", errors="strict"))
+        digest.update(b"\0")
+        digest.update(key.asbytes())
+        digest.update(b"\0")
+    return digest.digest()
 
 
 def _is_strict_host_key_rejection(exc: BaseException) -> bool:

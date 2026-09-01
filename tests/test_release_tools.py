@@ -1316,6 +1316,26 @@ def test_continuous_workflow_delegates_to_durable_reconciler() -> None:
     assert "Continuous publish verification dependency check failed." in publish_job
 
 
+def test_regular_validation_excludes_manual_soak_tests() -> None:
+    validation = Path("tools/validate.ps1").read_text(encoding="utf-8")
+
+    assert '$pytestArguments = @("-m", "pytest", "-m", "not soak")' in validation
+    for path in (
+        ".github/workflows/ci.yml",
+        ".github/workflows/continuous.yml",
+        ".github/workflows/release.yml",
+    ):
+        workflow = Path(path).read_text(encoding="utf-8")
+        assert "./tools/validate.ps1" in workflow
+
+    assert "python -m pytest -m soak" not in Path(".github/workflows/ci.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "python -m pytest -m soak" not in Path(".github/workflows/continuous.yml").read_text(
+        encoding="utf-8"
+    )
+
+
 def test_continuous_reconciler_persists_stages_and_uses_release_ids() -> None:
     script = Path("tools/publish_continuous.ps1").read_text(encoding="utf-8")
 
@@ -1365,7 +1385,11 @@ def test_continuous_reconciler_rechecks_main_tag_and_exact_single_zip() -> None:
 
 def test_nightly_workflow_runs_fixture_only_scaled_soak() -> None:
     workflow = Path(".github/workflows/nightly.yml").read_text(encoding="utf-8")
+    trigger = workflow[: workflow.index("permissions:")]
 
+    assert "workflow_dispatch:" in trigger
+    assert "schedule:" not in trigger
+    assert "cron:" not in trigger
     assert 'ARUBA_SOAK_POLLS: "20000"' in workflow
     assert "python -m pytest -m soak" in workflow
     assert "QT_QPA_PLATFORM: offscreen" in workflow

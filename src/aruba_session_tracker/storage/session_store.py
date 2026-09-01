@@ -51,6 +51,10 @@ from aruba_session_tracker.storage.raw import (
     contained_path,
     safe_segment,
 )
+from aruba_session_tracker.support_codes import (
+    mappable_diagnostic_pairs,
+    support_code_for,
+)
 
 if TYPE_CHECKING:
     from aruba_session_tracker.services.monitoring import LifecycleEvent
@@ -1403,22 +1407,52 @@ class SessionStore:
         self._ensure_initialized()
         if not 1 <= limit <= 1000:
             raise ValueError("limit는 1~1000 범위여야 합니다.")
+        diagnostic_pairs = mappable_diagnostic_pairs()
+        diagnostic_predicate = " OR ".join(
+            "(candidate.stage = ? AND candidate.code = ?)" for _pair in diagnostic_pairs
+        )
+        diagnostic_parameters = tuple(value for pair in diagnostic_pairs for value in pair)
+        # The interpolated fragment contains placeholder syntax only; every
+        # stage and code remains a bound parameter.
+        query = f"""
+            SELECT r.*,
+                   (SELECT count(*) FROM observations o WHERE o.run_id = r.id)
+                       AS observation_count,
+                   (SELECT count(*) FROM lifecycle_events l WHERE l.run_id = r.id)
+                       AS lifecycle_count,
+                   latest_diagnostic.stage AS latest_diagnostic_stage,
+                   latest_diagnostic.code AS latest_diagnostic_code
+            FROM runs r
+            LEFT JOIN diagnostic_events latest_diagnostic
+              ON latest_diagnostic.id = (
+                  SELECT candidate.id
+                  FROM diagnostic_events candidate
+                  WHERE candidate.run_id = r.id
+                    AND ({diagnostic_predicate})
+                  ORDER BY candidate.occurred_at DESC, candidate.id DESC
+                  LIMIT 1
+              )
+            ORDER BY r.started_at DESC
+            LIMIT ?
+            """  # noqa: S608
         try:
             with self._lock, self._connection() as connection:
                 rows = connection.execute(
-                    """
-                    SELECT r.*,
-                           (SELECT count(*) FROM observations o WHERE o.run_id = r.id)
-                               AS observation_count,
-                           (SELECT count(*) FROM lifecycle_events l WHERE l.run_id = r.id)
-                               AS lifecycle_count
-                    FROM runs r
-                    ORDER BY r.started_at DESC
-                    LIMIT ?
-                    """,
-                    (limit,),
+                    query,
+                    (*diagnostic_parameters, limit),
                 ).fetchall()
-                return tuple(dict(row) for row in rows)
+                results: list[dict[str, object]] = []
+                for row in rows:
+                    result = dict(row)
+                    stage = result["latest_diagnostic_stage"]
+                    code = result["latest_diagnostic_code"]
+                    result["latest_support_code"] = (
+                        support_code_for(stage, code).value
+                        if isinstance(stage, str) and isinstance(code, str)
+                        else None
+                    )
+                    results.append(result)
+                return tuple(results)
         except sqlite3.Error as error:
             raise StorageError(f"조회 실행 목록을 읽을 수 없습니다: {error}") from error
 
