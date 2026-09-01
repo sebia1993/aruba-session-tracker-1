@@ -896,7 +896,7 @@ class MainWindow(QMainWindow):
         self.result_status_guide.setObjectName("sectionHint")
         self.result_status_guide.setAccessibleName("결과 상태 안내")
         self.result_status_guide.setWordWrap(True)
-        results_header_layout.addWidget(self.result_status_guide)
+        result_options.insertWidget(1, self.result_status_guide, 2)
         self.result_table = QTableWidget(0, 16)
         self.result_table.setAccessibleName("세션 조회 결과 표")
         self.result_table.setAccessibleDescription(

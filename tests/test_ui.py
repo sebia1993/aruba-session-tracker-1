@@ -1274,6 +1274,8 @@ def test_query_screen_defaults_to_primary_monitoring_and_progressive_details(
     assert window.advanced_toggle_button.text() == "고급 조건 보기"
     assert window.advanced_panel.title() == "고급 조건"
     assert window.raw_diagnostics_toggle.text() == "상세 정보 보기"
+    assert window.result_status_guide.isVisible()
+    assert "장비 장애" in window.result_status_guide.text()
     assert not window.advanced_panel.isVisible()
     assert not window.details.isVisible()
     assert all(window.result_table.isColumnHidden(column) for column in (*range(5, 12), 13))
