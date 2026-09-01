@@ -26,6 +26,7 @@ from aruba_session_tracker.config import ConfigRepository
 from aruba_session_tracker.models import (
     AppConfig,
     DeviceTarget,
+    DiagnosticEvent,
     ErrorCode,
     QueryRequest,
     SessionObservation,
@@ -128,7 +129,8 @@ def test_main_window_runs_query_and_renders_korean_flag_status(
     assert window.result_table.item(0, 5).toolTip() == (
         "포트 번호 기준 대표 서비스 후보: HTTPS (443)"
     )
-    assert window.result_table.item(0, 14).text() == "차단, SYN 없음"
+    assert window.result_table.item(0, 14).text() == "현재 관측됨"
+    assert window.result_table.item(0, 15).text() == "차단, SYN 없음"
     assert "MM-Conductor" in window.context_label.text()
     assert window.password_edit.text() == "session-only"
     window.close()
@@ -189,11 +191,15 @@ def test_presentation_tracks_query_direction_and_empty_states(
                 "ended_at": "2026-08-31T01:00:05Z",
                 "status": "COMPLETED",
                 "observation_count": 1,
+                "latest_support_code": "AS20",
             },
         ),
         None,
     )
     assert not window.history_empty_label.isVisible()
+    assert window.history_table.columnCount() == 6
+    assert window.history_table.item(0, 5).text() == "AS20"
+    assert "사내 정보 없이" in window.history_table.item(0, 5).toolTip()
     assert window.delete_all_button.isEnabled()
     assert not window.export_button.isEnabled()
     window.history_table.selectRow(0)
@@ -261,7 +267,10 @@ def test_result_semantic_labels_fall_back_for_out_of_range_legacy_values(
     assert window.result_table.item(0, 1).text() == "999"
     assert window.result_table.item(0, 3).toolTip() == ""
     assert window.result_table.item(0, 5).toolTip() == ""
-    assert window.result_table.item(0, 14).toolTip() == window.result_table.item(0, 14).text()
+    assert window.result_table.item(0, 14).text() == "현재 관측됨"
+    assert "장비 장애" in window.result_table.item(0, 14).toolTip()
+    assert window.result_table.item(0, 15).text() == "표시된 특이사항 없음"
+    assert "정상 통신을 보장하지" in window.result_table.item(0, 15).toolTip()
     window.close()
 
 
@@ -357,7 +366,7 @@ def test_lifecycle_status_distinguishes_uncertain_missing_and_active_changes() -
             is_observed=False,
             authoritative=False,
         )
-        == "확인 불가 · 이전 관측 유지"
+        == "조회 결과 신뢰 불가 · 이전 관측 유지"
     )
     assert (
         _lifecycle_status(
@@ -367,7 +376,7 @@ def test_lifecycle_status_distinguishes_uncertain_missing_and_active_changes() -
             is_observed=False,
             authoritative=True,
         )
-        == "MISS 2/3 · 종료 확인 중"
+        == "이번 조회에서 미관측 (2/3) · 종료 판단 보류"
     )
     assert (
         _lifecycle_status(
@@ -377,7 +386,7 @@ def test_lifecycle_status_distinguishes_uncertain_missing_and_active_changes() -
             is_observed=True,
             authoritative=True,
         )
-        == "활성"
+        == "현재 관측됨"
     )
     assert (
         _lifecycle_status(
@@ -387,7 +396,7 @@ def test_lifecycle_status_distinguishes_uncertain_missing_and_active_changes() -
             is_observed=True,
             authoritative=True,
         )
-        == "활성 · 새 세션 · MD 변경 · 플래그 변경"
+        == "현재 관측됨 · 처음 관측 · 관측 MD 변경 · Flags 변경"
     )
 
 
@@ -437,7 +446,9 @@ def test_display_preparation_keeps_same_flow_from_multiple_controllers_visible()
         ("+5", "+50"),
         ("+5", "+50"),
     ]
-    assert {row.lifecycle_status for row in prepared.visible_rows} == {"활성 · 여러 MD에서 관측"}
+    assert {row.lifecycle_status for row in prepared.visible_rows} == {
+        "현재 관측됨 · 여러 MD에서 동시 관측"
+    }
     assert prepared.total_rows == 2
     assert prepared.next_counters == {
         first.session_key: (10, 100),
@@ -641,7 +652,7 @@ def test_history_export_failure_does_not_display_sensitive_exception_text(
     window._export_selected_run()
     qtbot.waitUntil(lambda: not window._storage_task_running, timeout=5000)  # type: ignore[attr-defined]
 
-    assert warnings == ["CSV 파일을 안전하게 내보내지 못했습니다."]
+    assert warnings == ["CSV 파일을 안전하게 내보내지 못했습니다.\n\n전달 코드: AS74"]
     assert sensitive_details not in warnings[0]
     window.close()
 
@@ -1171,9 +1182,44 @@ def test_unexpected_query_failure_is_sanitized_and_remains_failed(
     diagnostic = window.diagnostics_list.item(window.diagnostics_list.count() - 1).text()
     assert window.state_label.text() == "확인 필요"
     assert "UNEXPECTED" in diagnostic
+    assert "AS72" in diagnostic
     assert "RuntimeError" in diagnostic
     assert sensitive_details not in diagnostic
     assert all(sensitive_details not in message for message in warnings)
+    window.close()
+
+
+def test_md_login_failure_shows_same_short_code_in_diagnostics_and_dialog(
+    qtbot: object,
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    store = SessionStore(tmp_path / "tracker.db", tmp_path / "raw", tmp_path / "exports")
+    store.initialize()
+    window = MainWindow(ConfigRepository(tmp_path / "config.json"), store, _Executor())
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    warnings: list[str] = []
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        QMessageBox,
+        "warning",
+        lambda _parent, _title, message, *_args: warnings.append(str(message)),
+    )
+
+    window._display_outcome(
+        QueryOutcome(
+            diagnostics=(
+                DiagnosticEvent(
+                    stage="MD_LOGIN",
+                    code=ErrorCode.AUTH_FAILED,
+                    message="등록 MD 1번에서 SSH 인증에 실패했습니다.",
+                ),
+            ),
+        )
+    )
+
+    assert window.diagnostics_list.item(0).text().startswith("[AS20] [MD_LOGIN] AUTH_FAILED:")
+    assert warnings == ["인증 확인: 진단 이벤트를 확인하십시오.\n\n전달 코드: AS20"]
+    assert "AS20" in window.statusBar().currentMessage()
     window.close()
 
 
@@ -1230,10 +1276,10 @@ def test_query_screen_defaults_to_primary_monitoring_and_progressive_details(
     assert window.raw_diagnostics_toggle.text() == "상세 정보 보기"
     assert not window.advanced_panel.isVisible()
     assert not window.details.isVisible()
-    assert all(window.result_table.isColumnHidden(column) for column in range(5, 12))
+    assert all(window.result_table.isColumnHidden(column) for column in (*range(5, 12), 13))
     assert [
         window.result_table.horizontalHeaderItem(column).text()
-        for column in (0, 1, 2, 3, 4, 12, 13, 14)
+        for column in (0, 1, 2, 3, 4, 12, 14, 15)
     ] == [
         "장비",
         "프로토콜",
@@ -1241,9 +1287,12 @@ def test_query_screen_defaults_to_primary_monitoring_and_progressive_details(
         "출발지 포트",
         "목적지 IP",
         "마지막 확인 시각",
-        "장비 Flags",
-        "상태",
+        "관측 상태",
+        "세션 특이사항",
     ]
+    assert window.result_table.horizontalHeaderItem(13).text() == "장비 Flags"
+    assert "장비 전체 상태" in window.result_table.horizontalHeaderItem(14).toolTip()
+    assert "정상 통신을 보장하지" in window.result_table.horizontalHeaderItem(15).toolTip()
 
     window.advanced_toggle_button.setChecked(True)
     window.detail_columns_toggle.setChecked(True)
@@ -1252,7 +1301,7 @@ def test_query_screen_defaults_to_primary_monitoring_and_progressive_details(
     assert window.details.isVisible()
     assert window.advanced_toggle_button.text() == "고급 조건 숨기기"
     assert window.raw_diagnostics_toggle.text() == "상세 정보 숨기기"
-    assert all(not window.result_table.isColumnHidden(column) for column in range(5, 12))
+    assert all(not window.result_table.isColumnHidden(column) for column in (*range(5, 12), 13))
     advanced_layout = window.advanced_panel.layout()
     assert isinstance(advanced_layout, QGridLayout)
     for control in (
@@ -1312,7 +1361,7 @@ def test_query_progressive_controls_are_keyboard_and_accessibility_ready(
     assert _next_keyboard_focus(window.advanced_toggle_button) is window.enable_edit
     qtbot.keyClick(window.detail_columns_toggle, Qt.Key.Key_Space)  # type: ignore[attr-defined]
     assert window.detail_columns_toggle.isChecked()
-    assert all(not window.result_table.isColumnHidden(column) for column in range(5, 12))
+    assert all(not window.result_table.isColumnHidden(column) for column in (*range(5, 12), 13))
     qtbot.keyClick(window.raw_diagnostics_toggle, Qt.Key.Key_Space)  # type: ignore[attr-defined]
     assert window.raw_diagnostics_toggle.isChecked()
     assert window.details.isVisible()
@@ -1435,7 +1484,7 @@ assert window.monitor_button.accessibleName()
 assert window.advanced_toggle_button.accessibleDescription()
 assert window.advanced_panel.isHidden()
 assert window.details.isHidden()
-assert all(window.result_table.isColumnHidden(column) for column in range(5, 12))
+assert all(window.result_table.isColumnHidden(column) for column in (*range(5, 12), 13))
 window.advanced_toggle_button.setChecked(True)
 window.raw_diagnostics_toggle.setChecked(True)
 app.processEvents()
@@ -1759,7 +1808,7 @@ def test_delete_commit_failure_asynchronously_discards_exact_preview(
     assert store.delete_calls == 1
     assert store.discarded == [store.preview]
     assert window._pending_preview_discards == []
-    assert warnings == ["확인된 기록을 안전하게 삭제하지 못했습니다."]
+    assert warnings == ["확인된 기록을 안전하게 삭제하지 못했습니다.\n\n전달 코드: AS77"]
     window.close()
 
 
@@ -2016,6 +2065,7 @@ def test_storage_hard_stop_blocks_query_before_executor(
     assert "STORAGE_LOW_SPACE" in window.diagnostics_list.item(0).text()
     assert warnings == [
         "STORAGE_LOW_SPACE: 저장 공간이 부족합니다. 오래된 기록을 정리한 뒤 다시 시도하십시오."
+        "\n\n전달 코드: AS71"
     ]
     window.close()
 

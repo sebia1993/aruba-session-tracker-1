@@ -5,7 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
-from typing import Protocol
+from typing import Protocol, cast
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QColor, QFont, QResizeEvent
@@ -55,6 +55,12 @@ from aruba_session_tracker.models import (
 )
 from aruba_session_tracker.parsers import interpret_flags, overall_flag_severity
 from aruba_session_tracker.storage import DeletePreview, SessionStore, StorageError
+from aruba_session_tracker.support_codes import (
+    SupportCode,
+    UiFailureKey,
+    support_code_for,
+    support_code_for_ui_failure,
+)
 from aruba_session_tracker.ui.developer_inspector import (
     DeveloperInspectorController,
     UiElementMetadata,
@@ -64,7 +70,7 @@ from aruba_session_tracker.ui.shutdown import ShutdownCoordinator
 
 _UI_SOURCE_PATH = "src/aruba_session_tracker/ui/main_window.py"
 _MAX_VISIBLE_RESULT_ROWS = 2_000
-_DETAIL_COLUMN_INDEXES = range(5, 12)
+_DETAIL_COLUMN_INDEXES = (*range(5, 12), 13)
 _STORAGE_HEALTH_INTERVAL_SECONDS = 60.0
 # Advisory only: the supported five-second interval reaches 100,000 Raw files
 # in about 5.8 days.  Surface the filesystem-pressure risk before the first
@@ -871,7 +877,8 @@ class MainWindow(QMainWindow):
         self.detail_columns_toggle = QCheckBox("상세 열 보기")
         self.detail_columns_toggle.setAccessibleName("상세 결과 열 보기")
         self.detail_columns_toggle.setAccessibleDescription(
-            "목적지 포트, 패킷, 바이트, 변화량, 세션 경과, CPU ID 열을 표시하거나 숨깁니다."
+            "목적지 포트, 패킷, 바이트, 변화량, 세션 경과, CPU ID와 "
+            "원문 장비 Flags 열을 표시하거나 숨깁니다."
         )
         self.raw_diagnostics_toggle = QCheckBox("상세 정보 보기")
         self.raw_diagnostics_toggle.setAccessibleName("Raw 및 진단 패널 보기")
@@ -882,10 +889,19 @@ class MainWindow(QMainWindow):
         result_options.addWidget(self.raw_diagnostics_toggle)
         results_header_layout.addLayout(result_options)
         results_header_layout.addWidget(self.context_label)
-        self.result_table = QTableWidget(0, 15)
+        self.result_status_guide = QLabel(
+            "관측 상태는 이번 조회에서 세션이 보였는지를 뜻하며 장비 장애나 "
+            "통신 성공 판정이 아닙니다. 세션 특이사항은 장비 Flags의 참고용 풀이입니다."
+        )
+        self.result_status_guide.setObjectName("sectionHint")
+        self.result_status_guide.setAccessibleName("결과 상태 안내")
+        self.result_status_guide.setWordWrap(True)
+        results_header_layout.addWidget(self.result_status_guide)
+        self.result_table = QTableWidget(0, 16)
         self.result_table.setAccessibleName("세션 조회 결과 표")
         self.result_table.setAccessibleDescription(
-            "조회된 세션의 장비, 프로토콜, 출발지와 목적지, 상태를 표시합니다."
+            "조회된 세션의 장비, 프로토콜, 출발지와 목적지, 관측 상태와 "
+            "장비 Flags를 풀어 쓴 세션 특이사항을 표시합니다."
         )
         self.result_table.setHorizontalHeaderLabels(
             [
@@ -903,7 +919,8 @@ class MainWindow(QMainWindow):
                 "CPU ID",
                 "마지막 확인 시각",
                 "장비 Flags",
-                "상태",
+                "관측 상태",
+                "세션 특이사항",
             ]
         )
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -911,9 +928,24 @@ class MainWindow(QMainWindow):
         header = self.result_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setStretchLastSection(True)
-        widths = (120, 82, 140, 96, 140, 96, 85, 95, 96, 96, 88, 70, 150, 90)
+        widths = (120, 82, 140, 96, 140, 96, 85, 95, 96, 96, 88, 70, 150, 90, 210, 190)
         for column, width in enumerate(widths):
             header.resizeSection(column, width)
+        header_help = {
+            13: "Aruba 장비가 반환한 원문 Flags이며 상세 확인용입니다.",
+            14: (
+                "장비 조회 결과에서 이 세션이 보였는지를 표시합니다. "
+                "장비 전체 상태나 통신 성공 여부를 뜻하지 않습니다."
+            ),
+            15: (
+                "장비 Flags를 읽기 쉬운 말로 풀이한 참고 정보입니다. "
+                "특이사항이 없어도 정상 통신을 보장하지 않습니다."
+            ),
+        }
+        for column, help_text in header_help.items():
+            header_item = self.result_table.horizontalHeaderItem(column)
+            if header_item is not None:
+                header_item.setToolTip(help_text)
         for column in _DETAIL_COLUMN_INDEXES:
             self.result_table.setColumnHidden(column, True)
         self.detail_columns_toggle.toggled.connect(self._set_detail_columns_visible)
@@ -1189,13 +1221,13 @@ class MainWindow(QMainWindow):
         self.history_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.history_empty_label.setWordWrap(True)
         layout.addWidget(self.history_empty_label)
-        self.history_table = QTableWidget(0, 5)
+        self.history_table = QTableWidget(0, 6)
         self.history_table.setAccessibleName("실행 기록 표")
         self.history_table.setAccessibleDescription(
-            "저장된 실행의 시작과 종료 시각, 상태와 관측 결과 수를 표시합니다."
+            "저장된 실행의 시작과 종료 시각, 상태, 관측 결과 수와 최근 전달 코드를 표시합니다."
         )
         self.history_table.setHorizontalHeaderLabels(
-            ["실행 ID", "시작 시각", "종료 시각", "상태", "관측 결과"]
+            ["실행 ID", "시작 시각", "종료 시각", "상태", "관측 결과", "최근 전달 코드"]
         )
         self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.history_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -1741,10 +1773,12 @@ class MainWindow(QMainWindow):
         try:
             config = self._config_repository.load()
         except (ConfigError, OSError, ValueError):
+            support_code = support_code_for_ui_failure(UiFailureKey.CONFIG_READ_FAILED)
             QMessageBox.warning(
                 self,
                 "설정 읽기 실패",
-                "설정 파일을 안전하게 읽지 못했습니다. 파일 형식과 권한을 확인하십시오.",
+                "설정 파일을 안전하게 읽지 못했습니다. 파일 형식과 권한을 확인하십시오."
+                f"\n\n전달 코드: {support_code.value}",
             )
             return
         if config is None:
@@ -1786,10 +1820,12 @@ class MainWindow(QMainWindow):
             config = self._read_config_from_ui()
             self._config_repository.save(config)
         except (ConfigError, OSError, ValueError):
+            support_code = support_code_for_ui_failure(UiFailureKey.CONFIG_SAVE_FAILED)
             QMessageBox.warning(
                 self,
                 "설정 저장 실패",
-                "설정 파일을 안전하게 저장하지 못했습니다. 저장 위치의 권한을 확인하십시오.",
+                "설정 파일을 안전하게 저장하지 못했습니다. 저장 위치의 권한을 확인하십시오."
+                f"\n\n전달 코드: {support_code.value}",
             )
             return
         self._update_setup_guide()
@@ -2024,8 +2060,10 @@ class MainWindow(QMainWindow):
         for event in getattr(outcome, "diagnostics", ()):
             code = getattr(event, "code", None)
             code_text = getattr(code, "value", code) if code is not None else "INFO"
+            stage = str(getattr(event, "stage", "-"))
+            support_code = support_code_for(stage, code)
             self.diagnostics_list.addItem(
-                f"[{getattr(event, 'stage', '-')}] {code_text}: {getattr(event, 'message', '')}"
+                f"[{support_code.value}] [{stage}] {code_text}: {getattr(event, 'message', '')}"
             )
         if prepared.total_rows > _MAX_VISIBLE_RESULT_ROWS:
             self.diagnostics_list.addItem(
@@ -2039,7 +2077,8 @@ class MainWindow(QMainWindow):
         self._next_monitor_delay_seconds = (
             retry_after if retry_after > 0 else float(self.session_interval.value())
         )
-        fatal_code = _fatal_diagnostic_code(outcome)
+        fatal_event = _fatal_diagnostic_event(outcome)
+        fatal_code = _diagnostic_code_text(fatal_event)
         if bool(getattr(outcome, "cancelled", False)):
             self._set_state("대기")
         elif fatal_code is not None:
@@ -2055,15 +2094,19 @@ class MainWindow(QMainWindow):
                 "DB_WRITE_FAILED": "로컬 기록 저장 확인",
                 "STORAGE_LOW_SPACE": "저장 공간 확인",
             }.get(fatal_code, "연결 확인")
+            support_code = support_code_for(
+                str(getattr(fatal_event, "stage", "-")),
+                getattr(fatal_event, "code", None),
+            )
             self._set_state("확인 필요")
             self.statusBar().showMessage(
-                f"{reason}: 진단 이벤트의 안전한 오류 코드를 확인해 주세요.", 10000
+                f"{reason}: 전달 코드 {support_code.value}를 확인해 주세요.", 10000
             )
             if fatal_code != "HOST_KEY_UNKNOWN":
                 QMessageBox.warning(
                     self,
                     "조회 중단",
-                    f"{reason}: 진단 이벤트에서 안전한 오류 코드를 확인하십시오.",
+                    f"{reason}: 진단 이벤트를 확인하십시오.\n\n전달 코드: {support_code.value}",
                 )
         elif self._monitoring and transient_failures > 0:
             self._set_state("재시도 중")
@@ -2113,10 +2156,8 @@ class MainWindow(QMainWindow):
         self.result_table.insertRow(row)
         flag_details = interpret_flags(observation.flags)
         severity = overall_flag_severity(observation.flags)
-        flag_status = ", ".join(item.label_ko for item in flag_details) or "정상/정보 없음"
-        status = (
-            f"{lifecycle_status} · {flag_status}" if lifecycle_status is not None else flag_status
-        )
+        flag_status = ", ".join(item.label_ko for item in flag_details) or "표시된 특이사항 없음"
+        observation_status = lifecycle_status or "현재 관측됨"
         values = (
             observation.controller_name,
             _safe_protocol_label(observation.protocol),
@@ -2132,7 +2173,8 @@ class MainWindow(QMainWindow):
             _display_number(observation.cpu_id),
             _display_observed_at(observation),
             observation.flags or "-",
-            status,
+            observation_status,
+            flag_status,
         )
         for column, value in enumerate(values):
             item = QTableWidgetItem(value)
@@ -2148,10 +2190,16 @@ class MainWindow(QMainWindow):
                     item.setToolTip(
                         f"포트 번호 기준 대표 서비스 후보: {service.label} ({service.port})"
                     )
-            if column in (13, 14):
+            if column in (13, 15):
                 item.setForeground(_severity_color(severity.name))
             if column == 14:
-                item.setToolTip(status)
+                item.setToolTip(
+                    f"{observation_status}\n이 값은 장비 장애나 통신 성공 판정이 아닙니다."
+                )
+            if column == 15:
+                item.setToolTip(
+                    f"{flag_status}\n장비 Flags의 참고용 풀이며 정상 통신을 보장하지 않습니다."
+                )
             self.result_table.setItem(row, column, item)
 
     @Slot()
@@ -2166,6 +2214,7 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _display_failure(self, exc: Exception) -> None:
         code, message = _safe_query_failure(exc)
+        support_code = _support_code_for_query_failure(code)
         self._cancel_active_work()
         self.result_empty_label.setText(
             "조회가 취소되었습니다. 조건을 확인한 뒤 다시 시작할 수 있습니다."
@@ -2176,12 +2225,16 @@ class MainWindow(QMainWindow):
             self.result_table.rowCount() == 0 and not self.raw_diagnostics_toggle.isChecked()
         )
         self.diagnostics_list.clear()
-        self.diagnostics_list.addItem(f"[{code}] {message}")
+        self.diagnostics_list.addItem(f"[{support_code.value}] [{code}] {message}")
         self._set_state("대기" if code == ErrorCode.CANCELLED.value else "확인 필요")
         if code != ErrorCode.CANCELLED.value:
             self.raw_diagnostics_toggle.setChecked(True)
             self.details.setCurrentWidget(self.diagnostics_list)
-            QMessageBox.warning(self, "조회 실패", f"{code}: {message}")
+            QMessageBox.warning(
+                self,
+                "조회 실패",
+                f"{code}: {message}\n\n전달 코드: {support_code.value}",
+            )
 
     @Slot(int)
     def _query_finished(self, generation: int) -> None:
@@ -2215,8 +2268,10 @@ class MainWindow(QMainWindow):
             try:
                 invalidate()
             except Exception:
+                support_code = support_code_for_ui_failure(UiFailureKey.RUNTIME_CLEANUP_FAILED)
                 self.diagnostics_list.addItem(
-                    "[RUNTIME_ENVIRONMENT] 위치 캐시를 초기화하지 못했습니다."
+                    f"[{support_code.value}] [RUNTIME_ENVIRONMENT] "
+                    "위치 캐시를 초기화하지 못했습니다."
                 )
         if not self._monitoring or self._closing_requested:
             return
@@ -2246,10 +2301,13 @@ class MainWindow(QMainWindow):
         if not self._close_recovery_deferred:
             self._shutdown_finalization_succeeded = succeeded
         if not succeeded:
+            support_code = support_code_for_ui_failure(UiFailureKey.SHUTDOWN_INCOMPLETE)
             message = (
-                "[SHUTDOWN_DEFERRED] 종료 기록은 다음 실행에서 안전하게 복구합니다."
+                f"[{support_code.value}] [SHUTDOWN_DEFERRED] "
+                "종료 기록은 다음 실행에서 안전하게 복구합니다."
                 if exception_type == "ShutdownGraceTimeout"
-                else "[SHUTDOWN_FINALIZE_FAILED] 종료 기록 정리를 완료하지 못했습니다."
+                else f"[{support_code.value}] [SHUTDOWN_FINALIZE_FAILED] "
+                "종료 기록 정리를 완료하지 못했습니다."
             )
             self.diagnostics_list.addItem(message)
             if not self._closing_requested:
@@ -2377,8 +2435,11 @@ class MainWindow(QMainWindow):
         if not isinstance(result, _HistoryReadResult):
             self._history_dirty = True
             self._show_history_read_failure()
+            support_code = support_code_for_ui_failure(UiFailureKey.HISTORY_READ_FAILED)
             self.statusBar().showMessage(
-                "기록 읽기 실패: 로컬 기록을 안전하게 읽지 못했습니다.", 5000
+                "기록 읽기 실패: 로컬 기록을 안전하게 읽지 못했습니다. "
+                f"전달 코드 {support_code.value}",
+                5000,
             )
             self._drain_preview_discard_queue()
             self._close_if_idle()
@@ -2416,8 +2477,11 @@ class MainWindow(QMainWindow):
         self._history_dirty = True
         if not self._closing_requested:
             self._show_history_read_failure()
+            support_code = support_code_for_ui_failure(UiFailureKey.HISTORY_READ_FAILED)
             self.statusBar().showMessage(
-                "기록 읽기 실패: 로컬 기록을 안전하게 읽지 못했습니다.", 5000
+                "기록 읽기 실패: 로컬 기록을 안전하게 읽지 못했습니다. "
+                f"전달 코드 {support_code.value}",
+                5000,
             )
         self._drain_preview_discard_queue()
         self._close_if_idle()
@@ -2425,8 +2489,10 @@ class MainWindow(QMainWindow):
     def _show_history_read_failure(self) -> None:
         if self.history_table.rowCount() != 0:
             return
+        support_code = support_code_for_ui_failure(UiFailureKey.HISTORY_READ_FAILED)
         self.history_empty_label.setText(
-            "기록을 확인하지 못했습니다. 새로고침으로 다시 시도하십시오."
+            "기록을 확인하지 못했습니다. 새로고침으로 다시 시도하십시오. "
+            f"(전달 코드 {support_code.value})"
         )
         self.history_empty_label.setVisible(True)
 
@@ -2447,6 +2513,7 @@ class MainWindow(QMainWindow):
                     str(run.get("ended_at", "") or "-"),
                     str(run.get("status", "")),
                     str(run.get("observation_count", 0)),
+                    str(run.get("latest_support_code", "") or "-"),
                 )
             else:
                 values = (
@@ -2455,12 +2522,18 @@ class MainWindow(QMainWindow):
                     str(getattr(run, "finished_at", "") or "-"),
                     str(getattr(run, "status", "")),
                     str(getattr(run, "observation_count", 0)),
+                    str(getattr(run, "latest_support_code", "") or "-"),
                 )
             for column, value in enumerate(values):
                 display_value = _history_status_label(value) if column == 3 else value
                 item = QTableWidgetItem(display_value)
                 if column == 3 and display_value != value:
                     item.setToolTip(f"저장 상태 코드: {value}")
+                if column == 5:
+                    item.setToolTip(
+                        "사내 정보 없이 전달할 수 있는 최근 진단 코드입니다. "
+                        "'-'는 저장된 전달 코드가 없다는 뜻입니다."
+                    )
                 self.history_table.setItem(row, column, item)
             if values[0] == selected_run_id:
                 selected_row = row
@@ -2732,8 +2805,12 @@ class MainWindow(QMainWindow):
         self._close_if_idle()
 
     def _show_storage_failure(self, kind: str) -> None:
+        support_code = _support_code_for_storage_failure(kind)
         if kind == "delete-discard":
-            self.statusBar().showMessage("삭제 취소 상태를 정리하지 못했습니다.", 5000)
+            self.statusBar().showMessage(
+                f"삭제 취소 상태를 정리하지 못했습니다. 전달 코드 {support_code.value}",
+                5000,
+            )
             return
         title, message = {
             "export-csv": ("내보내기 실패", "CSV 파일을 안전하게 내보내지 못했습니다."),
@@ -2741,9 +2818,13 @@ class MainWindow(QMainWindow):
             "delete-preview": ("삭제 준비 실패", "삭제 대상을 안전하게 확인하지 못했습니다."),
             "delete-commit": ("삭제 실패", "확인된 기록을 안전하게 삭제하지 못했습니다."),
         }.get(kind, ("작업 실패", "로컬 파일 작업을 안전하게 마치지 못했습니다."))
-        self.statusBar().showMessage(message, 5000)
+        self.statusBar().showMessage(f"{message} 전달 코드 {support_code.value}", 5000)
         if not self._closing_requested:
-            QMessageBox.warning(self, title, message)
+            QMessageBox.warning(
+                self,
+                title,
+                f"{message}\n\n전달 코드: {support_code.value}",
+            )
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
@@ -2930,6 +3011,26 @@ def _safe_query_failure(exc: Exception) -> tuple[str, str]:
     )
 
 
+def _support_code_for_query_failure(code: str) -> SupportCode:
+    key = {
+        ErrorCode.AUTH_FAILED.value: UiFailureKey.QUERY_AUTH_FAILED,
+        ErrorCode.DB_WRITE_FAILED.value: UiFailureKey.QUERY_DB_WRITE_FAILED,
+        ErrorCode.STORAGE_LOW_SPACE.value: UiFailureKey.QUERY_STORAGE_LOW_SPACE,
+    }.get(code, UiFailureKey.QUERY_UNEXPECTED)
+    return support_code_for_ui_failure(key)
+
+
+def _support_code_for_storage_failure(kind: str) -> SupportCode:
+    key = {
+        "export-csv": UiFailureKey.EXPORT_CSV_FAILED,
+        "export-html": UiFailureKey.EXPORT_HTML_FAILED,
+        "delete-preview": UiFailureKey.DELETE_PREVIEW_FAILED,
+        "delete-commit": UiFailureKey.DELETE_COMMIT_FAILED,
+        "delete-discard": UiFailureKey.DELETE_DISCARD_FAILED,
+    }.get(kind, UiFailureKey.RUNTIME_CLEANUP_FAILED)
+    return support_code_for_ui_failure(key)
+
+
 def _ui_metadata(
     name_ko: str,
     stable_id: str,
@@ -3061,7 +3162,7 @@ def _prepare_display_outcome(
                         observation,
                         "-",
                         "-",
-                        f"종료 확인 ({close_after_misses}회 연속 MISS)",
+                        f"{close_after_misses}회 연속 미관측 · 종료 확인",
                     )
                 )
     else:
@@ -3081,7 +3182,7 @@ def _prepare_display_outcome(
                         observation.bytes_count,
                         None if previous is None else previous[1],
                     ),
-                    None,
+                    "현재 관측됨",
                 )
             )
             next_counters[counter_key] = (observation.packets, observation.bytes_count)
@@ -3109,21 +3210,21 @@ def _lifecycle_status(
 ) -> str | None:
     if not is_observed:
         if not authoritative:
-            return "확인 불가 · 이전 관측 유지"
-        return f"MISS {miss_count}/{close_after_misses} · 종료 확인 중"
+            return "조회 결과 신뢰 불가 · 이전 관측 유지"
+        return f"이번 조회에서 미관측 ({miss_count}/{close_after_misses}) · 종료 판단 보류"
     labels = []
     if "STARTED" in event_types:
-        labels.append("새 세션")
+        labels.append("처음 관측")
     if "CONTROLLER_CHANGED" in event_types:
-        labels.append("MD 변경")
+        labels.append("관측 MD 변경")
     if "CONTROLLER_OVERLAP" in event_types:
-        labels.append("여러 MD에서 관측")
+        labels.append("여러 MD에서 동시 관측")
     if "FLAGS_CHANGED" in event_types:
-        labels.append("플래그 변경")
-    return "활성" + (" · " + " · ".join(labels) if labels else "")
+        labels.append("Flags 변경")
+    return "현재 관측됨" + (" · " + " · ".join(labels) if labels else "")
 
 
-def _fatal_diagnostic_code(outcome: object) -> str | None:
+def _fatal_diagnostic_event(outcome: object) -> object | None:
     fatal = {
         "AUTH_FAILED",
         "COMMAND_REJECTED",
@@ -3145,8 +3246,19 @@ def _fatal_diagnostic_code(outcome: object) -> str | None:
             continue
         code = getattr(getattr(diagnostic, "code", None), "value", None)
         if code in fatal:
-            return str(code)
+            return cast(object, diagnostic)
     return None
+
+
+def _diagnostic_code_text(diagnostic: object | None) -> str | None:
+    code = getattr(getattr(diagnostic, "code", None), "value", None)
+    return str(code) if isinstance(code, str) else None
+
+
+def _fatal_diagnostic_code(outcome: object) -> str | None:
+    """Compatibility helper retained for callers that only need the raw code."""
+
+    return _diagnostic_code_text(_fatal_diagnostic_event(outcome))
 
 
 def _nonnegative_float(value: object) -> float:

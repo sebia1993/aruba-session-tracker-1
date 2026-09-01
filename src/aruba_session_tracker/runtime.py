@@ -8,6 +8,7 @@ from uuid import uuid4
 from aruba_session_tracker.collectors import (
     CancellationToken,
     HostKeyApproval,
+    MonitoringSSHConnectionFactory,
     SSHConnectionFactory,
     StrictNetmikoFactory,
 )
@@ -36,6 +37,16 @@ class _ActiveMonitorPoll:
     generation: int
     run_id: str | None
     cancel_token: CancellationToken
+
+
+@dataclass(frozen=True, slots=True)
+class _DetachedMonitor:
+    run_id: str | None
+    ssh_pool: MonitoringSSHConnectionFactory | None
+
+    def close_connections(self) -> None:
+        if self.ssh_pool is not None:
+            self.ssh_pool.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +82,7 @@ class RuntimeExecutor:
         self._ssh_factory = ssh_factory
         self._lock = threading.RLock()
         self._monitor: MonitorEngine | None = None
+        self._monitor_ssh_pool: MonitoringSSHConnectionFactory | None = None
         self._monitor_signature: str | None = None
         self._monitor_credentials: Credentials | None = None
         self._monitor_run_id: str | None = None
@@ -192,7 +204,7 @@ class RuntimeExecutor:
         return outcome
 
     def stop_monitor(self) -> None:
-        run_id: str | None = None
+        detached: _DetachedMonitor | None = None
         active_token: CancellationToken | None = None
         pending: _PendingMonitorPersistence | None = None
         retry_lease: _ActiveMonitorPoll | None = None
@@ -218,14 +230,16 @@ class RuntimeExecutor:
                 )
                 self._active_monitor_poll = retry_lease
             else:
-                run_id = self._detach_monitor_locked()
+                detached = self._detach_monitor_locked()
         if active_token is not None:
             active_token.cancel()
         if pending is not None and retry_lease is not None:
             self._resolve_pending_monitor_stop(pending, retry_lease)
             return
-        if run_id is not None:
-            self._finish_or_queue(run_id, "STOPPED")
+        if detached is not None:
+            detached.close_connections()
+            if detached.run_id is not None:
+                self._finish_or_queue(detached.run_id, "STOPPED")
         self._retry_pending_finishes(required=True)
 
     def _resolve_pending_monitor_stop(
@@ -257,16 +271,19 @@ class RuntimeExecutor:
                     self._active_monitor_poll = None
             raise
 
+        detached: _DetachedMonitor | None = None
         with self._lock:
             if self._pending_monitor_persistence is pending:
                 self._pending_monitor_persistence = None
-            run_id = (
+            detached = (
                 self._detach_monitor_locked() if self._lease_owns_monitor_locked(lease) else None
             )
             if self._active_monitor_poll is lease:
                 self._active_monitor_poll = None
-        if run_id is not None:
-            self._finish_or_queue(run_id, "STOPPED")
+        if detached is not None:
+            detached.close_connections()
+            if detached.run_id is not None:
+                self._finish_or_queue(detached.run_id, "STOPPED")
         self._retry_pending_finishes(required=True)
         return recovered
 
@@ -297,11 +314,14 @@ class RuntimeExecutor:
         return self._resolve_pending_monitor_stop(pending, lease)
 
     def invalidate_monitor_location(self) -> None:
-        """Force the next monitor poll to refresh MM routing information."""
+        """Drop network-bound state and refresh MM routing on the next poll."""
 
         with self._lock:
             if self._monitor is not None:
                 self._monitor.invalidate_location()
+            ssh_pool = self._monitor_ssh_pool
+        if ssh_pool is not None:
+            ssh_pool.invalidate()
 
     def _execute_monitor_poll(
         self,
@@ -314,7 +334,7 @@ class RuntimeExecutor:
         full_scan_approval: FullScanApproval,
     ) -> MonitorPollResult:
         signature = _monitor_signature(config, request, credentials.username)
-        restart_run_id: str | None = None
+        restart_detached: _DetachedMonitor | None = None
         pending: _PendingMonitorPersistence | None = None
         with self._lock:
             if self._active_monitor_poll is not None:
@@ -342,13 +362,17 @@ class RuntimeExecutor:
                     self._monitor_signature != signature or self._monitor_credentials != credentials
                 )
             ):
-                restart_run_id = self._detach_monitor_locked(reset_stop_request=False)
+                restart_detached = self._detach_monitor_locked(reset_stop_request=False)
+
+        if restart_detached is not None:
+            restart_detached.close_connections()
 
         prepared: _PreparedMonitorPoll | None = None
         monitor: MonitorEngine | None = None
         run_id: str | None = None
         persistence_indeterminate = False
         pending_retry_failed = False
+        unattached_pool: MonitoringSSHConnectionFactory | None = None
         try:
             if pending is not None:
                 monitor = pending.monitor
@@ -377,12 +401,14 @@ class RuntimeExecutor:
                 with self._lock:
                     if not self._lease_owns_monitor_locked(lease):
                         raise RuntimeError("모니터링 실행 소유권이 변경되었습니다.")
-                    restart_run_id = self._detach_monitor_locked(reset_stop_request=False)
+                    restart_detached = self._detach_monitor_locked(reset_stop_request=False)
                     lease.poll_id = uuid4().hex
                     lease.generation = self._monitor_generation
                     lease.run_id = None
+                restart_detached.close_connections()
                 pending = None
 
+            restart_run_id = restart_detached.run_id if restart_detached is not None else None
             if restart_run_id is not None:
                 finish_error = self._finish_or_queue(restart_run_id, "RESTARTED")
                 if finish_error is not None:
@@ -393,7 +419,17 @@ class RuntimeExecutor:
             with self._lock:
                 needs_monitor = self._monitor is None
             if needs_monitor:
-                service = self._service(config, host_key_approval, full_scan_approval)
+                ssh_pool = MonitoringSSHConnectionFactory(
+                    self._base_ssh_factory(),
+                    credentials,
+                )
+                unattached_pool = ssh_pool
+                service = self._service(
+                    config,
+                    host_key_approval,
+                    full_scan_approval,
+                    ssh_factory=ssh_pool,
+                )
                 monitor = MonitorEngine(
                     service,
                     request,
@@ -406,11 +442,13 @@ class RuntimeExecutor:
                         raise RuntimeError("모니터링 실행 소유권이 변경되었습니다.")
                     self._monitor_generation += 1
                     self._monitor = monitor
+                    self._monitor_ssh_pool = ssh_pool
                     self._monitor_signature = signature
                     self._monitor_credentials = credentials
                     self._monitor_run_id = run_id
                     lease.generation = self._monitor_generation
                     lease.run_id = run_id
+                    unattached_pool = None
             else:
                 with self._lock:
                     monitor = self._monitor
@@ -464,7 +502,7 @@ class RuntimeExecutor:
                 raise
             if prepared is not None and monitor is not None:
                 monitor._discard_prepared(prepared)
-            failed_run_id: str | None = None
+            failed_detached: _DetachedMonitor | None = None
             with self._lock:
                 if (
                     self._pending_monitor_persistence is not None
@@ -473,9 +511,14 @@ class RuntimeExecutor:
                     self._pending_monitor_persistence = None
                 stop_requested = self._monitor_stop_requested or cancel_token.is_cancelled
                 if self._lease_owns_monitor_locked(lease):
-                    failed_run_id = self._detach_monitor_locked()
+                    failed_detached = self._detach_monitor_locked()
                 elif self._monitor_stop_requested and self._monitor is None:
                     self._monitor_stop_requested = False
+            if failed_detached is not None:
+                failed_detached.close_connections()
+                failed_run_id = failed_detached.run_id
+            else:
+                failed_run_id = None
             if failed_run_id is not None:
                 finish_error = self._finish_or_queue(
                     failed_run_id,
@@ -488,17 +531,24 @@ class RuntimeExecutor:
                     self._active_monitor_poll = None
             raise
         finally:
-            stopped_run_id: str | None = None
+            if unattached_pool is not None:
+                unattached_pool.close()
+            stopped_detached: _DetachedMonitor | None = None
             with self._lock:
                 if persistence_indeterminate or pending_retry_failed:
                     if self._active_monitor_poll is lease:
                         self._active_monitor_poll = None
                 elif self._monitor_stop_requested and self._lease_owns_monitor_locked(lease):
-                    stopped_run_id = self._detach_monitor_locked()
+                    stopped_detached = self._detach_monitor_locked()
                 elif self._monitor_stop_requested and self._monitor is None:
                     self._monitor_stop_requested = False
-                if stopped_run_id is None and self._active_monitor_poll is lease:
+                if stopped_detached is None and self._active_monitor_poll is lease:
                     self._active_monitor_poll = None
+            if stopped_detached is not None:
+                stopped_detached.close_connections()
+                stopped_run_id = stopped_detached.run_id
+            else:
+                stopped_run_id = None
             if stopped_run_id is not None:
                 finish_error = self._finish_or_queue(stopped_run_id, "STOPPED")
                 with self._lock:
@@ -514,13 +564,18 @@ class RuntimeExecutor:
         config: AppConfig,
         host_key_approval: HostKeyApproval,
         full_scan_approval: FullScanApproval,
+        *,
+        ssh_factory: SSHConnectionFactory | None = None,
     ) -> TrackerService:
-        factory = self._ssh_factory or StrictNetmikoFactory(self._paths.known_hosts)
+        factory = ssh_factory or self._base_ssh_factory()
         callbacks = TrackerCallbacks(
             host_key_approval=host_key_approval,
             full_scan_approval=full_scan_approval,
         )
         return TrackerService(config, factory, callbacks)
+
+    def _base_ssh_factory(self) -> SSHConnectionFactory:
+        return self._ssh_factory or StrictNetmikoFactory(self._paths.known_hosts)
 
     def _lease_owns_monitor_locked(self, lease: _ActiveMonitorPoll) -> bool:
         return (
@@ -529,16 +584,22 @@ class RuntimeExecutor:
             and lease.run_id == self._monitor_run_id
         )
 
-    def _detach_monitor_locked(self, *, reset_stop_request: bool = True) -> str | None:
+    def _detach_monitor_locked(
+        self,
+        *,
+        reset_stop_request: bool = True,
+    ) -> _DetachedMonitor:
         run_id = self._monitor_run_id
+        ssh_pool = self._monitor_ssh_pool
         self._monitor = None
+        self._monitor_ssh_pool = None
         self._monitor_signature = None
         self._monitor_credentials = None
         self._monitor_run_id = None
         self._monitor_generation += 1
         if reset_stop_request:
             self._monitor_stop_requested = False
-        return run_id
+        return _DetachedMonitor(run_id, ssh_pool)
 
     def _finish_or_queue(self, run_id: str, status: str) -> Exception | None:
         try:

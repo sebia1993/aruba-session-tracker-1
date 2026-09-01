@@ -323,6 +323,7 @@ def test_startup_storage_failure_is_visible_and_returns_nonzero(
 
     assert main([]) == 1
     assert shown and "시작 실패" in shown[0][0]
+    assert "전달 코드: AS79" in shown[0][1]
     assert str(error) not in shown[0][1]
 
 

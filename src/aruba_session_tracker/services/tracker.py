@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from aruba_session_tracker.collectors import (
     CancellationToken,
     CollectorError,
+    CollectorPhase,
     HostKeyApproval,
     PollDeadline,
     SSHCollector,
@@ -417,11 +418,12 @@ class TrackerService:
                     deadline=device_deadline,
                 )
             except CollectorError as exc:
+                safe_target = _safe_md_reference(self.config, device)
                 diagnostics.append(
                     DiagnosticEvent(
-                        stage="MD_QUERY",
+                        stage=_collector_diagnostic_stage("MD", exc),
                         code=_md_error_code(exc),
-                        message=f"선택한 MD에서 세션 출력을 수집하지 못했습니다: {exc}",
+                        message=(f"{safe_target}에서 세션 출력을 수집하지 못했습니다: {exc}"),
                         transient=exc.retryable_network,
                     )
                 )
@@ -562,7 +564,7 @@ class TrackerService:
             except CollectorError as exc:
                 diagnostics.append(
                     DiagnosticEvent(
-                        stage="MM_QUERY",
+                        stage=_collector_diagnostic_stage("MM", exc),
                         code=exc.code,
                         message=f"MM 조회 실패: {exc}",
                         transient=exc.retryable_network,
@@ -702,6 +704,22 @@ class TrackerService:
 
 def _normalize_switch(value: str) -> str:
     return value.strip().rstrip(".").casefold()
+
+
+def _collector_diagnostic_stage(device_role: str, exc: CollectorError) -> str:
+    phase = getattr(exc, "phase", None)
+    if phase is CollectorPhase.LOGIN:
+        return f"{device_role}_LOGIN"
+    if phase is CollectorPhase.ENABLE:
+        return f"{device_role}_ENABLE"
+    return f"{device_role}_QUERY"
+
+
+def _safe_md_reference(config: AppConfig, target: DeviceTarget) -> str:
+    for index, configured in enumerate(config.managed_devices, start=1):
+        if configured == target:
+            return f"등록 MD {index}번"
+    return "선택한 MD"
 
 
 def _fair_device_deadline(

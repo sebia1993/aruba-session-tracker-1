@@ -43,6 +43,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 class _Connection(AbstractContextManager[CommandConnection]):
     def __init__(self, responses: dict[str, str]) -> None:
         self._responses = responses
+        self.closed = False
 
     def __enter__(self) -> Self:
         return self
@@ -60,7 +61,7 @@ class _Connection(AbstractContextManager[CommandConnection]):
         return self._responses[command]
 
     def close(self) -> None:
-        return None
+        self.closed = True
 
 
 class _Factory:
@@ -99,6 +100,7 @@ class _RecordingFactory(_Factory):
         super().__init__()
         self.targets: list[str] = []
         self.passwords: list[str] = []
+        self.connections: list[_Connection] = []
 
     def connect(
         self,
@@ -111,13 +113,16 @@ class _RecordingFactory(_Factory):
     ) -> AbstractContextManager[CommandConnection]:
         self.targets.append(target.name)
         self.passwords.append(credentials.password)
-        return super().connect(
+        connection = super().connect(
             target,
             credentials,
             host_key_approval=host_key_approval,
             cancel_token=cancel_token,
             deadline=deadline,
         )
+        assert isinstance(connection, _Connection)
+        self.connections.append(connection)
+        return connection
 
 
 class _BlockingConnection(_Connection):
@@ -192,7 +197,8 @@ def test_runtime_query_persists_observations_raw_and_diagnostics(tmp_path: Path)
     paths = _paths(tmp_path)
     store = SessionStore(paths.database, paths.raw, paths.exports)
     store.initialize()
-    executor = RuntimeExecutor(paths, store, ssh_factory=_Factory())
+    factory = _RecordingFactory()
+    executor = RuntimeExecutor(paths, store, ssh_factory=factory)
     request = QueryRequest("192.0.2.10", "203.0.113.20", 54321, 443)
 
     outcome = executor.execute(
@@ -207,6 +213,8 @@ def test_runtime_query_persists_observations_raw_and_diagnostics(tmp_path: Path)
 
     assert outcome.authoritative is True
     assert len(outcome.observations) == 2
+    assert factory.targets == ["MM-1", "MD-1"]
+    assert all(connection.closed for connection in factory.connections)
     assert executor.last_persistence_status is PollPersistenceStatus.COMMITTED
     runs = store.list_runs()
     assert len(runs) == 1
@@ -547,7 +555,8 @@ def test_runtime_monitor_reuses_one_run_and_finishes_on_stop(tmp_path: Path) -> 
     paths = _paths(tmp_path)
     store = SessionStore(paths.database, paths.raw, paths.exports)
     store.initialize()
-    executor = RuntimeExecutor(paths, store, ssh_factory=_Factory())
+    factory = _RecordingFactory()
+    executor = RuntimeExecutor(paths, store, ssh_factory=factory)
     request = QueryRequest("192.0.2.10", "203.0.113.20", 54321, 443)
     credentials = Credentials("operator", "session-only")
 
@@ -563,6 +572,8 @@ def test_runtime_monitor_reuses_one_run_and_finishes_on_stop(tmp_path: Path) -> 
         )
     executor.stop_monitor()
 
+    assert factory.targets == ["MM-1", "MD-1"]
+    assert all(connection.closed for connection in factory.connections)
     runs = store.list_runs()
     assert len(runs) == 1
     assert runs[0]["status"] == "STOPPED"
@@ -1112,7 +1123,8 @@ def test_runtime_discards_unpersisted_monitor_state_after_batch_failure(
     paths = _paths(tmp_path)
     store = SessionStore(paths.database, paths.raw, paths.exports)
     store.initialize()
-    executor = RuntimeExecutor(paths, store, ssh_factory=_Factory())
+    factory = _RecordingFactory()
+    executor = RuntimeExecutor(paths, store, ssh_factory=factory)
     request = QueryRequest("192.0.2.10", "203.0.113.20", 54321, 443)
     credentials = Credentials("operator", "session-only")
     original_batch = store.record_poll_batch
@@ -1136,6 +1148,8 @@ def test_runtime_discards_unpersisted_monitor_state_after_batch_failure(
             host_key_approval=lambda _target, _info: True,
             full_scan_approval=lambda _request, _devices: False,
         )
+
+    assert all(connection.closed for connection in factory.connections)
 
     result = executor.execute(
         _config(),
@@ -1227,6 +1241,7 @@ def test_runtime_restarts_monitor_when_in_memory_credentials_change(tmp_path: Pa
         cancel_token=CancellationToken(),
         **common,  # type: ignore[arg-type]
     )
+    first_identity_connections = tuple(factory.connections)
     executor.execute(
         _config(),
         request,
@@ -1235,6 +1250,7 @@ def test_runtime_restarts_monitor_when_in_memory_credentials_change(tmp_path: Pa
         **common,  # type: ignore[arg-type]
     )
 
+    assert all(connection.closed for connection in first_identity_connections)
     assert factory.passwords[:2] == ["first-session-secret", "first-session-secret"]
     assert factory.passwords[-2:] == ["second-session-secret", "second-session-secret"]
     assert "second-session-secret" not in str(executor._monitor_signature)
@@ -1264,9 +1280,11 @@ def test_runtime_can_invalidate_cached_monitor_location(tmp_path: Path) -> None:
     poll()
     factory.targets.clear()
     poll()
-    assert factory.targets == ["MD-1"]
+    assert factory.targets == []
 
+    previous_connections = tuple(factory.connections)
     executor.invalidate_monitor_location()
+    assert all(connection.closed for connection in previous_connections)
     factory.targets.clear()
     poll()
     assert factory.targets == ["MM-1", "MD-1"]

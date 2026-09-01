@@ -17,6 +17,7 @@ import aruba_session_tracker.services.monitoring as monitoring_module
 from aruba_session_tracker.collectors import (
     CancellationToken,
     CollectorError,
+    CollectorPhase,
     CommandConnection,
     PollDeadline,
 )
@@ -211,10 +212,15 @@ def test_primary_network_failure_uses_standby_but_auth_failure_does_not() -> Non
     assert outcome.authoritative is True
 
     auth_factory = FakeFactory(outputs)
-    auth_factory.errors["MM-Primary"] = CollectorError(ErrorCode.AUTH_FAILED, "auth")
+    auth_factory.errors["MM-Primary"] = CollectorError(
+        ErrorCode.AUTH_FAILED,
+        "auth",
+        phase=CollectorPhase.LOGIN,
+    )
     outcome = TrackerService(config, auth_factory).query_once(REQUEST, CREDENTIALS)
     assert outcome.observations == ()
     assert [event.code for event in outcome.diagnostics] == [ErrorCode.AUTH_FAILED]
+    assert [event.stage for event in outcome.diagnostics] == ["MM_LOGIN"]
     assert auth_factory.calls == ["MM-Primary"]
 
 
@@ -507,13 +513,42 @@ def test_md_authentication_failure_stops_before_other_candidates() -> None:
         "MD-2": {NO_PAGING_COMMAND: ""},
     }
     factory = FakeFactory(outputs)
-    factory.errors["MD-1"] = CollectorError(ErrorCode.AUTH_FAILED, "auth")
+    factory.errors["MD-1"] = CollectorError(
+        ErrorCode.AUTH_FAILED,
+        "auth",
+        phase=CollectorPhase.LOGIN,
+    )
 
     outcome = TrackerService(config, factory).query_once(REQUEST, CREDENTIALS)
 
     assert outcome.authoritative is False
     assert factory.calls == ["MM-Primary", "MD-1"]
-    assert ErrorCode.AUTH_FAILED in {event.code for event in outcome.diagnostics}
+    assert [(event.stage, event.code) for event in outcome.diagnostics] == [
+        ("MD_LOGIN", ErrorCode.AUTH_FAILED)
+    ]
+    assert "등록 MD 1번" in outcome.diagnostics[0].message
+
+
+def test_md_enable_authentication_failure_has_a_distinct_safe_stage() -> None:
+    config = _config()
+    outputs = {
+        "MM-Primary": _mm_outputs("192.0.2.101", "192.0.2.102"),
+        "MD-1": {NO_PAGING_COMMAND: ""},
+        "MD-2": {NO_PAGING_COMMAND: ""},
+    }
+    factory = FakeFactory(outputs)
+    factory.errors["MD-1"] = CollectorError(
+        ErrorCode.AUTH_FAILED,
+        "enable auth",
+        phase=CollectorPhase.ENABLE,
+    )
+
+    outcome = TrackerService(config, factory).query_once(REQUEST, CREDENTIALS)
+
+    assert [(event.stage, event.code) for event in outcome.diagnostics] == [
+        ("MD_ENABLE", ErrorCode.AUTH_FAILED)
+    ]
+    assert "등록 MD 1번" in outcome.diagnostics[0].message
 
 
 def test_md_host_key_failure_stops_before_other_candidates() -> None:
