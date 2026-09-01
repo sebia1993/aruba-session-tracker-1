@@ -46,7 +46,11 @@ class _HorizontalRailTabStyle(QProxyStyle):
         size: QSize,
         widget: QWidget | None = None,
     ) -> QSize:
-        calculated = super().sizeFromContents(content_type, option, size, widget)
+        calculated = (
+            super().sizeFromContents(content_type, option, size, widget)
+            if widget is not None
+            else super().sizeFromContents(content_type, option, size)
+        )
         if content_type == QStyle.ContentsType.CT_TabBarTab:
             return QSize(184, max(52, calculated.height()))
         return calculated
@@ -137,8 +141,11 @@ class _NocConsoleController(QObject):
             header_layout = QHBoxLayout(window.nav_identity)
         while header_layout.count():
             item = header_layout.takeAt(0)
-            if item is not None and item.widget() is not None:
-                item.widget().setParent(window.nav_identity)
+            if item is None:
+                continue
+            item_widget = item.widget()
+            if item_widget is not None:
+                item_widget.setParent(window.nav_identity)
         header_layout.setContentsMargins(18, 9, 18, 9)
         header_layout.setSpacing(10)
 
