@@ -46,9 +46,7 @@ class _HorizontalRailTabStyle(QProxyStyle):
         size: QSize,
         widget: QWidget | None = None,
     ) -> QSize:
-        calculated = super().sizeFromContents(
-            content_type, option, size, cast(QWidget, widget)
-        )
+        calculated = super().sizeFromContents(content_type, option, size, cast(QWidget, widget))
         if content_type == QStyle.ContentsType.CT_TabBarTab:
             return QSize(184, max(52, calculated.height()))
         return calculated
