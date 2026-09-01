@@ -25,42 +25,39 @@ jobs:
         shell: pwsh
         run: |
           $path = "src/aruba_session_tracker/ui/noc_console.py"
-          $text = Get-Content -Raw -Encoding UTF8 $path
+          $text = (Get-Content -Raw -Encoding UTF8 $path).Replace("`r`n", "`n")
 
-          $oldSize = @'
-                  calculated = super().sizeFromContents(content_type, option, size, widget)
-          '@
+          $oldSize = "        calculated = super().sizeFromContents(content_type, option, size, widget)"
           $newSize = @'
                   calculated = (
                       super().sizeFromContents(content_type, option, size, widget)
                       if widget is not None
                       else super().sizeFromContents(content_type, option, size)
                   )
-          '@
+          '@.TrimEnd()
           if (-not $text.Contains($oldSize)) {
-            throw "sizeFromContents target block was not found."
+            throw "sizeFromContents target line was not found."
           }
           $text = $text.Replace($oldSize, $newSize)
 
-          $oldWidget = @'
-                  while header_layout.count():
-                      item = header_layout.takeAt(0)
-                      if item is not None and item.widget() is not None:
-                          item.widget().setParent(window.nav_identity)
-          '@
-          $newWidget = @'
-                  while header_layout.count():
-                      item = header_layout.takeAt(0)
+          $oldGuard = "            if item is not None and item.widget() is not None:"
+          $newGuard = @'
                       if item is None:
                           continue
                       item_widget = item.widget()
                       if item_widget is not None:
-                          item_widget.setParent(window.nav_identity)
-          '@
-          if (-not $text.Contains($oldWidget)) {
-            throw "layout-item target block was not found."
+          '@.TrimEnd()
+          if (-not $text.Contains($oldGuard)) {
+            throw "layout-item guard line was not found."
           }
-          $text = $text.Replace($oldWidget, $newWidget)
+          $text = $text.Replace($oldGuard, $newGuard)
+
+          $oldParent = "                item.widget().setParent(window.nav_identity)"
+          $newParent = "                item_widget.setParent(window.nav_identity)"
+          if (-not $text.Contains($oldParent)) {
+            throw "layout-item parent line was not found."
+          }
+          $text = $text.Replace($oldParent, $newParent)
 
           [System.IO.File]::WriteAllText(
             (Resolve-Path $path),
