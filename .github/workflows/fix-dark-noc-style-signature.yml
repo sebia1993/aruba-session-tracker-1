@@ -1,0 +1,72 @@
+name: Fix Dark NOC style signature
+
+on:
+  push:
+    branches:
+      - design/dark-noc-console-v1
+    paths:
+      - .github/workflows/fix-dark-noc-style-signature.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: windows-latest
+    steps:
+      - name: Check out design branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: design/dark-noc-console-v1
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Apply PySide6 type-stub compatibility patch
+        shell: pwsh
+        run: |
+          $path = "src/aruba_session_tracker/ui/noc_console.py"
+          $text = (Get-Content -Raw -Encoding UTF8 $path).Replace("`r`n", "`n")
+
+          $oldImport = "from typing import TYPE_CHECKING"
+          $newImport = "from typing import TYPE_CHECKING, cast"
+          if (-not $text.Contains($oldImport)) {
+            throw "typing import target was not found."
+          }
+          $text = $text.Replace($oldImport, $newImport)
+
+          $oldBlock = @'
+                  calculated = (
+                      super().sizeFromContents(content_type, option, size, widget)
+                      if widget is not None
+                      else super().sizeFromContents(content_type, option, size)
+                  )
+          '@.TrimEnd()
+          $newBlock = @'
+                  calculated = super().sizeFromContents(
+                      content_type, option, size, cast(QWidget, widget)
+                  )
+          '@.TrimEnd()
+          if (-not $text.Contains($oldBlock)) {
+            throw "sizeFromContents compatibility block was not found."
+          }
+          $text = $text.Replace($oldBlock, $newBlock)
+
+          [System.IO.File]::WriteAllText(
+            (Resolve-Path $path),
+            $text,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          Remove-Item -Force .github/workflows/fix-dark-noc-style-signature.yml
+
+      - name: Commit compatibility fix
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { throw "Patch contains whitespace errors." }
+          git commit -m "Fix Dark NOC style signature typing"
+          if ($LASTEXITCODE -ne 0) { throw "Compatibility commit failed." }
+          git push origin HEAD:design/dark-noc-console-v1
+          if ($LASTEXITCODE -ne 0) { throw "Compatibility push failed." }
