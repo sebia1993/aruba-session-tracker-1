@@ -85,6 +85,24 @@ NetBox, Nautobot, Beszel, Gatus, and Tabler are visual references only. Do not
 copy their source or stylesheet wholesale. No GPL UI package may be linked into
 the application.
 
+## Implementation map
+
+- `src/aruba_session_tracker/ui/noc_console.py`: presentation controller,
+  left navigation, derived status header, KPI strip, and selected-session
+  detail composition.
+- `src/aruba_session_tracker/ui/theme.py`: local Dark NOC QSS, semantic states,
+  high-contrast fallback, table density, and responsive layout rules.
+- `src/aruba_session_tracker/storage/html_report_presentation.py`: standalone
+  investigation report structure, inline state ring, sanitized event timeline,
+  latest sessions, and streaming observation history.
+- `src/aruba_session_tracker/storage/__init__.py`: compatibility wiring that
+  keeps the existing public report API and `SessionStore` call path intact.
+- `tests/test_theme.py` plus the existing HTML, storage, UI, security, and
+  packaging suites: regression and acceptance coverage.
+
+No third-party UI runtime, remote asset, font package, icon package, or web
+service was introduced by this implementation.
+
 ## Acceptance
 
 - Existing functional behavior and Inspector IDs remain intact.
