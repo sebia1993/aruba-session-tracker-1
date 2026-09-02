@@ -63,6 +63,7 @@ from aruba_session_tracker.ui.main_window import (
     _safe_query_failure,
     _storage_status_text,
     _support_code_for_query_failure,
+    _support_reference_for_query_failure,
 )
 from aruba_session_tracker.ui.theme import apply_main_window_theme
 
@@ -606,6 +607,35 @@ def test_safe_query_failure_maps_known_storage_and_unexpected_errors() -> None:
         "UNEXPECTED",
         "예상하지 못한 내부 오류가 발생했습니다. 오류 유형: RuntimeError",
     )
+
+
+@pytest.mark.parametrize(
+    ("boundary", "expected"),
+    (
+        (StorageFailureBoundary.QUERY_PREFLIGHT, "AS86-P"),
+        (StorageFailureBoundary.QUERY_START, "AS86-S"),
+        (StorageFailureBoundary.QUERY_RESULT, "AS86-R"),
+        (StorageFailureBoundary.QUERY_FINALIZE, "AS86-F"),
+        (None, "AS86"),
+    ),
+)
+def test_storage_path_support_reference_adds_only_a_safe_boundary_suffix(
+    boundary: StorageFailureBoundary | None,
+    expected: str,
+) -> None:
+    failure = StorageError(
+        "password=secret C:\\private\\tracker.db",
+        failure_kind=StorageFailureKind.STORAGE_PATH,
+        boundary=boundary,
+    )
+
+    assert (
+        _support_reference_for_query_failure(failure, ErrorCode.STORAGE_PATH_FAILED.value)
+        == expected
+    )
+    assert "secret" not in expected
+    assert "tracker.db" not in expected
+    assert _support_reference_for_query_failure(failure, ErrorCode.DB_WRITE_FAILED.value) == "AS70"
 
 
 def test_lifecycle_status_distinguishes_uncertain_missing_and_active_changes() -> None:
@@ -2683,10 +2713,10 @@ def test_storage_health_path_integrity_failure_remains_fatal(
     assert store.health_calls == 1
     assert executor.call_count == 0
     assert unsafe_health_failure.boundary is StorageFailureBoundary.QUERY_PREFLIGHT
-    assert "[AS86] [STORAGE_PATH_FAILED]" in window.diagnostics_list.item(0).text()
+    assert "[AS86-P] [STORAGE_PATH_FAILED]" in window.diagnostics_list.item(0).text()
     assert warnings == [
         "STORAGE_PATH_FAILED: 로컬 저장 경로를 안전하게 사용할 수 없습니다. "
-        "저장소 권한과 보안 상태를 확인하십시오.\n\n전달 코드: AS86"
+        "저장소 권한과 보안 상태를 확인하십시오.\n\n전달 코드: AS86-P"
     ]
     assert "secret" not in warnings[0]
     assert "tracker.db" not in warnings[0]

@@ -2652,7 +2652,7 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _display_failure(self, exc: Exception) -> None:
         code, message = _safe_query_failure(exc)
-        support_code = _support_code_for_query_failure(code)
+        support_reference = _support_reference_for_query_failure(exc, code)
         self._cancel_active_work()
         self.result_empty_label.setText(
             "조회가 취소되었습니다. 조건을 확인한 뒤 다시 시작할 수 있습니다."
@@ -2663,7 +2663,7 @@ class MainWindow(QMainWindow):
             self.result_table.rowCount() == 0 and not self.raw_diagnostics_toggle.isChecked()
         )
         self.diagnostics_list.clear()
-        self.diagnostics_list.addItem(f"[{support_code.value}] [{code}] {message}")
+        self.diagnostics_list.addItem(f"[{support_reference}] [{code}] {message}")
         self._set_state("대기" if code == ErrorCode.CANCELLED.value else "확인 필요")
         if code != ErrorCode.CANCELLED.value:
             self.raw_diagnostics_toggle.setChecked(True)
@@ -2671,7 +2671,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "조회 실패",
-                f"{code}: {message}\n\n전달 코드: {support_code.value}",
+                f"{code}: {message}\n\n전달 코드: {support_reference}",
             )
 
     @Slot(int)
@@ -3633,6 +3633,29 @@ def _support_code_for_query_failure(code: str) -> SupportCode:
         ErrorCode.PERSISTENCE_INDETERMINATE.value: (UiFailureKey.QUERY_PERSISTENCE_INDETERMINATE),
     }.get(code, UiFailureKey.QUERY_UNEXPECTED)
     return support_code_for_ui_failure(key)
+
+
+def _support_reference_for_query_failure(exc: Exception, code: str) -> str:
+    """Add a non-sensitive persistence stage to AS86 field reports.
+
+    AS86 remains the stable support-code assignment.  The single-letter suffix
+    only identifies which storage boundary failed, so an operator can type a
+    useful field report without copying paths, credentials, or device output.
+    """
+
+    base = _support_code_for_query_failure(code).value
+    if code != ErrorCode.STORAGE_PATH_FAILED.value:
+        return base
+    boundary_value = getattr(exc, "boundary", None)
+    boundary = boundary_value if isinstance(boundary_value, StorageFailureBoundary) else None
+    suffix_by_boundary = {
+        StorageFailureBoundary.QUERY_PREFLIGHT: "P",
+        StorageFailureBoundary.QUERY_START: "S",
+        StorageFailureBoundary.QUERY_RESULT: "R",
+        StorageFailureBoundary.QUERY_FINALIZE: "F",
+    }
+    suffix = suffix_by_boundary.get(boundary) if boundary is not None else None
+    return f"{base}-{suffix}" if suffix is not None else base
 
 
 def _support_code_for_storage_failure(kind: str) -> SupportCode:

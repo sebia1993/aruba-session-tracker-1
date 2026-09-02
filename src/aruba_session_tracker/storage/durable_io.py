@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import stat
@@ -72,7 +73,7 @@ def replace_with_retry(
             return
         except OSError as error:
             if attempt == len(WINDOWS_FILE_RETRY_DELAYS) - 1 or not (
-                is_transient_windows_file_error(error)
+                is_retryable_windows_file_operation_error(error)
             ):
                 raise
 
@@ -83,12 +84,30 @@ def is_transient_windows_file_error(error: BaseException) -> bool:
     return os.name == "nt" and getattr(error, "winerror", None) in (_TRANSIENT_WINDOWS_FILE_ERRORS)
 
 
+def is_retryable_windows_file_operation_error(error: BaseException) -> bool:
+    """Return whether one Windows file operation merits a bounded retry.
+
+    CPython's Windows CRT-backed file operations can report a short-lived
+    access denial only as ``PermissionError(errno.EACCES)`` without a Win32
+    error code.  Accept that narrow representation for retry purposes, while
+    keeping :func:`is_transient_windows_file_error` Win32-only so persistent
+    errno-only permission failures retain their STORAGE_PATH classification.
+    """
+
+    if os.name != "nt":
+        return False
+    winerror = getattr(error, "winerror", None)
+    if winerror is not None:
+        return winerror in _TRANSIENT_WINDOWS_FILE_ERRORS
+    return isinstance(error, PermissionError) and error.errno == errno.EACCES
+
+
 def retry_windows_file_operation[ResultT](
     operation: Callable[[], ResultT],
     *,
     delays: tuple[float, ...] = WINDOWS_FILE_RETRY_DELAYS,
 ) -> ResultT:
-    """Retry only Win32 5/32/33 while leaving all integrity errors fail-closed."""
+    """Retry narrow Windows file-access collisions; fail closed otherwise."""
 
     if not delays:
         raise ValueError("at least one retry delay is required")
@@ -98,7 +117,7 @@ def retry_windows_file_operation[ResultT](
         try:
             return operation()
         except OSError as error:
-            if attempt == len(delays) - 1 or not is_transient_windows_file_error(error):
+            if attempt == len(delays) - 1 or not (is_retryable_windows_file_operation_error(error)):
                 raise
     raise AssertionError("Windows file retry loop did not return")  # pragma: no cover
 

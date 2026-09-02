@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO
 from uuid import uuid4
 
+import aruba_session_tracker.storage.windows_file_metadata as windows_file_metadata
 from aruba_session_tracker.models import (
     ControllerLocation,
     DiagnosticEvent,
@@ -50,6 +51,7 @@ from aruba_session_tracker.raw_bundle import (
 )
 from aruba_session_tracker.storage.csv_export import write_csv_atomic
 from aruba_session_tracker.storage.durable_io import (
+    is_retryable_windows_file_operation_error,
     is_transient_windows_file_error,
     replace_with_retry,
     retry_windows_file_operation,
@@ -89,6 +91,7 @@ _MAX_POLL_OBSERVATIONS = 20_000
 # valid saturated poll fail forever before prepared state can commit.
 _MAX_POLL_LIFECYCLE_EVENTS = _MAX_POLL_OBSERVATIONS * 4
 _POLL_COMMIT_RETRY_DELAYS = (0.0, 0.05, 0.15)
+_LEASE_FILE_RETRY_DELAYS = (0.0, 0.05, 0.1, 0.2, 0.4)
 _LOW_SPACE_ERRNOS = frozenset(
     value for name in ("ENOSPC", "EDQUOT") if isinstance(value := getattr(errno, name, None), int)
 )
@@ -476,6 +479,16 @@ class _RunLease:
     stream: BinaryIO
     device: int
     inode: int
+
+
+@dataclass(frozen=True, slots=True)
+class _LeaseFileInfo:
+    device: int
+    inode: int
+    link_count: int
+    file_size: int
+    is_regular: bool
+    is_reparse_point: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -4776,7 +4789,7 @@ def _acquire_file_lease(path: Path) -> _RunLease | None:
         )
 
     open_flags = os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
-    before: os.stat_result | None = None
+    before: _LeaseFileInfo | None = None
     initial_descriptor: int | None = None
     try:
         initial_descriptor = retry_windows_file_operation(
@@ -4784,18 +4797,14 @@ def _acquire_file_lease(path: Path) -> _RunLease | None:
         )
     except FileExistsError:
         try:
-            before = retry_windows_file_operation(
-                lambda: _existing_lease_file_info(path, parent_before)
-            )
-            _validate_lease_file_info(before)
+            before = _existing_lease_file_info(path, parent_before)
         except UnsafeManagedPath as error:
             raise StorageError(
                 str(error),
                 failure_kind=StorageFailureKind.STORAGE_PATH,
             ) from error
 
-    delays = (0.0, 0.05, 0.1, 0.2, 0.4)
-    for attempt, delay in enumerate(delays):
+    for attempt, delay in enumerate(_LEASE_FILE_RETRY_DELAYS):
         if delay:
             time.sleep(delay)
         stream: BinaryIO | None = None
@@ -4811,7 +4820,7 @@ def _acquire_file_lease(path: Path) -> _RunLease | None:
                 )
             stream = os.fdopen(descriptor, "r+b", buffering=0)
             descriptor = None
-            opened = os.fstat(stream.fileno())
+            opened = _lease_file_info_from_descriptor(stream.fileno())
             if before is None:
                 # A newly-created lease must keep this first handle identity
                 # fixed even if a following Windows path inspection needs a
@@ -4819,24 +4828,22 @@ def _acquire_file_lease(path: Path) -> _RunLease | None:
                 before = opened
             else:
                 _require_same_file_identity(before, opened)
-            path_after_open = os.lstat(path)
+            path_after_open = _checked_lease_path_info(path)
             parent_after_open = reject_link_or_reparse(path.parent)
             _validate_lease_file_info(opened)
-            _validate_lease_file_info(path_after_open)
             _require_same_file_identity(opened, path_after_open)
             _require_same_directory_identity(parent_before, parent_after_open)
 
             # Windows byte-range locking needs the first byte to exist. No
             # write occurs until handle, path, parent, reparse and link-count
             # checks all agree with the fixed identity above.
-            if opened.st_size == 0:
+            if opened.file_size == 0:
                 stream.write(b"0")
             stream.seek(0)
-            after_write = os.fstat(stream.fileno())
-            path_after_write = os.lstat(path)
+            after_write = _lease_file_info_from_descriptor(stream.fileno())
+            path_after_write = _checked_lease_path_info(path)
             parent_after_write = reject_link_or_reparse(path.parent)
             _validate_lease_file_info(after_write)
-            _validate_lease_file_info(path_after_write)
             _require_same_file_identity(opened, after_write)
             _require_same_file_identity(after_write, path_after_write)
             _require_same_directory_identity(parent_before, parent_after_write)
@@ -4852,28 +4859,31 @@ def _acquire_file_lease(path: Path) -> _RunLease | None:
                         int(fcntl.LOCK_EX) | int(fcntl.LOCK_NB),
                     )
             except OSError as error:
-                if is_transient_windows_file_error(error) and attempt < len(delays) - 1:
+                if is_retryable_windows_file_operation_error(error) and attempt < (
+                    len(_LEASE_FILE_RETRY_DELAYS) - 1
+                ):
                     stream.close()
                     continue
                 stream.close()
                 return None
 
-            locked = os.fstat(stream.fileno())
-            path_after_lock = os.lstat(path)
+            locked = _lease_file_info_from_descriptor(stream.fileno())
+            path_after_lock = _checked_lease_path_info(path)
             parent_after_lock = reject_link_or_reparse(path.parent)
             _validate_lease_file_info(locked)
-            _validate_lease_file_info(path_after_lock)
             _require_same_file_identity(after_write, locked)
             _require_same_file_identity(locked, path_after_lock)
             _require_same_directory_identity(parent_before, parent_after_lock)
-            return _RunLease(path, stream, int(locked.st_dev), int(locked.st_ino))
+            return _RunLease(path, stream, locked.device, locked.inode)
         except OSError as error:
             if stream is not None:
                 stream.close()
             elif descriptor is not None:
                 with suppress(OSError):
                     os.close(descriptor)
-            if attempt == len(delays) - 1 or not is_transient_windows_file_error(error):
+            if attempt == len(_LEASE_FILE_RETRY_DELAYS) - 1 or not (
+                is_retryable_windows_file_operation_error(error)
+            ):
                 raise
         except Exception:
             if stream is not None:
@@ -4898,33 +4908,112 @@ def _open_new_lease_file(
 def _existing_lease_file_info(
     path: Path,
     parent_before: os.stat_result,
-) -> os.stat_result:
+) -> _LeaseFileInfo:
     parent_current = reject_link_or_reparse(path.parent)
     _require_same_directory_identity(parent_before, parent_current)
-    return os.lstat(path)
+    return _checked_lease_path_info(path)
 
 
-def _validate_lease_file_info(info: os.stat_result) -> None:
+def _lease_file_info_from_descriptor(descriptor: int) -> _LeaseFileInfo:
+    if windows_file_metadata.available():
+        return _lease_file_info_from_windows(windows_file_metadata.from_descriptor(descriptor))
+    return _lease_file_info_from_stat(os.fstat(descriptor))
+
+
+def _lease_file_info_from_path(path: Path) -> _LeaseFileInfo:
+    if windows_file_metadata.available():
+        return _lease_file_info_from_windows(windows_file_metadata.from_path(path))
+    return _lease_file_info_from_stat(os.lstat(path))
+
+
+def _lease_file_info_from_windows(
+    info: windows_file_metadata.WindowsFileMetadata,
+) -> _LeaseFileInfo:
+    if info.identity == (0, 0):
+        raise StorageError(
+            "잠금 파일의 Windows 고유 ID를 확인할 수 없습니다.",
+            failure_kind=StorageFailureKind.STORAGE_PATH,
+        )
+    return _LeaseFileInfo(
+        device=info.volume_serial_number,
+        inode=info.file_index,
+        link_count=info.number_of_links,
+        file_size=info.file_size,
+        is_regular=info.is_disk_file,
+        is_reparse_point=info.is_reparse_point,
+    )
+
+
+def _lease_file_info_from_stat(info: os.stat_result) -> _LeaseFileInfo:
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     attributes = int(getattr(info, "st_file_attributes", 0))
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or stat.S_ISLNK(info.st_mode)
-        or (reparse_flag and attributes & reparse_flag)
-    ):
+    return _LeaseFileInfo(
+        device=int(info.st_dev),
+        inode=int(info.st_ino),
+        link_count=int(info.st_nlink),
+        file_size=int(info.st_size),
+        is_regular=stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode),
+        is_reparse_point=bool(reparse_flag and attributes & reparse_flag),
+    )
+
+
+def _checked_lease_path_info(path: Path) -> _LeaseFileInfo:
+    try:
+        info = _retry_lease_path_probe(lambda: _lease_file_info_from_path(path))
+    except FileNotFoundError:
+        # Lease removal is idempotent.  Callers that require the path to exist
+        # still convert this to STORAGE_PATH at their operation boundary.
+        raise
+    except OSError as error:
+        failure_kind = (
+            StorageFailureKind.STORAGE_BUSY
+            if is_transient_windows_file_error(error)
+            else StorageFailureKind.STORAGE_PATH
+        )
+        raise StorageError(
+            "잠금 파일 경로를 안전하게 검사할 수 없습니다.",
+            failure_kind=failure_kind,
+        ) from error
+    _validate_lease_file_info(info)
+    return info
+
+
+def _retry_lease_path_probe[ResultT](operation: Callable[[], ResultT]) -> ResultT:
+    if not windows_file_metadata.available():
+        return operation()
+    for attempt, delay in enumerate(_LEASE_FILE_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            return operation()
+        except OSError as error:
+            retryable_path_visibility = isinstance(error, FileNotFoundError) or (
+                isinstance(error, PermissionError)
+                and getattr(error, "winerror", None) is None
+                and error.errno == errno.EACCES
+            )
+            if attempt == len(_LEASE_FILE_RETRY_DELAYS) - 1 or not (
+                is_retryable_windows_file_operation_error(error) or retryable_path_visibility
+            ):
+                raise
+    raise AssertionError("lease path retry loop did not return")  # pragma: no cover
+
+
+def _validate_lease_file_info(info: _LeaseFileInfo) -> None:
+    if not info.is_regular or info.is_reparse_point:
         raise StorageError(
             "잠금 경로가 일반 비-reparse 파일이 아닙니다.",
             failure_kind=StorageFailureKind.STORAGE_PATH,
         )
-    if int(info.st_nlink) != 1:
+    if info.link_count != 1:
         raise StorageError(
             "잠금 파일에는 hardlink를 사용할 수 없습니다.",
             failure_kind=StorageFailureKind.STORAGE_PATH,
         )
 
 
-def _require_same_file_identity(left: os.stat_result, right: os.stat_result) -> None:
-    if (int(left.st_dev), int(left.st_ino)) != (int(right.st_dev), int(right.st_ino)):
+def _require_same_file_identity(left: _LeaseFileInfo, right: _LeaseFileInfo) -> None:
+    if (left.device, left.inode) != (right.device, right.inode):
         raise StorageError(
             "잠금 파일 경로가 여는 동안 다른 파일로 변경되었습니다.",
             failure_kind=StorageFailureKind.STORAGE_PATH,
@@ -4968,21 +5057,21 @@ def _release_run_lease(lease: _RunLease, *, remove: bool) -> None:
 
 
 def _remove_released_lease_with_retry(lease: _RunLease) -> None:
-    delays = (0.0, 0.05, 0.1, 0.2, 0.4)
-    for attempt, delay in enumerate(delays):
+    for attempt, delay in enumerate(_LEASE_FILE_RETRY_DELAYS):
         if delay:
             time.sleep(delay)
         try:
-            info = os.lstat(lease.path)
-            _validate_lease_file_info(info)
-            if (int(info.st_dev), int(info.st_ino)) != (lease.device, lease.inode):
+            info = _checked_lease_path_info(lease.path)
+            if (info.device, info.inode) != (lease.device, lease.inode):
                 return
             lease.path.unlink()
             return
         except FileNotFoundError:
             return
         except OSError as error:
-            if attempt == len(delays) - 1 or not is_transient_windows_file_error(error):
+            if attempt == len(_LEASE_FILE_RETRY_DELAYS) - 1 or not (
+                is_retryable_windows_file_operation_error(error)
+            ):
                 raise
 
 
