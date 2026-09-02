@@ -23,14 +23,6 @@ _DATAPATH_HEADER_RE = re.compile(
     r"[ \t]+Cntr[ \t]+Prio[ \t]+ToS[ \t]+Age[ \t]+Destination"
     r"[ \t]+TAge[ \t]+Packets[ \t]+Bytes[ \t]+Flags[ \t]+CPU[ \t]+ID[ \t]*$"
 )
-_FLAG_LEGEND_START_RE = re.compile(
-    r"^[ \t]*Flags:[ \t]*[A-Za-z][ \t]+-[ \t]+[^,\r\n]+"
-    r"(?:,[ \t]*[A-Za-z][ \t]+-[ \t]+[^,\r\n]+)*[ \t]*$"
-)
-_FLAG_LEGEND_CONTINUATION_RE = re.compile(
-    r"^[ \t]+[A-Za-z][ \t]+-[ \t]+[^,\r\n]+"
-    r"(?:,[ \t]*[A-Za-z][ \t]+-[ \t]+[^,\r\n]+)*[ \t]*$"
-)
 _FINAL_PROMPT_RE = re.compile(
     r"^\s*(?:"
     r"(?:\([^\r\n()]{1,64}\)\s*(?:(?:\^\*?|\*)\s*)?)?"
@@ -203,11 +195,11 @@ def _validated_table_data_lines(region: str) -> tuple[str, ...]:
             continue
         if _is_dash_separator(line) and not in_flag_legend:
             continue
-        if not saw_flag_legend and _FLAG_LEGEND_START_RE.fullmatch(line):
+        if not saw_flag_legend and _is_flag_legend_line(line, starts_legend=True):
             in_flag_legend = True
             saw_flag_legend = True
             continue
-        if in_flag_legend and _FLAG_LEGEND_CONTINUATION_RE.fullmatch(line):
+        if in_flag_legend and _is_flag_legend_line(line, starts_legend=False):
             continue
         raise ParseError("Datapath session table contains unrecognized data before its header.")
 
@@ -229,6 +221,32 @@ def _looks_like_datapath_header(line: str) -> bool:
     return normalized.startswith("Source IP or MAC ") and all(
         token in normalized for token in ("Destination IP", "Prot", "SPort", "DPort", "CPU ID")
     )
+
+
+def _is_flag_legend_line(line: str, *, starts_legend: bool) -> bool:
+    if not starts_legend and (not line or line[0] not in " \t"):
+        return False
+    text = line.strip()
+    if starts_legend:
+        if not text.startswith("Flags:"):
+            return False
+        text = text.removeprefix("Flags:").strip()
+    elif text.startswith("Flags:"):
+        return False
+    if not text:
+        return False
+    for item in text.split(","):
+        flag, separator, description = item.partition("-")
+        normalized_flag = flag.strip()
+        if (
+            separator != "-"
+            or len(normalized_flag) != 1
+            or not normalized_flag.isascii()
+            or not normalized_flag.isalpha()
+            or not description.strip()
+        ):
+            return False
+    return True
 
 
 def _is_dash_separator(line: str) -> bool:

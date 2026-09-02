@@ -500,6 +500,22 @@ def test_datapath_legend_continuation_requires_flags_start() -> None:
         )
 
 
+def test_datapath_parser_rejects_long_malformed_flag_legend_without_regex_backtracking() -> None:
+    malformed_legend = "Flags:" + ("A - +," * 5_000) + "A -"
+    output = fixture("datapath_empty.txt").replace(
+        "------------------------------",
+        f"------------------------------\n{malformed_legend}",
+        1,
+    )
+
+    with pytest.raises(ParseError, match="unrecognized data before its header"):
+        parse_datapath_sessions(
+            output,
+            controller_name="md-document-01",
+            controller_host="198.51.100.11",
+        )
+
+
 def test_datapath_column_separator_must_follow_header_inside_table_region() -> None:
     source = fixture("datapath_empty.txt")
     separator = next(
