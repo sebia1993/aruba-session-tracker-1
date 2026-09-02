@@ -8,12 +8,13 @@ import hashlib
 import os
 import tempfile
 from collections.abc import Iterable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 
-from aruba_session_tracker.analysis import protocol_label
+from aruba_session_tracker.analysis import protocol_label, service_label
 from aruba_session_tracker.storage.durable_io import replace_with_retry
 
 ReportRow = dict[str, object]
@@ -683,6 +684,7 @@ def _lifecycle_status(value: object) -> str | None:
 
 def _observation_row(row: ReportRow, status: str) -> str:
     protocol = _protocol(row.get("protocol"))
+    protocol_number = _optional_int(row.get("protocol"))
     return (
         f'<tr class="report-row" data-source-ip="{_filter_attribute(row.get("source_ip"))}" '
         f'data-destination-ip="{_filter_attribute(row.get("destination_ip"))}" '
@@ -690,8 +692,8 @@ def _observation_row(row: ReportRow, status: str) -> str:
         f'data-destination-port="{_filter_attribute(row.get("destination_port"))}" '
         f'data-protocol="{_filter_attribute(protocol)}">'
         f'<td class="protocol-cell">{_e(protocol)}</td>'
-        f'<td class="endpoint-cell">{_e(_endpoint(row.get("source_ip"), row.get("source_port")))}</td>'
-        f'<td class="endpoint-cell">{_e(_endpoint(row.get("destination_ip"), row.get("destination_port")))}</td>'
+        f'<td class="endpoint-cell">{_e(_endpoint(row.get("source_ip"), row.get("source_port"), protocol=protocol_number))}</td>'
+        f'<td class="endpoint-cell">{_e(_endpoint(row.get("destination_ip"), row.get("destination_port"), protocol=protocol_number))}</td>'
         f'<td class="status-cell">{_tracking_badge(status)}</td>'
         f'<td class="time-cell">{_e(_format_kst(row.get("observed_at")))}</td>'
         f'<td class="device-cell">{_e(row.get("controller_name"))}</td>'
@@ -725,23 +727,32 @@ def _flow_key_from_session_key(value: str) -> FlowKey | None:
     return (parts[1], parts[2], parts[3], parts[4], parts[5])
 
 
-def _endpoint(address: object, port: object) -> str:
+def _endpoint(address: object, port: object, *, protocol: int | None = None) -> str:
     address_text = _plain(address)
     if address_text == "-":
         return "-"
     port_text = _plain(port)
     if port_text == "-":
         return address_text
+    if protocol is not None:
+        with suppress(TypeError, ValueError):
+            port_text = service_label(protocol, int(port_text))
     if ":" in address_text and not (address_text.startswith("[") and address_text.endswith("]")):
         address_text = f"[{address_text}]"
     return f"{address_text}:{port_text}"
 
 
-def _query_endpoint(address: object, port: object, *, other_address: object) -> str:
+def _query_endpoint(
+    address: object,
+    port: object,
+    *,
+    other_address: object,
+    protocol: int | None = None,
+) -> str:
     if _plain(address) == "-" and _plain(other_address) != "-":
         port_text = _plain(port)
         return "모든 IP" if port_text == "-" else f"모든 IP:{port_text}"
-    return _endpoint(address, port)
+    return _endpoint(address, port, protocol=protocol)
 
 
 def _protocol(value: object) -> str:

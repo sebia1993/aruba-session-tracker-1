@@ -129,6 +129,7 @@ def _report_chunks(
     state_counts = _state_counts(latest_groups, flow_statuses, session_statuses)
     timeline = _timeline_markup(snapshot)
     duration = _format_duration(run.get("started_at"), run.get("ended_at"))
+    display_run_id = _display_run_identifier(run)
     observed_controllers = _observed_controllers(latest_observations)
     observed_controller_text = " · ".join(observed_controllers) if observed_controllers else "—"
 
@@ -459,6 +460,7 @@ def _report_chunks(
         <aside class="hero-side" aria-label="보고서 기준">
           <p class="section-kicker">REPORT BASIS</p>
           <dl class="run-facts">
+            {_run_fact("실행 ID", display_run_id)}
             {_run_fact("추적 시간", duration)}
             {_run_fact("최신 표시", f"{_base._format_integer(displayed_latest)}/{_base._format_integer(total_sessions)}개")}
             {_run_fact("전체 이력", f"{_base._format_integer(snapshot.observation_total)}건")}
@@ -740,8 +742,9 @@ def _session_key_context(value: object) -> str:
     if len(parts) != 6:
         return "저장된 논리 세션"
     protocol = _base._protocol(parts[1])
-    source = _base._endpoint(parts[2], parts[4])
-    destination = _base._endpoint(parts[3], parts[5])
+    protocol_number = _base._optional_int(parts[1])
+    source = _base._endpoint(parts[2], parts[4], protocol=protocol_number)
+    destination = _base._endpoint(parts[3], parts[5], protocol=protocol_number)
     return f"{protocol} · {source} → {destination}"
 
 
@@ -759,6 +762,13 @@ def _format_duration(started_at: object, ended_at: object) -> str:
     if hours:
         return f"{hours}시간 {minutes}분 {seconds}초"
     return f"{minutes}분 {seconds}초"
+
+
+def _display_run_identifier(run: ReportRow) -> str:
+    source = _base._plain(run.get("source_ip"))
+    destination = _base._plain(run.get("destination_ip"))
+    started = _base._format_kst(run.get("started_at"))
+    return f"{source} → {destination} · {started}"
 
 
 def _observed_controllers(rows: tuple[ReportRow, ...]) -> tuple[str, ...]:

@@ -21,6 +21,8 @@ from aruba_session_tracker.models import SessionObservation
 from aruba_session_tracker.services import QueryOutcome
 from aruba_session_tracker.storage import SessionStore
 from aruba_session_tracker.ui import MainWindow
+from aruba_session_tracker.ui.developer_inspector import DeveloperInspectorController
+from aruba_session_tracker.ui.main_window import _ResultFilterDialog
 from aruba_session_tracker.ui.theme import apply_main_window_theme, build_stylesheet
 
 
@@ -127,7 +129,7 @@ def test_theme_installs_dark_noc_shell_without_replacing_operational_widgets(
     assert window.nav_identity.minimumHeight() == 66
     assert window.nav_identity.maximumHeight() == 66
     assert window.product_name_label.text() == "ARUBA SESSION TRACKER"
-    assert "NETWORK SESSION INVESTIGATION CONSOLE" in window.product_meta_label.text()
+    assert "네트워크 세션 분석 콘솔" in window.product_meta_label.text()
 
     assert window.open_settings_button.property("buttonRole") == "primary"
     assert window.monitor_button.property("buttonRole") == "primary"
@@ -150,9 +152,9 @@ def test_theme_installs_dark_noc_shell_without_replacing_operational_widgets(
     assert [label.text() for label in metric_values] == ["0", "0", "0", "0"]
 
     assert window.details.count() == 3
-    assert window.details.tabText(0) == "DETAILS"
-    assert window.details.tabText(1) == "RAW CLI"
-    assert window.details.tabText(2) == "DIAGNOSTICS"
+    assert window.details.tabText(0) == "세션 요약"
+    assert window.details.tabText(1) == "장비 원문"
+    assert window.details.tabText(2) == "진단 이벤트"
     session_detail_page = window.findChild(QWidget, "sessionDetailPage")
     assert session_detail_page is not None
     assert window.details.minimumWidth() >= 380
@@ -443,6 +445,107 @@ def test_theme_keeps_header_text_visible_in_light_high_contrast(
         application.setPalette(original_palette)
 
 
+def test_light_high_contrast_covers_inspector_and_result_filter_surfaces(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    application = QApplication.instance()
+    assert isinstance(application, QApplication)
+    original_palette = application.palette()
+    palette = QPalette(original_palette)
+    palette.setColor(QPalette.ColorRole.Window, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    application.setPalette(palette)
+    window: MainWindow | None = None
+    inspector: DeveloperInspectorController | None = None
+    filter_dialog: _ResultFilterDialog | None = None
+    try:
+        store = SessionStore(
+            tmp_path / "tracker.db",
+            tmp_path / "raw",
+            tmp_path / "exports",
+        )
+        store.initialize()
+        inspector = DeveloperInspectorController(application, "v0.6.0")
+        window = MainWindow(
+            ConfigRepository(tmp_path / "config.json"),
+            store,
+            _Executor(),
+            developer_inspector=inspector,
+        )
+        qtbot.addWidget(window)  # type: ignore[attr-defined]
+        qtbot.waitUntil(  # type: ignore[attr-defined]
+            lambda: not window._history_task_running,
+            timeout=3000,
+        )
+        apply_main_window_theme(window)
+        window.show()
+        qtbot.keyClick(window, Qt.Key.Key_F12)  # type: ignore[attr-defined]
+
+        bar = window.findChild(QFrame, "developerInspectorBar")
+        assert bar is not None
+        qtbot.waitUntil(bar.isVisible, timeout=3000)  # type: ignore[attr-defined]
+        detail = inspector.show_element_detail(inspector.catalog[0], window)
+        catalog = inspector.show_catalog(window)
+        assert detail is not None
+        assert catalog is not None
+        filter_dialog = _ResultFilterDialog(
+            window,
+            title="목적지 포트",
+            values=((22, "22(SSH)"), (443, "443(HTTPS)")),
+            selected=set(),
+            filter_active=False,
+        )
+        qtbot.addWidget(filter_dialog)  # type: ignore[attr-defined]
+        filter_dialog.show()
+        QApplication.processEvents()
+
+        for surface in (bar, detail, catalog, filter_dialog):
+            surface_palette = surface.palette()
+            background = surface_palette.color(QPalette.ColorRole.Window).name()
+            foreground = surface_palette.color(QPalette.ColorRole.WindowText).name()
+            assert background == "#ffffff"
+            assert foreground == "#000000"
+            assert _contrast_ratio(foreground, background) >= 7.0
+
+        for label, surface in (
+            (bar.mode_label, bar),
+            (detail.intro_label, detail),
+            (catalog.guide_label, catalog),
+        ):
+            foreground = label.palette().color(label.foregroundRole()).name()
+            background = surface.palette().color(QPalette.ColorRole.Window).name()
+            assert _contrast_ratio(foreground, background) >= 7.0
+
+        for control in (
+            detail.name_value,
+            detail.purpose_value,
+            detail.request_preview,
+            catalog.element_list,
+            filter_dialog.search_edit,
+            filter_dialog.values_list,
+        ):
+            control_palette = control.palette()
+            background = control_palette.color(QPalette.ColorRole.Base).name()
+            foreground = control_palette.color(QPalette.ColorRole.Text).name()
+            assert _contrast_ratio(foreground, background) >= 7.0
+    finally:
+        if filter_dialog is not None:
+            filter_dialog.close()
+        if inspector is not None:
+            inspector.close()
+        if window is not None:
+            window.close()
+        QApplication.processEvents()
+        application.setPalette(original_palette)
+
+
 def test_raw_console_keeps_terminal_contrast_after_widget_is_shown(
     qtbot: object,
     tmp_path: Path,
@@ -499,7 +602,7 @@ def test_selected_session_summary_tracks_existing_row_and_preserves_raw_widgets(
     endpoint_values = window.findChildren(QLabel, "detailEndpointValue")
     assert [label.text() for label in endpoint_values] == [
         "192.0.2.10:50000",
-        "198.51.100.20:443",
+        "198.51.100.20:443(HTTPS)",
     ]
     assert all(label.wordWrap() for label in endpoint_values)
     assert all(
@@ -519,14 +622,14 @@ def test_selected_session_summary_tracks_existing_row_and_preserves_raw_widgets(
             or value.height() >= value.sizeHint().height()
         )
         fact_values[caption.text()] = value
-    assert fact_values["STATUS"].text() == "현재 관측됨"
-    assert fact_values["CONTROLLER"].text() == "MD-01"
-    assert fact_values["FLAGS"].text() == "D"
-    assert fact_values["LAST SEEN"].text() == window.result_table.item(0, 12).text()
-    assert fact_values["PACKETS"].text() == "10"
-    assert fact_values["BYTES"].text() == "2,048"
-    assert fact_values["AGE"].text() == "18"
-    assert fact_values["CPU"].text() == "1"
+    assert fact_values["관측 상태"].text() == "현재 관측됨"
+    assert fact_values["관측 MD"].text() == "MD-01"
+    assert fact_values["장비 Flags"].text() == "D"
+    assert fact_values["마지막 확인"].text() == window.result_table.item(0, 12).text()
+    assert fact_values["패킷"].text() == "10"
+    assert fact_values["바이트"].text() == "2,048"
+    assert fact_values["세션 경과"].text() == "18"
+    assert fact_values["CPU ID"].text() == "1"
 
     metric_values: dict[str, str] = {}
     for frame in window.findChildren(QFrame, "metricCard"):
@@ -536,16 +639,16 @@ def test_selected_session_summary_tracks_existing_row_and_preserves_raw_widgets(
         assert value is not None
         metric_values[caption.text()] = value.text()
     assert metric_values == {
-        "ACTIVE FLOWS": "1",
-        "VISIBLE ROWS": "1",
-        "CHANGED FLOWS": "0",
-        "CONTROLLERS": "1",
+        "현재 관측 흐름": "1",
+        "결과표 표시 행": "1",
+        "신규·변경 흐름": "0",
+        "관측 MD": "1",
     }
 
     status_item = window.result_table.item(0, 14)
     assert status_item.foreground().style() == Qt.BrushStyle.NoBrush
     assert window.result_table.item(0, 13).foreground().color().name() == "#e05c65"
-    assert window.result_table.item(0, 15).foreground().color().name() == "#e05c65"
+    assert window.result_table.item(0, 15).text() == ""
 
     window.details.setCurrentWidget(original_raw)
     assert window.raw_view.toPlainText() == "sanitized raw row"

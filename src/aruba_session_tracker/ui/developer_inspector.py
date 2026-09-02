@@ -138,11 +138,6 @@ class DeveloperInspectorBar(QFrame):
         self.setProperty("uiInspectorInternal", True)
         self.setObjectName("developerInspectorBar")
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setStyleSheet(
-            "#developerInspectorBar {"
-            " background: palette(alternate-base); border: 1px solid palette(highlight);"
-            " color: palette(text); }"
-        )
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 4, 8, 4)
@@ -186,7 +181,8 @@ class DeveloperInspectorBar(QFrame):
     def _sync_selection_mode(self, selecting: bool) -> None:
         self.mode_label.setText(
             "화면 개선 도우미 · 확인할 요소를 클릭하세요. "
-            "선택용 클릭은 실제 기능을 실행하지 않습니다."
+            "선택용 클릭은 실제 기능을 실행하지 않습니다. "
+            "선택할 대상이 없으면 우클릭 또는 Esc로 선택을 취소할 수 있습니다."
             if selecting
             else "화면 개선 도우미"
         )
@@ -205,6 +201,7 @@ class DeveloperInspectorDetailDialog(QDialog):
     def __init__(self, app_version: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setProperty("uiInspectorInternal", True)
+        self.setObjectName("developerInspectorDetailDialog")
         self._app_version = _application_version(app_version)
         self._metadata: UiElementMetadata | None = None
         self.setWindowTitle("화면 개선 도우미")
@@ -253,7 +250,7 @@ class DeveloperInspectorDetailDialog(QDialog):
         root.addWidget(self.technical_widget)
 
         request_title = QLabel("개선 요청 정보", self)
-        request_title.setStyleSheet("font-weight: 600;")
+        request_title.setObjectName("inspectorSectionTitle")
         root.addWidget(request_title)
         self.request_help = QLabel(
             "정보를 복사한 뒤 채팅이나 이슈에 붙여넣고 '현재 현상'과 "
@@ -353,6 +350,7 @@ class DeveloperInspectorCatalogDialog(QDialog):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setProperty("uiInspectorInternal", True)
+        self.setObjectName("developerInspectorCatalogDialog")
         self.setWindowTitle("화면 개선 도우미 - 목록")
         self.setModal(False)
         self.resize(590, 420)
@@ -457,8 +455,10 @@ class _SelectionOutline(QWidget):
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(QColor("#d96c00"), 3))
+            painter.setPen(QPen(QColor("#05080B"), 4))
             painter.drawRect(self.rect().adjusted(1, 1, -2, -2))
+            painter.setPen(QPen(QColor("#F7FBFF"), 2))
+            painter.drawRect(self.rect().adjusted(5, 5, -6, -6))
         finally:
             painter.end()
 
@@ -535,6 +535,7 @@ class DeveloperInspectorController(QObject):
             | None
         ) = None
         self._suppress_escape_release = False
+        self._suppress_context_menu_until = 0.0
         self._hovered_metadata: UiElementMetadata | None = None
         self._outline: _SelectionOutline | None = None
         self._detail_dialog: DeveloperInspectorDetailDialog | None = None
@@ -796,6 +797,7 @@ class DeveloperInspectorController(QObject):
         self._catalog_dialog = None
         self._suppressed_mouse_buttons.clear()
         self._post_selection_guard = None
+        self._suppress_context_menu_until = 0.0
         self._bars.clear()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
@@ -878,11 +880,17 @@ class DeveloperInspectorController(QObject):
                 # Never let that stale state swallow the next genuine click.
                 self._suppressed_mouse_buttons.discard(button)
                 self._post_selection_guard = None
+                self._suppress_context_menu_until = 0.0
             if (
                 event_type == QEvent.Type.MouseButtonRelease
                 and button in self._suppressed_mouse_buttons
             ):
                 self._suppressed_mouse_buttons.discard(button)
+                if button == Qt.MouseButton.RightButton:
+                    # Windows normally raises ContextMenu after release. Refresh
+                    # the bounded guard here so a deliberate long press cannot
+                    # escape the selection-only interaction boundary.
+                    self._suppress_context_menu_until = monotonic() + 0.5
                 event.accept()
                 return True
             if event_type == QEvent.Type.MouseButtonDblClick and self._post_selection_matches(
@@ -904,6 +912,16 @@ class DeveloperInspectorController(QObject):
                         if hit is not None:
                             self._select_hit(hit)
                             self._arm_post_selection_guard(watched, button)
+                    elif (
+                        button == Qt.MouseButton.RightButton
+                        and event_type == QEvent.Type.MouseButtonPress
+                    ):
+                        # Right-click is the explicit selection-cancel gesture.
+                        # The registered top-level window covers visually blank
+                        # areas, so hit-testing for ``None`` would make the
+                        # advertised cancellation path unreachable there.
+                        self._suppress_context_menu_until = monotonic() + 0.5
+                        self.cancel_selection()
                 return True
             if (
                 event_type == QEvent.Type.MouseButtonDblClick
@@ -912,13 +930,15 @@ class DeveloperInspectorController(QObject):
                 event.accept()
                 return True
 
-        if (
-            self._selection_mode
-            and event_type == QEvent.Type.ContextMenu
-            and not self._is_inspector_internal(watched)
-        ):
-            event.accept()
-            return True
+        if event_type == QEvent.Type.ContextMenu and not self._is_inspector_internal(watched):
+            if monotonic() <= self._suppress_context_menu_until:
+                event.accept()
+                return True
+            if self._selection_mode:
+                event.accept()
+                self._suppress_context_menu_until = monotonic() + 0.5
+                self.cancel_selection()
+                return True
 
         if (
             self._selection_mode
@@ -1014,6 +1034,9 @@ class DeveloperInspectorController(QObject):
         global_position = getattr(event, "globalPosition", None)
         if callable(global_position):
             return cast(QPoint, global_position().toPoint())
+        context_position = getattr(event, "globalPos", None)
+        if callable(context_position):
+            return cast(QPoint, context_position())
         if event.type() in {
             QEvent.Type.Enter,
             QEvent.Type.HoverEnter,

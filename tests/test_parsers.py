@@ -44,6 +44,23 @@ def test_datapath_parser_enforces_observation_capacity_before_append() -> None:
     assert caught.value.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
 
 
+def test_datapath_zero_capacity_precedes_malformed_ipv4_row_validation() -> None:
+    output = fixture("datapath_empty.txt").replace(
+        "Entries: 0",
+        "192.0.2.10 malformed\n(md-document-01)^*[mynode]#",
+    )
+
+    with pytest.raises(ParseError) as caught:
+        parse_datapath_sessions(
+            output,
+            controller_name="MD-1",
+            controller_host="198.51.100.11",
+            max_observations=0,
+        )
+
+    assert caught.value.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
+
+
 @pytest.mark.parametrize(
     "over_limit_row",
     [
@@ -107,6 +124,46 @@ def test_global_user_duplicate_rows_on_one_switch_are_not_ambiguous() -> None:
 def test_global_user_parser_rejects_declared_but_missing_row() -> None:
     with pytest.raises(ParseError, match="row count mismatch"):
         parse_global_user_table(fixture("global_user_truncated.txt"), client_ip="192.0.2.10")
+
+
+def test_global_user_parser_rejects_duplicate_or_trailing_completion_data() -> None:
+    duplicate = fixture("global_user_one.txt") + "\nTotal entries = 1\n"
+    with pytest.raises(ParseError, match="duplicated"):
+        parse_global_user_table(duplicate, client_ip="192.0.2.10")
+
+    trailing = fixture("global_user_one.txt") + "\nUNTRUSTED TRAILING DATA\n"
+    with pytest.raises(ParseError, match="data after completion"):
+        parse_global_user_table(trailing, client_ip="192.0.2.10")
+
+
+def test_global_user_parser_accepts_one_trusted_prompt_after_completion() -> None:
+    output = fixture("global_user_one.txt") + "\n(mm-primary)^*[mynode]#\n"
+
+    result = parse_global_user_table(output, client_ip="192.0.2.10")
+
+    assert result.status is GlobalUserStatus.FOUND
+    assert result.current_switch == "198.51.100.11"
+
+
+def test_global_user_parser_enforces_row_capacity_before_completion_marker() -> None:
+    source = fixture("global_user_one.txt")
+    lines = source.splitlines()
+    row = next(line for line in lines if line.startswith("192.0.2.10"))
+    marker_index = next(
+        index for index, line in enumerate(lines) if line.startswith("Total entries")
+    )
+    output = "\n".join(
+        (
+            *lines[:marker_index],
+            *(row for _ in range(20_001)),
+            "Total entries = 20001",
+        )
+    )
+
+    with pytest.raises(ParseError) as caught:
+        parse_global_user_table(output, client_ip="192.0.2.10")
+
+    assert caught.value.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
 
 
 def test_global_user_parser_rejects_invalid_current_switch() -> None:
@@ -305,10 +362,182 @@ def test_datapath_parser_rejects_declared_but_missing_row() -> None:
     [
         fixture("datapath_empty.txt").replace("Entries: 0", ""),
         fixture("datapath_sessions.txt").rsplit("Entries:", 1)[0],
+        fixture("datapath_empty.txt").replace("Entries: 0", "Entries:\n0"),
     ],
 )
 def test_datapath_parser_rejects_output_without_completion_marker(output: str) -> None:
     with pytest.raises(ParseError, match="completion marker"):
+        parse_datapath_sessions(
+            output,
+            controller_name="md-document-01",
+            controller_host="198.51.100.11",
+        )
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        fixture("datapath_empty.txt") + "\nEntries: 0\n",
+        fixture("datapath_empty.txt") + "\nUNTRUSTED TRAILING DATA\n",
+        fixture("datapath_empty.txt").replace(
+            "Entries: 0",
+            "(md-document-01)#\n(md-document-01)#",
+        ),
+    ],
+)
+def test_datapath_parser_rejects_duplicate_or_trailing_completion_data(output: str) -> None:
+    with pytest.raises(ParseError, match=r"completion marker|data after completion"):
+        parse_datapath_sessions(
+            output,
+            controller_name="md-document-01",
+            controller_host="198.51.100.11",
+        )
+
+
+def test_datapath_parser_bounds_declared_count_before_integer_conversion() -> None:
+    output = fixture("datapath_empty.txt").replace("Entries: 0", f"Entries: {'9' * 5_000}")
+
+    with pytest.raises(ParseError) as caught:
+        parse_datapath_sessions(
+            output,
+            controller_name="md-document-01",
+            controller_host="198.51.100.11",
+        )
+
+    assert caught.value.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
+
+
+def test_datapath_parser_accepts_one_trusted_prompt_after_count() -> None:
+    output = fixture("datapath_sessions.txt") + "\n(md-document-01)^*[mynode]#\n"
+
+    rows = parse_datapath_sessions(
+        output,
+        controller_name="md-document-01",
+        controller_host="198.51.100.11",
+    )
+
+    assert len(rows) == 3
+
+
+def test_datapath_parser_rejects_trusted_prompt_before_count() -> None:
+    output = fixture("datapath_sessions.txt").replace(
+        "Entries: 3",
+        "(md-document-01)^*[mynode]#\nEntries: 3",
+    )
+
+    with pytest.raises(ParseError, match="prompt appears before"):
+        parse_datapath_sessions(
+            output,
+            controller_name="md-document-01",
+            controller_host="198.51.100.11",
+        )
+
+
+@pytest.mark.parametrize(
+    "completion",
+    [
+        "Entries: 0",
+        "(md-document-01)^*[mynode]#",
+    ],
+)
+def test_datapath_parser_rejects_unrecognized_data_before_completion(
+    completion: str,
+) -> None:
+    output = fixture("datapath_empty.txt").replace(
+        "Entries: 0",
+        f"UNTRUSTED INTERRUPT\n{completion}",
+    )
+
+    with pytest.raises(ParseError, match="unrecognized data line"):
+        parse_datapath_sessions(
+            output,
+            controller_name="md-document-01",
+            controller_host="198.51.100.11",
+        )
+
+
+def test_datapath_table_start_accepts_safe_horizontal_spacing() -> None:
+    output = fixture("datapath_empty.txt").replace(
+        "Datapath Session Table Entries",
+        "\tDatapath\tSession   Table\tEntries  ",
+    )
+
+    assert (
+        parse_datapath_sessions(
+            output,
+            controller_name="md-document-01",
+            controller_host="198.51.100.11",
+        )
+        == ()
+    )
+
+
+def test_datapath_header_must_follow_exact_table_start() -> None:
+    source = fixture("datapath_empty.txt")
+    header = next(line for line in source.splitlines() if line.startswith("Source IP or MAC"))
+    output = f"{header}\n" + source.replace(f"{header}\n", "", 1)
+
+    with pytest.raises(ParseError, match="required column header"):
+        parse_datapath_sessions(
+            output,
+            controller_name="md-document-01",
+            controller_host="198.51.100.11",
+        )
+
+
+def test_datapath_legend_continuation_requires_flags_start() -> None:
+    output = fixture("datapath_empty.txt").replace(
+        "------------------------------",
+        "------------------------------\n       W - untrusted standalone text",
+        1,
+    )
+
+    with pytest.raises(ParseError, match="unrecognized data before its header"):
+        parse_datapath_sessions(
+            output,
+            controller_name="md-document-01",
+            controller_host="198.51.100.11",
+        )
+
+
+def test_datapath_parser_rejects_long_malformed_flag_legend_without_regex_backtracking() -> None:
+    malformed_legend = "Flags:" + ("A - +," * 5_000) + "A -"
+    output = fixture("datapath_empty.txt").replace(
+        "------------------------------",
+        f"------------------------------\n{malformed_legend}",
+        1,
+    )
+
+    with pytest.raises(ParseError, match="unrecognized data before its header"):
+        parse_datapath_sessions(
+            output,
+            controller_name="md-document-01",
+            controller_host="198.51.100.11",
+        )
+
+
+def test_datapath_column_separator_must_follow_header_inside_table_region() -> None:
+    source = fixture("datapath_empty.txt")
+    separator = next(
+        line for line in source.splitlines() if line.startswith("---------------- ----------------")
+    )
+    output = f"{separator}\n" + source.replace(f"{separator}\n", "", 1)
+
+    with pytest.raises(ParseError, match="validated column separator"):
+        parse_datapath_sessions(
+            output,
+            controller_name="md-document-01",
+            controller_host="198.51.100.11",
+        )
+
+
+def test_datapath_table_start_rejects_embedded_phrase() -> None:
+    output = fixture("datapath_empty.txt").replace(
+        "Datapath Session Table Entries",
+        "NOTICE: Datapath Session Table Entries will follow",
+    )
+
+    with pytest.raises(ParseError, match="incomplete or unrecognized"):
         parse_datapath_sessions(
             output,
             controller_name="md-document-01",

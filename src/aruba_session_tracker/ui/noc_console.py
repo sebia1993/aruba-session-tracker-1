@@ -120,9 +120,7 @@ class _NocConsoleController(QObject):
         window.product_meta_label.setParent(title_block)
         window.product_name_label.setObjectName("productName")
         window.product_meta_label.setObjectName("productMeta")
-        window.product_meta_label.setText(
-            f"NETWORK SESSION INVESTIGATION CONSOLE · v{_version_text(window)}"
-        )
+        window.product_meta_label.setText(f"네트워크 세션 분석 콘솔 · v{_version_text(window)}")
         title_layout.addWidget(window.product_name_label)
         title_layout.addWidget(window.product_meta_label)
         header_layout.addWidget(title_block)
@@ -131,8 +129,8 @@ class _NocConsoleController(QObject):
         for key, label, value, role in (
             ("mm", "MM", "설정 0/2", "neutral"),
             ("md", "MD", "설정 0/4", "neutral"),
-            ("poll", "POLL", _DASH, "info"),
-            ("last", "LAST SEEN", _DASH, "neutral"),
+            ("poll", "조회 주기", _DASH, "info"),
+            ("last", "최근 확인", _DASH, "neutral"),
         ):
             chip = _header_chip(label, value, role, window.nav_identity)
             header_layout.addWidget(chip)
@@ -140,7 +138,7 @@ class _NocConsoleController(QObject):
             if value_label is not None:
                 self._header_values[key] = value_label
 
-        local_chip = _header_chip("MODE", "LOCAL · READ ONLY", "success", window.nav_identity)
+        local_chip = _header_chip("실행 모드", "로컬 · 읽기 전용", "success", window.nav_identity)
         header_layout.addWidget(local_chip)
 
         window.state_label.setParent(window.nav_identity)
@@ -177,10 +175,10 @@ class _NocConsoleController(QObject):
         strip_layout.setSpacing(8)
 
         definitions = (
-            ("active", "ACTIVE FLOWS"),
-            ("rows", "VISIBLE ROWS"),
-            ("changes", "CHANGED FLOWS"),
-            ("controllers", "CONTROLLERS"),
+            ("active", "현재 관측 흐름"),
+            ("rows", "결과표 표시 행"),
+            ("changes", "신규·변경 흐름"),
+            ("controllers", "관측 MD"),
         )
         for key, label in definitions:
             card = QFrame(strip)
@@ -226,7 +224,7 @@ class _NocConsoleController(QObject):
 
         heading_row = QVBoxLayout()
         heading_row.setSpacing(2)
-        heading = QLabel("SELECTED SESSION", page)
+        heading = QLabel("선택한 세션", page)
         heading.setObjectName("detailEyebrow")
         self._detail_values["hint"] = QLabel("세션 행을 선택하면 조사 요약을 표시합니다.", page)
         self._detail_values["hint"].setObjectName("detailHint")
@@ -242,8 +240,8 @@ class _NocConsoleController(QObject):
         flow_layout.setHorizontalSpacing(8)
         flow_layout.setVerticalSpacing(4)
 
-        source_block = _detail_endpoint("SOURCE", page)
-        destination_block = _detail_endpoint("DESTINATION", page)
+        source_block = _detail_endpoint("출발지", page)
+        destination_block = _detail_endpoint("목적지", page)
         source_value = source_block.findChild(QLabel, "detailEndpointValue")
         destination_value = destination_block.findChild(QLabel, "detailEndpointValue")
         if source_value is not None:
@@ -278,14 +276,14 @@ class _NocConsoleController(QObject):
         facts_layout.setHorizontalSpacing(8)
         facts_layout.setVerticalSpacing(6)
         fields = (
-            ("status", "STATUS"),
-            ("controller", "CONTROLLER"),
-            ("flags", "FLAGS"),
-            ("last_seen", "LAST SEEN"),
-            ("packets", "PACKETS"),
-            ("bytes", "BYTES"),
-            ("age", "AGE"),
-            ("cpu", "CPU"),
+            ("status", "관측 상태"),
+            ("controller", "관측 MD"),
+            ("flags", "장비 Flags"),
+            ("last_seen", "마지막 확인"),
+            ("packets", "패킷"),
+            ("bytes", "바이트"),
+            ("age", "세션 경과"),
+            ("cpu", "CPU ID"),
         )
         for index, (key, label) in enumerate(fields):
             fact = QFrame(facts)
@@ -308,9 +306,9 @@ class _NocConsoleController(QObject):
         scroll.setWidget(content)
         page_layout.addWidget(scroll)
 
-        window.details.insertTab(0, page, "DETAILS")
-        window.details.setTabText(1, "RAW CLI")
-        window.details.setTabText(2, "DIAGNOSTICS")
+        window.details.insertTab(0, page, "세션 요약")
+        window.details.setTabText(1, "장비 원문")
+        window.details.setTabText(2, "진단 이벤트")
         window.details.setUsesScrollButtons(False)
         detail_tab_bar = window.details.tabBar()
         detail_tab_bar.setExpanding(True)
@@ -435,6 +433,8 @@ class _NocConsoleController(QObject):
             source_port = _item_text(table, row, 3)
             destination_ip = _item_text(table, row, 4)
             destination_port = _item_text(table, row, 5)
+            if table.isRowHidden(row):
+                continue
             status = _item_text(table, row, 14)
             flow = (protocol, source_ip, source_port, destination_ip, destination_port)
             if controller not in ("", "-"):
@@ -447,7 +447,10 @@ class _NocConsoleController(QObject):
             ):
                 changed_flows.add(flow)
         self._set_metric("active", len(active_flows))
-        self._set_metric("rows", table.rowCount())
+        self._set_metric(
+            "rows",
+            sum(not table.isRowHidden(row) for row in range(table.rowCount())),
+        )
         self._set_metric("changes", len(changed_flows))
         self._set_metric("controllers", len(controllers))
 
@@ -457,7 +460,14 @@ class _NocConsoleController(QObject):
     def _refresh_detail(self) -> None:
         table = self._window.result_table
         row = table.currentRow()
-        if row < 0:
+        selection_model = table.selectionModel()
+        selected_rows = selection_model.selectedRows() if selection_model is not None else []
+        if (
+            row < 0
+            or table.isRowHidden(row)
+            or len(selected_rows) != 1
+            or selected_rows[0].row() != row
+        ):
             self._set_detail("hint", "세션 행을 선택하면 조사 요약을 표시합니다.")
             for key in (
                 "source",

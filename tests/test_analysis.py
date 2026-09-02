@@ -46,8 +46,8 @@ def test_protocol_labels_are_static_and_keep_unknown_numbers() -> None:
 
 
 def test_service_lookup_is_protocol_aware_and_never_guesses() -> None:
-    assert service_label(6, 443) == "HTTPS (443)"
-    assert service_label(17, 53) == "DNS (53)"
+    assert service_label(6, 443) == "443(HTTPS)"
+    assert service_label(17, 53) == "53(DNS)"
     assert service_definition(17, 22) is None
     assert service_label(17, 22) == "22"
     assert service_label(1, 443) == "443"
