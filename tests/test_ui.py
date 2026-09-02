@@ -39,7 +39,10 @@ from aruba_session_tracker.models import (
     ErrorCode,
     QueryRequest,
     SessionObservation,
+    StorageFailureBoundary,
+    StorageFailureKind,
 )
+from aruba_session_tracker.paths import UnsafeManagedPath
 from aruba_session_tracker.services import QueryOutcome
 from aruba_session_tracker.storage import DeletePreview, SessionStore, StorageError
 from aruba_session_tracker.ui import MainWindow
@@ -56,8 +59,10 @@ from aruba_session_tracker.ui.main_window import (
     _lifecycle_status,
     _optional_port,
     _prepare_display_outcome,
+    _read_history_task,
     _safe_query_failure,
     _storage_status_text,
+    _support_code_for_query_failure,
 )
 from aruba_session_tracker.ui.theme import apply_main_window_theme
 
@@ -211,6 +216,7 @@ def test_presentation_tracks_query_direction_and_empty_states(
     )
     assert not window.history_empty_label.isVisible()
     assert window.history_table.columnCount() == 7
+    assert window.history_table.horizontalHeaderItem(0).text() == "조회 대상"
     assert "192.0.2.10" in window.history_table.item(0, 0).text()
     assert window.history_table.item(0, 6).text() == "AS20"
     assert "사내 정보 없이" in window.history_table.item(0, 6).toolTip()
@@ -349,7 +355,7 @@ def test_optional_port_accepts_only_blank_or_ascii_port_range() -> None:
         _optional_port("65536", "목적지 포트")
 
 
-def test_run_display_identifier_uses_query_ips_and_elapsed_format() -> None:
+def test_run_display_target_uses_only_query_ips_and_elapsed_format() -> None:
     assert (
         _display_run_identifier(
             {
@@ -358,8 +364,11 @@ def test_run_display_identifier_uses_query_ips_and_elapsed_format() -> None:
                 "started_at": "2026-09-02T05:32:10Z",
             }
         )
-        == "192.0.2.10 → 203.0.113.20 · 2026-09-02 14:32:10 KST"
+        == "192.0.2.10 → 203.0.113.20"
     )
+    assert _display_run_identifier({"source_ip": "192.0.2.10"}) == "출발지: 192.0.2.10"
+    assert _display_run_identifier({"destination_ip": "203.0.113.20"}) == "목적지: 203.0.113.20"
+    assert _display_run_identifier({"source_ip": "", "destination_ip": ""}) == "조회 대상 없음"
     assert (
         _format_elapsed(
             datetime(2026, 9, 2, 0, 0, tzinfo=UTC),
@@ -537,6 +546,12 @@ def test_safe_query_failure_maps_known_storage_and_unexpected_errors() -> None:
         ErrorCode.CANCELLED.value,
         "취소됨",
     )
+    assert _safe_query_failure(
+        StorageError("password=secret C:\\private\\tracker.db", code=ErrorCode.CANCELLED)
+    ) == (
+        ErrorCode.CANCELLED.value,
+        "작업이 취소되었습니다.",
+    )
     assert _safe_query_failure(StorageError("sensitive database path")) == (
         ErrorCode.DB_WRITE_FAILED.value,
         "로컬 조회 기록을 안전하게 저장하지 못했습니다.",
@@ -547,6 +562,46 @@ def test_safe_query_failure_maps_known_storage_and_unexpected_errors() -> None:
         ErrorCode.STORAGE_LOW_SPACE.value,
         "저장 공간이 부족합니다. 오래된 기록을 정리한 뒤 다시 시도하십시오.",
     )
+    expected_storage_failures = (
+        (
+            StorageFailureKind.STORAGE_PATH,
+            ErrorCode.STORAGE_PATH_FAILED.value,
+            "로컬 저장 경로를 안전하게 사용할 수 없습니다. 저장소 권한과 보안 상태를 확인하십시오.",
+            "AS86",
+        ),
+        (
+            StorageFailureKind.STORAGE_BUSY,
+            ErrorCode.STORAGE_BUSY.value,
+            "로컬 저장소가 다른 작업에서 사용 중입니다. 잠시 후 다시 시도하십시오.",
+            "AS87",
+        ),
+        (
+            StorageFailureKind.OUTPUT_LIMIT,
+            ErrorCode.OUTPUT_LIMIT_EXCEEDED.value,
+            "조회 결과가 안전 저장 한도를 초과했습니다. 조회 조건을 좁힌 뒤 다시 시도하십시오.",
+            "AS88",
+        ),
+        (
+            StorageFailureKind.PERSISTENCE_INDETERMINATE,
+            ErrorCode.PERSISTENCE_INDETERMINATE.value,
+            "조회 기록의 저장 완료 여부를 확인하지 못했습니다. 같은 조회를 다시 시도하십시오.",
+            "AS89",
+        ),
+    )
+    for (
+        failure_kind,
+        expected_code,
+        expected_message,
+        expected_support_code,
+    ) in expected_storage_failures:
+        failure = StorageError(
+            "password=secret C:\\private\\tracker.db",
+            failure_kind=failure_kind,
+        )
+        assert _safe_query_failure(failure) == (expected_code, expected_message)
+        assert _support_code_for_query_failure(expected_code).value == expected_support_code
+        assert "secret" not in expected_message
+        assert "tracker.db" not in expected_message
     assert _safe_query_failure(RuntimeError("sensitive runtime detail")) == (
         "UNEXPECTED",
         "예상하지 못한 내부 오류가 발생했습니다. 오류 유형: RuntimeError",
@@ -831,6 +886,12 @@ def test_export_completion_opens_without_gui_thread_filesystem_stat(
 
         def __init__(self, _parent: object) -> None:
             self._open_button: object | None = None
+
+        def setObjectName(self, _name: str) -> None:
+            return
+
+        def setProperty(self, _name: str, _value: object) -> None:
+            return
 
         def setIcon(self, _icon: object) -> None:
             return
@@ -1138,6 +1199,7 @@ class _StorageHealthStore(_EmptyStore):
         warning: bool = False,
         hard_stop: bool = False,
         capacity_failure: StorageError | None = None,
+        health_failure: Exception | None = None,
         raw_file_count: int = 0,
         raw_bytes: int = 0,
         total_managed_bytes: int = 0,
@@ -1146,6 +1208,7 @@ class _StorageHealthStore(_EmptyStore):
         self.warning = warning
         self.hard_stop = hard_stop
         self.capacity_failure = capacity_failure
+        self.health_failure = health_failure
         self.raw_file_count = raw_file_count
         self.raw_bytes = raw_bytes
         self.total_managed_bytes = total_managed_bytes
@@ -1160,6 +1223,8 @@ class _StorageHealthStore(_EmptyStore):
 
     def storage_health(self) -> object:
         self.health_calls += 1
+        if self.health_failure is not None:
+            raise self.health_failure
         return SimpleNamespace(
             warning=self.warning,
             hard_stop=self.hard_stop,
@@ -1730,7 +1795,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 
 from aruba_session_tracker.config import ConfigRepository
 from aruba_session_tracker.models import AppConfig, DeviceTarget
@@ -1782,6 +1847,23 @@ while window._history_task_running and time.monotonic() < deadline:
 app.processEvents()
 assert not window._history_task_running
 report_phase("history-ready")
+popup = QMessageBox(window)
+popup.setWindowTitle("HTML 보고서 완료")
+popup.setText("HTML 보고서를 저장했습니다. 문구와 버튼을 확인하십시오.")
+popup.setInformativeText(("긴-한글-파일명-" * 12) + "보고서.html")
+popup.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+popup.setDefaultButton(QMessageBox.StandardButton.No)
+popup.show()
+app.processEvents()
+body = popup.findChild(QLabel, "qt_msgbox_label")
+information = popup.findChild(QLabel, "qt_msgbox_informativelabel")
+assert body is not None and body.isVisible() and body.geometry().width() > 0
+assert information is not None and information.isVisible() and information.geometry().width() > 0
+assert information.text().endswith("보고서.html")
+assert popup.defaultButton() is popup.button(QMessageBox.StandardButton.No)
+assert popup.sizeHint().width() <= app.primaryScreen().availableGeometry().width()
+assert popup.sizeHint().height() <= app.primaryScreen().availableGeometry().height()
+popup.close()
 for width, height, orientation in (
     (1320, 820, Qt.Orientation.Horizontal),
     (1100, 820, Qt.Orientation.Vertical),
@@ -2488,12 +2570,11 @@ def test_storage_hard_stop_blocks_query_before_executor(
     tmp_path: Path,
     monkeypatch: object,
 ) -> None:
-    store = _StorageHealthStore(
-        capacity_failure=StorageError(
-            "sensitive capacity detail",
-            code=ErrorCode.STORAGE_LOW_SPACE,
-        )
+    capacity_failure = StorageError(
+        "sensitive capacity detail",
+        code=ErrorCode.STORAGE_LOW_SPACE,
     )
+    store = _StorageHealthStore(capacity_failure=capacity_failure)
     executor = _CountingExecutor()
     window = MainWindow(
         ConfigRepository(tmp_path / "config.json"),
@@ -2515,11 +2596,100 @@ def test_storage_hard_stop_blocks_query_before_executor(
     assert store.capacity_calls == 1
     assert store.health_calls == 0
     assert executor.call_count == 0
+    assert capacity_failure.boundary is StorageFailureBoundary.QUERY_PREFLIGHT
     assert "STORAGE_LOW_SPACE" in window.diagnostics_list.item(0).text()
     assert warnings == [
         "STORAGE_LOW_SPACE: 저장 공간이 부족합니다. 오래된 기록을 정리한 뒤 다시 시도하십시오."
         "\n\n전달 코드: AS71"
     ]
+    window.close()
+
+
+def test_storage_usage_summary_failure_is_advisory_and_query_continues(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    store = _StorageHealthStore(
+        health_failure=RuntimeError("password=secret C:\\private\\tracker.db")
+    )
+    executor = _CountingExecutor()
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        store,  # type: ignore[arg-type]
+        executor,
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    _configure_valid_query(window)
+
+    window._start_query()
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: executor.call_count == 1 and not window._query_running,
+        timeout=3000,
+    )
+
+    assert store.capacity_calls == 1
+    assert store.health_calls == 1
+    assert window.result_table.rowCount() == 1
+    assert window.state_label.text() == "정상"
+    assert "secret" not in window.statusBar().currentMessage()
+    assert "tracker.db" not in window.statusBar().currentMessage()
+    window.close()
+
+
+def test_history_refresh_treats_ordinary_storage_health_failure_as_advisory() -> None:
+    store = _StorageHealthStore(
+        health_failure=RuntimeError("password=secret C:\\private\\tracker.db")
+    )
+
+    result = _read_history_task(
+        store,  # type: ignore[arg-type]
+        lambda: False,
+        lambda _phase, _completed, _total: None,
+    )
+
+    assert result.runs == ()
+    assert result.pending_external_recoveries == 0
+    assert result.storage_health is None
+    assert store.health_calls == 1
+
+
+def test_storage_health_path_integrity_failure_remains_fatal(
+    qtbot: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unsafe_health_failure = StorageError("storage summary failed")
+    unsafe_health_failure.__cause__ = UnsafeManagedPath("password=secret C:\\private\\tracker.db")
+    store = _StorageHealthStore(health_failure=unsafe_health_failure)
+    executor = _CountingExecutor()
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, _title, message, *_args: warnings.append(str(message)),
+    )
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        store,  # type: ignore[arg-type]
+        executor,
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    _configure_valid_query(window)
+
+    window._start_query()
+    qtbot.waitUntil(lambda: not window._query_running, timeout=3000)  # type: ignore[attr-defined]
+
+    assert store.capacity_calls == 1
+    assert store.health_calls == 1
+    assert executor.call_count == 0
+    assert unsafe_health_failure.boundary is StorageFailureBoundary.QUERY_PREFLIGHT
+    assert "[AS86] [STORAGE_PATH_FAILED]" in window.diagnostics_list.item(0).text()
+    assert warnings == [
+        "STORAGE_PATH_FAILED: 로컬 저장 경로를 안전하게 사용할 수 없습니다. "
+        "저장소 권한과 보안 상태를 확인하십시오.\n\n전달 코드: AS86"
+    ]
+    assert "secret" not in warnings[0]
+    assert "tracker.db" not in warnings[0]
     window.close()
 
 

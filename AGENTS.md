@@ -108,9 +108,16 @@ datapath session rows from the relevant 7240XM managed device.
   persisted, and must reset whenever the report is reopened.
 - Keep the report summary ordered as query source IP:port, direction, query
   destination IP:port, run status, and four compact values: start, end, total
-  observations, and unique sessions. Do not add protocol/device distributions,
-  event timelines, or controller cards; the report is intentionally focused on
-  protocol and source/destination IP and port results.
+  observations, and unique sessions. The visible report-basis label is `조회 대상`
+  and uses only the configured source/destination IPs; the internal run UUID and
+  export filename remain unchanged.
+- The only permitted report distributions are static full-history `IP별 관측 횟수
+  TOP 5` and `포트·프로토콜별 관측 횟수 TOP 5` horizontal source/destination
+  bars. Count every stored observation direction, use deterministic ties, omit
+  blank IPs and port 0, and append service names only for catalogue-known
+  protocol/port pairs. These charts never follow result filters. Do not add
+  device/controller distributions, session-state summaries, event timelines,
+  diagnostic/cause charts, or external chart libraries/scripts.
 - Build autocomplete candidates from one full-history reverse index. Partial
   keystrokes may search only the cached unique candidate set, must discard any
   stale active option immediately, and must not rescan the report DOM. Touch

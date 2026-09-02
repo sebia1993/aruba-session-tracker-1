@@ -28,6 +28,29 @@ class ErrorCode(StrEnum):
     SESSION_NOT_FOUND = "SESSION_NOT_FOUND"
     STORAGE_LOW_SPACE = "STORAGE_LOW_SPACE"
     CANCELLED = "CANCELLED"
+    STORAGE_PATH_FAILED = "STORAGE_PATH_FAILED"
+    STORAGE_BUSY = "STORAGE_BUSY"
+    PERSISTENCE_INDETERMINATE = "PERSISTENCE_INDETERMINATE"
+
+
+class StorageFailureKind(StrEnum):
+    """Typed local-persistence failures safe to route without parsing text."""
+
+    DATABASE_WRITE = "DATABASE_WRITE"
+    STORAGE_PATH = "STORAGE_PATH"
+    STORAGE_BUSY = "STORAGE_BUSY"
+    LOW_SPACE = "LOW_SPACE"
+    OUTPUT_LIMIT = "OUTPUT_LIMIT"
+    PERSISTENCE_INDETERMINATE = "PERSISTENCE_INDETERMINATE"
+
+
+class StorageFailureBoundary(StrEnum):
+    """Query persistence boundary at which a storage failure was observed."""
+
+    QUERY_PREFLIGHT = "QUERY_PREFLIGHT"
+    QUERY_START = "QUERY_START"
+    QUERY_RESULT = "QUERY_RESULT"
+    QUERY_FINALIZE = "QUERY_FINALIZE"
 
 
 @dataclass(frozen=True, slots=True)

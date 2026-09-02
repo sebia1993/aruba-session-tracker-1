@@ -21,7 +21,10 @@ from aruba_session_tracker.paths import (
     reject_link_or_reparse,
     verify_managed_directory,
 )
-from aruba_session_tracker.storage.durable_io import replace_with_retry
+from aruba_session_tracker.storage.durable_io import (
+    replace_with_retry,
+    retry_windows_file_operation,
+)
 
 _SAFE_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
@@ -76,8 +79,8 @@ class RawOutputStore:
         """Atomically write one captured response below the run directory."""
 
         run_segment = safe_segment(run_id, "run_id")
-        kind_segment = _filename_segment(kind, "kind")
-        controller_segment = _filename_segment(controller_name, "controller_name")
+        kind_segment = filename_segment(kind, "kind")
+        controller_segment = filename_segment(controller_name, "controller_name")
         captured_utc = _as_utc(captured_at)
         timestamp = captured_utc.strftime("%Y%m%dT%H%M%S.%fZ")
         filename = f"{timestamp}_{kind_segment}_{controller_segment}_{uuid4().hex[:8]}.txt"
@@ -104,9 +107,24 @@ class RawOutputStore:
         path = contained_path(self.root, relative)
         data = content.encode("utf-8")
 
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{filename}.", suffix=".tmp", dir=directory
-        )
+        try:
+            temporary_parent = reject_link_or_reparse(directory)
+        except UnsafeManagedPath as error:
+            raise UnsafeStoragePath(str(error)) from error
+
+        def create_temporary() -> tuple[int, str]:
+            try:
+                current_parent = reject_link_or_reparse(directory)
+            except UnsafeManagedPath as error:
+                raise UnsafeStoragePath(str(error)) from error
+            if (int(current_parent.st_dev), int(current_parent.st_ino)) != (
+                int(temporary_parent.st_dev),
+                int(temporary_parent.st_ino),
+            ):
+                raise UnsafeStoragePath("Raw 임시 파일의 상위 경로가 준비 이후 변경되었습니다.")
+            return tempfile.mkstemp(prefix=f".{filename}.", suffix=".tmp", dir=directory)
+
+        descriptor, temporary_name = retry_windows_file_operation(create_temporary)
         temporary_path = Path(temporary_name)
         try:
             with os.fdopen(descriptor, "wb") as stream:
@@ -145,12 +163,16 @@ def safe_segment(value: str, label: str) -> str:
     return value
 
 
-def _filename_segment(value: str, label: str) -> str:
-    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip()).strip("._-")
-    if not normalized:
+def filename_segment(value: str, label: str) -> str:
+    """Return a stable ASCII filename segment while preserving Unicode metadata."""
+
+    stripped = value.strip()
+    if not stripped:
         raise UnsafeStoragePath(f"{label}은 비어 있을 수 없습니다.")
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", stripped).strip("._-")
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
-    return f"{normalized[:48]}-{digest}"
+    prefix = normalized[:48] or ("controller" if label == "controller_name" else "value")
+    return f"{prefix}-{digest}"
 
 
 def contained_path(root: Path, relative: Path) -> Path:

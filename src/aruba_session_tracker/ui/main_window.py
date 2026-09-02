@@ -56,9 +56,16 @@ from aruba_session_tracker.models import (
     ErrorCode,
     QueryRequest,
     SessionObservation,
+    StorageFailureBoundary,
 )
 from aruba_session_tracker.parsers import overall_flag_severity
-from aruba_session_tracker.storage import DeletePreview, SessionStore, StorageError
+from aruba_session_tracker.paths import UnsafeManagedPath
+from aruba_session_tracker.storage import (
+    DeletePreview,
+    SessionStore,
+    StorageError,
+    UnsafeStoragePath,
+)
 from aruba_session_tracker.support_codes import (
     SupportCode,
     UiFailureKey,
@@ -261,6 +268,7 @@ class _TaskSignals(QObject):
     finished = Signal(int)
     storage_warning = Signal(int, bool)
     storage_health_updated = Signal(int, object)
+    storage_health_unavailable = Signal(int)
 
 
 class _QueryTask(QRunnable):
@@ -300,26 +308,54 @@ class _QueryTask(QRunnable):
     def run(self) -> None:
         try:
             if self._query_capacity_check is not None:
-                self._query_capacity_check()
+                try:
+                    self._query_capacity_check()
+                except StorageError as capacity_error:
+                    capacity_error.at_boundary(StorageFailureBoundary.QUERY_PREFLIGHT)
+                    raise
             if self._storage_health_check is not None:
-                health = self._storage_health_check()
-                _emit_if_alive(
-                    self.signals.storage_health_updated,
-                    self.generation,
-                    health,
-                )
-                if bool(getattr(health, "warning", False)):
-                    hard_stop = bool(getattr(health, "hard_stop", False))
-                    _emit_if_alive(
-                        self.signals.storage_warning,
-                        self.generation,
-                        hard_stop,
-                    )
-                    if hard_stop:
-                        raise StorageError(
-                            "저장 공간이 부족하여 새 조회를 시작할 수 없습니다.",
-                            code=ErrorCode.STORAGE_LOW_SPACE,
+                try:
+                    health = self._storage_health_check()
+                except Exception as health_error:
+                    fatal_code = _fatal_storage_health_code(health_error)
+                    if fatal_code is not None:
+                        if isinstance(health_error, StorageError):
+                            health_error.at_boundary(StorageFailureBoundary.QUERY_PREFLIGHT)
+                        existing_code = getattr(
+                            getattr(health_error, "code", None),
+                            "value",
+                            None,
                         )
+                        if existing_code == fatal_code.value:
+                            raise
+                        raise StorageError(
+                            "저장소 안전성 또는 저장 가능 상태를 확인하지 못했습니다.",
+                            code=fatal_code,
+                            boundary=StorageFailureBoundary.QUERY_PREFLIGHT,
+                        ) from health_error
+                    _emit_if_alive(
+                        self.signals.storage_health_unavailable,
+                        self.generation,
+                    )
+                else:
+                    _emit_if_alive(
+                        self.signals.storage_health_updated,
+                        self.generation,
+                        health,
+                    )
+                    if bool(getattr(health, "warning", False)):
+                        hard_stop = bool(getattr(health, "hard_stop", False))
+                        _emit_if_alive(
+                            self.signals.storage_warning,
+                            self.generation,
+                            hard_stop,
+                        )
+                        if hard_stop:
+                            raise StorageError(
+                                "저장 공간이 부족하여 새 조회를 시작할 수 없습니다.",
+                                code=ErrorCode.STORAGE_LOW_SPACE,
+                                boundary=StorageFailureBoundary.QUERY_PREFLIGHT,
+                            )
             outcome = self._executor.execute(
                 self._config,
                 self._request,
@@ -567,6 +603,8 @@ class ApprovalBridge(QObject):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             self._owner,
         )
+        dialog.setObjectName("approvalDialog")
+        dialog.setProperty("popupSurface", "approval")
         dialog.setDefaultButton(QMessageBox.StandardButton.No)
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
         self._dialogs[request] = dialog
@@ -607,6 +645,8 @@ class ApprovalBridge(QObject):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             self._owner,
         )
+        dialog.setObjectName("approvalDialog")
+        dialog.setProperty("popupSurface", "approval")
         dialog.setDefaultButton(QMessageBox.StandardButton.No)
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
         self._dialogs[request] = dialog
@@ -1177,6 +1217,8 @@ class MainWindow(QMainWindow):
     def _open_result_filter_menu(self, column: int | None = None) -> None:
         if column is None:
             menu = QMenu(self)
+            menu.setObjectName("resultFilterMenu")
+            menu.setProperty("popupSurface", "menu")
             for logical_index, _label in _FILTER_COLUMNS.items():
                 action = menu.addAction(self._filter_header_text(logical_index))
                 action.triggered.connect(
@@ -1539,12 +1581,12 @@ class MainWindow(QMainWindow):
         self.history_table = QTableWidget(0, 7)
         self.history_table.setAccessibleName("실행 기록 표")
         self.history_table.setAccessibleDescription(
-            "저장된 실행의 IP 기반 표시 ID, 시작·종료 시각, 경과 시간, "
+            "저장된 실행의 조회 대상 IP, 시작·종료 시각, 경과 시간, "
             "상태, 관측 결과 수와 최근 전달 코드를 표시합니다."
         )
         self.history_table.setHorizontalHeaderLabels(
             [
-                "실행 ID",
+                "조회 대상",
                 "시작 시각",
                 "종료 시각",
                 "경과 시간",
@@ -2273,6 +2315,7 @@ class MainWindow(QMainWindow):
         task.signals.finished.connect(self._query_finished)
         task.signals.storage_warning.connect(self._show_storage_warning)
         task.signals.storage_health_updated.connect(self._storage_health_updated)
+        task.signals.storage_health_unavailable.connect(self._show_storage_health_unavailable)
         _start_daemon_task(task.run, f"aruba-session-query-{generation}")
 
     @Slot()
@@ -3125,6 +3168,15 @@ class MainWindow(QMainWindow):
         )
         self.statusBar().showMessage(message, 15000)
 
+    @Slot(int)
+    def _show_storage_health_unavailable(self, generation: int) -> None:
+        if not self._owns_task(generation) or self._closing_requested:
+            return
+        self.statusBar().showMessage(
+            "저장소 사용량 요약을 확인하지 못했습니다. 세션 조회는 계속합니다.",
+            10_000,
+        )
+
     @Slot(int, object)
     def _storage_health_updated(self, generation: int, health: object) -> None:
         if not self._owns_task(generation) or self._closing_requested:
@@ -3228,6 +3280,8 @@ class MainWindow(QMainWindow):
     def _show_export_completion(self, title: str, result: object) -> None:
         path = Path(result) if isinstance(result, (str, Path)) else None
         dialog = QMessageBox(self)
+        dialog.setObjectName("exportCompletionDialog")
+        dialog.setProperty("popupSurface", "completion")
         dialog.setIcon(QMessageBox.Icon.Information)
         dialog.setWindowTitle(f"{title} 완료")
         if path is None:
@@ -3484,8 +3538,32 @@ def _read_history_task(
     if storage_health is None and not reconcile_storage:
         health_check = getattr(store, "storage_health", None)
         if callable(health_check):
-            storage_health = health_check()
+            try:
+                storage_health = health_check()
+            except Exception as error:
+                if _fatal_storage_health_code(error) is not None:
+                    raise
     return _HistoryReadResult(result, pending_recoveries, storage_health)
+
+
+def _fatal_storage_health_code(exc: Exception) -> ErrorCode | None:
+    """Keep security/capacity failures fatal while usage totals stay advisory."""
+
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, (UnsafeManagedPath, UnsafeStoragePath)):
+            return ErrorCode.STORAGE_PATH_FAILED
+        code = getattr(getattr(current, "code", None), "value", None)
+        kind = getattr(current, "failure_kind", None)
+        failure_kind = getattr(kind, "value", kind)
+        if code == ErrorCode.STORAGE_PATH_FAILED.value or failure_kind == "STORAGE_PATH":
+            return ErrorCode.STORAGE_PATH_FAILED
+        if code == ErrorCode.STORAGE_LOW_SPACE.value or failure_kind == "LOW_SPACE":
+            return ErrorCode.STORAGE_LOW_SPACE
+        current = current.__cause__
+    return None
 
 
 def _safe_query_failure(exc: Exception) -> tuple[str, str]:
@@ -3494,9 +3572,50 @@ def _safe_query_failure(exc: Exception) -> tuple[str, str]:
     if isinstance(exc, CollectorError) and isinstance(raw_code, str) and raw_code in known_codes:
         return raw_code, str(exc) or "안전하게 처리할 수 없는 조회 오류가 발생했습니다."
     if isinstance(exc, StorageError):
-        if raw_code == ErrorCode.STORAGE_LOW_SPACE.value:
-            return raw_code, "저장 공간이 부족합니다. 오래된 기록을 정리한 뒤 다시 시도하십시오."
-        return ErrorCode.DB_WRITE_FAILED.value, "로컬 조회 기록을 안전하게 저장하지 못했습니다."
+        if raw_code == ErrorCode.CANCELLED.value:
+            return ErrorCode.CANCELLED.value, "작업이 취소되었습니다."
+        kind = getattr(exc, "failure_kind", None)
+        failure_kind = getattr(kind, "value", kind)
+        storage_codes = {
+            ErrorCode.DB_WRITE_FAILED.value,
+            ErrorCode.STORAGE_LOW_SPACE.value,
+            ErrorCode.STORAGE_PATH_FAILED.value,
+            ErrorCode.STORAGE_BUSY.value,
+            ErrorCode.OUTPUT_LIMIT_EXCEEDED.value,
+            ErrorCode.PERSISTENCE_INDETERMINATE.value,
+        }
+        code = (
+            raw_code
+            if isinstance(raw_code, str) and raw_code in storage_codes
+            else {
+                "DATABASE_WRITE": ErrorCode.DB_WRITE_FAILED.value,
+                "STORAGE_PATH": ErrorCode.STORAGE_PATH_FAILED.value,
+                "STORAGE_BUSY": ErrorCode.STORAGE_BUSY.value,
+                "LOW_SPACE": ErrorCode.STORAGE_LOW_SPACE.value,
+                "OUTPUT_LIMIT": ErrorCode.OUTPUT_LIMIT_EXCEEDED.value,
+                "PERSISTENCE_INDETERMINATE": ErrorCode.PERSISTENCE_INDETERMINATE.value,
+            }.get(str(failure_kind), ErrorCode.DB_WRITE_FAILED.value)
+        )
+        message = {
+            ErrorCode.DB_WRITE_FAILED.value: "로컬 조회 기록을 안전하게 저장하지 못했습니다.",
+            ErrorCode.STORAGE_LOW_SPACE.value: (
+                "저장 공간이 부족합니다. 오래된 기록을 정리한 뒤 다시 시도하십시오."
+            ),
+            ErrorCode.STORAGE_PATH_FAILED.value: (
+                "로컬 저장 경로를 안전하게 사용할 수 없습니다. "
+                "저장소 권한과 보안 상태를 확인하십시오."
+            ),
+            ErrorCode.STORAGE_BUSY.value: (
+                "로컬 저장소가 다른 작업에서 사용 중입니다. 잠시 후 다시 시도하십시오."
+            ),
+            ErrorCode.OUTPUT_LIMIT_EXCEEDED.value: (
+                "조회 결과가 안전 저장 한도를 초과했습니다. 조회 조건을 좁힌 뒤 다시 시도하십시오."
+            ),
+            ErrorCode.PERSISTENCE_INDETERMINATE.value: (
+                "조회 기록의 저장 완료 여부를 확인하지 못했습니다. 같은 조회를 다시 시도하십시오."
+            ),
+        }.get(code, "로컬 조회 기록을 안전하게 저장하지 못했습니다.")
+        return code, message
     return (
         "UNEXPECTED",
         f"예상하지 못한 내부 오류가 발생했습니다. 오류 유형: {type(exc).__name__}",
@@ -3508,6 +3627,10 @@ def _support_code_for_query_failure(code: str) -> SupportCode:
         ErrorCode.AUTH_FAILED.value: UiFailureKey.QUERY_AUTH_FAILED,
         ErrorCode.DB_WRITE_FAILED.value: UiFailureKey.QUERY_DB_WRITE_FAILED,
         ErrorCode.STORAGE_LOW_SPACE.value: UiFailureKey.QUERY_STORAGE_LOW_SPACE,
+        ErrorCode.STORAGE_PATH_FAILED.value: UiFailureKey.QUERY_STORAGE_PATH_FAILED,
+        ErrorCode.STORAGE_BUSY.value: UiFailureKey.QUERY_STORAGE_BUSY,
+        ErrorCode.OUTPUT_LIMIT_EXCEEDED.value: UiFailureKey.QUERY_OUTPUT_LIMIT_EXCEEDED,
+        ErrorCode.PERSISTENCE_INDETERMINATE.value: (UiFailureKey.QUERY_PERSISTENCE_INDETERMINATE),
     }.get(code, UiFailureKey.QUERY_UNEXPECTED)
     return support_code_for_ui_failure(key)
 
@@ -3621,10 +3744,15 @@ def _format_elapsed_from_text(started: object, ended: object) -> str:
 
 
 def _display_run_identifier(run: dict[str, object]) -> str:
-    source = str(run.get("source_ip") or "-").strip() or "-"
-    destination = str(run.get("destination_ip") or "-").strip() or "-"
-    started = _display_timestamp(run.get("started_at"))
-    return f"{source} → {destination} · {started}"
+    source = str(run.get("source_ip") or "").strip()
+    destination = str(run.get("destination_ip") or "").strip()
+    if source and destination:
+        return f"{source} → {destination}"
+    if source:
+        return f"출발지: {source}"
+    if destination:
+        return f"목적지: {destination}"
+    return "조회 대상 없음"
 
 
 def _flow_key(observation: SessionObservation) -> str:

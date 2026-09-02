@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib
 import io
@@ -29,6 +30,8 @@ from aruba_session_tracker.models import (
     ErrorCode,
     QueryRequest,
     SessionObservation,
+    StorageFailureBoundary,
+    StorageFailureKind,
 )
 from aruba_session_tracker.paths import (
     DirectoryIdentity,
@@ -38,8 +41,19 @@ from aruba_session_tracker.paths import (
     reject_managed_file_link,
     verify_managed_directory,
 )
+from aruba_session_tracker.raw_bundle import (
+    MAX_PERSISTED_RAW_BYTES,
+    RAW_BUNDLE_MAGIC,
+    persisted_raw_size,
+    raw_bundle_prefix,
+    raw_bundle_section_parts,
+)
 from aruba_session_tracker.storage.csv_export import write_csv_atomic
-from aruba_session_tracker.storage.durable_io import replace_with_retry
+from aruba_session_tracker.storage.durable_io import (
+    is_transient_windows_file_error,
+    replace_with_retry,
+    retry_windows_file_operation,
+)
 from aruba_session_tracker.storage.html_report import (
     RunReportSnapshot,
     write_html_report_stream_atomic,
@@ -49,6 +63,7 @@ from aruba_session_tracker.storage.raw import (
     RawOutputStore,
     UnsafeStoragePath,
     contained_path,
+    filename_segment,
     safe_segment,
 )
 from aruba_session_tracker.support_codes import (
@@ -66,7 +81,7 @@ _CSV_FETCH_BATCH = 1000
 _HASH_CHUNK_SIZE = 1024 * 1024
 _MANIFEST_VERSION = 1
 _MAX_PENDING_DELETIONS = 16
-_MAX_POLL_RAW_BYTES = 32 * 1024 * 1024
+_MAX_POLL_RAW_BYTES = MAX_PERSISTED_RAW_BYTES
 _MAX_POLL_OBSERVATIONS = 20_000
 # One already-active observation can legitimately produce OBSERVED plus
 # controller, flags and counter-change events in the same poll. Lifecycle rows
@@ -74,6 +89,10 @@ _MAX_POLL_OBSERVATIONS = 20_000
 # valid saturated poll fail forever before prepared state can commit.
 _MAX_POLL_LIFECYCLE_EVENTS = _MAX_POLL_OBSERVATIONS * 4
 _POLL_COMMIT_RETRY_DELAYS = (0.0, 0.05, 0.15)
+_LOW_SPACE_ERRNOS = frozenset(
+    value for name in ("ENOSPC", "EDQUOT") if isinstance(value := getattr(errno, name, None), int)
+)
+_LOW_SPACE_WINERRORS = frozenset({39, 112})
 STORAGE_WARNING_FREE_BYTES = 5 * 1024**3
 STORAGE_HARD_STOP_FREE_BYTES = 1024**3
 _OPERATION_ID = re.compile(r"[0-9a-f]{32}\Z")
@@ -83,7 +102,6 @@ _IPV4_TEXT = re.compile(r"(?<![0-9.])(?:\d{1,3}\.){3}\d{1,3}(?![0-9.])")
 _CREDENTIAL_TEXT = re.compile(
     r"(?i)\b(username|user|password|passwd|secret|token)\s*[:=]\s*([^\s,;]+)"
 )
-_RAW_BUNDLE_MAGIC = b"ARUBA_SESSION_TRACKER_RAW_BUNDLE_V1\n"
 _RAW_BUNDLE_CONTROLLER = "POLL_BUNDLE"
 _RAW_BUNDLE_KIND = "poll-bundle"
 # Windows errors that mean a removable device or network target is absent,
@@ -272,20 +290,74 @@ CREATE INDEX IF NOT EXISTS ix_poll_commits_run_id
     ON poll_commits(run_id, poll_id);
 """
 
+_ERROR_CODE_BY_STORAGE_KIND = {
+    StorageFailureKind.DATABASE_WRITE: ErrorCode.DB_WRITE_FAILED,
+    StorageFailureKind.STORAGE_PATH: ErrorCode.STORAGE_PATH_FAILED,
+    StorageFailureKind.STORAGE_BUSY: ErrorCode.STORAGE_BUSY,
+    StorageFailureKind.LOW_SPACE: ErrorCode.STORAGE_LOW_SPACE,
+    StorageFailureKind.OUTPUT_LIMIT: ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+    StorageFailureKind.PERSISTENCE_INDETERMINATE: ErrorCode.PERSISTENCE_INDETERMINATE,
+}
+_STORAGE_KIND_BY_ERROR_CODE = {code: kind for kind, code in _ERROR_CODE_BY_STORAGE_KIND.items()}
+
 
 class StorageError(RuntimeError):
     """Local history could not be read or safely changed."""
 
-    def __init__(self, message: str, *, code: ErrorCode | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: ErrorCode | None = None,
+        failure_kind: StorageFailureKind | None = None,
+        boundary: StorageFailureBoundary | None = None,
+    ) -> None:
         super().__init__(message)
-        self.code = code
+        inferred_kind = (
+            failure_kind
+            if failure_kind is not None
+            else _STORAGE_KIND_BY_ERROR_CODE.get(code)
+            if code is not None
+            else None
+        )
+        self.failure_kind = inferred_kind
+        self.code = code or (
+            _ERROR_CODE_BY_STORAGE_KIND.get(inferred_kind) if inferred_kind is not None else None
+        )
+        self.boundary = boundary
+
+    def at_boundary(
+        self,
+        boundary: StorageFailureBoundary,
+        *,
+        default_kind: StorageFailureKind = StorageFailureKind.DATABASE_WRITE,
+    ) -> StorageError:
+        """Attach missing typed routing metadata without changing the message."""
+
+        if self.failure_kind is None:
+            self.failure_kind = _storage_failure_kind_from_exception(self) or default_kind
+        if self.code is None:
+            self.code = _ERROR_CODE_BY_STORAGE_KIND[self.failure_kind]
+        if self.boundary is None:
+            self.boundary = boundary
+        return self
 
 
 class PollPersistenceIndeterminate(StorageError):
     """A poll may have committed, but its durable receipt could not be read."""
 
-    def __init__(self, message: str, *, poll_id: str) -> None:
-        super().__init__(message)
+    def __init__(
+        self,
+        message: str,
+        *,
+        poll_id: str,
+        boundary: StorageFailureBoundary = StorageFailureBoundary.QUERY_RESULT,
+    ) -> None:
+        super().__init__(
+            message,
+            failure_kind=StorageFailureKind.PERSISTENCE_INDETERMINATE,
+            boundary=boundary,
+        )
         self.poll_id = poll_id
 
 
@@ -545,12 +617,19 @@ class SessionStore:
     def storage_health(self) -> StorageHealth:
         """Return a conservative snapshot of managed disk use and free capacity."""
 
-        self._ensure_initialized()
         try:
+            self._ensure_initialized()
             with self._lock:
                 return self._storage_health_unlocked()
+        except StorageError:
+            raise
         except (OSError, sqlite3.Error, UnsafeManagedPath, UnsafeStoragePath) as error:
-            raise StorageError(f"저장소 상태를 확인할 수 없습니다: {error}") from error
+            raise StorageError(
+                f"저장소 상태를 확인할 수 없습니다: {error}",
+                failure_kind=(
+                    _storage_failure_kind_from_exception(error) or StorageFailureKind.DATABASE_WRITE
+                ),
+            ) from error
 
     def reconcile_storage_health(
         self,
@@ -737,8 +816,27 @@ class SessionStore:
         every poll, while the full recursive usage snapshot remains rate-limited.
         """
 
-        self._ensure_initialized()
-        self._require_storage_capacity()
+        try:
+            self._ensure_initialized()
+            self._require_storage_capacity()
+        except StorageError as error:
+            _query_storage_error(
+                error,
+                StorageFailureBoundary.QUERY_PREFLIGHT,
+            )
+            raise
+        except (
+            OSError,
+            sqlite3.Error,
+            UnsafeStoragePath,
+            UnsafeManagedPath,
+            ValueError,
+        ) as error:
+            raise _wrapped_query_storage_error(
+                f"조회 저장소를 사전 점검할 수 없습니다: {error}",
+                error,
+                StorageFailureBoundary.QUERY_PREFLIGHT,
+            ) from error
 
     def start_run(
         self,
@@ -747,18 +845,21 @@ class SessionStore:
         run_id: str | None = None,
         started_at: datetime | None = None,
     ) -> str:
-        self._ensure_initialized()
-        self._require_storage_capacity()
-        identifier = run_id or str(uuid4())
-        safe_segment(identifier, "run_id")
-        timestamp = _iso(started_at)
         lease: _RunLease | None = None
         try:
+            self._ensure_initialized()
+            self._require_storage_capacity()
+            identifier = run_id or str(uuid4())
+            safe_segment(identifier, "run_id")
+            timestamp = _iso(started_at)
             with self._lock:
                 self._assert_managed_layout()
                 lease = self._acquire_run_lease(identifier)
                 if lease is None:
-                    raise StorageError("같은 실행 ID가 다른 프로세스에서 사용 중입니다.")
+                    raise StorageError(
+                        "같은 실행 ID가 다른 프로세스에서 사용 중입니다.",
+                        failure_kind=StorageFailureKind.STORAGE_BUSY,
+                    )
                 with self._connection() as connection:
                     connection.execute(
                         """
@@ -779,13 +880,33 @@ class SessionStore:
                     )
                 self._run_leases[identifier] = lease
             return identifier
-        except (sqlite3.Error, UnsafeStoragePath, UnsafeManagedPath) as error:
+        except (OSError, sqlite3.Error, UnsafeStoragePath, UnsafeManagedPath) as error:
             if lease is not None:
-                _release_run_lease(lease, remove=True)
-            raise StorageError(f"조회 실행 기록을 시작할 수 없습니다: {error}") from error
-        except StorageError:
+                try:
+                    _release_run_lease(lease, remove=True)
+                except Exception as cleanup_error:
+                    error.add_note(
+                        "조회 시작 실패 후 잠금 정리도 실패했습니다: "
+                        f"{type(cleanup_error).__name__}"
+                    )
+            wrapped = _wrapped_query_storage_error(
+                f"조회 실행 기록을 시작할 수 없습니다: {error}",
+                error,
+                StorageFailureBoundary.QUERY_START,
+            )
+            for note in getattr(error, "__notes__", ()):
+                wrapped.add_note(note)
+            raise wrapped from error
+        except StorageError as error:
             if lease is not None:
-                _release_run_lease(lease, remove=True)
+                try:
+                    _release_run_lease(lease, remove=True)
+                except Exception as cleanup_error:
+                    error.add_note(
+                        "조회 시작 실패 후 잠금 정리도 실패했습니다: "
+                        f"{type(cleanup_error).__name__}"
+                    )
+            _query_storage_error(error, StorageFailureBoundary.QUERY_START)
             raise
 
     def finish_run(
@@ -795,9 +916,9 @@ class SessionStore:
         status: str = "COMPLETED",
         ended_at: datetime | None = None,
     ) -> None:
-        self._ensure_initialized()
-        normalized_status = _event_name(status, "status")
         try:
+            self._ensure_initialized()
+            normalized_status = _event_name(status, "status")
             with self._lock:
                 self._require_owned_running_run(run_id)
                 self._assert_managed_layout()
@@ -821,13 +942,30 @@ class SessionStore:
                 try:
                     _release_run_lease(lease, remove=True)
                 except (OSError, UnsafeStoragePath, UnsafeManagedPath) as error:
-                    raise StorageError(
-                        f"조회 실행 종료 후 잠금 파일을 정리할 수 없습니다: {error}"
+                    raise _wrapped_query_storage_error(
+                        f"조회 실행 종료 후 잠금 파일을 정리할 수 없습니다: {error}",
+                        error,
+                        StorageFailureBoundary.QUERY_FINALIZE,
+                        default_kind=StorageFailureKind.STORAGE_PATH,
                     ) from error
                 if self._run_leases.get(run_id) is lease:
                     del self._run_leases[run_id]
         except sqlite3.Error as error:
-            raise StorageError(f"조회 실행 종료를 기록할 수 없습니다: {error}") from error
+            raise _wrapped_query_storage_error(
+                f"조회 실행 종료를 기록할 수 없습니다: {error}",
+                error,
+                StorageFailureBoundary.QUERY_FINALIZE,
+            ) from error
+        except (OSError, UnsafeStoragePath, UnsafeManagedPath) as error:
+            raise _wrapped_query_storage_error(
+                f"조회 실행 종료 경로를 확인할 수 없습니다: {error}",
+                error,
+                StorageFailureBoundary.QUERY_FINALIZE,
+                default_kind=StorageFailureKind.STORAGE_PATH,
+            ) from error
+        except StorageError as error:
+            _query_storage_error(error, StorageFailureBoundary.QUERY_FINALIZE)
+            raise
 
     def record_query(
         self,
@@ -900,18 +1038,34 @@ class SessionStore:
     ) -> PollPersistenceResult:
         """Persist one complete poll with an idempotent durable receipt."""
 
-        self._ensure_initialized()
-        safe_segment(run_id, "run_id")
-        self._require_owned_running_run(run_id)
-        self._validate_poll_batch_limits(outcome, events)
-        lifecycle_events = tuple(events)
-        raw_kind_overrides = tuple(_raw_kind_overrides)
-        payload_sha256 = _poll_payload_sha256(
-            outcome,
-            lifecycle_events,
-            raw_kind_overrides,
-        )
-        operation_id = _validate_poll_id(poll_id or uuid4().hex)
+        try:
+            self._ensure_initialized()
+            safe_segment(run_id, "run_id")
+            self._require_owned_running_run(run_id)
+            self._validate_poll_batch_limits(outcome, events)
+            lifecycle_events = tuple(events)
+            raw_kind_overrides = tuple(_raw_kind_overrides)
+            payload_sha256 = _poll_payload_sha256(
+                outcome,
+                lifecycle_events,
+                raw_kind_overrides,
+            )
+            operation_id = _validate_poll_id(poll_id or uuid4().hex)
+        except StorageError as error:
+            _query_storage_error(error, StorageFailureBoundary.QUERY_RESULT)
+            raise
+        except (
+            OSError,
+            sqlite3.Error,
+            UnsafeStoragePath,
+            UnsafeManagedPath,
+            ValueError,
+        ) as error:
+            raise _wrapped_query_storage_error(
+                f"조회 결과 batch를 준비할 수 없습니다: {error}",
+                error,
+                StorageFailureBoundary.QUERY_RESULT,
+            ) from error
         stage_root = self.raw_root / f".raw-staging-{operation_id}"
         prepared: tuple[_PreparedRaw, ...] = ()
         manifest_path: Path | None = None
@@ -924,7 +1078,10 @@ class SessionStore:
                 self._assert_managed_layout()
                 operation_lease = self._acquire_operation_lease(operation_id)
                 if operation_lease is None:
-                    raise StorageError("같은 poll 저장 작업이 이미 진행 중입니다.")
+                    raise StorageError(
+                        "같은 poll 저장 작업이 이미 진행 중입니다.",
+                        failure_kind=StorageFailureKind.STORAGE_BUSY,
+                    )
 
                 existing_manifest = self._manifests_root / f"{operation_id}.json"
                 manifest_disappeared = False
@@ -964,7 +1121,10 @@ class SessionStore:
                     operation_lease = None
                     return result
                 if manifest_disappeared:
-                    raise StorageError("poll manifest가 receipt 없이 사라졌습니다.")
+                    raise StorageError(
+                        "poll manifest가 receipt 없이 사라졌습니다.",
+                        failure_kind=StorageFailureKind.STORAGE_PATH,
+                    )
 
                 self._require_storage_capacity()
                 prepared, remaining = self._prepare_poll_raw_files(
@@ -1006,7 +1166,10 @@ class SessionStore:
                     item.destination.parent.mkdir(parents=True, exist_ok=True)
                     _reject_managed_chain(self.raw_root, item.destination.parent)
                     if os.path.lexists(item.destination):
-                        raise StorageError("Raw 대상 파일이 이미 존재합니다.")
+                        raise StorageError(
+                            "Raw 대상 파일이 이미 존재합니다.",
+                            failure_kind=StorageFailureKind.STORAGE_PATH,
+                        )
                     _verify_file_fingerprint(
                         item.staged_path,
                         item.artifact.sha256,
@@ -1114,6 +1277,7 @@ class SessionStore:
                     )
             if cleanup_error is not None:
                 error.add_note(f"Raw batch 정리도 실패했습니다: {type(cleanup_error).__name__}")
+            _query_storage_error(error, StorageFailureBoundary.QUERY_RESULT)
             raise
         except (OSError, sqlite3.Error, UnsafeStoragePath, UnsafeManagedPath, ValueError) as error:
             cleanup_error = (
@@ -1134,7 +1298,11 @@ class SessionStore:
                     error.add_note(
                         f"poll 저장 작업 잠금 정리도 실패했습니다: {type(lease_error).__name__}"
                     )
-            wrapped = StorageError(f"조회 결과 batch를 기록할 수 없습니다: {error}")
+            wrapped = _wrapped_query_storage_error(
+                f"조회 결과 batch를 기록할 수 없습니다: {error}",
+                error,
+                StorageFailureBoundary.QUERY_RESULT,
+            )
             if cleanup_error is not None:
                 wrapped.add_note(f"Raw batch 정리도 실패했습니다: {type(cleanup_error).__name__}")
             raise wrapped from error
@@ -1145,14 +1313,25 @@ class SessionStore:
         *,
         uninitialized: bool = False,
     ) -> tuple[str, str] | None:
-        with self._connection(uninitialized=uninitialized) as connection:
-            row = connection.execute(
-                """
-                SELECT operation_id, run_id, payload_sha256
-                FROM poll_commits WHERE poll_id = ?
-                """,
-                (poll_id,),
-            ).fetchone()
+        row: sqlite3.Row | None = None
+        for attempt, delay in enumerate(_POLL_COMMIT_RETRY_DELAYS):
+            if delay:
+                time.sleep(delay)
+            try:
+                with self._connection(uninitialized=uninitialized) as connection:
+                    row = connection.execute(
+                        """
+                        SELECT operation_id, run_id, payload_sha256
+                        FROM poll_commits WHERE poll_id = ?
+                        """,
+                        (poll_id,),
+                    ).fetchone()
+                break
+            except sqlite3.OperationalError as error:
+                if attempt == len(
+                    _POLL_COMMIT_RETRY_DELAYS
+                ) - 1 or not _retryable_poll_commit_error(error):
+                    raise
         if row is None:
             return None
         if str(row["operation_id"]) != poll_id:
@@ -1292,14 +1471,26 @@ class SessionStore:
                 "한 번의 조회에서 저장할 수 있는 Raw 항목 수를 초과했습니다.",
                 code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
             )
-        raw_bytes = 0
-        for snapshot in outcome.raw_snapshots:
-            raw_bytes += len(snapshot.output.encode("utf-8", errors="replace"))
-            if raw_bytes > _MAX_POLL_RAW_BYTES:
-                raise StorageError(
-                    "한 번의 조회에서 저장할 수 있는 Raw 출력 총량을 초과했습니다.",
-                    code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
-                )
+        snapshots = tuple(outcome.raw_snapshots)
+        observation_keys_by_snapshot: tuple[tuple[str, ...], ...] | None = None
+        if len(snapshots) > 1:
+            remaining = {item.session_key: item for item in outcome.observations}
+            selected_keys: list[tuple[str, ...]] = []
+            for snapshot in snapshots:
+                selected = _select_snapshot_observations(snapshot, remaining)
+                selected_keys.append(tuple(item.session_key for item in selected))
+            observation_keys_by_snapshot = tuple(selected_keys)
+        if (
+            persisted_raw_size(
+                snapshots,
+                observation_keys_by_snapshot=observation_keys_by_snapshot,
+            )
+            > _MAX_POLL_RAW_BYTES
+        ):
+            raise StorageError(
+                "한 번의 조회에서 저장할 수 있는 Raw 출력 총량을 초과했습니다.",
+                code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+            )
 
     def record_lifecycle(
         self,
@@ -1623,6 +1814,85 @@ class SessionStore:
                             (run_id,),
                         ).fetchone()[0]
                     )
+                    ip_frequency_summary = tuple(
+                        (
+                            str(row["endpoint"]),
+                            int(row["source_count"]),
+                            int(row["destination_count"]),
+                        )
+                        for row in connection.execute(
+                            """
+                            WITH endpoints AS (
+                                SELECT trim(source_ip) AS endpoint,
+                                       1 AS source_count, 0 AS destination_count
+                                FROM observations
+                                WHERE run_id = ? AND source_ip IS NOT NULL
+                                  AND trim(source_ip) <> ''
+                                UNION ALL
+                                SELECT trim(destination_ip) AS endpoint,
+                                       0 AS source_count, 1 AS destination_count
+                                FROM observations
+                                WHERE run_id = ? AND destination_ip IS NOT NULL
+                                  AND trim(destination_ip) <> ''
+                            ), aggregated AS (
+                                SELECT endpoint,
+                                       sum(source_count) AS source_count,
+                                       sum(destination_count) AS destination_count
+                                FROM endpoints
+                                GROUP BY endpoint
+                            )
+                            SELECT endpoint, source_count, destination_count
+                            FROM aggregated
+                            ORDER BY source_count + destination_count DESC,
+                                     endpoint COLLATE BINARY ASC
+                            LIMIT 5
+                            """,
+                            (run_id, run_id),
+                        )
+                    )
+                    protocol_port_frequency_summary = tuple(
+                        (
+                            int(row["protocol"]),
+                            int(row["port"]),
+                            int(row["source_count"]),
+                            int(row["destination_count"]),
+                        )
+                        for row in connection.execute(
+                            """
+                            WITH endpoints AS (
+                                SELECT protocol, source_port AS port,
+                                       1 AS source_count, 0 AS destination_count
+                                FROM observations
+                                WHERE run_id = ?
+                                  AND typeof(protocol) = 'integer'
+                                  AND protocol BETWEEN 0 AND 255
+                                  AND typeof(source_port) = 'integer'
+                                  AND source_port BETWEEN 1 AND 65535
+                                UNION ALL
+                                SELECT protocol, destination_port AS port,
+                                       0 AS source_count, 1 AS destination_count
+                                FROM observations
+                                WHERE run_id = ?
+                                  AND typeof(protocol) = 'integer'
+                                  AND protocol BETWEEN 0 AND 255
+                                  AND typeof(destination_port) = 'integer'
+                                  AND destination_port BETWEEN 1 AND 65535
+                            ), aggregated AS (
+                                SELECT protocol, port,
+                                       sum(source_count) AS source_count,
+                                       sum(destination_count) AS destination_count
+                                FROM endpoints
+                                GROUP BY protocol, port
+                            )
+                            SELECT protocol, port, source_count, destination_count
+                            FROM aggregated
+                            ORDER BY source_count + destination_count DESC,
+                                     protocol ASC, port ASC
+                            LIMIT 5
+                            """,
+                            (run_id, run_id),
+                        )
+                    )
                     latest = tuple(
                         dict(row)
                         for row in connection.execute(
@@ -1673,6 +1943,8 @@ class SessionStore:
                         raw_files=(),
                         raw_file_total=0,
                         raw_byte_total=0,
+                        ip_frequency_summary=ip_frequency_summary,
+                        protocol_port_frequency_summary=protocol_port_frequency_summary,
                     )
                     history = _iter_cursor_dicts(
                         connection.execute(
@@ -2097,7 +2369,12 @@ class SessionStore:
         except StorageError:
             raise
         except (OSError, UnsafeManagedPath, UnsafeStoragePath) as error:
-            raise StorageError(f"저장소 여유 공간을 확인할 수 없습니다: {error}") from error
+            raise StorageError(
+                f"저장소 여유 공간을 확인할 수 없습니다: {error}",
+                failure_kind=(
+                    _storage_failure_kind_from_exception(error) or StorageFailureKind.STORAGE_PATH
+                ),
+            ) from error
 
     def _estimate_export_bytes(self, run_id: str, *, html: bool) -> int:
         """Return a conservative preflight size without materializing report rows."""
@@ -2154,7 +2431,10 @@ class SessionStore:
         self._assert_managed_layout()
         path = self._manifests_root / f"{operation_id}.json"
         if os.path.lexists(path):
-            raise StorageError("같은 저장 작업 manifest가 이미 존재합니다.")
+            raise StorageError(
+                "같은 저장 작업 manifest가 이미 존재합니다.",
+                failure_kind=StorageFailureKind.STORAGE_PATH,
+            )
         _write_json_atomic(path, payload)
         return path
 
@@ -2267,7 +2547,10 @@ class SessionStore:
         if not prepared:
             return
         if os.path.lexists(stage_root):
-            raise StorageError("Raw staging 경로가 이미 존재합니다.")
+            raise StorageError(
+                "Raw staging 경로가 이미 존재합니다.",
+                failure_kind=StorageFailureKind.STORAGE_PATH,
+            )
         stage_root.mkdir(parents=False, exist_ok=False)
         _reject_managed_chain(self.raw_root, stage_root)
         for item in prepared:
@@ -2937,7 +3220,10 @@ class SessionStore:
         try:
             self._assert_managed_layout()
         except (UnsafeManagedPath, UnsafeStoragePath) as error:
-            raise StorageError(f"관리 저장 경로가 안전하지 않습니다: {error}") from error
+            raise StorageError(
+                f"관리 저장 경로가 안전하지 않습니다: {error}",
+                failure_kind=StorageFailureKind.STORAGE_PATH,
+            ) from error
 
     def _require_owned_running_run(self, run_id: str) -> None:
         if run_id not in self._run_leases:
@@ -4293,7 +4579,71 @@ def _retryable_poll_commit_error(error: sqlite3.OperationalError) -> bool:
     code = getattr(error, "sqlite_errorcode", None)
     if type(code) is not int:
         return False
-    return (code & 0xFF) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+    if (code & 0xFF) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+        return True
+    lock_io_codes = {
+        value
+        for name in (
+            "SQLITE_IOERR_LOCK",
+            "SQLITE_IOERR_RDLOCK",
+            "SQLITE_IOERR_CHECKRESERVEDLOCK",
+            "SQLITE_IOERR_SHMLOCK",
+        )
+        if type(value := getattr(sqlite3, name, None)) is int
+    }
+    return code in lock_io_codes
+
+
+def _storage_failure_kind_from_exception(
+    error: BaseException,
+) -> StorageFailureKind | None:
+    """Classify by typed exception metadata and OS/SQLite codes only."""
+
+    current: BaseException | None = error
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, StorageError) and current.failure_kind is not None:
+            return current.failure_kind
+        if isinstance(current, (UnsafeManagedPath, UnsafeStoragePath)):
+            return StorageFailureKind.STORAGE_PATH
+        if isinstance(current, sqlite3.Error) and (
+            getattr(current, "sqlite_errorcode", None) == sqlite3.SQLITE_FULL
+        ):
+            return StorageFailureKind.LOW_SPACE
+        if isinstance(current, sqlite3.OperationalError) and _retryable_poll_commit_error(current):
+            return StorageFailureKind.STORAGE_BUSY
+        if isinstance(current, OSError) and (
+            current.errno in _LOW_SPACE_ERRNOS
+            or getattr(current, "winerror", None) in _LOW_SPACE_WINERRORS
+        ):
+            return StorageFailureKind.LOW_SPACE
+        if isinstance(current, OSError) and is_transient_windows_file_error(current):
+            return StorageFailureKind.STORAGE_BUSY
+        if isinstance(current, OSError):
+            return StorageFailureKind.STORAGE_PATH
+        current = current.__cause__
+    return None
+
+
+def _query_storage_error(
+    error: StorageError,
+    boundary: StorageFailureBoundary,
+    *,
+    default_kind: StorageFailureKind = StorageFailureKind.DATABASE_WRITE,
+) -> StorageError:
+    return error.at_boundary(boundary, default_kind=default_kind)
+
+
+def _wrapped_query_storage_error(
+    message: str,
+    error: BaseException,
+    boundary: StorageFailureBoundary,
+    *,
+    default_kind: StorageFailureKind = StorageFailureKind.DATABASE_WRITE,
+) -> StorageError:
+    kind = _storage_failure_kind_from_exception(error) or default_kind
+    return StorageError(message, failure_kind=kind, boundary=boundary)
 
 
 def _poll_payload_sha256(
@@ -4415,79 +4765,143 @@ def _acquire_file_lease(path: Path) -> _RunLease | None:
     try:
         parent_before = reject_link_or_reparse(path.parent)
     except UnsafeManagedPath as error:
-        raise StorageError(str(error)) from error
+        raise StorageError(
+            str(error),
+            failure_kind=StorageFailureKind.STORAGE_PATH,
+        ) from error
     if not stat.S_ISDIR(parent_before.st_mode):
-        raise StorageError("잠금 파일의 상위 경로가 디렉터리가 아닙니다.")
+        raise StorageError(
+            "잠금 파일의 상위 경로가 디렉터리가 아닙니다.",
+            failure_kind=StorageFailureKind.STORAGE_PATH,
+        )
 
     open_flags = os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
     before: os.stat_result | None = None
-    created = False
+    initial_descriptor: int | None = None
     try:
-        descriptor = os.open(path, open_flags | os.O_CREAT | os.O_EXCL, 0o600)
-        created = True
+        initial_descriptor = retry_windows_file_operation(
+            lambda: _open_new_lease_file(path, open_flags, parent_before)
+        )
     except FileExistsError:
         try:
-            before = os.lstat(path)
+            before = retry_windows_file_operation(
+                lambda: _existing_lease_file_info(path, parent_before)
+            )
             _validate_lease_file_info(before)
-            descriptor = os.open(path, open_flags | getattr(os, "O_NOFOLLOW", 0))
         except UnsafeManagedPath as error:
-            raise StorageError(str(error)) from error
+            raise StorageError(
+                str(error),
+                failure_kind=StorageFailureKind.STORAGE_PATH,
+            ) from error
 
-    stream = os.fdopen(descriptor, "r+b", buffering=0)
-    try:
-        opened = os.fstat(stream.fileno())
-        path_after_open = os.lstat(path)
-        parent_after_open = reject_link_or_reparse(path.parent)
-        _validate_lease_file_info(opened)
-        _validate_lease_file_info(path_after_open)
-        _require_same_file_identity(opened, path_after_open)
-        if before is not None:
-            _require_same_file_identity(before, opened)
-        if not created and before is None:  # pragma: no cover - defensive invariant
-            raise StorageError("기존 잠금 파일의 최초 신원을 확인할 수 없습니다.")
-        _require_same_directory_identity(parent_before, parent_after_open)
-
-        # Windows byte-range locking needs the first byte to exist.  No write
-        # occurs until the opened handle, path, parent, regular-file type,
-        # reparse state, and single-link identity all agree.
-        if opened.st_size == 0:
-            stream.write(b"0")
-        stream.seek(0)
-        after_write = os.fstat(stream.fileno())
-        path_after_write = os.lstat(path)
-        parent_after_write = reject_link_or_reparse(path.parent)
-        _validate_lease_file_info(after_write)
-        _validate_lease_file_info(path_after_write)
-        _require_same_file_identity(opened, after_write)
-        _require_same_file_identity(after_write, path_after_write)
-        _require_same_directory_identity(parent_before, parent_after_write)
+    delays = (0.0, 0.05, 0.1, 0.2, 0.4)
+    for attempt, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        stream: BinaryIO | None = None
+        descriptor: int | None = None
         try:
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            if initial_descriptor is not None:
+                descriptor = initial_descriptor
+                initial_descriptor = None
             else:
-                fcntl: Any = importlib.import_module("fcntl")
-                fcntl.flock(
-                    stream.fileno(),
-                    int(fcntl.LOCK_EX) | int(fcntl.LOCK_NB),
+                descriptor = os.open(
+                    path,
+                    open_flags | getattr(os, "O_NOFOLLOW", 0),
                 )
-        except OSError:
-            stream.close()
-            return None
+            stream = os.fdopen(descriptor, "r+b", buffering=0)
+            descriptor = None
+            opened = os.fstat(stream.fileno())
+            if before is None:
+                # A newly-created lease must keep this first handle identity
+                # fixed even if a following Windows path inspection needs a
+                # bounded retry.
+                before = opened
+            else:
+                _require_same_file_identity(before, opened)
+            path_after_open = os.lstat(path)
+            parent_after_open = reject_link_or_reparse(path.parent)
+            _validate_lease_file_info(opened)
+            _validate_lease_file_info(path_after_open)
+            _require_same_file_identity(opened, path_after_open)
+            _require_same_directory_identity(parent_before, parent_after_open)
 
-        locked = os.fstat(stream.fileno())
-        path_after_lock = os.lstat(path)
-        parent_after_lock = reject_link_or_reparse(path.parent)
-        _validate_lease_file_info(locked)
-        _validate_lease_file_info(path_after_lock)
-        _require_same_file_identity(after_write, locked)
-        _require_same_file_identity(locked, path_after_lock)
-        _require_same_directory_identity(parent_before, parent_after_lock)
-        return _RunLease(path, stream, int(locked.st_dev), int(locked.st_ino))
-    except Exception:
-        stream.close()
-        raise
+            # Windows byte-range locking needs the first byte to exist. No
+            # write occurs until handle, path, parent, reparse and link-count
+            # checks all agree with the fixed identity above.
+            if opened.st_size == 0:
+                stream.write(b"0")
+            stream.seek(0)
+            after_write = os.fstat(stream.fileno())
+            path_after_write = os.lstat(path)
+            parent_after_write = reject_link_or_reparse(path.parent)
+            _validate_lease_file_info(after_write)
+            _validate_lease_file_info(path_after_write)
+            _require_same_file_identity(opened, after_write)
+            _require_same_file_identity(after_write, path_after_write)
+            _require_same_directory_identity(parent_before, parent_after_write)
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl: Any = importlib.import_module("fcntl")
+                    fcntl.flock(
+                        stream.fileno(),
+                        int(fcntl.LOCK_EX) | int(fcntl.LOCK_NB),
+                    )
+            except OSError as error:
+                if is_transient_windows_file_error(error) and attempt < len(delays) - 1:
+                    stream.close()
+                    continue
+                stream.close()
+                return None
+
+            locked = os.fstat(stream.fileno())
+            path_after_lock = os.lstat(path)
+            parent_after_lock = reject_link_or_reparse(path.parent)
+            _validate_lease_file_info(locked)
+            _validate_lease_file_info(path_after_lock)
+            _require_same_file_identity(after_write, locked)
+            _require_same_file_identity(locked, path_after_lock)
+            _require_same_directory_identity(parent_before, parent_after_lock)
+            return _RunLease(path, stream, int(locked.st_dev), int(locked.st_ino))
+        except OSError as error:
+            if stream is not None:
+                stream.close()
+            elif descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+            if attempt == len(delays) - 1 or not is_transient_windows_file_error(error):
+                raise
+        except Exception:
+            if stream is not None:
+                stream.close()
+            elif descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+            raise
+    raise AssertionError("lease retry loop did not return")  # pragma: no cover
+
+
+def _open_new_lease_file(
+    path: Path,
+    open_flags: int,
+    parent_before: os.stat_result,
+) -> int:
+    parent_current = reject_link_or_reparse(path.parent)
+    _require_same_directory_identity(parent_before, parent_current)
+    return os.open(path, open_flags | os.O_CREAT | os.O_EXCL, 0o600)
+
+
+def _existing_lease_file_info(
+    path: Path,
+    parent_before: os.stat_result,
+) -> os.stat_result:
+    parent_current = reject_link_or_reparse(path.parent)
+    _require_same_directory_identity(parent_before, parent_current)
+    return os.lstat(path)
 
 
 def _validate_lease_file_info(info: os.stat_result) -> None:
@@ -4498,14 +4912,23 @@ def _validate_lease_file_info(info: os.stat_result) -> None:
         or stat.S_ISLNK(info.st_mode)
         or (reparse_flag and attributes & reparse_flag)
     ):
-        raise StorageError("잠금 경로가 일반 비-reparse 파일이 아닙니다.")
+        raise StorageError(
+            "잠금 경로가 일반 비-reparse 파일이 아닙니다.",
+            failure_kind=StorageFailureKind.STORAGE_PATH,
+        )
     if int(info.st_nlink) != 1:
-        raise StorageError("잠금 파일에는 hardlink를 사용할 수 없습니다.")
+        raise StorageError(
+            "잠금 파일에는 hardlink를 사용할 수 없습니다.",
+            failure_kind=StorageFailureKind.STORAGE_PATH,
+        )
 
 
 def _require_same_file_identity(left: os.stat_result, right: os.stat_result) -> None:
     if (int(left.st_dev), int(left.st_ino)) != (int(right.st_dev), int(right.st_ino)):
-        raise StorageError("잠금 파일 경로가 여는 동안 다른 파일로 변경되었습니다.")
+        raise StorageError(
+            "잠금 파일 경로가 여는 동안 다른 파일로 변경되었습니다.",
+            failure_kind=StorageFailureKind.STORAGE_PATH,
+        )
 
 
 def _require_same_directory_identity(left: os.stat_result, right: os.stat_result) -> None:
@@ -4516,7 +4939,10 @@ def _require_same_directory_identity(left: os.stat_result, right: os.stat_result
         int(right.st_dev),
         int(right.st_ino),
     ):
-        raise StorageError("잠금 파일의 상위 경로가 여는 동안 변경되었습니다.")
+        raise StorageError(
+            "잠금 파일의 상위 경로가 여는 동안 변경되었습니다.",
+            failure_kind=StorageFailureKind.STORAGE_PATH,
+        )
 
 
 def _release_run_lease(lease: _RunLease, *, remove: bool) -> None:
@@ -4546,26 +4972,17 @@ def _remove_released_lease_with_retry(lease: _RunLease) -> None:
     for attempt, delay in enumerate(delays):
         if delay:
             time.sleep(delay)
-        if not os.path.lexists(lease.path):
-            return
         try:
             info = os.lstat(lease.path)
-        except FileNotFoundError:
-            return
-        _validate_lease_file_info(info)
-        if (int(info.st_dev), int(info.st_ino)) != (lease.device, lease.inode):
-            return
-        try:
+            _validate_lease_file_info(info)
+            if (int(info.st_dev), int(info.st_ino)) != (lease.device, lease.inode):
+                return
             lease.path.unlink()
             return
         except FileNotFoundError:
             return
         except OSError as error:
-            retryable = os.name == "nt" and (
-                getattr(error, "winerror", None) in {5, 32, 33}
-                or (getattr(error, "winerror", None) is None and isinstance(error, PermissionError))
-            )
-            if attempt == len(delays) - 1 or not retryable:
+            if attempt == len(delays) - 1 or not is_transient_windows_file_error(error):
                 raise
 
 
@@ -4597,7 +5014,20 @@ def _replace_file(
 def _write_bytes_atomic(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        parent_before = reject_link_or_reparse(path.parent)
+    except UnsafeManagedPath as error:
+        raise StorageError(
+            str(error),
+            failure_kind=StorageFailureKind.STORAGE_PATH,
+        ) from error
+
+    def create_temporary() -> int:
+        parent_current = reject_link_or_reparse(path.parent)
+        _require_same_directory_identity(parent_before, parent_current)
+        return os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+
+    descriptor = retry_windows_file_operation(create_temporary)
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(data)
@@ -4763,52 +5193,70 @@ def _file_fingerprint(
     total: int | None = None,
 ) -> tuple[str, int]:
     _check_cancelled(cancel_check)
-    _reject_link_or_reparse(path)
-    info = os.lstat(path)
-    if not stat.S_ISREG(info.st_mode):
-        raise UnsafeStoragePath("관리 대상은 일반 파일이어야 합니다.")
-    digest = hashlib.sha256()
-    size = 0
-    with path.open("rb") as stream:
-        opened = os.fstat(stream.fileno())
-        if (int(opened.st_dev), int(opened.st_ino)) != (
+    info = retry_windows_file_operation(lambda: _plain_regular_file_info(path))
+
+    def fingerprint_fixed_file() -> tuple[str, int]:
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (int(opened.st_dev), int(opened.st_ino)) != (
+                int(info.st_dev),
+                int(info.st_ino),
+            ):
+                raise StorageError(
+                    "fingerprint 대상 파일이 열기 전에 변경되었습니다.",
+                    failure_kind=StorageFailureKind.STORAGE_PATH,
+                )
+            while True:
+                _check_cancelled(cancel_check)
+                chunk = stream.read(_HASH_CHUNK_SIZE)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+                _notify_progress(progress, phase, completed_base + size, total)
+            opened_after = os.fstat(stream.fileno())
+        after = os.lstat(path)
+        if (
+            int(opened_after.st_dev),
+            int(opened_after.st_ino),
+            int(opened_after.st_size),
+            int(opened_after.st_mtime_ns),
+        ) != (
             int(info.st_dev),
             int(info.st_ino),
+            int(info.st_size),
+            int(info.st_mtime_ns),
+        ) or (
+            int(after.st_dev),
+            int(after.st_ino),
+            int(after.st_size),
+            int(after.st_mtime_ns),
+        ) != (
+            int(info.st_dev),
+            int(info.st_ino),
+            int(info.st_size),
+            int(info.st_mtime_ns),
         ):
-            raise StorageError("fingerprint 대상 파일이 열기 전에 변경되었습니다.")
-        while True:
-            _check_cancelled(cancel_check)
-            chunk = stream.read(_HASH_CHUNK_SIZE)
-            if not chunk:
-                break
-            digest.update(chunk)
-            size += len(chunk)
-            _notify_progress(progress, phase, completed_base + size, total)
-        opened_after = os.fstat(stream.fileno())
-    after = os.lstat(path)
-    if (
-        int(opened_after.st_dev),
-        int(opened_after.st_ino),
-        int(opened_after.st_size),
-        int(opened_after.st_mtime_ns),
-    ) != (
-        int(info.st_dev),
-        int(info.st_ino),
-        int(info.st_size),
-        int(info.st_mtime_ns),
-    ) or (
-        int(after.st_dev),
-        int(after.st_ino),
-        int(after.st_size),
-        int(after.st_mtime_ns),
-    ) != (
-        int(info.st_dev),
-        int(info.st_ino),
-        int(info.st_size),
-        int(info.st_mtime_ns),
-    ):
-        raise StorageError("fingerprint 계산 중 관리 파일이 변경되었습니다.")
-    return digest.hexdigest(), size
+            raise StorageError(
+                "fingerprint 계산 중 관리 파일이 변경되었습니다.",
+                failure_kind=StorageFailureKind.STORAGE_PATH,
+            )
+        return digest.hexdigest(), size
+
+    return retry_windows_file_operation(fingerprint_fixed_file)
+
+
+def _plain_regular_file_info(path: Path) -> os.stat_result:
+    info = os.lstat(path)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = int(getattr(info, "st_file_attributes", 0))
+    if stat.S_ISLNK(info.st_mode) or (reparse_flag and attributes & reparse_flag):
+        raise UnsafeStoragePath("심볼릭 링크나 reparse point는 관리 대상으로 사용할 수 없습니다.")
+    if not stat.S_ISREG(info.st_mode):
+        raise UnsafeStoragePath("관리 대상은 일반 파일이어야 합니다.")
+    return info
 
 
 def _verify_file_fingerprint(
@@ -4840,7 +5288,10 @@ def _verify_file_fingerprint(
             total=total,
         )
     if actual_sha != sha256 or actual_size != byte_size:
-        raise StorageError("관리 파일의 SHA-256 또는 크기가 변경되었습니다.")
+        raise StorageError(
+            "관리 파일의 SHA-256 또는 크기가 변경되었습니다.",
+            failure_kind=StorageFailureKind.STORAGE_PATH,
+        )
 
 
 def _fingerprint_matches(path: Path, sha256: str, byte_size: int) -> bool:
@@ -4936,14 +5387,6 @@ def _iter_cursor_dicts(
         _notify_progress(progress, phase, completed, total)
 
 
-def _raw_filename_segment(value: str, label: str) -> str:
-    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip()).strip("._-")
-    if not normalized:
-        raise UnsafeStoragePath(f"{label}은 비어 있을 수 없습니다.")
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
-    return f"{normalized[:48]}-{digest}"
-
-
 def _select_snapshot_observations(
     snapshot: RawSnapshot,
     remaining: dict[str, SessionObservation],
@@ -4977,16 +5420,7 @@ def _raw_bundle_data(
             )
         buffer.write(part)
 
-    write_part(_RAW_BUNDLE_MAGIC)
-    write_part(
-        json.dumps(
-            {"snapshot_count": len(snapshots)},
-            ensure_ascii=True,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        + b"\n"
-    )
+    write_part(raw_bundle_prefix(len(snapshots)))
     sections: list[_RawBundleSection] = []
     for index, (snapshot, observations) in enumerate(
         zip(snapshots, section_observations, strict=True),
@@ -4996,27 +5430,12 @@ def _raw_bundle_data(
         digest = hashlib.sha256(output).hexdigest()
         section = _RawBundleSection(index, digest, len(output))
         sections.append(section)
-        metadata = {
-            "command": snapshot.command,
-            "device_name": snapshot.device_name,
-            "index": index,
-            "observation_keys": [item.session_key for item in observations],
-            "observed_at": _iso(snapshot.observed_at),
-            "output_sha256": digest,
-            "output_utf8_bytes": len(output),
-        }
-        write_part(f"--- BEGIN SNAPSHOT {index} ---\n".encode())
-        write_part(
-            json.dumps(
-                metadata,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            + b"\n"
-        )
-        write_part(output)
-        write_part(f"\n--- END SNAPSHOT {index} ---\n".encode())
+        for part in raw_bundle_section_parts(
+            snapshot,
+            index,
+            tuple(item.session_key for item in observations),
+        ):
+            write_part(part)
     data = buffer.getvalue()
     _verify_raw_bundle_stream(io.BytesIO(data), tuple(sections))
     return data, tuple(sections)
@@ -5036,8 +5455,8 @@ def _raw_artifact_for_data(
     captured_utc = captured_at.astimezone(UTC)
     timestamp = captured_utc.strftime("%Y%m%dT%H%M%S.%fZ")
     filename = (
-        f"{timestamp}_{_raw_filename_segment(kind, 'kind')}_"
-        f"{_raw_filename_segment(controller_name, 'controller_name')}_"
+        f"{timestamp}_{filename_segment(kind, 'kind')}_"
+        f"{filename_segment(controller_name, 'controller_name')}_"
         f"{uuid4().hex[:8]}.txt"
     )
     relative = (
@@ -5076,7 +5495,7 @@ def _verify_raw_bundle_stream(
     stream: BinaryIO,
     sections: tuple[_RawBundleSection, ...],
 ) -> None:
-    if stream.readline() != _RAW_BUNDLE_MAGIC:
+    if stream.readline() != RAW_BUNDLE_MAGIC:
         raise StorageError("Raw poll bundle 헤더가 올바르지 않습니다.")
     try:
         header = json.loads(stream.readline().decode("utf-8"))

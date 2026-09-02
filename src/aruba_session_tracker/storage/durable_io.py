@@ -12,6 +12,8 @@ from pathlib import Path
 ReplaceCallable = Callable[[Path, Path], object]
 _HASH_CHUNK_SIZE = 1024 * 1024
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+WINDOWS_FILE_RETRY_DELAYS = (0.0, 0.05, 0.1, 0.2, 0.4)
+_TRANSIENT_WINDOWS_FILE_ERRORS = frozenset({5, 32, 33})
 
 
 def replace_with_retry(
@@ -34,7 +36,7 @@ def replace_with_retry(
     # Always fingerprint the actual staged bytes before the first publication
     # attempt.  Trusting a caller-supplied digest without comparing it here
     # would allow a same-sized corrupted staging file to be published.
-    source_state = _file_state(source, with_hash=True)
+    source_state = _capture_hashed_file_state(source)
     source_sha = source_state.sha256 if expected_sha256 is None else expected_sha256
     if source_sha is None:  # pragma: no cover - defensive invariant
         raise OSError("atomic replace source fingerprint is unavailable")
@@ -44,40 +46,61 @@ def replace_with_retry(
     source_parent = _directory_state(source.parent)
     destination_parent = _directory_state(destination.parent)
     destination_state = (
-        _file_state(destination, with_hash=True) if os.path.lexists(destination) else None
+        _capture_hashed_file_state(destination) if os.path.lexists(destination) else None
     )
-    delays = (0.0, 0.05, 0.1, 0.2, 0.4)
-    for attempt, delay in enumerate(delays):
+    for attempt, delay in enumerate(WINDOWS_FILE_RETRY_DELAYS):
         if delay:
             time.sleep(delay)
-        # Revalidate every identity and fingerprint immediately before every
-        # replace call, including the first.  This closes the gap between the
-        # initial capture and publication as well as every retry delay.
-        _validate_directory_state(source.parent, source_parent)
-        _validate_directory_state(destination.parent, destination_parent)
-        _validate_file_state(
-            source,
-            source_state,
-            expected_sha256=source_sha,
-            expected_size=source_size,
-        )
-        _validate_destination_state(destination, destination_state)
         try:
+            # Revalidate every identity and fingerprint immediately before
+            # every replace call, including the first. Transient Windows file
+            # locks may affect these opens as well as the replace itself, but
+            # the identity captured above stays fixed across every retry.
+            _validate_directory_state(source.parent, source_parent)
+            _validate_directory_state(destination.parent, destination_parent)
+            _validate_file_state(
+                source,
+                source_state,
+                expected_sha256=source_sha,
+                expected_size=source_size,
+            )
+            _validate_destination_state(destination, destination_state)
             if _can_use_windows_write_through(replace):
                 _move_file_ex_write_through(source, destination)
             else:
                 replace(source, destination)
             return
         except OSError as error:
-            if attempt == len(delays) - 1 or not _retryable_replace_error(error):
+            if attempt == len(WINDOWS_FILE_RETRY_DELAYS) - 1 or not (
+                is_transient_windows_file_error(error)
+            ):
                 raise
 
 
-def _retryable_replace_error(error: OSError) -> bool:
-    if os.name != "nt":
-        return False
-    winerror = getattr(error, "winerror", None)
-    return winerror in {5, 32, 33} or (winerror is None and isinstance(error, PermissionError))
+def is_transient_windows_file_error(error: BaseException) -> bool:
+    """Return whether Windows identified a bounded sharing/access collision."""
+
+    return os.name == "nt" and getattr(error, "winerror", None) in (_TRANSIENT_WINDOWS_FILE_ERRORS)
+
+
+def retry_windows_file_operation[ResultT](
+    operation: Callable[[], ResultT],
+    *,
+    delays: tuple[float, ...] = WINDOWS_FILE_RETRY_DELAYS,
+) -> ResultT:
+    """Retry only Win32 5/32/33 while leaving all integrity errors fail-closed."""
+
+    if not delays:
+        raise ValueError("at least one retry delay is required")
+    for attempt, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        try:
+            return operation()
+        except OSError as error:
+            if attempt == len(delays) - 1 or not is_transient_windows_file_error(error):
+                raise
+    raise AssertionError("Windows file retry loop did not return")  # pragma: no cover
 
 
 class _FileState:
@@ -147,6 +170,30 @@ def _file_state(path: Path, *, with_hash: bool) -> _FileState:
         sha256=digest,
         size=int(info.st_size),
     )
+
+
+def _capture_hashed_file_state(path: Path) -> _FileState:
+    """Fingerprint one fixed file identity across transient Windows opens."""
+
+    initial = retry_windows_file_operation(lambda: _file_state(path, with_hash=False))
+
+    def capture() -> _FileState:
+        current = _file_state(path, with_hash=True)
+        if (
+            current.device,
+            current.inode,
+            current.modified_ns,
+            current.size,
+        ) != (
+            initial.device,
+            initial.inode,
+            initial.modified_ns,
+            initial.size,
+        ):
+            raise OSError("atomic replace file identity changed while fingerprinting")
+        return current
+
+    return retry_windows_file_operation(capture)
 
 
 def _validate_file_state(

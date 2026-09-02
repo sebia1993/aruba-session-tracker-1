@@ -1465,6 +1465,9 @@ def _verify_packaged_report_text(report_text: str) -> None:
         "최신 세션 결과",
         "전체 추적 이력",
         "조회 출발지",
+        "조회 대상",
+        "IP별 관측 횟수 TOP 5",
+        "포트·프로토콜별 관측 횟수 TOP 5",
         "출발지 IP·포트",
         "목적지 IP·포트",
         "KST",
@@ -1476,6 +1479,8 @@ def _verify_packaged_report_text(report_text: str) -> None:
         'class="report-row"',
         'class="flow-panel"',
         'class="summary-stats"',
+        'class="frequency-list"',
+        'class="frequency-bar" aria-hidden="true"',
         'class="protocol-cell"',
         "script-src 'sha256-",
         '<details class="history-toggle">',
@@ -1494,6 +1499,8 @@ def _verify_packaged_report_text(report_text: str) -> None:
         "바이트",
         "프로토콜별 최신 세션",
         "장비별 최신 세션",
+        "최신 표시 세션 상태",
+        "주요 세션 변화",
         "XMLHttpRequest",
         "WebSocket",
         "navigator.clipboard",
@@ -1502,7 +1509,13 @@ def _verify_packaged_report_text(report_text: str) -> None:
         "eval(",
     )
     section_positions = tuple(
-        report_text.find(marker) for marker in ("결과 찾기", "최신 세션 결과", "전체 추적 이력")
+        report_text.find(marker)
+        for marker in (
+            "전체 이력 관측 빈도 TOP 5",
+            "결과 찾기",
+            "최신 세션 결과",
+            "전체 추적 이력",
+        )
     )
     if (
         "<!doctype html>" not in report_text.casefold()

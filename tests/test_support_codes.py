@@ -84,6 +84,13 @@ def test_ui_failure_keys_are_explicit_and_do_not_parse_messages() -> None:
     assert support_code_for_ui_failure(UiFailureKey.EXPORT_CSV_FAILED) is SupportCode.AS74
     assert support_code_for_ui_failure(UiFailureKey.CONFIG_READ_FAILED) is SupportCode.AS84
     assert support_code_for_ui_failure(UiFailureKey.CONFIG_SAVE_FAILED) is SupportCode.AS85
+    assert support_code_for_ui_failure(UiFailureKey.QUERY_STORAGE_PATH_FAILED) is SupportCode.AS86
+    assert support_code_for_ui_failure(UiFailureKey.QUERY_STORAGE_BUSY) is SupportCode.AS87
+    assert support_code_for_ui_failure(UiFailureKey.QUERY_OUTPUT_LIMIT_EXCEEDED) is SupportCode.AS88
+    assert (
+        support_code_for_ui_failure(UiFailureKey.QUERY_PERSISTENCE_INDETERMINATE)
+        is SupportCode.AS89
+    )
     assert support_code_for_ui_failure("password=secret AUTH_FAILED") is SupportCode.AS00
 
 

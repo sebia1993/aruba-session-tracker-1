@@ -38,13 +38,17 @@ from aruba_session_tracker.parsers import (
     parse_datapath_sessions,
     parse_global_user_table,
 )
+from aruba_session_tracker.raw_bundle import (
+    MAX_PERSISTED_RAW_BYTES,
+    persisted_raw_size,
+)
 
 FullScanApproval = (
     Callable[[QueryRequest, tuple[DeviceTarget, ...]], bool]
     | Callable[[QueryRequest, tuple[DeviceTarget, ...], PollDeadline], bool]
 )
 ProgressCallback = Callable[[str, str], None]
-MAX_POLL_RAW_BYTES = 32 * 1024 * 1024
+MAX_POLL_RAW_BYTES = MAX_PERSISTED_RAW_BYTES
 MAX_POLL_OBSERVATIONS = 20_000
 
 
@@ -86,6 +90,15 @@ class PollBudget:
         if self.raw_bytes + byte_size > self.max_raw_bytes:
             return False
         self.raw_bytes += byte_size
+        return True
+
+    def consume_snapshots(self, snapshots: tuple[RawSnapshot, ...]) -> bool:
+        """Reserve the exact persisted Raw bytes, including bundle envelope."""
+
+        byte_size = persisted_raw_size(snapshots)
+        if byte_size > self.max_raw_bytes:
+            return False
+        self.raw_bytes = byte_size
         return True
 
     def consume_observations(self, count: int) -> bool:
@@ -446,7 +459,13 @@ class TrackerService:
             controllers.append(device.name)
             command = build_datapath_session_command(filter_ip)
             output = batch.output_for(command)
-            if not budget.consume_raw(output):
+            candidate_snapshot = RawSnapshot(
+                device.name,
+                command,
+                output,
+                observation_keys=(),
+            )
+            if not budget.consume_snapshots((*raw_snapshots, candidate_snapshot)):
                 diagnostics.append(
                     DiagnosticEvent(
                         stage="MD_COLLECT",
@@ -457,7 +476,7 @@ class TrackerService:
                 authoritative = False
                 break
             snapshot_index = len(raw_snapshots)
-            raw_snapshots.append(RawSnapshot(device.name, command, output, observation_keys=()))
+            raw_snapshots.append(candidate_snapshot)
             try:
                 parsed = parse_datapath_sessions(
                     output,
@@ -498,10 +517,23 @@ class TrackerService:
                     if key not in observations:
                         observations[key] = observation
                         matched_keys.append(key)
-            raw_snapshots[snapshot_index] = replace(
-                raw_snapshots[snapshot_index],
+            completed_snapshot = replace(
+                candidate_snapshot,
                 observation_keys=tuple(dict.fromkeys(matched_keys)),
             )
+            if not budget.consume_snapshots((*raw_snapshots[:snapshot_index], completed_snapshot)):
+                for key in matched_keys:
+                    observations.pop(key, None)
+                diagnostics.append(
+                    DiagnosticEvent(
+                        stage="MD_COLLECT",
+                        code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+                        message="한 번의 조회에서 저장할 수 있는 Raw 출력 총량을 초과했습니다.",
+                    )
+                )
+                authoritative = False
+                break
+            raw_snapshots[snapshot_index] = completed_snapshot
 
         if not observations and authoritative:
             diagnostics.append(
@@ -599,7 +631,13 @@ class TrackerService:
         for client_ip in request.client_ips:
             command = build_global_user_command(client_ip)
             output = batch.output_for(command)
-            if not budget.consume_raw(output):
+            candidate_snapshot = RawSnapshot(
+                selected_mm.name,
+                command,
+                output,
+                observation_keys=(),
+            )
+            if not budget.consume_snapshots((*raw_snapshots, candidate_snapshot)):
                 diagnostics.append(
                     DiagnosticEvent(
                         stage="MM_COLLECT",
@@ -608,9 +646,7 @@ class TrackerService:
                     )
                 )
                 return None
-            raw_snapshots.append(
-                RawSnapshot(selected_mm.name, command, output, observation_keys=())
-            )
+            raw_snapshots.append(candidate_snapshot)
             try:
                 lookup = parse_global_user_table(output, client_ip=client_ip)
             except ParseError as exc:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import errno
 import hashlib
 import json
 import os
@@ -11,7 +12,7 @@ import sys
 import threading
 import time
 from collections.abc import Iterator
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -27,7 +28,10 @@ from aruba_session_tracker.models import (
     ErrorCode,
     QueryRequest,
     SessionObservation,
+    StorageFailureBoundary,
+    StorageFailureKind,
 )
+from aruba_session_tracker.raw_bundle import persisted_raw_size
 from aruba_session_tracker.services.monitoring import LifecycleEvent, LifecycleEventType
 from aruba_session_tracker.services.tracker import QueryOutcome, RawSnapshot
 from aruba_session_tracker.storage import (
@@ -80,6 +84,56 @@ def _observation(
 
 def _run(store: SessionStore) -> str:
     return store.start_run(QueryRequest("192.0.2.100", "203.0.113.80", 53000, 443))
+
+
+def test_storage_error_metadata_is_optional_and_code_inference_is_typed() -> None:
+    legacy = StorageError("legacy caller")
+    assert legacy.code is None
+    assert legacy.failure_kind is None
+    assert legacy.boundary is None
+
+    limited = StorageError("bounded", code=ErrorCode.OUTPUT_LIMIT_EXCEEDED)
+    assert limited.failure_kind is StorageFailureKind.OUTPUT_LIMIT
+    limited.at_boundary(StorageFailureBoundary.QUERY_RESULT)
+    assert limited.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
+    assert limited.boundary is StorageFailureBoundary.QUERY_RESULT
+
+    database = StorageError("database").at_boundary(StorageFailureBoundary.QUERY_START)
+    assert database.code is ErrorCode.DB_WRITE_FAILED
+    assert database.failure_kind is StorageFailureKind.DATABASE_WRITE
+
+
+def test_start_run_cleanup_failure_does_not_mask_typed_primary_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    original_release = session_store_module._release_run_lease
+
+    @contextmanager
+    def fail_connection(*, uninitialized: bool = False) -> Iterator[sqlite3.Connection]:
+        del uninitialized
+        raise sqlite3.DatabaseError("sanitized start failure")
+        yield  # pragma: no cover - contextmanager generator contract
+
+    def release_then_fail(
+        lease: object,
+        *,
+        remove: bool,
+    ) -> None:
+        original_release(lease, remove=remove)  # type: ignore[arg-type]
+        raise OSError("sanitized cleanup failure")
+
+    monkeypatch.setattr(store, "_connection", fail_connection)
+    monkeypatch.setattr(session_store_module, "_release_run_lease", release_then_fail)
+
+    with pytest.raises(StorageError) as caught:
+        store.start_run(QueryRequest("192.0.2.100", "203.0.113.80"))
+
+    assert caught.value.code is ErrorCode.DB_WRITE_FAILED
+    assert caught.value.failure_kind is StorageFailureKind.DATABASE_WRITE
+    assert caught.value.boundary is StorageFailureBoundary.QUERY_START
+    assert any("잠금 정리도 실패" in note for note in caught.value.__notes__)
 
 
 def test_single_ip_query_round_trips_without_a_schema_change(tmp_path: Path) -> None:
@@ -496,10 +550,49 @@ def test_release_run_lease_retries_transient_windows_unlink_failure(
         if path == lease.path:
             attempts += 1
             if attempts == 1:
-                raise PermissionError("fixture sharing violation")
+                error = PermissionError("fixture sharing violation")
+                error.winerror = 32
+                raise error
         original_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(Path, "unlink", transient_unlink)
+    monkeypatch.setattr(session_store_module.time, "sleep", lambda _seconds: None)
+    try:
+        session_store_module._release_run_lease(lease, remove=True)
+    finally:
+        if not lease.stream.closed:
+            lease.stream.close()
+        if os.path.lexists(lease.path):
+            original_unlink(lease.path)
+
+    assert attempts == 2
+    assert lease.stream.closed
+    assert not os.path.lexists(lease.path)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sharing-violation retry test")
+def test_release_run_lease_retries_transient_windows_identity_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    lease = store._acquire_operation_lease("c" * 32)
+    assert lease is not None
+    original_lstat = os.lstat
+    original_unlink = Path.unlink
+    attempts = 0
+
+    def transient_lstat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        nonlocal attempts
+        if os.fspath(path) == os.fspath(lease.path):
+            attempts += 1
+            if attempts == 1:
+                error = PermissionError("fixture sharing violation")
+                error.winerror = 32
+                raise error
+        return original_lstat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "lstat", transient_lstat)
     monkeypatch.setattr(session_store_module.time, "sleep", lambda _seconds: None)
     try:
         session_store_module._release_run_lease(lease, remove=True)
@@ -589,6 +682,30 @@ def test_record_query_links_relative_raw_path_sha256_and_legacy_kind(tmp_path: P
     assert size == len(raw_text.encode("utf-8"))
     assert raw_kind == "legacy-custom-kind"
     assert "raw_line" not in stored_raw_line
+
+
+def test_single_snapshot_preserves_unicode_only_controller_name(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    controller_name = "서울장비🔥"
+    raw_text = "순수 유니코드 장비 Raw 출력\n"
+
+    store.record_query(
+        run_id,
+        [_observation(controller_name=controller_name)],
+        raw_text=raw_text,
+        controller_name=controller_name,
+    )
+
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        stored_name, relative_path = connection.execute(
+            "SELECT controller_name, relative_path FROM raw_files WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+    assert stored_name == controller_name
+    assert re.search(r"controller-[0-9a-f]{8}", Path(relative_path).name)
+    assert Path(relative_path).name.isascii()
+    assert (store.raw_root / relative_path).read_text(encoding="utf-8") == raw_text
 
 
 def test_record_poll_batch_is_atomic_when_a_late_insert_fails(tmp_path: Path) -> None:
@@ -784,6 +901,109 @@ def test_poll_commit_retries_busy_once_without_duplicate_rows(
         assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 1
 
 
+@pytest.mark.parametrize(
+    "sqlite_code",
+    [
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+        *[
+            value
+            for name in (
+                "SQLITE_IOERR_LOCK",
+                "SQLITE_IOERR_RDLOCK",
+                "SQLITE_IOERR_CHECKRESERVEDLOCK",
+                "SQLITE_IOERR_SHMLOCK",
+            )
+            if isinstance(value := getattr(sqlite3, name, None), int)
+        ],
+    ],
+)
+def test_poll_commit_retries_only_explicit_lock_codes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_code: int,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    original_commit = SessionStore._commit_poll_batch_once
+    attempts = 0
+
+    def fail_lock_once(self: SessionStore, *args: object, **kwargs: object) -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            error = sqlite3.OperationalError("sanitized lock fixture")
+            error.sqlite_errorcode = sqlite_code
+            raise error
+        return original_commit(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(SessionStore, "_commit_poll_batch_once", fail_lock_once)
+    result = store.record_poll_batch(
+        run_id,
+        QueryOutcome(observations=(_observation(),), authoritative=True),
+        poll_id="a" * 32,
+    )
+
+    assert result.status is session_store_module.PollPersistenceStatus.COMMITTED
+    assert attempts == 2
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM poll_commits").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 1
+
+
+def test_poll_commit_busy_exhaustion_has_typed_query_result_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+
+    def always_busy(*_args: object, **_kwargs: object) -> bool:
+        error = sqlite3.OperationalError("sanitized busy fixture")
+        error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+        raise error
+
+    monkeypatch.setattr(store, "_commit_poll_batch_once", always_busy)
+    with pytest.raises(StorageError) as caught:
+        store.record_poll_batch(
+            run_id,
+            QueryOutcome(observations=(_observation(),), authoritative=True),
+            poll_id="b" * 32,
+        )
+
+    assert caught.value.code is ErrorCode.STORAGE_BUSY
+    assert caught.value.failure_kind is StorageFailureKind.STORAGE_BUSY
+    assert caught.value.boundary is StorageFailureBoundary.QUERY_RESULT
+
+
+def test_poll_commit_receipt_retries_transient_sqlite_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    original_connection = store._connection
+    attempts = 0
+    sleeps: list[float] = []
+
+    @contextmanager
+    def flaky_connection(*, uninitialized: bool = False) -> Iterator[sqlite3.Connection]:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            error = sqlite3.OperationalError("sanitized receipt lock fixture")
+            error.sqlite_errorcode = sqlite3.SQLITE_LOCKED
+            raise error
+        with original_connection(uninitialized=uninitialized) as connection:
+            yield connection
+
+    monkeypatch.setattr(store, "_connection", flaky_connection)
+    monkeypatch.setattr(session_store_module.time, "sleep", sleeps.append)
+
+    assert store._poll_commit_receipt("c" * 32) is None
+    assert attempts == 3
+    assert sleeps == list(session_store_module._POLL_COMMIT_RETRY_DELAYS[1:])
+
+
 def test_poll_commit_does_not_retry_non_lock_operational_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -909,6 +1129,9 @@ def test_indeterminate_poll_commit_keeps_recovery_anchor_and_reuses_poll_id(
 
     manifest = store._manifests_root / f"{poll_id}.json"
     assert captured.value.poll_id == poll_id
+    assert captured.value.code is ErrorCode.PERSISTENCE_INDETERMINATE
+    assert captured.value.failure_kind is StorageFailureKind.PERSISTENCE_INDETERMINATE
+    assert captured.value.boundary is StorageFailureBoundary.QUERY_RESULT
     assert manifest.exists()
     assert json.loads(manifest.read_text(encoding="utf-8"))["phase"] == "INSTALLED"
     with closing(sqlite3.connect(store.db_path)) as connection:
@@ -1320,6 +1543,8 @@ def test_record_poll_batch_rejects_storage_limits_before_staging(
         store.record_poll_batch(run_id, outcome)
 
     assert caught.value.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
+    assert caught.value.failure_kind is StorageFailureKind.OUTPUT_LIMIT
+    assert caught.value.boundary is StorageFailureBoundary.QUERY_RESULT
     with closing(sqlite3.connect(store.db_path)) as connection:
         assert connection.execute("SELECT count(*) FROM observations").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM raw_files").fetchone()[0] == 0
@@ -1370,6 +1595,174 @@ def test_poll_bundle_limit_counts_metadata_and_delimiters_before_staging(
         assert connection.execute("SELECT count(*) FROM raw_files").fetchone()[0] == 0
     assert not tuple(store.raw_root.rglob("*.txt"))
     assert not tuple(store._manifests_root.glob("*.json"))
+
+
+def test_poll_bundle_exact_persisted_boundary_matches_shared_sizer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    observed_at = datetime(2026, 8, 28, 8, 0, tzinfo=UTC)
+    snapshots = (
+        RawSnapshot("서울-MM", "show one", "가" * 40, observed_at, observation_keys=()),
+        RawSnapshot("서울-MD", "show two", "B" * 40, observed_at, observation_keys=()),
+    )
+    expected_size = persisted_raw_size(snapshots)
+    monkeypatch.setattr(session_store_module, "_MAX_POLL_RAW_BYTES", expected_size)
+
+    store.record_poll_batch(
+        run_id,
+        QueryOutcome(raw_snapshots=snapshots, authoritative=True),
+        poll_id="d" * 32,
+    )
+
+    raw_files = tuple(store.raw_root.rglob("*.txt"))
+    assert len(raw_files) == 1
+    assert raw_files[0].stat().st_size == expected_size
+
+    rejected_run_id = _run(store)
+    monkeypatch.setattr(session_store_module, "_MAX_POLL_RAW_BYTES", expected_size - 1)
+    with pytest.raises(StorageError) as caught:
+        store.record_poll_batch(
+            rejected_run_id,
+            QueryOutcome(raw_snapshots=snapshots, authoritative=True),
+            poll_id="e" * 32,
+        )
+    assert caught.value.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
+    assert caught.value.failure_kind is StorageFailureKind.OUTPUT_LIMIT
+    assert caught.value.boundary is StorageFailureBoundary.QUERY_RESULT
+    store.finish_run(run_id)
+    store.finish_run(rejected_run_id, status="FAILED")
+
+
+def test_nontransient_raw_path_error_is_not_reported_as_database_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+
+    def fail_path(*_args: object, **_kwargs: object) -> object:
+        raise OSError("sanitized raw path fixture")
+
+    monkeypatch.setattr(store, "_prepare_poll_raw_files", fail_path)
+    with pytest.raises(StorageError) as caught:
+        store.record_poll_batch(
+            run_id,
+            QueryOutcome(authoritative=True),
+            poll_id="f" * 32,
+        )
+
+    assert caught.value.code is ErrorCode.STORAGE_PATH_FAILED
+    assert caught.value.failure_kind is StorageFailureKind.STORAGE_PATH
+    assert caught.value.boundary is StorageFailureBoundary.QUERY_RESULT
+    store.finish_run(run_id, status="FAILED")
+
+
+def test_poll_batch_prevalidation_wraps_path_error_at_query_result_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    original_initialized_check = store._ensure_initialized
+
+    def fail_initialized_check() -> None:
+        raise PermissionError("sanitized prevalidation path fixture")
+
+    monkeypatch.setattr(store, "_ensure_initialized", fail_initialized_check)
+    with pytest.raises(StorageError) as caught:
+        store.record_poll_batch(
+            run_id,
+            QueryOutcome(authoritative=True),
+            poll_id="0" * 32,
+        )
+
+    assert caught.value.code is ErrorCode.STORAGE_PATH_FAILED
+    assert caught.value.failure_kind is StorageFailureKind.STORAGE_PATH
+    assert caught.value.boundary is StorageFailureBoundary.QUERY_RESULT
+
+    monkeypatch.setattr(store, "_ensure_initialized", original_initialized_check)
+    store.finish_run(run_id, status="FAILED")
+
+
+def test_poll_id_validation_is_typed_at_query_result_boundary(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+
+    with pytest.raises(StorageError) as caught:
+        store.record_poll_batch(
+            run_id,
+            QueryOutcome(authoritative=True),
+            poll_id="not-a-valid-poll-id",
+        )
+
+    assert caught.value.code is ErrorCode.DB_WRITE_FAILED
+    assert caught.value.failure_kind is StorageFailureKind.DATABASE_WRITE
+    assert caught.value.boundary is StorageFailureBoundary.QUERY_RESULT
+    store.finish_run(run_id, status="FAILED")
+
+
+@pytest.mark.parametrize(
+    ("error_attribute", "error_number"),
+    (("errno", errno.ENOSPC), ("winerror", 112), ("winerror", 39)),
+)
+def test_actual_disk_full_errors_preserve_low_space_query_result_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_attribute: str,
+    error_number: int,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+
+    def fail_write(*_args: object, **_kwargs: object) -> object:
+        if error_attribute == "errno":
+            error = OSError(error_number, "sanitized disk-full fixture")
+        else:
+            error = OSError("sanitized disk-full fixture")
+            error.winerror = error_number
+        raise error
+
+    monkeypatch.setattr(store, "_prepare_poll_raw_files", fail_write)
+    with pytest.raises(StorageError) as caught:
+        store.record_poll_batch(
+            run_id,
+            QueryOutcome(authoritative=True),
+            poll_id="1" * 32,
+        )
+
+    assert caught.value.code is ErrorCode.STORAGE_LOW_SPACE
+    assert caught.value.failure_kind is StorageFailureKind.LOW_SPACE
+    assert caught.value.boundary is StorageFailureBoundary.QUERY_RESULT
+    store.finish_run(run_id, status="FAILED")
+
+
+def test_sqlite_full_preserves_low_space_query_result_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+
+    def fail_full(*_args: object, **_kwargs: object) -> bool:
+        error = sqlite3.OperationalError("sanitized SQLite full fixture")
+        error.sqlite_errorcode = sqlite3.SQLITE_FULL
+        raise error
+
+    monkeypatch.setattr(store, "_commit_poll_batch_once", fail_full)
+    with pytest.raises(StorageError) as caught:
+        store.record_poll_batch(
+            run_id,
+            QueryOutcome(authoritative=True),
+            poll_id="2" * 32,
+        )
+
+    assert caught.value.code is ErrorCode.STORAGE_LOW_SPACE
+    assert caught.value.failure_kind is StorageFailureKind.LOW_SPACE
+    assert caught.value.boundary is StorageFailureBoundary.QUERY_RESULT
+    store.finish_run(run_id, status="FAILED")
 
 
 def test_record_poll_batch_uses_explicit_same_controller_raw_provenance(
@@ -3305,6 +3698,90 @@ def test_html_export_uses_database_id_order_for_equal_observation_and_lifecycle_
     assert stored_counters == [(987_654_321, 123_456_789), (987_654_322, 123_456_790)]
 
 
+def test_html_export_frequency_ignores_malformed_sqlite_protocols_and_ports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    rows = (
+        (6, 53000, 443, "valid"),
+        (6, "", 443, "text-source-port"),
+        ("invalid", 22, 443, "text-protocol"),
+        (300, 22, 443, "high-protocol"),
+        (6, 22, 70000, "high-destination-port"),
+        (6, -1, 0, "low-ports"),
+    )
+    with closing(sqlite3.connect(store.db_path)) as connection, connection:
+        connection.executemany(
+            """
+            INSERT INTO observations (
+                run_id, raw_file_id, observed_at, controller_name,
+                controller_host, protocol, source_ip, destination_ip,
+                source_port, destination_port, counter, priority, tos,
+                age, destination, tunnel_age, packets, bytes_count,
+                flags, cpu_id, session_key
+            ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    run_id,
+                    "2026-08-28T08:00:00.000Z",
+                    "MD-01",
+                    "198.51.100.21",
+                    protocol,
+                    "192.0.2.100",
+                    "203.0.113.80",
+                    source_port,
+                    destination_port,
+                    "0/0",
+                    0,
+                    0,
+                    1,
+                    "local",
+                    1,
+                    1,
+                    128,
+                    "FC",
+                    1,
+                    session_key,
+                )
+                for protocol, source_port, destination_port, session_key in rows
+            ),
+        )
+    store.finish_run(run_id)
+
+    captured: list[tuple[tuple[int, int, int, int], ...] | None] = []
+
+    def capture_frequency_summary(
+        destination: Path | str,
+        snapshot: RunReportSnapshot,
+        observation_history: Iterator[dict[str, object]],
+        *,
+        logical_session_total: int,
+    ) -> Path:
+        del observation_history, logical_session_total
+        captured.append(snapshot.protocol_port_frequency_summary)
+        path = Path(destination)
+        path.write_text("<!doctype html><title>fixture</title>", encoding="utf-8")
+        return path
+
+    monkeypatch.setattr(
+        session_store_module,
+        "write_html_report_stream_atomic",
+        capture_frequency_summary,
+    )
+    store.export_run_html(run_id, tmp_path / "malformed-frequency.html")
+
+    assert captured == [
+        (
+            (6, 443, 0, 2),
+            (6, 22, 1, 0),
+            (6, 53000, 1, 0),
+        )
+    ]
+
+
 def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3434,6 +3911,12 @@ def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
     store.finish_run(run_id)
     original_writer = session_store_module.write_html_report_stream_atomic
     streaming_inputs: list[bool] = []
+    frequency_summaries: list[
+        tuple[
+            tuple[tuple[str, int, int], ...] | None,
+            tuple[tuple[int, int, int, int], ...] | None,
+        ]
+    ] = []
 
     def observe_streaming_writer(
         destination: Path,
@@ -3443,6 +3926,9 @@ def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
         logical_session_total: int,
     ) -> Path:
         streaming_inputs.append(not isinstance(observation_history, (tuple, list)))
+        frequency_summaries.append(
+            (snapshot.ip_frequency_summary, snapshot.protocol_port_frequency_summary)
+        )
         return original_writer(
             destination,
             snapshot,
@@ -3487,6 +3973,8 @@ def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
     assert "oldest-raw-kind" not in document
     assert "capture-0000.txt" not in document
     assert "private-raw-body-0" not in document
+    assert "총 2,005회 · 출발지 2,005회 · 목적지 0회" in document
+    assert "총 2,005회 · 출발지 0회 · 목적지 2,005회" in document
     assert (
         '<summary id="history-filter-summary" aria-controls="observation-history-body">'
         "전체 추적 이력 2,005/2,005건 보기</summary>"
@@ -3495,6 +3983,12 @@ def test_html_export_contains_every_stored_row_without_ui_or_legacy_limits(
     assert "패킷" not in document
     assert "바이트" not in document
     assert streaming_inputs == [True]
+    assert frequency_summaries == [
+        (
+            (("192.0.2.100", 2_005, 0), ("203.0.113.80", 0, 2_005)),
+            ((6, 443, 0, 2_005), (6, 53000, 2_005, 0)),
+        )
+    ]
 
 
 def test_record_writes_and_second_finish_require_running_run(tmp_path: Path) -> None:
@@ -3790,6 +4284,42 @@ def test_storage_health_reports_managed_usage_and_thresholds(
     assert warning.hard_stop is False
     assert hard_stop.warning is True
     assert hard_stop.hard_stop is True
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_kind", "expected_code"),
+    (
+        ("path", StorageFailureKind.STORAGE_PATH, ErrorCode.STORAGE_PATH_FAILED),
+        ("space", StorageFailureKind.LOW_SPACE, ErrorCode.STORAGE_LOW_SPACE),
+        ("database", StorageFailureKind.DATABASE_WRITE, ErrorCode.DB_WRITE_FAILED),
+    ),
+)
+def test_storage_health_preserves_typed_failure_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    expected_kind: StorageFailureKind,
+    expected_code: ErrorCode,
+) -> None:
+    store = _store(tmp_path)
+
+    def fail_health() -> StorageHealth:
+        if failure == "path":
+            raise PermissionError("sanitized health path fixture")
+        if failure == "space":
+            raise OSError(errno.ENOSPC, "sanitized health space fixture")
+        raise sqlite3.DatabaseError("sanitized health database fixture")
+
+    if failure == "path":
+        monkeypatch.setattr(store, "_ensure_initialized", fail_health)
+    else:
+        monkeypatch.setattr(store, "_storage_health_unlocked", fail_health)
+    with pytest.raises(StorageError) as caught:
+        store.storage_health()
+
+    assert caught.value.code is expected_code
+    assert caught.value.failure_kind is expected_kind
+    assert caught.value.boundary is None
 
 
 def test_storage_health_tolerates_sqlite_wal_disappearing_after_presence_check(
@@ -4227,8 +4757,33 @@ def test_low_space_blocks_growth_with_stable_error_but_allows_run_finish(
         store.start_run(QueryRequest("192.0.2.1", "203.0.113.1"))
 
     assert caught.value.code is ErrorCode.STORAGE_LOW_SPACE
+    assert caught.value.failure_kind is StorageFailureKind.LOW_SPACE
+    assert caught.value.boundary is StorageFailureBoundary.QUERY_START
     assert len(store.list_runs()) == 1
     assert store.list_runs()[0]["status"] == "COMPLETED"
+
+
+def test_finish_run_wraps_managed_path_failure_at_finalize_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    original_assert_layout = store._assert_managed_layout
+
+    def fail_layout() -> None:
+        raise session_store_module.UnsafeManagedPath("sanitized managed-path fixture")
+
+    monkeypatch.setattr(store, "_assert_managed_layout", fail_layout)
+    with pytest.raises(StorageError) as caught:
+        store.finish_run(run_id)
+
+    assert caught.value.code is ErrorCode.STORAGE_PATH_FAILED
+    assert caught.value.failure_kind is StorageFailureKind.STORAGE_PATH
+    assert caught.value.boundary is StorageFailureBoundary.QUERY_FINALIZE
+
+    monkeypatch.setattr(store, "_assert_managed_layout", original_assert_layout)
+    store.finish_run(run_id, status="FAILED")
 
 
 def test_export_preflight_reserves_space_for_the_staged_report(
@@ -4252,6 +4807,8 @@ def test_export_preflight_reserves_space_for_the_staged_report(
         store.export_run_csv(run_id, tmp_path / "preflight.csv")
 
     assert caught.value.code is ErrorCode.STORAGE_LOW_SPACE
+    assert caught.value.failure_kind is StorageFailureKind.LOW_SPACE
+    assert caught.value.boundary is None
     assert not (tmp_path / "preflight.csv").exists()
     assert not tuple(store._manifests_root.glob("*.json"))
 
@@ -4269,13 +4826,118 @@ def test_windows_atomic_replace_retries_transient_sharing_violation(tmp_path: Pa
         nonlocal attempts
         attempts += 1
         if attempts < 3:
-            raise PermissionError("fixture sharing violation")
+            error = PermissionError("fixture sharing violation")
+            error.winerror = 32
+            raise error
         os.replace(current, target)
 
     durable_io_module.replace_with_retry(source, destination, replace=flaky_replace)
 
     assert attempts == 3
     assert destination.read_bytes() == b"replacement"
+
+
+@pytest.mark.windows
+def test_windows_atomic_replace_retries_initial_fingerprint_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows sharing violations apply only on Windows")
+    source = tmp_path / "source.tmp"
+    destination = tmp_path / "destination.txt"
+    source.write_bytes(b"replacement")
+    original_file_state = durable_io_module._file_state
+    attempts = 0
+
+    def flaky_file_state(path: Path, *, with_hash: bool) -> object:
+        nonlocal attempts
+        if path == source and not with_hash:
+            attempts += 1
+            if attempts == 1:
+                error = PermissionError("fixture sharing violation")
+                error.winerror = 32
+                raise error
+        return original_file_state(path, with_hash=with_hash)
+
+    monkeypatch.setattr(durable_io_module, "_file_state", flaky_file_state)
+    monkeypatch.setattr(durable_io_module.time, "sleep", lambda _delay: None)
+
+    durable_io_module.replace_with_retry(source, destination)
+
+    assert attempts == 2
+    assert destination.read_bytes() == b"replacement"
+
+
+@pytest.mark.windows
+def test_windows_file_fingerprint_retries_transient_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows sharing violations apply only on Windows")
+    target = tmp_path / "fingerprint.txt"
+    content = b"trusted fingerprint content"
+    target.write_bytes(content)
+    original_open = Path.open
+    attempts = 0
+
+    def flaky_open(self: Path, *args: object, **kwargs: object) -> object:
+        nonlocal attempts
+        if self == target:
+            attempts += 1
+            if attempts == 1:
+                error = PermissionError("fixture sharing violation")
+                error.winerror = 32
+                raise error
+        return original_open(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "open", flaky_open)
+    monkeypatch.setattr(session_store_module.time, "sleep", lambda _delay: None)
+
+    digest, byte_size = session_store_module._file_fingerprint(target)
+
+    assert attempts == 2
+    assert digest == hashlib.sha256(content).hexdigest()
+    assert byte_size == len(content)
+
+
+@pytest.mark.windows
+def test_windows_existing_lease_retries_transient_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows sharing violations apply only on Windows")
+    lease_path = tmp_path / "lease.lock"
+    lease_path.write_bytes(b"0")
+    original_open = os.open
+    attempts = 0
+
+    def flaky_open(
+        path: object,
+        flags: int,
+        *args: object,
+        **kwargs: object,
+    ) -> int:
+        nonlocal attempts
+        if os.fspath(path) == os.fspath(lease_path) and not flags & os.O_EXCL:
+            attempts += 1
+            if attempts == 1:
+                error = PermissionError("fixture sharing violation")
+                error.winerror = 32
+                raise error
+        return original_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", flaky_open)
+    monkeypatch.setattr(session_store_module.time, "sleep", lambda _delay: None)
+
+    lease = session_store_module._acquire_file_lease(lease_path)
+    assert lease is not None
+    session_store_module._release_run_lease(lease, remove=True)
+
+    assert attempts == 2
+    assert not lease_path.exists()
 
 
 @pytest.mark.windows
@@ -4292,7 +4954,9 @@ def test_windows_replace_retry_fails_closed_if_source_changes(tmp_path: Path) ->
         nonlocal attempts
         attempts += 1
         source.write_bytes(b"tampered replacement")
-        raise PermissionError("fixture sharing violation")
+        error = PermissionError("fixture sharing violation")
+        error.winerror = 32
+        raise error
 
     with pytest.raises(OSError, match="identity or fingerprint changed"):
         durable_io_module.replace_with_retry(
@@ -4408,6 +5072,26 @@ def test_query_capacity_check_is_fast_and_fails_before_a_poll(
         store.ensure_query_capacity()
 
     assert caught.value.code is ErrorCode.STORAGE_LOW_SPACE
+    assert caught.value.failure_kind is StorageFailureKind.LOW_SPACE
+    assert caught.value.boundary is StorageFailureBoundary.QUERY_PREFLIGHT
+
+
+def test_query_capacity_wraps_path_error_at_preflight_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+
+    def fail_initialized_check() -> None:
+        raise PermissionError("sanitized preflight path fixture")
+
+    monkeypatch.setattr(store, "_ensure_initialized", fail_initialized_check)
+    with pytest.raises(StorageError) as caught:
+        store.ensure_query_capacity()
+
+    assert caught.value.code is ErrorCode.STORAGE_PATH_FAILED
+    assert caught.value.failure_kind is StorageFailureKind.STORAGE_PATH
+    assert caught.value.boundary is StorageFailureBoundary.QUERY_PREFLIGHT
 
 
 def test_delete_preview_discard_expiry_sweep_and_cap(

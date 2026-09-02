@@ -38,7 +38,7 @@ from aruba_session_tracker.storage import SessionStore, StorageError
 from aruba_session_tracker.support_codes import UiFailureKey, support_code_for_ui_failure
 from aruba_session_tracker.ui import DeveloperInspectorController, MainWindow
 from aruba_session_tracker.ui.startup import StartupCoordinator, StartupWindow
-from aruba_session_tracker.ui.theme import apply_main_window_theme
+from aruba_session_tracker.ui.theme import apply_application_popup_theme, apply_main_window_theme
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +88,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     application = (
         existing if isinstance(existing, QApplication) else QApplication([sys.argv[0], *arguments])
     )
+    apply_application_popup_theme(application)
     application.setApplicationName("Aruba Session Tracker")
     application.setApplicationVersion(__version__)
     startup_support_code = support_code_for_ui_failure(UiFailureKey.STARTUP_FAILED).value
@@ -113,6 +114,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     startup_window = StartupWindow()
+    startup_window.setObjectName("startupWindow")
+    startup_window.setProperty("popupSurface", "startup")
     startup = StartupCoordinator(application)
     startup_loop = QEventLoop()
     startup_result: list[_RuntimeBundle] = []

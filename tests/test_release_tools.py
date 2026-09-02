@@ -609,8 +609,14 @@ def test_packaged_report_verifier_requires_printable_history_structure() -> None
     report = f"""<!doctype html>
     <meta http-equiv="Content-Security-Policy" content="{csp}">
     세션 추적 결과 KST 한국어-MD
-    <div class="flow-panel">조회 출발지</div>
+    <div class="flow-panel">조회 출발지</div> 조회 대상
     <dl class="summary-stats"></dl>
+    전체 이력 관측 빈도 TOP 5
+    IP별 관측 횟수 TOP 5
+    포트·프로토콜별 관측 횟수 TOP 5
+    <ol class="frequency-list" role="list">
+      <li><div class="frequency-bar" aria-hidden="true"></div></li>
+    </ol>
     결과 찾기
     <section id="result-filter"></section>
     <input id="filter-ip"><select id="filter-protocol"></select><input id="filter-port">

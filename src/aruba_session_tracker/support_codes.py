@@ -82,6 +82,10 @@ class SupportCode(StrEnum):
     AS83 = "AS83"
     AS84 = "AS84"
     AS85 = "AS85"
+    AS86 = "AS86"
+    AS87 = "AS87"
+    AS88 = "AS88"
+    AS89 = "AS89"
 
 
 class UiFailureKey(StrEnum):
@@ -104,6 +108,10 @@ class UiFailureKey(StrEnum):
     RUNTIME_CLEANUP_FAILED = "RUNTIME_CLEANUP_FAILED"
     CONFIG_READ_FAILED = "CONFIG_READ_FAILED"
     CONFIG_SAVE_FAILED = "CONFIG_SAVE_FAILED"
+    QUERY_STORAGE_PATH_FAILED = "QUERY_STORAGE_PATH_FAILED"
+    QUERY_STORAGE_BUSY = "QUERY_STORAGE_BUSY"
+    QUERY_OUTPUT_LIMIT_EXCEEDED = "QUERY_OUTPUT_LIMIT_EXCEEDED"
+    QUERY_PERSISTENCE_INDETERMINATE = "QUERY_PERSISTENCE_INDETERMINATE"
 
 
 # AS01-AS19: MM.  Keep the tuples and their assigned values unchanged; append
@@ -186,6 +194,10 @@ _UI_FAILURE_SUPPORT_CODES: dict[UiFailureKey, SupportCode] = {
     UiFailureKey.RUNTIME_CLEANUP_FAILED: SupportCode.AS83,
     UiFailureKey.CONFIG_READ_FAILED: SupportCode.AS84,
     UiFailureKey.CONFIG_SAVE_FAILED: SupportCode.AS85,
+    UiFailureKey.QUERY_STORAGE_PATH_FAILED: SupportCode.AS86,
+    UiFailureKey.QUERY_STORAGE_BUSY: SupportCode.AS87,
+    UiFailureKey.QUERY_OUTPUT_LIMIT_EXCEEDED: SupportCode.AS88,
+    UiFailureKey.QUERY_PERSISTENCE_INDETERMINATE: SupportCode.AS89,
 }
 
 UI_FAILURE_SUPPORT_CODES: Final[Mapping[UiFailureKey, SupportCode]] = MappingProxyType(

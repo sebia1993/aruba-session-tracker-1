@@ -1,5 +1,6 @@
 """Public local-persistence API for Aruba Session Tracker."""
 
+from aruba_session_tracker.models import StorageFailureBoundary, StorageFailureKind
 from aruba_session_tracker.storage.csv_export import guard_csv_cell, write_csv_atomic
 from aruba_session_tracker.storage.html_report import (
     RunReportSnapshot,
@@ -29,6 +30,8 @@ __all__ = [
     "RunReportSnapshot",
     "SessionStore",
     "StorageError",
+    "StorageFailureBoundary",
+    "StorageFailureKind",
     "StorageHealth",
     "UnsafeStoragePath",
     "guard_csv_cell",

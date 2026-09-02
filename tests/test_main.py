@@ -119,6 +119,51 @@ def test_single_instance_guard_failures_are_bounded_and_sanitized(
     assert "GUARD_SECRET_CANARY" not in repr(shown)
 
 
+def test_popup_theme_is_installed_before_the_first_startup_message(
+    qtbot: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del qtbot
+    root = tmp_path / "app"
+    paths = AppPaths(
+        root=root,
+        config=root / "config.json",
+        known_hosts=root / "known_hosts",
+        database=root / "tracker.db",
+        raw=root / "raw",
+        exports=root / "exports",
+    )
+    events: list[str] = []
+
+    class _Guard:
+        def __init__(self, _identity: str) -> None:
+            pass
+
+        def acquire(self) -> bool:
+            events.append("guard")
+            return False
+
+        def release(self) -> None:
+            raise AssertionError("unacquired guard must not be released")
+
+    monkeypatch.setattr(main_module.AppPaths, "default", lambda: paths)
+    monkeypatch.setattr(main_module, "SingleInstanceGuard", _Guard)
+    monkeypatch.setattr(
+        main_module,
+        "apply_application_popup_theme",
+        lambda _application: events.append("theme"),
+    )
+    monkeypatch.setattr(
+        main_module.QMessageBox,
+        "information",
+        lambda *_args, **_kwargs: events.append("message"),
+    )
+
+    assert main([]) == 0
+    assert events == ["theme", "guard", "message"]
+
+
 class _SmokeApplication:
     def __init__(self) -> None:
         self.exit_codes: list[int] = []

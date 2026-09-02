@@ -35,6 +35,7 @@ from aruba_session_tracker.models import (
     QueryRequest,
     SessionObservation,
 )
+from aruba_session_tracker.raw_bundle import persisted_raw_size
 from aruba_session_tracker.services import (
     MAX_POLL_OBSERVATIONS,
     MAX_POLL_RAW_BYTES,
@@ -1343,6 +1344,25 @@ def test_poll_budget_rejects_non_integer_consumption() -> None:
 
     with pytest.raises(TypeError):
         budget.consume_observations(1.5)  # type: ignore[arg-type]
+
+
+def test_poll_budget_counts_the_exact_persisted_bundle_envelope() -> None:
+    observed_at = datetime(2026, 9, 2, 1, 0, tzinfo=UTC)
+    snapshots = (
+        RawSnapshot("서울-MM", "show one", "가" * 20, observed_at, observation_keys=()),
+        RawSnapshot("서울-MD", "show two", "B" * 20, observed_at, observation_keys=()),
+    )
+    persisted_size = persisted_raw_size(snapshots)
+    body_size = sum(len(snapshot.output.encode("utf-8")) for snapshot in snapshots)
+    assert persisted_size > body_size
+
+    accepted = PollBudget(max_raw_bytes=persisted_size)
+    rejected = PollBudget(max_raw_bytes=persisted_size - 1)
+
+    assert accepted.consume_snapshots(snapshots) is True
+    assert accepted.raw_bytes == persisted_size
+    assert rejected.consume_snapshots(snapshots) is False
+    assert rejected.raw_bytes == 0
 
 
 def test_rejected_filtered_command_never_falls_back_to_unfiltered_table() -> None:
