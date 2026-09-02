@@ -578,11 +578,13 @@ def test_release_run_lease_retries_transient_windows_identity_probe(
     store = _store(tmp_path)
     lease = store._acquire_operation_lease("c" * 32)
     assert lease is not None
-    original_lstat = os.lstat
+    original_from_path = session_store_module.windows_file_metadata.from_path
     original_unlink = Path.unlink
     attempts = 0
 
-    def transient_lstat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+    def transient_native_metadata(
+        path: Path,
+    ) -> session_store_module.windows_file_metadata.WindowsFileMetadata:
         nonlocal attempts
         if os.fspath(path) == os.fspath(lease.path):
             attempts += 1
@@ -590,9 +592,13 @@ def test_release_run_lease_retries_transient_windows_identity_probe(
                 error = PermissionError("fixture sharing violation")
                 error.winerror = 32
                 raise error
-        return original_lstat(path, *args, **kwargs)  # type: ignore[arg-type]
+        return original_from_path(path)
 
-    monkeypatch.setattr(os, "lstat", transient_lstat)
+    monkeypatch.setattr(
+        session_store_module.windows_file_metadata,
+        "from_path",
+        transient_native_metadata,
+    )
     monkeypatch.setattr(session_store_module.time, "sleep", lambda _seconds: None)
     try:
         session_store_module._release_run_lease(lease, remove=True)
@@ -4838,6 +4844,99 @@ def test_windows_atomic_replace_retries_transient_sharing_violation(tmp_path: Pa
 
 
 @pytest.mark.windows
+def test_windows_file_retry_accepts_errno_only_eacces_without_busy_reclassification() -> None:
+    if os.name != "nt":
+        pytest.skip("Windows CRT access-denied behavior applies only on Windows")
+    error = PermissionError(errno.EACCES, "fixture transient access denial")
+
+    assert getattr(error, "winerror", None) is None
+    assert durable_io_module.is_retryable_windows_file_operation_error(error) is True
+    assert durable_io_module.is_transient_windows_file_error(error) is False
+    assert (
+        session_store_module._storage_failure_kind_from_exception(error)
+        is StorageFailureKind.STORAGE_PATH
+    )
+
+
+@pytest.mark.windows
+def test_windows_file_operation_retries_errno_only_eacces() -> None:
+    if os.name != "nt":
+        pytest.skip("Windows CRT access-denied behavior applies only on Windows")
+    attempts = 0
+
+    def flaky_operation() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError(errno.EACCES, "fixture transient access denial")
+        return "recovered"
+
+    result = durable_io_module.retry_windows_file_operation(
+        flaky_operation,
+        delays=(0.0, 0.0),
+    )
+
+    assert result == "recovered"
+    assert attempts == 2
+
+
+@pytest.mark.windows
+def test_windows_file_operation_persistent_errno_only_eacces_stays_path_failure() -> None:
+    if os.name != "nt":
+        pytest.skip("Windows CRT access-denied behavior applies only on Windows")
+    attempts = 0
+
+    def blocked_operation() -> None:
+        nonlocal attempts
+        attempts += 1
+        raise PermissionError(errno.EACCES, "fixture persistent access denial")
+
+    with pytest.raises(PermissionError) as caught:
+        durable_io_module.retry_windows_file_operation(
+            blocked_operation,
+            delays=(0.0, 0.0, 0.0),
+        )
+
+    assert attempts == 3
+    assert (
+        session_store_module._storage_failure_kind_from_exception(caught.value)
+        is StorageFailureKind.STORAGE_PATH
+    )
+
+
+@pytest.mark.windows
+def test_windows_atomic_replace_retries_errno_only_eacces(tmp_path: Path) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows CRT access-denied behavior applies only on Windows")
+    source = tmp_path / "source.tmp"
+    destination = tmp_path / "destination.txt"
+    source.write_bytes(b"replacement")
+    attempts = 0
+
+    def flaky_replace(current: Path, target: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError(errno.EACCES, "fixture transient access denial")
+        os.replace(current, target)
+
+    durable_io_module.replace_with_retry(source, destination, replace=flaky_replace)
+
+    assert attempts == 2
+    assert destination.read_bytes() == b"replacement"
+
+
+@pytest.mark.windows
+def test_windows_file_retry_rejects_eacces_with_unrelated_winerror() -> None:
+    if os.name != "nt":
+        pytest.skip("Windows CRT access-denied behavior applies only on Windows")
+    error = PermissionError(errno.EACCES, "fixture unrelated Windows failure")
+    error.winerror = 65
+
+    assert durable_io_module.is_retryable_windows_file_operation_error(error) is False
+
+
+@pytest.mark.windows
 def test_windows_atomic_replace_retries_initial_fingerprint_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4938,6 +5037,35 @@ def test_windows_existing_lease_retries_transient_open(
 
     assert attempts == 2
     assert not lease_path.exists()
+
+
+@pytest.mark.windows
+def test_windows_lease_lock_persistent_errno_only_eacces_returns_busy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows byte-range locking applies only on Windows")
+    import msvcrt
+
+    lease_path = tmp_path / "lease.lock"
+    original_locking = msvcrt.locking
+    attempts = 0
+
+    def blocked_locking(descriptor: int, mode: int, byte_count: int) -> None:
+        nonlocal attempts
+        if mode == msvcrt.LK_NBLCK:
+            attempts += 1
+            raise PermissionError(errno.EACCES, "fixture transient access denial")
+        original_locking(descriptor, mode, byte_count)
+
+    monkeypatch.setattr(msvcrt, "locking", blocked_locking)
+    monkeypatch.setattr(session_store_module.time, "sleep", lambda _delay: None)
+
+    lease = session_store_module._acquire_file_lease(lease_path)
+
+    assert lease is None
+    assert attempts == len(session_store_module._LEASE_FILE_RETRY_DELAYS)
 
 
 @pytest.mark.windows
