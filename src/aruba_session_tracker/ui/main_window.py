@@ -687,6 +687,7 @@ class MainWindow(QMainWindow):
         self._next_storage_health_check_at = 0.0
         self._last_counters: dict[str, tuple[int | None, int | None]] = {}
         self._run_started_at: datetime | None = None
+        self._run_started_monotonic: float | None = None
         self._result_filter_values: dict[int, set[object]] = {}
         self._result_filter_popup: QWidget | None = None
         self._monitor_timer = QTimer(self)
@@ -832,7 +833,7 @@ class MainWindow(QMainWindow):
         source_endpoint_layout = QVBoxLayout(self.source_endpoint_panel)
         source_endpoint_layout.setContentsMargins(12, 9, 12, 11)
         source_endpoint_layout.setSpacing(4)
-        source_eyebrow = QLabel("SOURCE")
+        source_eyebrow = QLabel("출발지")
         source_eyebrow.setObjectName("flowEyebrow")
         source_label = QLabel("출발지 IP")
         source_label.setObjectName("flowFieldLabel")
@@ -864,7 +865,7 @@ class MainWindow(QMainWindow):
         destination_endpoint_layout = QVBoxLayout(self.destination_endpoint_panel)
         destination_endpoint_layout.setContentsMargins(12, 9, 12, 11)
         destination_endpoint_layout.setSpacing(4)
-        destination_eyebrow = QLabel("DESTINATION")
+        destination_eyebrow = QLabel("목적지")
         destination_eyebrow.setObjectName("flowEyebrow")
         destination_label = QLabel("목적지 IP")
         destination_label.setObjectName("flowFieldLabel")
@@ -1293,36 +1294,53 @@ class MainWindow(QMainWindow):
 
     def _apply_result_filters(self) -> None:
         for row in range(self.result_table.rowCount()):
-            matches = True
-            for column, selected in self._result_filter_values.items():
-                item = self.result_table.item(row, column)
-                value = item.data(_FILTER_VALUE_ROLE) if item is not None else None
-                matches = matches and value in selected
-            self.result_table.setRowHidden(row, not matches)
+            self.result_table.setRowHidden(row, not self._row_matches_result_filters(row))
         self._update_filter_controls()
         visible = sum(
             not self.result_table.isRowHidden(row) for row in range(self.result_table.rowCount())
         )
         current_row = self.result_table.currentRow()
-        if current_row >= 0 and self.result_table.isRowHidden(current_row):
+        selection_model = self.result_table.selectionModel()
+        selected_rows = selection_model.selectedRows() if selection_model is not None else ()
+        hidden_selection = any(
+            self.result_table.isRowHidden(index.row()) for index in selected_rows
+        )
+        if (current_row >= 0 and self.result_table.isRowHidden(current_row)) or hidden_selection:
             self.result_table.clearSelection()
+            if selection_model is not None:
+                selection_model.clearCurrentIndex()
             self.raw_view.setPlainText("결과 행을 선택하면 해당 Raw 행을 표시합니다.")
+        loaded_rows = self.result_table.rowCount()
         if self.result_table.rowCount() and visible == 0:
-            self.result_empty_label.setText("필터 조건에 맞는 행이 없습니다.")
+            empty_scope = (
+                f"화면에 불러온 {loaded_rows:,}행 중 "
+                if self._result_total_rows > loaded_rows
+                else ""
+            )
+            self.result_empty_label.setText(f"{empty_scope}필터 조건에 맞는 행이 없습니다.")
             self.result_empty_label.setVisible(not self.raw_diagnostics_toggle.isChecked())
         elif self.result_table.rowCount():
             self.result_empty_label.setVisible(False)
         context = self.context_label.text()
         if "결과표 표시:" in context:
-            prefix = context.split("결과표 표시:", 1)[0].rstrip()
+            prefix = context.split("결과표 표시:", 1)[0]
             filter_suffix = " · 필터 적용" if self._result_filter_values else ""
-            self._set_result_context(
-                f"{prefix}결과표 표시: {visible}/{self._result_total_rows}{filter_suffix}"
-            )
+            count_summary = f"{visible}/{self._result_total_rows}"
+            if self._result_total_rows > loaded_rows:
+                count_summary = f"{visible}/{loaded_rows} · 전체 결과: {self._result_total_rows}"
+            self._set_result_context(f"{prefix}결과표 표시: {count_summary}{filter_suffix}")
         controller = self.findChild(QObject, "darkNocConsoleController")
         schedule_refresh = getattr(controller, "schedule_refresh", None)
         if callable(schedule_refresh):
             schedule_refresh()
+
+    def _row_matches_result_filters(self, row: int) -> bool:
+        for column, selected in self._result_filter_values.items():
+            item = self.result_table.item(row, column)
+            value = item.data(_FILTER_VALUE_ROLE) if item is not None else None
+            if value not in selected:
+                return False
+        return True
 
     @Slot(bool)
     def _set_details_visible(self, visible: bool) -> None:
@@ -2169,23 +2187,23 @@ class MainWindow(QMainWindow):
             or self._shutdown.restart_required
         ):
             return
-        if not self._monitoring:
-            self._last_counters.clear()
-            self._result_filter_values.clear()
-            self._update_filter_controls()
-            self._run_started_at = datetime.now(UTC)
-        elif self._run_started_at is None:
-            self._run_started_at = datetime.now(UTC)
-        self._elapsed_timer.start()
-        self._refresh_elapsed_labels()
         try:
             config, request, credentials = self._read_query()
         except ValueError as exc:
-            QMessageBox.warning(self, "입력 확인", str(exc))
-            self._cancel_active_work()
-            self._set_state("확인 필요")
-            self.statusBar().showMessage("입력값을 확인한 뒤 다시 시도해 주세요.", 5000)
+            self._show_query_input_error(exc)
             return
+        if not self._monitoring:
+            self._last_counters.clear()
+            self._clear_result_filters()
+            self._run_started_at = datetime.now(UTC)
+            self._run_started_monotonic = monotonic()
+        elif self._run_started_at is None:
+            self._run_started_at = datetime.now(UTC)
+            self._run_started_monotonic = monotonic()
+        elif self._run_started_monotonic is None:
+            self._run_started_monotonic = monotonic()
+        self._elapsed_timer.start()
+        self._refresh_elapsed_labels()
         self._shutdown.reset()
         self._shutdown_finalization_succeeded = None
         self._query_running = True
@@ -2266,10 +2284,15 @@ class MainWindow(QMainWindow):
             or self._shutdown.restart_required
         ):
             return
+        try:
+            self._read_query()
+        except ValueError as exc:
+            self._show_query_input_error(exc)
+            return
         self._last_counters.clear()
         self._run_started_at = datetime.now(UTC)
-        self._result_filter_values.clear()
-        self._update_filter_controls()
+        self._run_started_monotonic = monotonic()
+        self._clear_result_filters()
         self._monitoring = True
         self._next_storage_health_check_at = 0.0
         self._next_monitor_delay_seconds = float(self.session_interval.value())
@@ -2277,6 +2300,12 @@ class MainWindow(QMainWindow):
         self.monitor_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self._start_query()
+
+    def _show_query_input_error(self, exc: ValueError) -> None:
+        QMessageBox.warning(self, "입력 확인", str(exc))
+        self._cancel_active_work()
+        self._set_state("확인 필요")
+        self.statusBar().showMessage("입력값을 확인한 뒤 다시 시도해 주세요.", 5000)
 
     @Slot()
     def _stop_work(self) -> None:
@@ -2350,8 +2379,12 @@ class MainWindow(QMainWindow):
         if started is None:
             self.elapsed_label.setText("시작 시각: - · 경과: 00:00:00")
             return
-        now = datetime.now(UTC)
-        elapsed = _format_elapsed(started, now)
+        monotonic_started = self._run_started_monotonic
+        elapsed = (
+            _format_elapsed_seconds(monotonic() - monotonic_started)
+            if monotonic_started is not None
+            else "00:00:00"
+        )
         local_started = started.astimezone(_KST).strftime("%Y-%m-%d %H:%M:%S KST")
         self.elapsed_label.setText(f"시작 시각: {local_started} · 경과: {elapsed}")
 
@@ -2561,6 +2594,8 @@ class MainWindow(QMainWindow):
                     f"{observation_status}\n이 값은 장비 장애나 통신 성공 판정이 아닙니다."
                 )
             self.result_table.setItem(row, column, item)
+        if self._result_filter_values:
+            self.result_table.setRowHidden(row, not self._row_matches_result_filters(row))
 
     @Slot()
     def _show_selected_raw(self) -> None:
@@ -3207,8 +3242,6 @@ class MainWindow(QMainWindow):
         if dialog.clickedButton() is not open_button or path is None:
             return
         try:
-            if not path.is_file():
-                raise OSError("파일이 존재하지 않습니다.")
             opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
         except (OSError, RuntimeError):
             opened = False
@@ -3563,7 +3596,14 @@ def _format_elapsed(started: datetime | None, ended: datetime | None) -> str:
         started = started.replace(tzinfo=UTC)
     if ended.tzinfo is None:
         ended = ended.replace(tzinfo=UTC)
-    seconds = int(max(0, (ended - started).total_seconds()))
+    elapsed_seconds = (ended - started).total_seconds()
+    if elapsed_seconds < 0:
+        return "-"
+    return _format_elapsed_seconds(elapsed_seconds)
+
+
+def _format_elapsed_seconds(elapsed_seconds: float) -> str:
+    seconds = int(max(0, elapsed_seconds))
     days, remainder = divmod(seconds, 86_400)
     hours, remainder = divmod(remainder, 3_600)
     minutes, seconds = divmod(remainder, 60)

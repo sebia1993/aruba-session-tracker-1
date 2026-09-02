@@ -51,10 +51,14 @@ from aruba_session_tracker.services import (
 GLOBAL_HEADER = "IP              MAC                Name              Current switch    Role"
 GLOBAL_SEPARATOR = "-" * len(GLOBAL_HEADER)
 FIXTURES = Path(__file__).parent / "fixtures"
-DATAPATH_HEADER = """Datapath Session Table Entries
-Source IP Destination IP Prot SPort DPort Cnt Prio ToS Age Destination TAge
-Packets Bytes Flags CPU ID
-"""
+DATAPATH_HEADER = (
+    "Datapath Session Table Entries\n"
+    "------------------------------\n"
+    "Source IP or MAC Destination IP Prot SPort DPort Cntr Prio ToS Age "
+    "Destination TAge Packets Bytes Flags CPU ID\n"
+    "---------------- ---------------- ---- ----- ----- ---- ---- --- --- "
+    "----------- ---- ------- ----- ----- ------\n"
+)
 DATAPATH_EMPTY = DATAPATH_HEADER + "Entries: 0\n"
 
 
@@ -538,6 +542,30 @@ def test_duplicate_session_key_is_non_authoritative_and_preserves_raw() -> None:
     parse_event = next(event for event in outcome.diagnostics if event.stage == "MD_PARSE")
     assert parse_event.code is ErrorCode.PARSE_PARTIAL
     assert "duplicate session key" in parse_event.message
+
+
+def test_oversized_md_completion_count_stays_inside_safe_parse_diagnostics() -> None:
+    oversized_output = _datapath_output().replace("Entries: 1", f"Entries: {'9' * 5_000}")
+    command = build_datapath_session_command(REQUEST.source_ip)
+    outputs = {
+        "MM-Primary": _mm_outputs("192.0.2.101", "192.0.2.101"),
+        "MD-1": {
+            NO_PAGING_COMMAND: "",
+            command: oversized_output,
+        },
+    }
+
+    outcome = TrackerService(_config(), FakeFactory(outputs)).query_once(
+        REQUEST,
+        CREDENTIALS,
+    )
+
+    assert outcome.observations == ()
+    assert outcome.authoritative is False
+    snapshot = next(item for item in outcome.raw_snapshots if item.command == command)
+    assert snapshot.output == oversized_output
+    parse_event = next(event for event in outcome.diagnostics if event.stage == "MD_PARSE")
+    assert parse_event.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
 
 
 def test_md_authentication_failure_stops_before_other_candidates() -> None:

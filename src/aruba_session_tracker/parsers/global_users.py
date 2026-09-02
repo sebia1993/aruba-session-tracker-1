@@ -65,6 +65,13 @@ _MAC_RE = re.compile(
     r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}|"
     r"(?:[0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}"
 )
+_FINAL_PROMPT_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:\([^\r\n()]{1,64}\)\s*(?:(?:\^\*?|\*)\s*)?)?"
+    r"(?:\[[^\r\n\[\]]{1,64}\]\s*)?"
+    r"|[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\s*"
+    r")[#>]\s*$"
+)
 
 
 def parse_global_user_table(output: str, *, client_ip: str) -> GlobalUserLookup:
@@ -80,21 +87,42 @@ def parse_global_user_table(output: str, *, client_ip: str) -> GlobalUserLookup:
     normalized_client = str(IPv4Address(client_ip))
     lines = output.splitlines()
     header_index = _find_header(lines)
-    total_match = _TOTAL_RE.search(output)
-    if header_index is None or total_match is None:
+    if header_index is None:
         raise ParseError("Global user table is incomplete or unrecognized.")
 
-    declared_total = _bounded_total(total_match.group(1))
     separator_index, starts = _table_geometry(lines, header_index)
+    if any(_TOTAL_RE.fullmatch(line) is not None for line in lines[: separator_index + 1]):
+        raise ParseError("Global user table completion marker appears before the table rows.")
 
     parsed_rows = 0
+    declared_total: int | None = None
+    completed_by_prompt = False
     switches: list[str] = []
     entries: list[GlobalUserEntry] = []
     for line in lines[separator_index + 1 :]:
-        if _TOTAL_RE.match(line):
-            break
-        if not line.strip() or _is_separator(line):
+        stripped = line.strip()
+        if not stripped:
             continue
+        total_match = _TOTAL_RE.fullmatch(line)
+        if declared_total is not None:
+            if total_match is not None:
+                raise ParseError("Global user table completion marker is duplicated.")
+            if not completed_by_prompt and _FINAL_PROMPT_RE.fullmatch(stripped) is not None:
+                completed_by_prompt = True
+                continue
+            raise ParseError("Global user table contains data after completion.")
+        if total_match is not None:
+            declared_total = _bounded_total(total_match.group(1))
+            continue
+        if _FINAL_PROMPT_RE.fullmatch(stripped) is not None:
+            raise ParseError("Global user table is missing its row-count completion marker.")
+        if _is_separator(line):
+            continue
+        if parsed_rows >= _MAX_GLOBAL_USER_ROWS:
+            raise ParseError(
+                "Global user table exceeds the supported row limit.",
+                code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
+            )
         entry = _parse_entry(line, starts)
         parsed_rows += 1
         if entry.client_ip != normalized_client:
@@ -103,6 +131,8 @@ def parse_global_user_table(output: str, *, client_ip: str) -> GlobalUserLookup:
         if entry.current_switch not in switches:
             switches.append(entry.current_switch)
 
+    if declared_total is None:
+        raise ParseError("Global user table is missing its row-count completion marker.")
     if parsed_rows != declared_total:
         raise ParseError(
             "Global user table row count mismatch "

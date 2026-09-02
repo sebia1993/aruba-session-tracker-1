@@ -7,15 +7,24 @@ import sys
 import threading
 import time
 import tracemalloc
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QItemSelectionModel, Qt, QUrl
 from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import QApplication, QFileDialog, QGridLayout, QMessageBox, QWidget
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QFileDialog,
+    QGridLayout,
+    QLabel,
+    QMessageBox,
+    QWidget,
+)
 
+import aruba_session_tracker.ui.main_window as main_window_module
 from aruba_session_tracker.collectors.ssh import (
     CancellationToken,
     CollectorError,
@@ -50,6 +59,7 @@ from aruba_session_tracker.ui.main_window import (
     _safe_query_failure,
     _storage_status_text,
 )
+from aruba_session_tracker.ui.theme import apply_main_window_theme
 
 
 class _Executor:
@@ -357,6 +367,34 @@ def test_run_display_identifier_uses_query_ips_and_elapsed_format() -> None:
         )
         == "1일 01:02:03"
     )
+    assert (
+        _format_elapsed(
+            datetime(2026, 9, 2, 0, 0, tzinfo=UTC),
+            datetime(2026, 9, 2, 0, 0, tzinfo=UTC) - timedelta(seconds=1),
+        )
+        == "-"
+    )
+
+
+def test_current_run_elapsed_uses_monotonic_time(
+    qtbot: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        _EmptyStore(),  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    window._run_started_at = datetime(2026, 9, 2, 0, 0, tzinfo=UTC)
+    window._run_started_monotonic = 100.25
+    monkeypatch.setattr(main_window_module, "monotonic", lambda: 112.99)
+
+    window._refresh_elapsed_labels()
+
+    assert window.elapsed_label.text() == "시작 시각: 2026-09-02 09:00:00 KST · 경과: 00:00:12"
+    window.close()
 
 
 def test_result_filters_use_raw_ip_and_port_values_without_guessing_services(
@@ -369,6 +407,7 @@ def test_result_filters_use_raw_ip_and_port_values_without_guessing_services(
         _Executor(),
     )
     qtbot.addWidget(window)  # type: ignore[attr-defined]
+    apply_main_window_theme(window)
     rows = (
         ("192.0.2.10", "203.0.113.20", 53000, 443),
         ("192.0.2.11", "203.0.113.21", 53001, 65000),
@@ -383,6 +422,7 @@ def test_result_filters_use_raw_ip_and_port_values_without_guessing_services(
                 destination_ip=destination_ip,
                 source_port=source_port,
                 destination_port=destination_port,
+                raw_line=f"raw {source_ip}",
             )
         )
     window._result_total_rows = 2
@@ -390,15 +430,105 @@ def test_result_filters_use_raw_ip_and_port_values_without_guessing_services(
 
     candidates = window._filter_candidates(5)
     assert candidates == ((443, "443(HTTPS)"), (65000, "65000"))
+    window.result_table.setCurrentCell(1, 0)
+    window.result_table.selectRow(1)
+    endpoint_values = window.findChildren(QLabel, "detailEndpointValue")
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: (
+            window.raw_view.toPlainText() == "raw 192.0.2.11"
+            and [label.text() for label in endpoint_values]
+            == ["192.0.2.11:53001", "203.0.113.21:65000"]
+        ),
+        timeout=3000,
+    )
     window._result_filter_values = {2: {"192.0.2.10"}, 5: {443}}
     window._apply_result_filters()
 
     assert not window.result_table.isRowHidden(0)
     assert window.result_table.isRowHidden(1)
+    assert window.result_table.currentRow() == -1
+    assert not window.result_table.selectionModel().hasSelection()
+    assert window.raw_view.toPlainText() == "결과 행을 선택하면 해당 Raw 행을 표시합니다."
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: [label.text() for label in endpoint_values] == ["—", "—"],
+        timeout=3000,
+    )
     assert "결과표 표시: 1/2" in window.context_label.text()
     assert window.clear_result_filters_button.isEnabled()
+    window._append_observation(
+        SessionObservation(
+            controller_name="MD-01",
+            controller_host="198.51.100.21",
+            protocol=6,
+            source_ip="192.0.2.12",
+            destination_ip="203.0.113.22",
+            source_port=53_002,
+            destination_port=443,
+        )
+    )
+    assert window.result_table.isRowHidden(2)
+    window._result_total_rows = 3
     window._clear_result_filters()
-    assert not any(window.result_table.isRowHidden(row) for row in range(2))
+    assert not any(window.result_table.isRowHidden(row) for row in range(3))
+    window.close()
+
+
+def test_result_filter_clears_ctrl_selected_row_when_it_becomes_hidden(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        _EmptyStore(),  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    apply_main_window_theme(window)
+    window.result_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+    for index in range(2):
+        window._append_observation(
+            SessionObservation(
+                controller_name="MD-01",
+                controller_host="198.51.100.21",
+                protocol=6,
+                source_ip=f"192.0.2.{10 + index}",
+                destination_ip=f"203.0.113.{20 + index}",
+                source_port=53_000 + index,
+                destination_port=443,
+                raw_line=f"raw row {index}",
+            )
+        )
+    window._result_total_rows = 2
+    window._set_result_context("결과표 표시: 2/2")
+
+    window.result_table.setCurrentCell(0, 0)
+    window.result_table.selectRow(0)
+    endpoint_values = window.findChildren(QLabel, "detailEndpointValue")
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: window.raw_view.toPlainText() == "raw row 0",
+        timeout=3000,
+    )
+    selection_model = window.result_table.selectionModel()
+    selection_model.select(
+        window.result_table.model().index(1, 0),
+        QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+    )
+    assert window.result_table.currentRow() == 0
+    assert {index.row() for index in selection_model.selectedRows()} == {0, 1}
+    assert window.raw_view.toPlainText() == "raw row 0"
+
+    window._result_filter_values = {2: {"192.0.2.10"}}
+    window._apply_result_filters()
+
+    assert not window.result_table.isRowHidden(0)
+    assert window.result_table.isRowHidden(1)
+    assert window.result_table.currentRow() == -1
+    assert not selection_model.hasSelection()
+    assert window.raw_view.toPlainText() == "결과 행을 선택하면 해당 Raw 행을 표시합니다."
+    qtbot.waitUntil(  # type: ignore[attr-defined]
+        lambda: [label.text() for label in endpoint_values] == ["—", "—"],
+        timeout=3000,
+    )
     window.close()
 
 
@@ -678,6 +808,76 @@ def test_html_report_export_is_independent_from_csv(
     assert window.html_export_button.text() == "HTML 보고서"
     assert destination.is_file()
     assert messages == [("HTML 보고서", str(destination))]
+    window.close()
+
+
+def test_export_completion_opens_without_gui_thread_filesystem_stat(
+    qtbot: object,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        _EmptyStore(),  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    qtbot.waitUntil(lambda: not window._history_task_running, timeout=3000)  # type: ignore[attr-defined]
+    opened_paths: list[str] = []
+
+    class _CompletionDialog:
+        Icon = QMessageBox.Icon
+        ButtonRole = QMessageBox.ButtonRole
+
+        def __init__(self, _parent: object) -> None:
+            self._open_button: object | None = None
+
+        def setIcon(self, _icon: object) -> None:
+            return
+
+        def setWindowTitle(self, _title: str) -> None:
+            return
+
+        def setText(self, _text: str) -> None:
+            return
+
+        def setInformativeText(self, _text: str) -> None:
+            return
+
+        def addButton(self, text: str, _role: object) -> object:
+            button = object()
+            if text == "파일 열기":
+                self._open_button = button
+            return button
+
+        def setDefaultButton(self, _button: object) -> None:
+            return
+
+        def exec(self) -> int:
+            return 0
+
+        def clickedButton(self) -> object | None:
+            return self._open_button
+
+    class _DesktopServices:
+        @staticmethod
+        def openUrl(url: QUrl) -> bool:
+            opened_paths.append(url.toLocalFile())
+            return True
+
+    def reject_gui_filesystem_probe(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("GUI completion path must not stat the exported file")
+
+    destination = tmp_path / "not-created.csv"
+    with monkeypatch.context() as scoped:
+        scoped.setattr(main_window_module, "QMessageBox", _CompletionDialog)
+        scoped.setattr(main_window_module, "QDesktopServices", _DesktopServices)
+        scoped.setattr(Path, "is_file", reject_gui_filesystem_probe)
+        scoped.setattr(Path, "stat", reject_gui_filesystem_probe)
+
+        window._show_export_completion("CSV 내보내기", destination)
+
+    assert opened_paths == [str(destination)]
     window.close()
 
 
@@ -1212,11 +1412,37 @@ def test_invalid_input_keeps_input_status_instead_of_stop_status(
         "warning",
         lambda *_args, **_kwargs: QMessageBox.StandardButton.Ok,
     )
+    window._append_observation(
+        SessionObservation(
+            controller_name="MD-01",
+            controller_host="198.51.100.21",
+            protocol=6,
+            source_ip="192.0.2.101",
+            destination_ip="203.0.113.50",
+            source_port=50_000,
+            destination_port=443,
+        )
+    )
+    window._result_total_rows = 1
+    window._set_result_context("결과표 표시: 1/1")
+    window._result_filter_values = {2: {"192.0.2.101"}}
+    window._apply_result_filters()
+    started_at = datetime(2026, 9, 2, 0, 0, tzinfo=UTC)
+    window._run_started_at = started_at
+    window._run_started_monotonic = 42.5
+    window.elapsed_label.setText("시작 시각: 기존 조회 · 경과: 00:00:07")
+    elapsed_timer_active = window._elapsed_timer.isActive()
 
     window._start_query()
 
     assert not window._query_running
     assert window.state_label.text() == "확인 필요"
+    assert window._result_filter_values == {2: {"192.0.2.101"}}
+    assert not window.result_table.isRowHidden(0)
+    assert window._run_started_at == started_at
+    assert window._run_started_monotonic == 42.5
+    assert window.elapsed_label.text() == "시작 시각: 기존 조회 · 경과: 00:00:07"
+    assert window._elapsed_timer.isActive() is elapsed_timer_active
     window.close()
 
 
@@ -1826,8 +2052,26 @@ def test_result_rendering_caps_visible_rows_without_dropping_outcome_count(
         timeout=5_000,
     )
     assert window.result_table.rowCount() == 2_000
-    assert "결과표 표시: 2000/2005" in window.context_label.text()
+    assert "결과표 표시: 2000/2000 · 전체 결과: 2005" in window.context_label.text()
     assert "DISPLAY_LIMIT" in window.diagnostics_list.item(0).text()
+    window._result_filter_values = {3: {10_000}}
+    window._apply_result_filters()
+    assert (
+        sum(
+            not window.result_table.isRowHidden(row)
+            for row in range(window.result_table.rowCount())
+        )
+        == 1
+    )
+    assert "결과표 표시: 1/2000 · 전체 결과: 2005 · 필터 적용" in window.context_label.text()
+    window._result_filter_values = {3: {65_535}}
+    window._apply_result_filters()
+    assert not any(
+        not window.result_table.isRowHidden(row) for row in range(window.result_table.rowCount())
+    )
+    assert window.result_empty_label.text() == (
+        "화면에 불러온 2,000행 중 필터 조건에 맞는 행이 없습니다."
+    )
     raw_role = int(Qt.ItemDataRole.UserRole)
     assert window.result_table.item(0, 0).data(raw_role)
     assert window.result_table.item(0, 1).data(raw_role) is None

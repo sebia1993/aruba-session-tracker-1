@@ -962,6 +962,10 @@ def build_stylesheet() -> str:
     QMainWindow#mainWindow[themeContrast="high"] QFrame#metricCard,
     QMainWindow#mainWindow[themeContrast="high"] QFrame#sessionFlowCard,
     QMainWindow#mainWindow[themeContrast="high"] QFrame#detailFact,
+    QMainWindow#mainWindow[themeContrast="high"] QFrame#developerInspectorBar,
+    QMainWindow#mainWindow[themeContrast="high"] QDialog#developerInspectorDetailDialog,
+    QMainWindow#mainWindow[themeContrast="high"] QDialog#developerInspectorCatalogDialog,
+    QMainWindow#mainWindow[themeContrast="high"] QDialog#resultFilterDialog,
     QMainWindow#mainWindow[themeContrast="high"] QGroupBox,
     QMainWindow#mainWindow[themeContrast="high"] QGroupBox::title,
     QMainWindow#mainWindow[themeContrast="high"] QLabel#contextSummary,
@@ -986,6 +990,7 @@ def build_stylesheet() -> str:
     QMainWindow#mainWindow[themeContrast="high"] QSpinBox,
     QMainWindow#mainWindow[themeContrast="high"] QTableWidget,
     QMainWindow#mainWindow[themeContrast="high"] QListWidget,
+    QMainWindow#mainWindow[themeContrast="high"] QTextEdit,
     QMainWindow#mainWindow[themeContrast="high"] QPlainTextEdit#rawConsole {
         color: palette(text);
         background-color: palette(base);

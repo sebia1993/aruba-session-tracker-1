@@ -886,6 +886,11 @@ class DeveloperInspectorController(QObject):
                 and button in self._suppressed_mouse_buttons
             ):
                 self._suppressed_mouse_buttons.discard(button)
+                if button == Qt.MouseButton.RightButton:
+                    # Windows normally raises ContextMenu after release. Refresh
+                    # the bounded guard here so a deliberate long press cannot
+                    # escape the selection-only interaction boundary.
+                    self._suppress_context_menu_until = monotonic() + 0.5
                 event.accept()
                 return True
             if event_type == QEvent.Type.MouseButtonDblClick and self._post_selection_matches(
@@ -911,10 +916,12 @@ class DeveloperInspectorController(QObject):
                         button == Qt.MouseButton.RightButton
                         and event_type == QEvent.Type.MouseButtonPress
                     ):
-                        hit = self._hit_for_event(watched, event)
-                        if hit is None:
-                            self._suppress_context_menu_until = monotonic() + 0.5
-                            self.cancel_selection()
+                        # Right-click is the explicit selection-cancel gesture.
+                        # The registered top-level window covers visually blank
+                        # areas, so hit-testing for ``None`` would make the
+                        # advertised cancellation path unreachable there.
+                        self._suppress_context_menu_until = monotonic() + 0.5
+                        self.cancel_selection()
                 return True
             if (
                 event_type == QEvent.Type.MouseButtonDblClick
@@ -929,9 +936,8 @@ class DeveloperInspectorController(QObject):
                 return True
             if self._selection_mode:
                 event.accept()
-                if self._hit_for_event(watched, event) is None:
-                    self._suppress_context_menu_until = monotonic() + 0.5
-                    self.cancel_selection()
+                self._suppress_context_menu_until = monotonic() + 0.5
+                self.cancel_selection()
                 return True
 
         if (

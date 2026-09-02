@@ -408,7 +408,8 @@ def test_context_menu_is_blocked_and_inspector_widgets_are_excluded(
     app.processEvents()
     assert event.isAccepted()
     assert context_spy.count() == 0
-    assert inspector.selection_mode is True
+    assert inspector.selection_mode is False
+    assert inspector.enabled is True
 
     QTest.mouseMove(bar.select_button, bar.select_button.rect().center())
     app.processEvents()
@@ -420,6 +421,7 @@ def test_context_menu_is_blocked_and_inspector_widgets_are_excluded(
     )
     assert bar.select_button.nextInFocusChain() is bar.catalog_button
     assert bar.catalog_button.nextInFocusChain() is bar.exit_button
+    assert inspector.begin_selection()
     QTest.keyClick(bar.select_button, Qt.Key.Key_Space)
     assert inspector.selection_mode is False
     assert bar.select_button.text() == "화면에서 선택"
@@ -430,9 +432,10 @@ def test_context_menu_is_blocked_and_inspector_widgets_are_excluded(
     assert inspector.enabled is False
 
 
-def test_right_click_on_blank_area_cancels_selection_without_opening_menu(
+def test_right_click_on_registered_main_window_blank_area_cancels_long_press_menu(
     qtbot: Any,
     inspector: DeveloperInspectorController,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app = _app()
     host = QWidget()
@@ -440,7 +443,15 @@ def test_right_click_on_blank_area_cancels_selection_without_opening_menu(
     layout = QVBoxLayout(host)
     target = QPushButton("선택 대상", host)
     layout.addWidget(target)
+    host.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    context_spy = QSignalSpy(host.customContextMenuRequested)
+    inspector.register_widget(host, _metadata("MAIN-WINDOW"))
     inspector.register_widget(target, _metadata("MAIN-RIGHT-CLICK-TARGET"))
+    clock = [10.0]
+    monkeypatch.setattr(
+        "aruba_session_tracker.ui.developer_inspector.monotonic",
+        lambda: clock[0],
+    )
     host.resize(320, 180)
     host.show()
     app.processEvents()
@@ -465,12 +476,28 @@ def test_right_click_on_blank_area_cancels_selection_without_opening_menu(
         Qt.MouseButton.NoButton,
         Qt.KeyboardModifier.NoModifier,
     )
+    press.ignore()
+    release.ignore()
     QApplication.sendEvent(host, press)
+    assert inspector.selection_mode is False
+
+    # Windows emits the context-menu event on release. Simulate a deliberate
+    # long press so the press-time guard expires before release refreshes it.
+    clock[0] += 0.75
     QApplication.sendEvent(host, release)
+    context_event = QContextMenuEvent(
+        QContextMenuEvent.Reason.Mouse,
+        blank,
+        global_blank,
+    )
+    context_event.ignore()
+    QApplication.sendEvent(host, context_event)
     app.processEvents()
 
     assert press.isAccepted()
     assert release.isAccepted()
+    assert context_event.isAccepted()
+    assert context_spy.count() == 0
     assert inspector.selection_mode is False
     assert inspector.enabled is True
 

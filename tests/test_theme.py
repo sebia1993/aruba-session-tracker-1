@@ -21,6 +21,8 @@ from aruba_session_tracker.models import SessionObservation
 from aruba_session_tracker.services import QueryOutcome
 from aruba_session_tracker.storage import SessionStore
 from aruba_session_tracker.ui import MainWindow
+from aruba_session_tracker.ui.developer_inspector import DeveloperInspectorController
+from aruba_session_tracker.ui.main_window import _ResultFilterDialog
 from aruba_session_tracker.ui.theme import apply_main_window_theme, build_stylesheet
 
 
@@ -440,6 +442,107 @@ def test_theme_keeps_header_text_visible_in_light_high_contrast(
     finally:
         if window is not None:
             window.close()
+        application.setPalette(original_palette)
+
+
+def test_light_high_contrast_covers_inspector_and_result_filter_surfaces(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    application = QApplication.instance()
+    assert isinstance(application, QApplication)
+    original_palette = application.palette()
+    palette = QPalette(original_palette)
+    palette.setColor(QPalette.ColorRole.Window, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    application.setPalette(palette)
+    window: MainWindow | None = None
+    inspector: DeveloperInspectorController | None = None
+    filter_dialog: _ResultFilterDialog | None = None
+    try:
+        store = SessionStore(
+            tmp_path / "tracker.db",
+            tmp_path / "raw",
+            tmp_path / "exports",
+        )
+        store.initialize()
+        inspector = DeveloperInspectorController(application, "v0.6.0")
+        window = MainWindow(
+            ConfigRepository(tmp_path / "config.json"),
+            store,
+            _Executor(),
+            developer_inspector=inspector,
+        )
+        qtbot.addWidget(window)  # type: ignore[attr-defined]
+        qtbot.waitUntil(  # type: ignore[attr-defined]
+            lambda: not window._history_task_running,
+            timeout=3000,
+        )
+        apply_main_window_theme(window)
+        window.show()
+        qtbot.keyClick(window, Qt.Key.Key_F12)  # type: ignore[attr-defined]
+
+        bar = window.findChild(QFrame, "developerInspectorBar")
+        assert bar is not None
+        qtbot.waitUntil(bar.isVisible, timeout=3000)  # type: ignore[attr-defined]
+        detail = inspector.show_element_detail(inspector.catalog[0], window)
+        catalog = inspector.show_catalog(window)
+        assert detail is not None
+        assert catalog is not None
+        filter_dialog = _ResultFilterDialog(
+            window,
+            title="목적지 포트",
+            values=((22, "22(SSH)"), (443, "443(HTTPS)")),
+            selected=set(),
+            filter_active=False,
+        )
+        qtbot.addWidget(filter_dialog)  # type: ignore[attr-defined]
+        filter_dialog.show()
+        QApplication.processEvents()
+
+        for surface in (bar, detail, catalog, filter_dialog):
+            surface_palette = surface.palette()
+            background = surface_palette.color(QPalette.ColorRole.Window).name()
+            foreground = surface_palette.color(QPalette.ColorRole.WindowText).name()
+            assert background == "#ffffff"
+            assert foreground == "#000000"
+            assert _contrast_ratio(foreground, background) >= 7.0
+
+        for label, surface in (
+            (bar.mode_label, bar),
+            (detail.intro_label, detail),
+            (catalog.guide_label, catalog),
+        ):
+            foreground = label.palette().color(label.foregroundRole()).name()
+            background = surface.palette().color(QPalette.ColorRole.Window).name()
+            assert _contrast_ratio(foreground, background) >= 7.0
+
+        for control in (
+            detail.name_value,
+            detail.purpose_value,
+            detail.request_preview,
+            catalog.element_list,
+            filter_dialog.search_edit,
+            filter_dialog.values_list,
+        ):
+            control_palette = control.palette()
+            background = control_palette.color(QPalette.ColorRole.Base).name()
+            foreground = control_palette.color(QPalette.ColorRole.Text).name()
+            assert _contrast_ratio(foreground, background) >= 7.0
+    finally:
+        if filter_dialog is not None:
+            filter_dialog.close()
+        if inspector is not None:
+            inspector.close()
+        if window is not None:
+            window.close()
+        QApplication.processEvents()
         application.setPalette(original_palette)
 
 

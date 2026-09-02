@@ -240,8 +240,8 @@ class _NocConsoleController(QObject):
         flow_layout.setHorizontalSpacing(8)
         flow_layout.setVerticalSpacing(4)
 
-        source_block = _detail_endpoint("SOURCE", page)
-        destination_block = _detail_endpoint("DESTINATION", page)
+        source_block = _detail_endpoint("출발지", page)
+        destination_block = _detail_endpoint("목적지", page)
         source_value = source_block.findChild(QLabel, "detailEndpointValue")
         destination_value = destination_block.findChild(QLabel, "detailEndpointValue")
         if source_value is not None:
@@ -460,7 +460,14 @@ class _NocConsoleController(QObject):
     def _refresh_detail(self) -> None:
         table = self._window.result_table
         row = table.currentRow()
-        if row < 0:
+        selection_model = table.selectionModel()
+        selected_rows = selection_model.selectedRows() if selection_model is not None else []
+        if (
+            row < 0
+            or table.isRowHidden(row)
+            or len(selected_rows) != 1
+            or selected_rows[0].row() != row
+        ):
             self._set_detail("hint", "세션 행을 선택하면 조사 요약을 표시합니다.")
             for key in (
                 "source",
