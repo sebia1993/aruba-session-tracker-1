@@ -127,7 +127,7 @@ def test_theme_installs_dark_noc_shell_without_replacing_operational_widgets(
     assert window.nav_identity.minimumHeight() == 66
     assert window.nav_identity.maximumHeight() == 66
     assert window.product_name_label.text() == "ARUBA SESSION TRACKER"
-    assert "NETWORK SESSION INVESTIGATION CONSOLE" in window.product_meta_label.text()
+    assert "네트워크 세션 분석 콘솔" in window.product_meta_label.text()
 
     assert window.open_settings_button.property("buttonRole") == "primary"
     assert window.monitor_button.property("buttonRole") == "primary"
@@ -150,9 +150,9 @@ def test_theme_installs_dark_noc_shell_without_replacing_operational_widgets(
     assert [label.text() for label in metric_values] == ["0", "0", "0", "0"]
 
     assert window.details.count() == 3
-    assert window.details.tabText(0) == "DETAILS"
-    assert window.details.tabText(1) == "RAW CLI"
-    assert window.details.tabText(2) == "DIAGNOSTICS"
+    assert window.details.tabText(0) == "세션 요약"
+    assert window.details.tabText(1) == "장비 원문"
+    assert window.details.tabText(2) == "진단 이벤트"
     session_detail_page = window.findChild(QWidget, "sessionDetailPage")
     assert session_detail_page is not None
     assert window.details.minimumWidth() >= 380
@@ -499,7 +499,7 @@ def test_selected_session_summary_tracks_existing_row_and_preserves_raw_widgets(
     endpoint_values = window.findChildren(QLabel, "detailEndpointValue")
     assert [label.text() for label in endpoint_values] == [
         "192.0.2.10:50000",
-        "198.51.100.20:443",
+        "198.51.100.20:443(HTTPS)",
     ]
     assert all(label.wordWrap() for label in endpoint_values)
     assert all(
@@ -519,14 +519,14 @@ def test_selected_session_summary_tracks_existing_row_and_preserves_raw_widgets(
             or value.height() >= value.sizeHint().height()
         )
         fact_values[caption.text()] = value
-    assert fact_values["STATUS"].text() == "현재 관측됨"
-    assert fact_values["CONTROLLER"].text() == "MD-01"
-    assert fact_values["FLAGS"].text() == "D"
-    assert fact_values["LAST SEEN"].text() == window.result_table.item(0, 12).text()
-    assert fact_values["PACKETS"].text() == "10"
-    assert fact_values["BYTES"].text() == "2,048"
-    assert fact_values["AGE"].text() == "18"
-    assert fact_values["CPU"].text() == "1"
+    assert fact_values["관측 상태"].text() == "현재 관측됨"
+    assert fact_values["관측 MD"].text() == "MD-01"
+    assert fact_values["장비 Flags"].text() == "D"
+    assert fact_values["마지막 확인"].text() == window.result_table.item(0, 12).text()
+    assert fact_values["패킷"].text() == "10"
+    assert fact_values["바이트"].text() == "2,048"
+    assert fact_values["세션 경과"].text() == "18"
+    assert fact_values["CPU ID"].text() == "1"
 
     metric_values: dict[str, str] = {}
     for frame in window.findChildren(QFrame, "metricCard"):
@@ -536,16 +536,16 @@ def test_selected_session_summary_tracks_existing_row_and_preserves_raw_widgets(
         assert value is not None
         metric_values[caption.text()] = value.text()
     assert metric_values == {
-        "ACTIVE FLOWS": "1",
-        "VISIBLE ROWS": "1",
-        "CHANGED FLOWS": "0",
-        "CONTROLLERS": "1",
+        "현재 관측 흐름": "1",
+        "결과표 표시 행": "1",
+        "신규·변경 흐름": "0",
+        "관측 MD": "1",
     }
 
     status_item = window.result_table.item(0, 14)
     assert status_item.foreground().style() == Qt.BrushStyle.NoBrush
     assert window.result_table.item(0, 13).foreground().color().name() == "#e05c65"
-    assert window.result_table.item(0, 15).foreground().color().name() == "#e05c65"
+    assert window.result_table.item(0, 15).text() == ""
 
     window.details.setCurrentWidget(original_raw)
     assert window.raw_view.toPlainText() == "sanitized raw row"

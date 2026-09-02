@@ -456,9 +456,9 @@ def build_stylesheet() -> str:
 
     QLabel#metricLabel {
         color: #7F96AA;
-        font-size: 7pt;
+        font-size: 9pt;
         font-weight: 800;
-        letter-spacing: .8px;
+        letter-spacing: 0;
     }
 
     /* Input controls. */
@@ -885,6 +885,57 @@ def build_stylesheet() -> str:
         padding: 5px 7px;
     }
 
+    /* Inspector surfaces use the same dark palette; never inherit a light
+       macOS dialog palette while the selection helper is active. */
+    QFrame#developerInspectorBar,
+    QDialog#developerInspectorDetailDialog,
+    QDialog#developerInspectorCatalogDialog,
+    QDialog#resultFilterDialog {
+        color: #E8EFF6;
+        background-color: #152331;
+        border: 1px solid #526F87;
+    }
+    QFrame#developerInspectorBar QLabel,
+    QDialog#developerInspectorDetailDialog QLabel,
+    QDialog#developerInspectorCatalogDialog QLabel,
+    QDialog#resultFilterDialog QLabel {
+        color: #D5E0E9;
+    }
+    QDialog#developerInspectorDetailDialog QLabel#inspectorSectionTitle {
+        color: #FFFFFF;
+        font-weight: 700;
+    }
+    QDialog#developerInspectorDetailDialog QLineEdit,
+    QDialog#developerInspectorDetailDialog QTextEdit,
+    QDialog#developerInspectorCatalogDialog QListWidget,
+    QDialog#resultFilterDialog QLineEdit,
+    QDialog#resultFilterDialog QListWidget {
+        color: #E8EFF6;
+        background-color: #0C1822;
+        border: 1px solid #526F87;
+    }
+    QDialog#developerInspectorDetailDialog QPushButton,
+    QDialog#developerInspectorCatalogDialog QPushButton,
+    QDialog#resultFilterDialog QPushButton,
+    QFrame#developerInspectorBar QPushButton {
+        color: #E8EFF6;
+        background-color: #1C2E3F;
+        border: 1px solid #66859D;
+        border-radius: 4px;
+        padding: 4px 10px;
+    }
+    QDialog#developerInspectorDetailDialog QPushButton:hover,
+    QDialog#developerInspectorCatalogDialog QPushButton:hover,
+    QDialog#resultFilterDialog QPushButton:hover,
+    QFrame#developerInspectorBar QPushButton:hover {
+        background-color: #243A4E;
+    }
+
+    QLabel#elapsedSummary {
+        color: #B8C8D6;
+        font-size: 8pt;
+    }
+
     /* Native-palette fallback for Windows high-contrast startup. */
     QMainWindow#mainWindow[themeContrast="high"] {
         color: palette(window-text);
@@ -1055,6 +1106,8 @@ def _configure_component_roles(window: MainWindow) -> None:
     _set_role(window.refresh_history_button, "secondary")
     _set_role(window.export_button, "secondary")
     _set_role(window.html_export_button, "secondary")
+    _set_role(window.result_filter_button, "tertiary")
+    _set_role(window.clear_result_filters_button, "tertiary")
     _set_role(window.delete_button, "danger")
     _set_role(window.delete_all_button, "dangerStrong")
 
@@ -1101,7 +1154,7 @@ def _configure_tables(window: MainWindow) -> None:
 
     # Presentation-only visual order: state and protocol first, then the flow.
     result_header = window.result_table.horizontalHeader()
-    desired_logical_order = (14, 1, 2, 3, 4, 5, 0, 12, 13, 15, 6, 7, 8, 9, 10, 11)
+    desired_logical_order = (14, 1, 2, 3, 4, 5, 0, 12, 13, 6, 7, 8, 9, 10, 11, 15)
     for visual_index, logical_index in enumerate(desired_logical_order):
         current = result_header.visualIndex(logical_index)
         if current != visual_index:
@@ -1112,7 +1165,7 @@ def _clear_explicit_result_foregrounds(window: MainWindow) -> None:
     """Let the native high-contrast palette own all result-cell text colors."""
 
     for row in range(window.result_table.rowCount()):
-        for column in (13, 14, 15):
+        for column in (13, 14):
             item = window.result_table.item(row, column)
             if item is not None:
                 item.setForeground(QBrush())

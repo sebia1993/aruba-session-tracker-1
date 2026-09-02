@@ -3,16 +3,18 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
 from typing import Protocol, cast
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QCloseEvent, QColor, QFont, QResizeEvent
+from PySide6.QtCore import QObject, QRunnable, Qt, QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QCloseEvent, QColor, QDesktopServices, QFont, QResizeEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -23,7 +25,9 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -53,7 +57,7 @@ from aruba_session_tracker.models import (
     QueryRequest,
     SessionObservation,
 )
-from aruba_session_tracker.parsers import interpret_flags, overall_flag_severity
+from aruba_session_tracker.parsers import overall_flag_severity
 from aruba_session_tracker.storage import DeletePreview, SessionStore, StorageError
 from aruba_session_tracker.support_codes import (
     SupportCode,
@@ -70,7 +74,7 @@ from aruba_session_tracker.ui.shutdown import ShutdownCoordinator
 
 _UI_SOURCE_PATH = "src/aruba_session_tracker/ui/main_window.py"
 _MAX_VISIBLE_RESULT_ROWS = 2_000
-_DETAIL_COLUMN_INDEXES = (*range(5, 12), 13)
+_DETAIL_COLUMN_INDEXES = (0, 6, 7, 8, 9, 10, 11, 13)
 _STORAGE_HEALTH_INTERVAL_SECONDS = 60.0
 # Advisory only: the supported five-second interval reaches 100,000 Raw files
 # in about 5.8 days.  Surface the filesystem-pressure risk before the first
@@ -96,11 +100,19 @@ _HISTORY_STATUS_LABELS = {
 }
 _RESULT_RENDER_CHUNK_SIZE = 200
 _COMPACT_RESULT_LAYOUT_HEIGHT = 760
+_FILTER_VALUE_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+_RUN_ID_ROLE = int(Qt.ItemDataRole.UserRole) + 2
+_FILTER_COLUMNS = {
+    2: "출발지 IP",
+    3: "출발지 포트",
+    4: "목적지 IP",
+    5: "목적지 포트",
+}
+_KST = timezone(timedelta(hours=9), "KST")
 _RESULT_TABLE_ACCESSIBLE_DESCRIPTION = (
-    "조회된 세션의 장비, 프로토콜, 출발지와 목적지, 관측 상태와 장비 Flags를 "
-    "풀어 쓴 세션 특이사항을 표시합니다. 관측 상태는 이번 조회에서 세션이 "
-    "보였는지를 뜻하며 장비 장애나 통신 성공 판정이 아닙니다. 세션 특이사항은 "
-    "장비 Flags의 참고용 풀이입니다."
+    "조회된 세션의 프로토콜, 출발지와 목적지, 관측 상태와 마지막 확인 시각을 "
+    "표시합니다. 관측 상태는 이번 조회에서 세션이 보였는지를 뜻하며 장비 장애나 "
+    "통신 성공 판정이 아닙니다. 상세 열 보기에서 원문 장비 Flags를 확인할 수 있습니다."
 )
 
 
@@ -118,6 +130,92 @@ class _PreparedDisplayOutcome:
     visible_rows: tuple[_DisplayRow, ...]
     total_rows: int
     next_counters: dict[str, tuple[int | None, int | None]]
+
+
+class _ResultFilterDialog(QDialog):
+    """Small keyboard-accessible transient selector for one result column."""
+
+    def __init__(
+        self,
+        parent: QWidget,
+        *,
+        title: str,
+        values: tuple[tuple[object, str], ...],
+        selected: set[object],
+        filter_active: bool,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"{title} 필터")
+        self.setModal(True)
+        self.setMinimumWidth(300)
+        self.setObjectName("resultFilterDialog")
+        layout = QVBoxLayout(self)
+        self.search_edit = QLineEdit(self)
+        self.search_edit.setPlaceholderText("검색어 입력")
+        self.search_edit.setAccessibleName(f"{title} 필터 검색")
+        layout.addWidget(self.search_edit)
+        self.values_list = QListWidget(self)
+        self.values_list.setAccessibleName(f"{title} 필터 값 목록")
+        self.values_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        for value, display in values:
+            item = QListWidgetItem(display, self.values_list)
+            item.setData(Qt.ItemDataRole.UserRole, value)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            check_state = (
+                Qt.CheckState.Checked
+                if not filter_active or value in selected
+                else Qt.CheckState.Unchecked
+            )
+            item.setCheckState(check_state)
+        layout.addWidget(self.values_list, 1)
+        action_row = QHBoxLayout()
+        select_all = QPushButton("모두 선택", self)
+        clear_all = QPushButton("모두 해제", self)
+        select_all.clicked.connect(self._select_all)
+        clear_all.clicked.connect(self._clear_all)
+        action_row.addWidget(select_all)
+        action_row.addWidget(clear_all)
+        action_row.addStretch(1)
+        layout.addLayout(action_row)
+        button_row = QHBoxLayout()
+        apply_button = QPushButton("적용", self)
+        cancel_button = QPushButton("취소", self)
+        apply_button.setDefault(True)
+        apply_button.clicked.connect(self.accept)
+        cancel_button.clicked.connect(self.reject)
+        button_row.addStretch(1)
+        button_row.addWidget(apply_button)
+        button_row.addWidget(cancel_button)
+        layout.addLayout(button_row)
+        self.search_edit.textChanged.connect(self._filter_items)
+        self.search_edit.setFocus()
+
+    def selected_values(self) -> set[object]:
+        values: set[object] = set()
+        for index in range(self.values_list.count()):
+            item = self.values_list.item(index)
+            if item is not None and item.checkState() == Qt.CheckState.Checked:
+                values.add(item.data(Qt.ItemDataRole.UserRole))
+        return values
+
+    def _filter_items(self, text: str) -> None:
+        query = text.strip().casefold()
+        for index in range(self.values_list.count()):
+            item = self.values_list.item(index)
+            if item is not None:
+                item.setHidden(bool(query) and query not in item.text().casefold())
+
+    def _select_all(self) -> None:
+        for index in range(self.values_list.count()):
+            item = self.values_list.item(index)
+            if item is not None:
+                item.setCheckState(Qt.CheckState.Checked)
+
+    def _clear_all(self) -> None:
+        for index in range(self.values_list.count()):
+            item = self.values_list.item(index)
+            if item is not None:
+                item.setCheckState(Qt.CheckState.Unchecked)
 
 
 @dataclass(frozen=True, slots=True)
@@ -588,6 +686,9 @@ class MainWindow(QMainWindow):
         self._next_monitor_delay_seconds = 0.0
         self._next_storage_health_check_at = 0.0
         self._last_counters: dict[str, tuple[int | None, int | None]] = {}
+        self._run_started_at: datetime | None = None
+        self._result_filter_values: dict[int, set[object]] = {}
+        self._result_filter_popup: QWidget | None = None
         self._monitor_timer = QTimer(self)
         self._monitor_timer.setSingleShot(True)
         self._monitor_timer.timeout.connect(self._start_query)
@@ -598,10 +699,17 @@ class MainWindow(QMainWindow):
         self._result_render_timer = QTimer(self)
         self._result_render_timer.setSingleShot(True)
         self._result_render_timer.timeout.connect(self._render_next_result_chunk)
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._refresh_elapsed_labels)
+        self._history_elapsed_timer = QTimer(self)
+        self._history_elapsed_timer.setInterval(1000)
+        self._history_elapsed_timer.timeout.connect(self._refresh_history_elapsed_cells)
         self._result_render_generation = 0
         self._pending_result_rows: tuple[_DisplayRow, ...] = ()
         self._pending_result_index = 0
         self._pending_result_total_rows = 0
+        self._result_total_rows = 0
         self._shutdown = ShutdownCoordinator(
             self._executor.stop_monitor,
             self,
@@ -875,38 +983,58 @@ class MainWindow(QMainWindow):
         self.results_title_label = QLabel("세션 조회 결과")
         self.results_title_label.setObjectName("sectionTitle")
         self.result_status_guide = QLabel(
-            "관측 상태=세션 표시 여부(장비 장애·통신 성공 판정 아님) · 특이사항=Flags 풀이"
+            "관측 상태=이번 조회에서 세션이 보였는지(장비 장애·통신 성공 판정 아님) · "
+            "장비 Flags=원문 참고 정보"
         )
         self.result_status_guide.setObjectName("sectionHint")
         self.result_status_guide.setAccessibleName("결과 상태 안내")
         self.result_status_guide.setAccessibleDescription(
             "관측 상태는 이번 조회에서 세션이 보였는지를 뜻하며 장비 장애나 "
-            "통신 성공 판정이 아닙니다. 세션 특이사항은 장비 Flags의 참고용 풀이입니다."
+            "통신 성공 판정이 아닙니다. 장비 Flags는 상세 확인을 위한 원문 참고 정보입니다."
         )
         self.result_status_guide.setToolTip(
             "관측 상태는 이번 조회에서 세션이 보였는지를 뜻하며 장비 장애나 "
             "통신 성공 판정이 아닙니다.\n"
-            "세션 특이사항은 장비 Flags의 참고용 풀이입니다."
+            "장비 Flags는 상세 확인을 위한 원문 참고 정보입니다."
         )
         result_title_block.addWidget(self.results_title_label)
         result_title_block.addWidget(self.result_status_guide)
         result_options.addLayout(result_title_block, 1)
         self.context_label = QLabel("MM/MD: 아직 조회하지 않음")
+        self.elapsed_label = QLabel("시작 시각: - · 경과: 00:00:00")
+        self.elapsed_label.setObjectName("elapsedSummary")
+        self.elapsed_label.setAccessibleName("조회 시작 시각과 경과 시간")
+        self.elapsed_label.setAccessibleDescription(
+            "현재 조회 또는 모니터링의 시작 시각과 경과 시간을 표시합니다."
+        )
         self.detail_columns_toggle = QCheckBox("상세 열 보기")
         self.detail_columns_toggle.setAccessibleName("상세 결과 열 보기")
         self.detail_columns_toggle.setAccessibleDescription(
-            "목적지 포트, 패킷, 바이트, 변화량, 세션 경과, CPU ID와 "
-            "원문 장비 Flags 열을 표시하거나 숨깁니다."
+            "장비, 패킷, 바이트, 변화량, 세션 경과, CPU ID와 원문 장비 Flags 열을 "
+            "표시하거나 숨깁니다. 목적지 포트는 기본 표시됩니다."
         )
+        self.result_filter_button = QPushButton("결과 필터")
+        self.result_filter_button.setAccessibleName("결과 필터")
+        self.result_filter_button.setAccessibleDescription(
+            "출발지와 목적지 IP 및 포트 결과를 여러 개 선택해 필터링합니다."
+        )
+        self.result_filter_button.clicked.connect(self._open_result_filter_menu)
+        self.clear_result_filters_button = QPushButton("필터 모두 해제")
+        self.clear_result_filters_button.setAccessibleName("결과 필터 모두 해제")
+        self.clear_result_filters_button.clicked.connect(self._clear_result_filters)
+        self.clear_result_filters_button.setEnabled(False)
         self.raw_diagnostics_toggle = QCheckBox("상세 정보 보기")
         self.raw_diagnostics_toggle.setAccessibleName("Raw 및 진단 패널 보기")
         self.raw_diagnostics_toggle.setAccessibleDescription(
             "선택한 Raw 행과 진단 이벤트 패널을 표시하거나 숨깁니다."
         )
         result_options.addWidget(self.detail_columns_toggle)
+        result_options.addWidget(self.result_filter_button)
+        result_options.addWidget(self.clear_result_filters_button)
         result_options.addWidget(self.raw_diagnostics_toggle)
         results_header_layout.addLayout(result_options)
         results_header_layout.addWidget(self.context_label)
+        results_header_layout.addWidget(self.elapsed_label)
         self.result_table = QTableWidget(0, 16)
         self.result_table.setAccessibleName("세션 조회 결과 표")
         self.result_table.setAccessibleDescription(_RESULT_TABLE_ACCESSIBLE_DESCRIPTION)
@@ -927,7 +1055,7 @@ class MainWindow(QMainWindow):
                 "마지막 확인 시각",
                 "장비 Flags",
                 "관측 상태",
-                "세션 특이사항",
+                "",
             ]
         )
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -944,10 +1072,6 @@ class MainWindow(QMainWindow):
                 "장비 조회 결과에서 이 세션이 보였는지를 표시합니다. "
                 "장비 전체 상태나 통신 성공 여부를 뜻하지 않습니다."
             ),
-            15: (
-                "장비 Flags를 읽기 쉬운 말로 풀이한 참고 정보입니다. "
-                "특이사항이 없어도 정상 통신을 보장하지 않습니다."
-            ),
         }
         for column, help_text in header_help.items():
             header_item = self.result_table.horizontalHeaderItem(column)
@@ -955,6 +1079,8 @@ class MainWindow(QMainWindow):
                 header_item.setToolTip(help_text)
         for column in _DETAIL_COLUMN_INDEXES:
             self.result_table.setColumnHidden(column, True)
+        self.result_table.setColumnHidden(15, True)
+        header.sectionClicked.connect(self._result_header_clicked)
         self.detail_columns_toggle.toggled.connect(self._set_detail_columns_visible)
         self.result_table.itemSelectionChanged.connect(self._show_selected_raw)
         result_layout.addWidget(self.results_header)
@@ -984,6 +1110,7 @@ class MainWindow(QMainWindow):
         self.details.addTab(self.diagnostics_list, "진단 이벤트")
         self.details.setVisible(False)
         self.raw_diagnostics_toggle.toggled.connect(self._set_details_visible)
+        self._update_filter_controls()
         splitter.addWidget(result_panel)
         splitter.addWidget(self.details)
         splitter.setStretchFactor(0, 4)
@@ -1004,6 +1131,8 @@ class MainWindow(QMainWindow):
             self.query_button,
             self.stop_button,
             self.detail_columns_toggle,
+            self.result_filter_button,
+            self.clear_result_filters_button,
             self.raw_diagnostics_toggle,
             self.result_table,
         )
@@ -1036,12 +1165,173 @@ class MainWindow(QMainWindow):
     def _set_detail_columns_visible(self, visible: bool) -> None:
         for column in _DETAIL_COLUMN_INDEXES:
             self.result_table.setColumnHidden(column, not visible)
+        self.result_table.setColumnHidden(15, True)
+
+    @Slot(int)
+    def _result_header_clicked(self, logical_index: int) -> None:
+        if logical_index in _FILTER_COLUMNS:
+            self._open_result_filter_menu(logical_index)
+
+    @Slot()
+    def _open_result_filter_menu(self, column: int | None = None) -> None:
+        if column is None:
+            menu = QMenu(self)
+            for logical_index, _label in _FILTER_COLUMNS.items():
+                action = menu.addAction(self._filter_header_text(logical_index))
+                action.triggered.connect(
+                    lambda _checked=False, index=logical_index: self._open_result_filter_dialog(
+                        index
+                    )
+                )
+            menu.exec(
+                self.result_filter_button.mapToGlobal(self.result_filter_button.rect().bottomLeft())
+            )
+            return
+        self._open_result_filter_dialog(column)
+
+    def _open_result_filter_dialog(self, column: int) -> None:
+        values = self._filter_candidates(column)
+        if not values:
+            self.statusBar().showMessage("현재 결과에 필터링할 값이 없습니다.", 3000)
+            return
+        selected = self._result_filter_values.get(column, set())
+        dialog = _ResultFilterDialog(
+            self,
+            title=_FILTER_COLUMNS[column],
+            values=values,
+            selected=selected,
+            filter_active=column in self._result_filter_values,
+        )
+        self._result_filter_popup = dialog
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            chosen = dialog.selected_values()
+            all_values = {value for value, _display in values}
+            if chosen == all_values:
+                self._result_filter_values.pop(column, None)
+            else:
+                self._result_filter_values[column] = chosen
+            self._apply_result_filters()
+        finally:
+            self._result_filter_popup = None
+            dialog.deleteLater()
+
+    def _filter_candidates(self, column: int) -> tuple[tuple[object, str], ...]:
+        candidates: dict[object, str] = {}
+        observed_services: dict[object, set[str]] = {}
+        for row in range(self.result_table.rowCount()):
+            item = self.result_table.item(row, column)
+            if item is None:
+                continue
+            raw = item.data(_FILTER_VALUE_ROLE)
+            if raw is None:
+                raw = item.text()
+            if raw in (None, ""):
+                continue
+            if column in (3, 5):
+                try:
+                    port = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                service = self._service_label_for_row(row, column, port)
+                observed_services.setdefault(port, set()).add(service)
+                candidates[port] = str(port)
+            else:
+                candidates[str(raw)] = str(raw)
+        for value in self._result_filter_values.get(column, set()):
+            if value not in candidates:
+                candidates[value] = f"{value} (현재 결과 없음)"
+        result: list[tuple[object, str]] = []
+        for value in sorted(
+            candidates,
+            key=lambda item: int(item) if isinstance(item, int) else str(item),
+        ):
+            display = candidates[value]
+            if isinstance(value, int):
+                services = observed_services.get(value, set())
+                if len(services) == 1 and next(iter(services)):
+                    display = next(iter(services))
+            result.append((value, display))
+        return tuple(result)
+
+    def _service_label_for_row(self, row: int, column: int, port: int) -> str:
+        protocol_item = self.result_table.item(row, 1)
+        try:
+            protocol_text = protocol_item.data(_FILTER_VALUE_ROLE) if protocol_item else None
+            if type(protocol_text) is not int:
+                return str(port)
+            protocol = protocol_text
+        except (TypeError, ValueError):
+            return str(port)
+        try:
+            service = service_definition(protocol, port)
+        except (TypeError, ValueError):
+            service = None
+        return _format_port(port, service)
+
+    def _filter_header_text(self, column: int) -> str:
+        label = _FILTER_COLUMNS[column]
+        selected = self._result_filter_values.get(column)
+        suffix = f" [{len(selected)}]" if selected is not None else ""
+        return f"{label}{suffix} ▾"
+
+    def _update_filter_controls(self) -> None:
+        active = bool(self._result_filter_values)
+        self.clear_result_filters_button.setEnabled(active)
+        active_count = sum(len(values) for values in self._result_filter_values.values())
+        self.result_filter_button.setText("결과 필터" + (f" [{active_count}]" if active else ""))
+        for column in _FILTER_COLUMNS:
+            item = self.result_table.horizontalHeaderItem(column)
+            if item is not None:
+                item.setText(self._filter_header_text(column))
+
+    @Slot()
+    def _clear_result_filters(self) -> None:
+        self._result_filter_values.clear()
+        self._apply_result_filters()
+
+    def _apply_result_filters(self) -> None:
+        for row in range(self.result_table.rowCount()):
+            matches = True
+            for column, selected in self._result_filter_values.items():
+                item = self.result_table.item(row, column)
+                value = item.data(_FILTER_VALUE_ROLE) if item is not None else None
+                matches = matches and value in selected
+            self.result_table.setRowHidden(row, not matches)
+        self._update_filter_controls()
+        visible = sum(
+            not self.result_table.isRowHidden(row) for row in range(self.result_table.rowCount())
+        )
+        current_row = self.result_table.currentRow()
+        if current_row >= 0 and self.result_table.isRowHidden(current_row):
+            self.result_table.clearSelection()
+            self.raw_view.setPlainText("결과 행을 선택하면 해당 Raw 행을 표시합니다.")
+        if self.result_table.rowCount() and visible == 0:
+            self.result_empty_label.setText("필터 조건에 맞는 행이 없습니다.")
+            self.result_empty_label.setVisible(not self.raw_diagnostics_toggle.isChecked())
+        elif self.result_table.rowCount():
+            self.result_empty_label.setVisible(False)
+        context = self.context_label.text()
+        if "결과표 표시:" in context:
+            prefix = context.split("결과표 표시:", 1)[0].rstrip()
+            filter_suffix = " · 필터 적용" if self._result_filter_values else ""
+            self._set_result_context(
+                f"{prefix}결과표 표시: {visible}/{self._result_total_rows}{filter_suffix}"
+            )
+        controller = self.findChild(QObject, "darkNocConsoleController")
+        schedule_refresh = getattr(controller, "schedule_refresh", None)
+        if callable(schedule_refresh):
+            schedule_refresh()
 
     @Slot(bool)
     def _set_details_visible(self, visible: bool) -> None:
         self.details.setVisible(visible)
         self.raw_diagnostics_toggle.setText("상세 정보 숨기기" if visible else "상세 정보 보기")
-        self.result_empty_label.setVisible(self.result_table.rowCount() == 0 and not visible)
+        visible_rows = sum(
+            not self.result_table.isRowHidden(row) for row in range(self.result_table.rowCount())
+        )
+        self.result_empty_label.setVisible(visible_rows == 0 and not visible)
         if visible:
             self._sync_result_splitter_orientation(reset_sizes=True)
 
@@ -1228,13 +1518,22 @@ class MainWindow(QMainWindow):
         self.history_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.history_empty_label.setWordWrap(True)
         layout.addWidget(self.history_empty_label)
-        self.history_table = QTableWidget(0, 6)
+        self.history_table = QTableWidget(0, 7)
         self.history_table.setAccessibleName("실행 기록 표")
         self.history_table.setAccessibleDescription(
-            "저장된 실행의 시작과 종료 시각, 상태, 관측 결과 수와 최근 전달 코드를 표시합니다."
+            "저장된 실행의 IP 기반 표시 ID, 시작·종료 시각, 경과 시간, "
+            "상태, 관측 결과 수와 최근 전달 코드를 표시합니다."
         )
         self.history_table.setHorizontalHeaderLabels(
-            ["실행 ID", "시작 시각", "종료 시각", "상태", "관측 결과", "최근 전달 코드"]
+            [
+                "실행 ID",
+                "시작 시각",
+                "종료 시각",
+                "경과 시간",
+                "상태",
+                "관측 결과",
+                "최근 전달 코드",
+            ]
         )
         self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.history_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -1271,6 +1570,10 @@ class MainWindow(QMainWindow):
     def _tab_changed(self, index: int) -> None:
         if self.tabs.widget(index) is self.history_page and self._history_dirty:
             self._refresh_history()
+        if self.tabs.widget(index) is self.history_page:
+            self._sync_history_elapsed_timer()
+        else:
+            self._history_elapsed_timer.stop()
 
     def _register_developer_inspector_catalog(self) -> None:
         inspector = self._developer_inspector
@@ -1868,6 +2171,13 @@ class MainWindow(QMainWindow):
             return
         if not self._monitoring:
             self._last_counters.clear()
+            self._result_filter_values.clear()
+            self._update_filter_controls()
+            self._run_started_at = datetime.now(UTC)
+        elif self._run_started_at is None:
+            self._run_started_at = datetime.now(UTC)
+        self._elapsed_timer.start()
+        self._refresh_elapsed_labels()
         try:
             config, request, credentials = self._read_query()
         except ValueError as exc:
@@ -1957,6 +2267,9 @@ class MainWindow(QMainWindow):
         ):
             return
         self._last_counters.clear()
+        self._run_started_at = datetime.now(UTC)
+        self._result_filter_values.clear()
+        self._update_filter_controls()
         self._monitoring = True
         self._next_storage_health_check_at = 0.0
         self._next_monitor_delay_seconds = float(self.session_interval.value())
@@ -1995,6 +2308,8 @@ class MainWindow(QMainWindow):
             self._set_state(status)
         self._set_monitor_inputs_enabled(True)
         self._set_busy(self._query_running)
+        if not self._query_running:
+            self._elapsed_timer.stop()
 
     @Slot(int, object)
     def _task_succeeded(self, generation: int, outcome: object) -> None:
@@ -2029,9 +2344,22 @@ class MainWindow(QMainWindow):
         self.context_label.setText(text)
         self._sync_result_accessibility_context()
 
+    @Slot()
+    def _refresh_elapsed_labels(self) -> None:
+        started = self._run_started_at
+        if started is None:
+            self.elapsed_label.setText("시작 시각: - · 경과: 00:00:00")
+            return
+        now = datetime.now(UTC)
+        elapsed = _format_elapsed(started, now)
+        local_started = started.astimezone(_KST).strftime("%Y-%m-%d %H:%M:%S KST")
+        self.elapsed_label.setText(f"시작 시각: {local_started} · 경과: {elapsed}")
+
     def _sync_result_accessibility_context(self) -> None:
         context = self.context_label.text().strip()
         suffix = f" 현재 조회 범위: {context}." if context else ""
+        if self._result_filter_values:
+            suffix += " 현재 결과 필터가 적용되어 있습니다."
         self.result_table.setAccessibleDescription(
             f"{_RESULT_TABLE_ACCESSIBLE_DESCRIPTION}{suffix}"
         )
@@ -2056,6 +2384,7 @@ class MainWindow(QMainWindow):
         self._pending_result_rows = prepared.visible_rows
         self._pending_result_index = 0
         self._pending_result_total_rows = prepared.total_rows
+        self._result_total_rows = prepared.total_rows
         self.result_table.setRowCount(0)
         self.result_empty_label.setText(
             "조회 조건과 일치하는 세션이 없습니다."
@@ -2071,9 +2400,11 @@ class MainWindow(QMainWindow):
         controllers = ", ".join(getattr(outcome, "controllers", ())) or "-"
         self._set_result_context(
             f"MM: {used_mm}   |   조회 MD: {controllers}   |   "
-            f"현재 일치: {len(observations)}   |   "
-            f"화면 표시: {len(prepared.visible_rows)}/{prepared.total_rows}"
+            f"이번 조회 발견 행: {len(observations)}   |   "
+            f"결과표 표시: {len(prepared.visible_rows)}/{prepared.total_rows}"
         )
+        if self._result_filter_values:
+            self._apply_result_filters()
         self.diagnostics_list.clear()
         for event in getattr(outcome, "diagnostics", ()):
             code = getattr(event, "code", None)
@@ -2161,6 +2492,7 @@ class MainWindow(QMainWindow):
         else:
             self._pending_result_rows = ()
             self._pending_result_index = 0
+            self._apply_result_filters()
 
     def _append_observation(
         self,
@@ -2172,17 +2504,20 @@ class MainWindow(QMainWindow):
     ) -> None:
         row = self.result_table.rowCount()
         self.result_table.insertRow(row)
-        flag_details = interpret_flags(observation.flags)
         severity = overall_flag_severity(observation.flags)
-        flag_status = ", ".join(item.label_ko for item in flag_details) or "표시된 특이사항 없음"
         observation_status = lifecycle_status or "현재 관측됨"
+        source_port = _format_port_for_observation(observation.protocol, observation.source_port)
+        destination_port = _format_port_for_observation(
+            observation.protocol,
+            observation.destination_port,
+        )
         values = (
             observation.controller_name,
             _safe_protocol_label(observation.protocol),
             observation.source_ip,
-            str(observation.source_port),
+            source_port,
             observation.destination_ip,
-            str(observation.destination_port),
+            destination_port,
             _display_number(observation.packets),
             _display_number(observation.bytes_count),
             packet_delta,
@@ -2192,23 +2527,29 @@ class MainWindow(QMainWindow):
             _display_observed_at(observation),
             observation.flags or "-",
             observation_status,
-            flag_status,
+            "",
         )
         for column, value in enumerate(values):
             item = QTableWidgetItem(value)
             if column == 0:
                 item.setData(_raw_data_role(), observation.raw_line)
+            if column == 1:
+                item.setData(_FILTER_VALUE_ROLE, observation.protocol)
+            if column in (2, 4):
+                item.setData(_FILTER_VALUE_ROLE, value)
             if column in (3, 5):
                 port = observation.source_port if column == 3 else observation.destination_port
+                item.setData(_FILTER_VALUE_ROLE, port)
                 try:
                     service = service_definition(observation.protocol, port)
                 except (TypeError, ValueError):
                     service = None
                 if service is not None:
                     item.setToolTip(
-                        f"포트 번호 기준 대표 서비스 후보: {service.label} ({service.port})"
+                        "포트 번호 기준 대표 서비스 후보입니다. "
+                        "실제 트래픽 서비스와 다를 수 있습니다."
                     )
-            if column in (13, 15) and self.property("themeContrast") != "high":
+            if column == 13 and self.property("themeContrast") != "high":
                 item.setForeground(
                     _severity_color(
                         severity.name,
@@ -2218,10 +2559,6 @@ class MainWindow(QMainWindow):
             if column == 14:
                 item.setToolTip(
                     f"{observation_status}\n이 값은 장비 장애나 통신 성공 판정이 아닙니다."
-                )
-            if column == 15:
-                item.setToolTip(
-                    f"{flag_status}\n장비 Flags의 참고용 풀이며 정상 통신을 보장하지 않습니다."
                 )
             self.result_table.setItem(row, column, item)
 
@@ -2272,6 +2609,9 @@ class MainWindow(QMainWindow):
         self._environment_cancel_generation = None
         self._set_busy(False)
         self._cancel_token = None
+        self._refresh_elapsed_labels()
+        if not self._monitoring:
+            self._elapsed_timer.stop()
         if user_cancelled and not self._closing_requested:
             self._set_state("대기")
         elif environment_cancelled and self._monitoring and not self._closing_requested:
@@ -2396,7 +2736,10 @@ class MainWindow(QMainWindow):
             return None
         row = selected_rows[0].row()
         item = self.history_table.item(row, 0)
-        return item.text() if item else None
+        if item is None:
+            return None
+        value = item.data(_RUN_ID_ROLE)
+        return str(value) if value not in (None, "") else None
 
     @Slot()
     def _refresh_history(self) -> None:
@@ -2530,35 +2873,64 @@ class MainWindow(QMainWindow):
             row = self.history_table.rowCount()
             self.history_table.insertRow(row)
             if isinstance(run, dict):
+                internal_run_id = str(run.get("id", ""))
+                started_at = str(run.get("started_at", ""))
+                ended_at = str(run.get("ended_at", "") or "")
+                status_value = str(run.get("status", ""))
                 values = (
-                    str(run.get("id", "")),
-                    str(run.get("started_at", "")),
-                    str(run.get("ended_at", "") or "-"),
-                    str(run.get("status", "")),
+                    _display_run_identifier(run),
+                    _display_timestamp(started_at),
+                    _display_timestamp(ended_at) if ended_at else "-",
+                    _format_elapsed_from_text(started_at, ended_at)
+                    if ended_at
+                    else _format_elapsed(_parse_timestamp(started_at), datetime.now(UTC))
+                    if status_value == "RUNNING"
+                    else "-",
+                    status_value,
                     str(run.get("observation_count", 0)),
                     str(run.get("latest_support_code", "") or "-"),
                 )
             else:
+                internal_run_id = str(getattr(run, "run_id", ""))
+                started_at = str(getattr(run, "started_at", ""))
+                ended_at = str(getattr(run, "finished_at", "") or "")
+                status_value = str(getattr(run, "status", ""))
                 values = (
-                    str(getattr(run, "run_id", "")),
-                    str(getattr(run, "started_at", "")),
-                    str(getattr(run, "finished_at", "") or "-"),
-                    str(getattr(run, "status", "")),
+                    _display_run_identifier(
+                        {
+                            "id": getattr(run, "run_id", ""),
+                            "source_ip": getattr(run, "source_ip", ""),
+                            "destination_ip": getattr(run, "destination_ip", ""),
+                            "started_at": started_at,
+                        }
+                    ),
+                    _display_timestamp(started_at),
+                    _display_timestamp(ended_at) if ended_at else "-",
+                    _format_elapsed_from_text(started_at, ended_at)
+                    if ended_at
+                    else _format_elapsed(_parse_timestamp(started_at), datetime.now(UTC))
+                    if status_value == "RUNNING"
+                    else "-",
+                    status_value,
                     str(getattr(run, "observation_count", 0)),
                     str(getattr(run, "latest_support_code", "") or "-"),
                 )
             for column, value in enumerate(values):
-                display_value = _history_status_label(value) if column == 3 else value
+                display_value = _history_status_label(value) if column == 4 else value
                 item = QTableWidgetItem(display_value)
-                if column == 3 and display_value != value:
+                if column == 0:
+                    item.setData(_RUN_ID_ROLE, internal_run_id)
+                if column == 1:
+                    item.setData(Qt.ItemDataRole.UserRole, started_at)
+                if column == 4 and display_value != value:
                     item.setToolTip(f"저장 상태 코드: {value}")
-                if column == 5:
+                if column == 6:
                     item.setToolTip(
                         "사내 정보 없이 전달할 수 있는 최근 진단 코드입니다. "
                         "'-'는 저장된 전달 코드가 없다는 뜻입니다."
                     )
                 self.history_table.setItem(row, column, item)
-            if values[0] == selected_run_id:
+            if internal_run_id == selected_run_id:
                 selected_row = row
         if selected_row >= 0:
             self.history_table.selectRow(selected_row)
@@ -2567,6 +2939,40 @@ class MainWindow(QMainWindow):
         )
         self.history_empty_label.setVisible(self.history_table.rowCount() == 0)
         self._sync_history_action_state()
+        self._sync_history_elapsed_timer()
+
+    def _sync_history_elapsed_timer(self) -> None:
+        if self.tabs.currentWidget() is not self.history_page:
+            self._history_elapsed_timer.stop()
+            return
+        running = False
+        for row in range(self.history_table.rowCount()):
+            status_item = self.history_table.item(row, 4)
+            if status_item is not None and status_item.text() == "진행 중":
+                running = True
+                break
+        if running:
+            self._history_elapsed_timer.start()
+        else:
+            self._history_elapsed_timer.stop()
+
+    @Slot()
+    def _refresh_history_elapsed_cells(self) -> None:
+        for row in range(self.history_table.rowCount()):
+            status_item = self.history_table.item(row, 4)
+            if status_item is None or status_item.text() != "진행 중":
+                continue
+            start_item = self.history_table.item(row, 1)
+            if start_item is None:
+                continue
+            started = _parse_timestamp(
+                start_item.data(Qt.ItemDataRole.UserRole) or start_item.text()
+            )
+            if started is None:
+                continue
+            elapsed_item = self.history_table.item(row, 3)
+            if elapsed_item is not None:
+                elapsed_item.setText(_format_elapsed(started, datetime.now(UTC)))
 
     @Slot()
     def _export_selected_run(self) -> None:
@@ -2776,13 +3182,41 @@ class MainWindow(QMainWindow):
         elif kind == "export-csv":
             self.statusBar().showMessage("CSV 내보내기를 완료했습니다.", 5000)
             if not self._closing_requested:
-                QMessageBox.information(self, "내보내기 완료", str(result))
+                self._show_export_completion("CSV 내보내기", result)
         elif kind == "export-html":
             self.statusBar().showMessage("HTML 보고서를 만들었습니다.", 5000)
             if not self._closing_requested:
-                QMessageBox.information(self, "HTML 보고서 완료", str(result))
+                self._show_export_completion("HTML 보고서", result)
         self._drain_preview_discard_queue()
         self._close_if_idle()
+
+    def _show_export_completion(self, title: str, result: object) -> None:
+        path = Path(result) if isinstance(result, (str, Path)) else None
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setWindowTitle(f"{title} 완료")
+        if path is None:
+            dialog.setText(f"{title}를 완료했습니다.")
+        else:
+            dialog.setText(f"{title}를 저장했습니다.")
+            dialog.setInformativeText(path.name)
+        open_button = dialog.addButton("파일 열기", QMessageBox.ButtonRole.AcceptRole)
+        dialog.addButton("확인", QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(open_button)
+        dialog.exec()
+        if dialog.clickedButton() is not open_button or path is None:
+            return
+        try:
+            if not path.is_file():
+                raise OSError("파일이 존재하지 않습니다.")
+            opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        except (OSError, RuntimeError):
+            opened = False
+        if not opened:
+            self.statusBar().showMessage(
+                f"기본 앱으로 파일을 열지 못했습니다. 저장 위치: {path.name}",
+                7000,
+            )
 
     def _confirm_delete_preview(self, preview: DeletePreview) -> None:
         answer = QMessageBox.warning(
@@ -2886,6 +3320,8 @@ class MainWindow(QMainWindow):
         self._closing_requested = True
         self._close_when_idle = True
         self._result_render_timer.stop()
+        self._elapsed_timer.stop()
+        self._history_elapsed_timer.stop()
         self._pending_result_rows = ()
         self._pending_result_index = 0
         self._cancel_active_work(user_requested=True)
@@ -3079,8 +3515,76 @@ def _safe_protocol_label(value: object) -> str:
     return protocol_label(value)
 
 
+def _format_port(port: int, service: object | None = None) -> str:
+    if service is None:
+        return str(port)
+    label = str(getattr(service, "label", "")).strip()
+    return f"{port}({label})" if label else str(port)
+
+
+def _format_port_for_observation(protocol: int, port: int) -> str:
+    try:
+        service = service_definition(protocol, port)
+    except (TypeError, ValueError):
+        service = None
+    return _format_port(port, service)
+
+
 def _display_observed_at(observation: SessionObservation) -> str:
-    return observation.observed_at.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    return observation.observed_at.astimezone(_KST).strftime("%Y-%m-%d %H:%M:%S KST")
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _display_timestamp(value: object) -> str:
+    parsed = _parse_timestamp(value)
+    if parsed is None:
+        return "-"
+    return parsed.astimezone(_KST).strftime("%Y-%m-%d %H:%M:%S KST")
+
+
+def _format_elapsed(started: datetime | None, ended: datetime | None) -> str:
+    if started is None or ended is None:
+        return "-"
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=UTC)
+    if ended.tzinfo is None:
+        ended = ended.replace(tzinfo=UTC)
+    seconds = int(max(0, (ended - started).total_seconds()))
+    days, remainder = divmod(seconds, 86_400)
+    hours, remainder = divmod(remainder, 3_600)
+    minutes, seconds = divmod(remainder, 60)
+    if days:
+        return f"{days}일 {hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _format_elapsed_from_text(started: object, ended: object) -> str:
+    start_value = _parse_timestamp(started)
+    end_value = _parse_timestamp(ended)
+    if end_value is None:
+        return "-"
+    return _format_elapsed(start_value, end_value)
+
+
+def _display_run_identifier(run: dict[str, object]) -> str:
+    source = str(run.get("source_ip") or "-").strip() or "-"
+    destination = str(run.get("destination_ip") or "-").strip() or "-"
+    started = _display_timestamp(run.get("started_at"))
+    return f"{source} → {destination} · {started}"
 
 
 def _flow_key(observation: SessionObservation) -> str:

@@ -129,12 +129,12 @@ def service_definition(protocol: int, port: int) -> ServiceDefinition | None:
 
 
 def service_label(protocol: int, port: int) -> str:
-    """Return ``NAME (port)`` for a known pair, otherwise the numeric port."""
+    """Return ``port(NAME)`` for a known pair, otherwise the numeric port."""
 
     definition = service_definition(protocol, port)
     if definition is None:
         return str(port)
-    return f"{definition.label} ({port})"
+    return f"{port}({definition.label})"
 
 
 def _validate_protocol(number: int) -> None:

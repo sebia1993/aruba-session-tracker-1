@@ -8,7 +8,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QEvent, QObject, Qt
+from PySide6.QtCore import QEvent, QObject, QPoint, Qt
 from PySide6.QtGui import QAction, QContextMenuEvent, QKeyEvent, QKeySequence, QMouseEvent
 from PySide6.QtTest import QSignalSpy, QTest
 from PySide6.QtWidgets import (
@@ -428,6 +428,51 @@ def test_context_menu_is_blocked_and_inspector_widgets_are_excluded(
     QTest.mouseClick(bar.exit_button, Qt.MouseButton.LeftButton)
     assert inspector.selection_mode is False
     assert inspector.enabled is False
+
+
+def test_right_click_on_blank_area_cancels_selection_without_opening_menu(
+    qtbot: Any,
+    inspector: DeveloperInspectorController,
+) -> None:
+    app = _app()
+    host = QWidget()
+    qtbot.addWidget(host)
+    layout = QVBoxLayout(host)
+    target = QPushButton("선택 대상", host)
+    layout.addWidget(target)
+    inspector.register_widget(target, _metadata("MAIN-RIGHT-CLICK-TARGET"))
+    host.resize(320, 180)
+    host.show()
+    app.processEvents()
+
+    QTest.keyClick(target, Qt.Key.Key_F12)
+    assert inspector.begin_selection()
+    blank = QPoint(host.width() - 8, host.height() - 8)
+    global_blank = host.mapToGlobal(blank)
+    press = QMouseEvent(
+        QEvent.Type.MouseButtonPress,
+        blank,
+        global_blank,
+        Qt.MouseButton.RightButton,
+        Qt.MouseButton.RightButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    release = QMouseEvent(
+        QEvent.Type.MouseButtonRelease,
+        blank,
+        global_blank,
+        Qt.MouseButton.RightButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(host, press)
+    QApplication.sendEvent(host, release)
+    app.processEvents()
+
+    assert press.isAccepted()
+    assert release.isAccepted()
+    assert inspector.selection_mode is False
+    assert inspector.enabled is True
 
 
 def test_non_inspector_modal_cancels_selection_but_keeps_f12_mode_usable(

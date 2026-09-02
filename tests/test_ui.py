@@ -40,7 +40,9 @@ from aruba_session_tracker.ui.main_window import (
     ApprovalBridge,
     _counter_delta,
     _display_bytes,
+    _display_run_identifier,
     _fatal_diagnostic_code,
+    _format_elapsed,
     _history_status_label,
     _lifecycle_status,
     _optional_port,
@@ -126,11 +128,10 @@ def test_main_window_runs_query_and_renders_korean_flag_status(
     qtbot.waitUntil(lambda: window.result_table.rowCount() == 1, timeout=3000)  # type: ignore[attr-defined]
 
     assert window.result_table.item(0, 1).text() == "TCP (6)"
-    assert window.result_table.item(0, 5).toolTip() == (
-        "포트 번호 기준 대표 서비스 후보: HTTPS (443)"
-    )
+    assert window.result_table.item(0, 5).text() == "443(HTTPS)"
+    assert "대표 서비스 후보" in window.result_table.item(0, 5).toolTip()
     assert window.result_table.item(0, 14).text() == "현재 관측됨"
-    assert window.result_table.item(0, 15).text() == "차단, SYN 없음"
+    assert window.result_table.item(0, 15).text() == ""
     assert "MM-Conductor" in window.context_label.text()
     assert window.password_edit.text() == "session-only"
     window.close()
@@ -189,6 +190,8 @@ def test_presentation_tracks_query_direction_and_empty_states(
                 "id": "presentation-run",
                 "started_at": "2026-08-31T01:00:00Z",
                 "ended_at": "2026-08-31T01:00:05Z",
+                "source_ip": "192.0.2.10",
+                "destination_ip": "203.0.113.20",
                 "status": "COMPLETED",
                 "observation_count": 1,
                 "latest_support_code": "AS20",
@@ -197,9 +200,10 @@ def test_presentation_tracks_query_direction_and_empty_states(
         None,
     )
     assert not window.history_empty_label.isVisible()
-    assert window.history_table.columnCount() == 6
-    assert window.history_table.item(0, 5).text() == "AS20"
-    assert "사내 정보 없이" in window.history_table.item(0, 5).toolTip()
+    assert window.history_table.columnCount() == 7
+    assert "192.0.2.10" in window.history_table.item(0, 0).text()
+    assert window.history_table.item(0, 6).text() == "AS20"
+    assert "사내 정보 없이" in window.history_table.item(0, 6).toolTip()
     assert window.delete_all_button.isEnabled()
     assert not window.export_button.isEnabled()
     window.history_table.selectRow(0)
@@ -269,8 +273,7 @@ def test_result_semantic_labels_fall_back_for_out_of_range_legacy_values(
     assert window.result_table.item(0, 5).toolTip() == ""
     assert window.result_table.item(0, 14).text() == "현재 관측됨"
     assert "장비 장애" in window.result_table.item(0, 14).toolTip()
-    assert window.result_table.item(0, 15).text() == "표시된 특이사항 없음"
-    assert "정상 통신을 보장하지" in window.result_table.item(0, 15).toolTip()
+    assert window.result_table.item(0, 15).text() == ""
     window.close()
 
 
@@ -334,6 +337,69 @@ def test_optional_port_accepts_only_blank_or_ascii_port_range() -> None:
         _optional_port("not-a-port", "목적지 포트")
     with pytest.raises(ValueError, match="0~65535 범위"):
         _optional_port("65536", "목적지 포트")
+
+
+def test_run_display_identifier_uses_query_ips_and_elapsed_format() -> None:
+    assert (
+        _display_run_identifier(
+            {
+                "source_ip": "192.0.2.10",
+                "destination_ip": "203.0.113.20",
+                "started_at": "2026-09-02T05:32:10Z",
+            }
+        )
+        == "192.0.2.10 → 203.0.113.20 · 2026-09-02 14:32:10 KST"
+    )
+    assert (
+        _format_elapsed(
+            datetime(2026, 9, 2, 0, 0, tzinfo=UTC),
+            datetime(2026, 9, 3, 1, 2, 3, tzinfo=UTC),
+        )
+        == "1일 01:02:03"
+    )
+
+
+def test_result_filters_use_raw_ip_and_port_values_without_guessing_services(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        ConfigRepository(tmp_path / "config.json"),
+        _EmptyStore(),  # type: ignore[arg-type]
+        _Executor(),
+    )
+    qtbot.addWidget(window)  # type: ignore[attr-defined]
+    rows = (
+        ("192.0.2.10", "203.0.113.20", 53000, 443),
+        ("192.0.2.11", "203.0.113.21", 53001, 65000),
+    )
+    for source_ip, destination_ip, source_port, destination_port in rows:
+        window._append_observation(
+            SessionObservation(
+                controller_name="MD-01",
+                controller_host="198.51.100.21",
+                protocol=6,
+                source_ip=source_ip,
+                destination_ip=destination_ip,
+                source_port=source_port,
+                destination_port=destination_port,
+            )
+        )
+    window._result_total_rows = 2
+    window._set_result_context("결과표 표시: 2/2")
+
+    candidates = window._filter_candidates(5)
+    assert candidates == ((443, "443(HTTPS)"), (65000, "65000"))
+    window._result_filter_values = {2: {"192.0.2.10"}, 5: {443}}
+    window._apply_result_filters()
+
+    assert not window.result_table.isRowHidden(0)
+    assert window.result_table.isRowHidden(1)
+    assert "결과표 표시: 1/2" in window.context_label.text()
+    assert window.clear_result_filters_button.isEnabled()
+    window._clear_result_filters()
+    assert not any(window.result_table.isRowHidden(row) for row in range(2))
+    window.close()
 
 
 def test_safe_query_failure_maps_known_storage_and_unexpected_errors() -> None:
@@ -597,9 +663,9 @@ def test_html_report_export_is_independent_from_csv(
         lambda *_args, **_kwargs: (str(destination), "HTML 문서 (*.html)"),
     )
     monkeypatch.setattr(  # type: ignore[attr-defined]
-        QMessageBox,
-        "information",
-        lambda _parent, title, message: messages.append((title, str(message))),
+        window,
+        "_show_export_completion",
+        lambda title, result: messages.append((title, str(result))),
     )
 
     window._export_selected_run_html()
@@ -611,7 +677,7 @@ def test_html_report_export_is_independent_from_csv(
     assert window.export_button.text() == "CSV 내보내기"
     assert window.html_export_button.text() == "HTML 보고서"
     assert destination.is_file()
-    assert messages == [("HTML 보고서 완료", str(destination))]
+    assert messages == [("HTML 보고서", str(destination))]
     window.close()
 
 
@@ -1278,23 +1344,24 @@ def test_query_screen_defaults_to_primary_monitoring_and_progressive_details(
     assert "장비 장애" in window.result_status_guide.text()
     assert not window.advanced_panel.isVisible()
     assert not window.details.isVisible()
-    assert all(window.result_table.isColumnHidden(column) for column in (*range(5, 12), 13))
+    assert all(window.result_table.isColumnHidden(column) for column in (0, *range(6, 12), 13, 15))
     assert [
         window.result_table.horizontalHeaderItem(column).text()
-        for column in (0, 1, 2, 3, 4, 12, 14, 15)
+        for column in (0, 1, 2, 3, 4, 5, 12, 14, 15)
     ] == [
         "장비",
         "프로토콜",
-        "출발지 IP",
-        "출발지 포트",
-        "목적지 IP",
+        "출발지 IP ▾",
+        "출발지 포트 ▾",
+        "목적지 IP ▾",
+        "목적지 포트 ▾",
         "마지막 확인 시각",
         "관측 상태",
-        "세션 특이사항",
+        "",
     ]
     assert window.result_table.horizontalHeaderItem(13).text() == "장비 Flags"
     assert "장비 전체 상태" in window.result_table.horizontalHeaderItem(14).toolTip()
-    assert "정상 통신을 보장하지" in window.result_table.horizontalHeaderItem(15).toolTip()
+    assert window.result_table.horizontalHeaderItem(15).toolTip() == ""
 
     window.advanced_toggle_button.setChecked(True)
     window.detail_columns_toggle.setChecked(True)
@@ -1303,7 +1370,7 @@ def test_query_screen_defaults_to_primary_monitoring_and_progressive_details(
     assert window.details.isVisible()
     assert window.advanced_toggle_button.text() == "고급 조건 숨기기"
     assert window.raw_diagnostics_toggle.text() == "상세 정보 숨기기"
-    assert all(not window.result_table.isColumnHidden(column) for column in (*range(5, 12), 13))
+    assert all(not window.result_table.isColumnHidden(column) for column in (0, *range(6, 12), 13))
     advanced_layout = window.advanced_panel.layout()
     assert isinstance(advanced_layout, QGridLayout)
     for control in (
@@ -1363,7 +1430,7 @@ def test_query_progressive_controls_are_keyboard_and_accessibility_ready(
     assert _next_keyboard_focus(window.advanced_toggle_button) is window.enable_edit
     qtbot.keyClick(window.detail_columns_toggle, Qt.Key.Key_Space)  # type: ignore[attr-defined]
     assert window.detail_columns_toggle.isChecked()
-    assert all(not window.result_table.isColumnHidden(column) for column in (*range(5, 12), 13))
+    assert all(not window.result_table.isColumnHidden(column) for column in (0, *range(6, 12), 13))
     qtbot.keyClick(window.raw_diagnostics_toggle, Qt.Key.Key_Space)  # type: ignore[attr-defined]
     assert window.raw_diagnostics_toggle.isChecked()
     assert window.details.isVisible()
@@ -1512,7 +1579,10 @@ assert window.advanced_toggle_button.accessibleDescription()
 assert window.result_status_guide.isVisible()
 assert window.advanced_panel.isHidden()
 assert window.details.isHidden()
-assert all(window.result_table.isColumnHidden(column) for column in (*range(5, 12), 13))
+assert all(
+    window.result_table.isColumnHidden(column)
+    for column in (0, *range(6, 12), 13, 15)
+)
 window.advanced_toggle_button.setChecked(True)
 window.raw_diagnostics_toggle.setChecked(True)
 deadline = time.monotonic() + 3
@@ -1540,7 +1610,7 @@ for control in (
     assert window.advanced_panel.rect().contains(control.geometry().bottomRight())
 assert window.result_table.viewport().geometry().height() >= 40
 assert (
-    window.result_table.viewport().visibleRegion().boundingRect().height()
+    window.result_table.viewport().geometry().height()
     >= window.result_table.verticalHeader().defaultSectionSize()
 )
 assert window.details.width() >= 300
@@ -1756,7 +1826,7 @@ def test_result_rendering_caps_visible_rows_without_dropping_outcome_count(
         timeout=5_000,
     )
     assert window.result_table.rowCount() == 2_000
-    assert "화면 표시: 2000/2005" in window.context_label.text()
+    assert "결과표 표시: 2000/2005" in window.context_label.text()
     assert "DISPLAY_LIMIT" in window.diagnostics_list.item(0).text()
     raw_role = int(Qt.ItemDataRole.UserRole)
     assert window.result_table.item(0, 0).data(raw_role)
