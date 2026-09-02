@@ -9,6 +9,9 @@ import stat
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import BinaryIO
+
+import aruba_session_tracker.storage.windows_file_metadata as windows_file_metadata
 
 ReplaceCallable = Callable[[Path, Path], object]
 _HASH_CHUNK_SIZE = 1024 * 1024
@@ -24,12 +27,17 @@ def replace_with_retry(
     replace: ReplaceCallable = os.replace,
     expected_sha256: str | None = None,
     expected_size: int | None = None,
+    use_native_windows_identity: bool = False,
 ) -> None:
     """Replace ``destination`` with bounded retries for Windows sharing locks.
 
     Antivirus and indexing processes can briefly hold a just-written file on
     Windows.  Retrying only the known sharing/access failures avoids hiding
     path, permission, or integrity defects.
+
+    Native 128-bit identity is opt-in for application-managed files. External
+    FAT/exFAT destinations keep the CRT-compatible path because ``FileIdInfo``
+    is not available on every Windows filesystem.
     """
 
     source = Path(os.path.abspath(source))
@@ -37,7 +45,10 @@ def replace_with_retry(
     # Always fingerprint the actual staged bytes before the first publication
     # attempt.  Trusting a caller-supplied digest without comparing it here
     # would allow a same-sized corrupted staging file to be published.
-    source_state = _capture_hashed_file_state(source)
+    source_state = _capture_hashed_file_state(
+        source,
+        use_native_windows_identity=use_native_windows_identity,
+    )
     source_sha = source_state.sha256 if expected_sha256 is None else expected_sha256
     if source_sha is None:  # pragma: no cover - defensive invariant
         raise OSError("atomic replace source fingerprint is unavailable")
@@ -47,7 +58,12 @@ def replace_with_retry(
     source_parent = _directory_state(source.parent)
     destination_parent = _directory_state(destination.parent)
     destination_state = (
-        _capture_hashed_file_state(destination) if os.path.lexists(destination) else None
+        _capture_hashed_file_state(
+            destination,
+            use_native_windows_identity=use_native_windows_identity,
+        )
+        if os.path.lexists(destination)
+        else None
     )
     for attempt, delay in enumerate(WINDOWS_FILE_RETRY_DELAYS):
         if delay:
@@ -64,8 +80,13 @@ def replace_with_retry(
                 source_state,
                 expected_sha256=source_sha,
                 expected_size=source_size,
+                use_native_windows_identity=use_native_windows_identity,
             )
-            _validate_destination_state(destination, destination_state)
+            _validate_destination_state(
+                destination,
+                destination_state,
+                use_native_windows_identity=use_native_windows_identity,
+            )
             if _can_use_windows_write_through(replace):
                 _move_file_ex_write_through(source, destination)
             else:
@@ -162,7 +183,14 @@ def _validate_directory_state(path: Path, expected: _DirectoryState) -> None:
         raise OSError("atomic replace parent identity changed during retry")
 
 
-def _file_state(path: Path, *, with_hash: bool) -> _FileState:
+def _file_state(
+    path: Path,
+    *,
+    with_hash: bool,
+    use_native_windows_identity: bool = False,
+) -> _FileState:
+    if use_native_windows_identity and windows_file_metadata.available():
+        return _windows_file_state(path, with_hash=with_hash)
     info = os.lstat(path)
     if not stat.S_ISREG(info.st_mode) or _is_reparse(info):
         raise OSError("atomic replace path is not a plain regular file")
@@ -191,13 +219,80 @@ def _file_state(path: Path, *, with_hash: bool) -> _FileState:
     )
 
 
-def _capture_hashed_file_state(path: Path) -> _FileState:
+def _windows_file_state(path: Path, *, with_hash: bool) -> _FileState:
+    if not with_hash:
+        info = windows_file_metadata.from_path(path)
+        _validate_windows_plain_file(info)
+        return _file_state_from_windows(info, sha256=None)
+
+    with path.open("rb") as stream:
+        opened = windows_file_metadata.from_descriptor(stream.fileno())
+        _validate_windows_plain_file(opened)
+        digest, bytes_read = _hash_stream(stream)
+        opened_after = windows_file_metadata.from_descriptor(stream.fileno())
+    through_path = windows_file_metadata.from_path(path)
+    _validate_windows_plain_file(opened_after)
+    _validate_windows_plain_file(through_path)
+    expected_state = _windows_file_state_key(opened)
+    if (
+        bytes_read != opened.file_size
+        or _windows_file_state_key(opened_after) != expected_state
+        or _windows_file_state_key(through_path) != expected_state
+    ):
+        raise OSError("atomic replace file changed while fingerprinting")
+    return _file_state_from_windows(opened, sha256=digest)
+
+
+def _validate_windows_plain_file(info: windows_file_metadata.WindowsFileMetadata) -> None:
+    if info.identity == (0, 0):
+        raise OSError("atomic replace file identity is unavailable")
+    if not info.is_disk_file or info.is_reparse_point:
+        raise OSError("atomic replace path is not a plain regular file")
+    if info.number_of_links != 1:
+        raise OSError("atomic replace path must have exactly one hard link")
+
+
+def _windows_file_state_key(
+    info: windows_file_metadata.WindowsFileMetadata,
+) -> tuple[int, int, int, int]:
+    return (*info.identity, info.modified_ns, info.file_size)
+
+
+def _file_state_from_windows(
+    info: windows_file_metadata.WindowsFileMetadata,
+    *,
+    sha256: str | None,
+) -> _FileState:
+    return _FileState(
+        device=info.volume_serial_number,
+        inode=info.file_index,
+        modified_ns=info.modified_ns,
+        sha256=sha256,
+        size=info.file_size,
+    )
+
+
+def _capture_hashed_file_state(
+    path: Path,
+    *,
+    use_native_windows_identity: bool = False,
+) -> _FileState:
     """Fingerprint one fixed file identity across transient Windows opens."""
 
-    initial = retry_windows_file_operation(lambda: _file_state(path, with_hash=False))
+    initial = retry_windows_file_operation(
+        lambda: _file_state(
+            path,
+            with_hash=False,
+            use_native_windows_identity=use_native_windows_identity,
+        )
+    )
 
     def capture() -> _FileState:
-        current = _file_state(path, with_hash=True)
+        current = _file_state(
+            path,
+            with_hash=True,
+            use_native_windows_identity=use_native_windows_identity,
+        )
         if (
             current.device,
             current.inode,
@@ -221,8 +316,13 @@ def _validate_file_state(
     *,
     expected_sha256: str,
     expected_size: int,
+    use_native_windows_identity: bool = False,
 ) -> None:
-    current = _file_state(path, with_hash=True)
+    current = _file_state(
+        path,
+        with_hash=True,
+        use_native_windows_identity=use_native_windows_identity,
+    )
     if (
         current.device,
         current.inode,
@@ -239,7 +339,12 @@ def _validate_file_state(
         raise OSError("atomic replace source identity or fingerprint changed during retry")
 
 
-def _validate_destination_state(path: Path, expected: _FileState | None) -> None:
+def _validate_destination_state(
+    path: Path,
+    expected: _FileState | None,
+    *,
+    use_native_windows_identity: bool = False,
+) -> None:
     if expected is None:
         if os.path.lexists(path):
             raise OSError("atomic replace destination appeared during retry")
@@ -252,15 +357,23 @@ def _validate_destination_state(path: Path, expected: _FileState | None) -> None
         expected,
         expected_sha256=expected.sha256,
         expected_size=expected.size,
+        use_native_windows_identity=use_native_windows_identity,
     )
 
 
 def _hash_file(path: Path) -> str:
-    digest = hashlib.sha256()
     with path.open("rb") as stream:
-        while chunk := stream.read(_HASH_CHUNK_SIZE):
-            digest.update(chunk)
-    return digest.hexdigest()
+        digest, _size = _hash_stream(stream)
+    return digest
+
+
+def _hash_stream(stream: BinaryIO) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    while chunk := stream.read(_HASH_CHUNK_SIZE):
+        digest.update(chunk)
+        size += len(chunk)
+    return digest.hexdigest(), size
 
 
 def _is_reparse(info: os.stat_result) -> bool:

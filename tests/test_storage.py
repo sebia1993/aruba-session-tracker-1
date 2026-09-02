@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -15,7 +16,7 @@ from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
@@ -815,6 +816,173 @@ def test_record_poll_batch_is_exactly_once_for_the_same_poll_id(tmp_path: Path) 
         "lifecycle_events": 1,
     }
     assert len(tuple(store.raw_root.rglob("*.txt"))) == 1
+
+
+@pytest.mark.parametrize("include_raw", (False, True))
+def test_poll_batch_uses_native_windows_metadata_when_crt_stat_is_incomplete(
+    include_raw: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    run_id = _run(store)
+    observation = _observation()
+    original_lstat = os.lstat
+
+    class IncompleteRegularStat:
+        def __init__(self, info: os.stat_result) -> None:
+            self._info = info
+
+        @property
+        def st_dev(self) -> int:
+            return 0
+
+        @property
+        def st_ino(self) -> int:
+            return 0
+
+        @property
+        def st_size(self) -> int:
+            return 0
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._info, name)
+
+    def incomplete_regular_lstat(
+        path: object,
+        *args: object,
+        **kwargs: object,
+    ) -> os.stat_result | IncompleteRegularStat:
+        info = original_lstat(path, *args, **kwargs)  # type: ignore[arg-type]
+        if not stat.S_ISREG(info.st_mode):
+            return info
+        return IncompleteRegularStat(info)
+
+    def native_info(info: os.stat_result) -> object:
+        attributes = 0x10 if stat.S_ISDIR(info.st_mode) else 0
+        return session_store_module.windows_file_metadata.WindowsFileMetadata(
+            volume_serial_number=int(info.st_dev),
+            file_index=int(info.st_ino),
+            number_of_links=int(info.st_nlink),
+            file_attributes=attributes,
+            file_size=int(info.st_size),
+            modified_ns=int(info.st_mtime_ns),
+        )
+
+    monkeypatch.setattr(os, "lstat", incomplete_regular_lstat)
+    monkeypatch.setattr(
+        session_store_module.windows_file_metadata,
+        "available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        session_store_module.windows_file_metadata,
+        "from_path",
+        lambda path: native_info(os.stat(path, follow_symlinks=False)),
+    )
+    monkeypatch.setattr(
+        session_store_module.windows_file_metadata,
+        "from_descriptor",
+        lambda descriptor: native_info(os.fstat(descriptor)),
+    )
+    outcome = QueryOutcome(
+        observations=(observation,) if include_raw else (),
+        raw_snapshots=(
+            RawSnapshot(
+                "MD-01",
+                "show datapath session table 192.0.2.100",
+                "native metadata raw",
+                observation.observed_at,
+                (observation.session_key,),
+            ),
+        )
+        if include_raw
+        else (),
+        authoritative=True,
+    )
+
+    result = store.record_poll_batch(
+        run_id,
+        outcome,
+        poll_id=("b" if include_raw else "a") * 32,
+    )
+
+    assert result.status is session_store_module.PollPersistenceStatus.COMMITTED
+    with closing(sqlite3.connect(store.db_path)) as connection:
+        assert connection.execute("SELECT count(*) FROM poll_commits").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM raw_files").fetchone()[0] == int(
+            include_raw
+        )
+    assert not tuple(store._manifests_root.glob("*.json"))
+    assert not tuple(store.raw_root.glob(".raw-staging-*"))
+    store.finish_run(run_id)
+
+
+def test_raw_staging_and_compact_temporary_fit_legacy_windows_path_limit() -> None:
+    profile_root = (
+        PureWindowsPath("C:/Users")
+        / "very-long-corporate-username"
+        / "AppData/Local/ArubaSessionTracker"
+    )
+    stage_root = profile_root / "raw" / f".raw-staging-{'a' * 32}"
+    staged = stage_root / session_store_module._raw_staged_name("b" * 64)
+    temporary = staged.with_name(f".tmp-{'c' * 32}")
+
+    assert staged.parent == stage_root
+    assert len(str(staged)) < 260
+    assert len(str(temporary)) < 260
+    assert "very-long-corporate-username" in str(staged)
+    assert staged.name not in temporary.name
+
+
+def test_compact_atomic_temporary_does_not_repeat_destination_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / f"{'d' * 64}.raw"
+    captured_source: Path | None = None
+    original_replace = session_store_module._replace_file
+
+    def capture_replace(source: Path, target: Path, **kwargs: object) -> None:
+        nonlocal captured_source
+        captured_source = source
+        original_replace(source, target, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        session_store_module,
+        "uuid4",
+        lambda: SimpleNamespace(hex="e" * 32),
+    )
+    monkeypatch.setattr(session_store_module, "_replace_file", capture_replace)
+
+    session_store_module._write_bytes_atomic(
+        destination,
+        b"raw payload",
+        compact_temporary=True,
+    )
+
+    assert captured_source is not None
+    assert captured_source.name == f".tmp-{'e' * 32}"
+    assert destination.read_bytes() == b"raw payload"
+
+
+def test_raw_manifest_staged_name_is_digest_bound_and_legacy_compatible() -> None:
+    digest = "f" * 64
+    common = {
+        "relative_path": "run/20260902/08/raw.txt",
+        "sha256": digest,
+        "byte_size": 3,
+    }
+
+    current = session_store_module._manifest_files(
+        {"files": [{**common, "staged_name": f"{digest}.raw"}]}
+    )
+    legacy = session_store_module._manifest_files({"files": [common]})
+
+    assert current[0]["staged_name"] == f"{digest}.raw"
+    assert legacy[0]["staged_name"] is None
+    with pytest.raises(StorageError, match="staging 파일명"):
+        session_store_module._manifest_files({"files": [{**common, "staged_name": "other.raw"}]})
 
 
 def test_record_poll_batch_rejects_reused_poll_id_with_different_payload(
@@ -2379,6 +2547,103 @@ def test_startup_restores_committed_raw_file_from_batch_staging(tmp_path: Path) 
     assert destination.read_bytes() == raw_data
     assert not staged.exists()
     assert not manifest.exists()
+
+
+@pytest.mark.parametrize(
+    ("manifest_format", "symlink_location"),
+    (
+        ("flat", "stage_root"),
+        ("legacy", "stage_root"),
+        ("legacy", "intermediate"),
+    ),
+)
+def test_raw_batch_recovery_rejects_symlinked_staging_before_external_access(
+    manifest_format: str,
+    symlink_location: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    operation_id = "9" * 32
+    run_id = "uncommitted-run"
+    relative = f"{run_id}/20260902/08/capture.txt"
+    victim_data = b"external victim must stay private"
+    digest = hashlib.sha256(victim_data).hexdigest()
+    stage_root = store.raw_root / f".raw-staging-{operation_id}"
+    external_root = tmp_path / f"external-{manifest_format}-{symlink_location}"
+    external_root.mkdir()
+
+    if symlink_location == "stage_root":
+        victim_relative = Path(digest + ".raw") if manifest_format == "flat" else Path(relative)
+        victim = external_root / victim_relative
+        victim.parent.mkdir(parents=True, exist_ok=True)
+        victim.write_bytes(victim_data)
+        try:
+            stage_root.symlink_to(external_root, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"symlink creation is unavailable: {error}")
+    else:
+        assert manifest_format == "legacy"
+        stage_root.mkdir()
+        victim = external_root / "20260902/08/capture.txt"
+        victim.parent.mkdir(parents=True)
+        victim.write_bytes(victim_data)
+        try:
+            (stage_root / run_id).symlink_to(external_root, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"symlink creation is unavailable: {error}")
+
+    file_payload: dict[str, object] = {
+        "relative_path": relative,
+        "sha256": digest,
+        "byte_size": len(victim_data),
+    }
+    payload: dict[str, object] = {
+        "version": 1,
+        "kind": "raw_batch",
+        "operation_id": operation_id,
+        "run_id": run_id,
+        "stage_root": stage_root.name,
+        "files": [file_payload],
+    }
+    if manifest_format == "flat":
+        file_payload["staged_name"] = f"{digest}.raw"
+        payload.update(
+            {
+                "poll_id": operation_id,
+                "payload_sha256": "a" * 64,
+                "phase": "PREPARED",
+            }
+        )
+    manifest = store._write_manifest(operation_id, payload)
+    victim_resolved = victim.resolve(strict=True)
+    fingerprint_attempts: list[Path] = []
+    unlink_attempts: list[Path] = []
+    original_verify = session_store_module._verify_file_fingerprint
+    original_unlink = Path.unlink
+
+    def observe_fingerprint(path: Path, *args: object, **kwargs: object) -> None:
+        if path.resolve(strict=False) == victim_resolved:
+            fingerprint_attempts.append(path)
+        original_verify(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    def block_external_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path.resolve(strict=False) == victim_resolved:
+            unlink_attempts.append(path)
+            raise AssertionError("recovery attempted to delete an external victim")
+        original_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(session_store_module, "_verify_file_fingerprint", observe_fingerprint)
+    monkeypatch.setattr(Path, "unlink", block_external_unlink)
+
+    reopened = SessionStore(store.db_path, store.raw_root, store.exports_root)
+    with pytest.raises(StorageError, match=r"link|reparse|staging|관리 경로"):
+        reopened.initialize()
+
+    assert fingerprint_attempts == []
+    assert unlink_attempts == []
+    assert victim.read_bytes() == victim_data
+    assert manifest.exists()
 
 
 @pytest.mark.parametrize(
@@ -4949,7 +5214,12 @@ def test_windows_atomic_replace_retries_initial_fingerprint_open(
     original_file_state = durable_io_module._file_state
     attempts = 0
 
-    def flaky_file_state(path: Path, *, with_hash: bool) -> object:
+    def flaky_file_state(
+        path: Path,
+        *,
+        with_hash: bool,
+        use_native_windows_identity: bool = False,
+    ) -> object:
         nonlocal attempts
         if path == source and not with_hash:
             attempts += 1
@@ -4957,7 +5227,11 @@ def test_windows_atomic_replace_retries_initial_fingerprint_open(
                 error = PermissionError("fixture sharing violation")
                 error.winerror = 32
                 raise error
-        return original_file_state(path, with_hash=with_hash)
+        return original_file_state(
+            path,
+            with_hash=with_hash,
+            use_native_windows_identity=use_native_windows_identity,
+        )
 
     monkeypatch.setattr(durable_io_module, "_file_state", flaky_file_state)
     monkeypatch.setattr(durable_io_module.time, "sleep", lambda _delay: None)

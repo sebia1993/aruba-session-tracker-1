@@ -1158,6 +1158,7 @@ class SessionStore:
                     "files": [
                         {
                             "relative_path": item.artifact.relative_path,
+                            "staged_name": item.staged_path.name,
                             "sha256": item.artifact.sha256,
                             "byte_size": item.artifact.byte_size,
                             "bundle_sections": [
@@ -1187,6 +1188,7 @@ class SessionStore:
                         item.staged_path,
                         item.artifact.sha256,
                         item.artifact.byte_size,
+                        use_native_windows_identity=True,
                     )
                     if item.bundle_sections:
                         _verify_raw_bundle_file(item.staged_path, item.bundle_sections)
@@ -1195,6 +1197,7 @@ class SessionStore:
                         item.destination,
                         expected_sha256=item.artifact.sha256,
                         expected_size=item.artifact.byte_size,
+                        use_native_windows_identity=True,
                     )
                     installed.append(item)
                 manifest_payload = {**manifest_payload, "phase": "INSTALLED"}
@@ -2494,12 +2497,11 @@ class SessionStore:
                 data=data,
                 captured_at=captured_at,
             )
-            relative = Path(artifact.relative_path)
             return (
                 (
                     _PreparedRaw(
                         artifact=artifact,
-                        staged_path=stage_root / relative,
+                        staged_path=stage_root / _raw_staged_name(artifact.sha256),
                         destination=_managed_file_path(
                             self.raw_root,
                             artifact.relative_path,
@@ -2533,11 +2535,10 @@ class SessionStore:
                 content=snapshot.output,
                 captured_at=snapshot.observed_at,
             )
-            relative = Path(artifact.relative_path)
             prepared.append(
                 _PreparedRaw(
                     artifact=artifact,
-                    staged_path=stage_root / relative,
+                    staged_path=stage_root / _raw_staged_name(artifact.sha256),
                     destination=_managed_file_path(
                         self.raw_root,
                         artifact.relative_path,
@@ -2568,7 +2569,7 @@ class SessionStore:
         _reject_managed_chain(self.raw_root, stage_root)
         for item in prepared:
             item.staged_path.parent.mkdir(parents=True, exist_ok=True)
-            _write_bytes_atomic(item.staged_path, item.data)
+            _write_bytes_atomic(item.staged_path, item.data, compact_temporary=True)
 
     def _cleanup_failed_raw_batch(
         self,
@@ -2583,6 +2584,7 @@ class SessionStore:
                         item.destination,
                         item.artifact.sha256,
                         item.artifact.byte_size,
+                        use_native_windows_identity=True,
                     )
                     item.destination.unlink()
             self._remove_operation_artifacts(manifest_path, stage_root)
@@ -2747,6 +2749,24 @@ class SessionStore:
             ) from error
         if len({item["relative_path"] for item in files}) != len(files):
             raise StorageError("Raw batch manifest에 중복 파일 경로가 있습니다.")
+        staged_names = [item["staged_name"] for item in files if item["staged_name"] is not None]
+        if len(set(staged_names)) != len(staged_names):
+            raise StorageError("Raw batch manifest에 중복 staging 파일명이 있습니다.")
+        _reject_managed_chain(self.raw_root, stage_root)
+        recovery_files: list[tuple[dict[str, Any], Path, Path]] = []
+        for item in files:
+            destination = _managed_file_path(
+                self.raw_root,
+                item["relative_path"],
+                allow_missing=True,
+            )
+            staged_relative = item["staged_name"] or item["relative_path"]
+            staged = _managed_file_path(
+                stage_root,
+                staged_relative,
+                allow_missing=True,
+            )
+            recovery_files.append((item, destination, staged))
         with self._connection(uninitialized=True) as connection:
             run_exists = (
                 connection.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone()
@@ -2811,17 +2831,24 @@ class SessionStore:
                 if phase == "DB_COMMITTED" and run_exists:
                     raise StorageError("DB_COMMITTED Raw batch에 commit receipt가 없습니다.")
                 committed = False
-            for item in files:
-                relative = item["relative_path"]
-                destination = _managed_file_path(self.raw_root, relative, allow_missing=True)
-                staged = stage_root / Path(relative)
+            for item, destination, staged in recovery_files:
                 if committed:
                     if os.path.lexists(destination):
-                        _verify_file_fingerprint(destination, item["sha256"], item["byte_size"])
+                        _verify_file_fingerprint(
+                            destination,
+                            item["sha256"],
+                            item["byte_size"],
+                            use_native_windows_identity=True,
+                        )
                         if item["bundle_sections"]:
                             _verify_raw_bundle_file(destination, item["bundle_sections"])
                     elif os.path.lexists(staged):
-                        _verify_file_fingerprint(staged, item["sha256"], item["byte_size"])
+                        _verify_file_fingerprint(
+                            staged,
+                            item["sha256"],
+                            item["byte_size"],
+                            use_native_windows_identity=True,
+                        )
                         if item["bundle_sections"]:
                             _verify_raw_bundle_file(staged, item["bundle_sections"])
                         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -2830,13 +2857,19 @@ class SessionStore:
                             destination,
                             expected_sha256=item["sha256"],
                             expected_size=item["byte_size"],
+                            use_native_windows_identity=True,
                         )
                     else:
                         raise StorageError("DB가 참조하는 Raw 파일을 복구할 수 없습니다.")
                 else:
                     for candidate in (destination, staged):
                         if os.path.lexists(candidate):
-                            _verify_file_fingerprint(candidate, item["sha256"], item["byte_size"])
+                            _verify_file_fingerprint(
+                                candidate,
+                                item["sha256"],
+                                item["byte_size"],
+                                use_native_windows_identity=True,
+                            )
                             if item["bundle_sections"]:
                                 _verify_raw_bundle_file(candidate, item["bundle_sections"])
                             candidate.unlink()
@@ -4112,6 +4145,7 @@ class SessionStore:
                     phase="export_raw_bytes",
                     completed_base=verified_bytes,
                     total=byte_total,
+                    use_native_windows_identity=True,
                 )
                 last_id = int(row["id"])
                 verified_files += 1
@@ -5088,6 +5122,7 @@ def _replace_file(
     *,
     expected_sha256: str | None = None,
     expected_size: int | None = None,
+    use_native_windows_identity: bool = False,
 ) -> None:
     """Replace a file with bounded retries for transient Windows sharing locks."""
 
@@ -5097,12 +5132,20 @@ def _replace_file(
         replace=os.replace,
         expected_sha256=expected_sha256,
         expected_size=expected_size,
+        use_native_windows_identity=use_native_windows_identity,
     )
 
 
-def _write_bytes_atomic(path: Path, data: bytes) -> None:
+def _write_bytes_atomic(
+    path: Path,
+    data: bytes,
+    *,
+    compact_temporary: bool = False,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    temporary = path.with_name(
+        f".tmp-{uuid4().hex}" if compact_temporary else f".{path.name}.{uuid4().hex}.tmp"
+    )
     try:
         parent_before = reject_link_or_reparse(path.parent)
     except UnsafeManagedPath as error:
@@ -5127,6 +5170,7 @@ def _write_bytes_atomic(path: Path, data: bytes) -> None:
             path,
             expected_sha256=hashlib.sha256(data).hexdigest(),
             expected_size=len(data),
+            use_native_windows_identity=True,
         )
     finally:
         if os.path.lexists(temporary):
@@ -5206,15 +5250,31 @@ def _manifest_files(payload: dict[str, Any]) -> tuple[dict[str, Any], ...]:
         sha256 = _manifest_text(value, "sha256")
         if re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
             raise StorageError("manifest SHA-256 값이 올바르지 않습니다.")
+        staged_name_value = value.get("staged_name")
+        if staged_name_value is None:
+            staged_name = None
+        elif not isinstance(staged_name_value, str) or staged_name_value != _raw_staged_name(
+            sha256
+        ):
+            raise StorageError("Raw batch manifest의 staging 파일명이 올바르지 않습니다.")
+        else:
+            staged_name = staged_name_value
         result.append(
             {
                 "relative_path": relative,
+                "staged_name": staged_name,
                 "sha256": sha256,
                 "byte_size": _manifest_int(value, "byte_size"),
                 "bundle_sections": _manifest_bundle_sections(value),
             }
         )
     return tuple(result)
+
+
+def _raw_staged_name(sha256: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
+        raise StorageError("Raw staging SHA-256 값이 올바르지 않습니다.")
+    return f"{sha256}.raw"
 
 
 def _manifest_bundle_sections(payload: dict[str, Any]) -> tuple[_RawBundleSection, ...]:
@@ -5280,8 +5340,18 @@ def _file_fingerprint(
     phase: str = "file_hash",
     completed_base: int = 0,
     total: int | None = None,
+    use_native_windows_identity: bool = False,
 ) -> tuple[str, int]:
     _check_cancelled(cancel_check)
+    if use_native_windows_identity and windows_file_metadata.available():
+        return _windows_file_fingerprint(
+            path,
+            cancel_check=cancel_check,
+            progress=progress,
+            phase=phase,
+            completed_base=completed_base,
+            total=total,
+        )
     info = retry_windows_file_operation(lambda: _plain_regular_file_info(path))
 
     def fingerprint_fixed_file() -> tuple[str, int]:
@@ -5337,6 +5407,85 @@ def _file_fingerprint(
     return retry_windows_file_operation(fingerprint_fixed_file)
 
 
+def _windows_file_fingerprint(
+    path: Path,
+    *,
+    cancel_check: CancelCheck | None,
+    progress: ProgressCallback | None,
+    phase: str,
+    completed_base: int,
+    total: int | None,
+) -> tuple[str, int]:
+    initial = retry_windows_file_operation(
+        lambda: _validated_windows_fingerprint_info(windows_file_metadata.from_path(path))
+    )
+
+    def fingerprint_fixed_file() -> tuple[str, int]:
+        digest = hashlib.sha256()
+        size = 0
+        with path.open("rb") as stream:
+            opened = _validated_windows_fingerprint_info(
+                windows_file_metadata.from_descriptor(stream.fileno())
+            )
+            if _windows_fingerprint_state(opened) != _windows_fingerprint_state(initial):
+                raise StorageError(
+                    "fingerprint 대상 파일이 열기 전에 변경되었습니다.",
+                    failure_kind=StorageFailureKind.STORAGE_PATH,
+                )
+            while True:
+                _check_cancelled(cancel_check)
+                chunk = stream.read(_HASH_CHUNK_SIZE)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+                _notify_progress(progress, phase, completed_base + size, total)
+            opened_after = _validated_windows_fingerprint_info(
+                windows_file_metadata.from_descriptor(stream.fileno())
+            )
+        path_after = _validated_windows_fingerprint_info(windows_file_metadata.from_path(path))
+        expected_state = _windows_fingerprint_state(initial)
+        if (
+            size != initial.file_size
+            or _windows_fingerprint_state(opened_after) != expected_state
+            or _windows_fingerprint_state(path_after) != expected_state
+        ):
+            raise StorageError(
+                "fingerprint 계산 중 관리 파일이 변경되었습니다.",
+                failure_kind=StorageFailureKind.STORAGE_PATH,
+            )
+        return digest.hexdigest(), size
+
+    return retry_windows_file_operation(fingerprint_fixed_file)
+
+
+def _validated_windows_fingerprint_info(
+    info: windows_file_metadata.WindowsFileMetadata,
+) -> windows_file_metadata.WindowsFileMetadata:
+    if info.identity == (0, 0):
+        raise StorageError(
+            "fingerprint 대상의 Windows 고유 ID를 확인할 수 없습니다.",
+            failure_kind=StorageFailureKind.STORAGE_PATH,
+        )
+    if not info.is_disk_file or info.is_reparse_point:
+        raise StorageError(
+            "fingerprint 대상이 일반 비-reparse 파일이 아닙니다.",
+            failure_kind=StorageFailureKind.STORAGE_PATH,
+        )
+    if info.number_of_links != 1:
+        raise StorageError(
+            "fingerprint 대상에는 hardlink를 사용할 수 없습니다.",
+            failure_kind=StorageFailureKind.STORAGE_PATH,
+        )
+    return info
+
+
+def _windows_fingerprint_state(
+    info: windows_file_metadata.WindowsFileMetadata,
+) -> tuple[int, int, int, int]:
+    return (*info.identity, info.modified_ns, info.file_size)
+
+
 def _plain_regular_file_info(path: Path) -> os.stat_result:
     info = os.lstat(path)
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
@@ -5358,6 +5507,7 @@ def _verify_file_fingerprint(
     phase: str = "file_hash",
     completed_base: int = 0,
     total: int | None = None,
+    use_native_windows_identity: bool = False,
 ) -> None:
     if (
         cancel_check is None
@@ -5366,16 +5516,33 @@ def _verify_file_fingerprint(
         and completed_base == 0
         and total is None
     ):
-        actual_sha, actual_size = _file_fingerprint(path)
+        if use_native_windows_identity:
+            actual_sha, actual_size = _file_fingerprint(
+                path,
+                use_native_windows_identity=True,
+            )
+        else:
+            actual_sha, actual_size = _file_fingerprint(path)
     else:
-        actual_sha, actual_size = _file_fingerprint(
-            path,
-            cancel_check=cancel_check,
-            progress=progress,
-            phase=phase,
-            completed_base=completed_base,
-            total=total,
-        )
+        if use_native_windows_identity:
+            actual_sha, actual_size = _file_fingerprint(
+                path,
+                cancel_check=cancel_check,
+                progress=progress,
+                phase=phase,
+                completed_base=completed_base,
+                total=total,
+                use_native_windows_identity=True,
+            )
+        else:
+            actual_sha, actual_size = _file_fingerprint(
+                path,
+                cancel_check=cancel_check,
+                progress=progress,
+                phase=phase,
+                completed_base=completed_base,
+                total=total,
+            )
     if actual_sha != sha256 or actual_size != byte_size:
         raise StorageError(
             "관리 파일의 SHA-256 또는 크기가 변경되었습니다.",

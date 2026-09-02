@@ -122,7 +122,7 @@ class RawOutputStore:
                 int(temporary_parent.st_ino),
             ):
                 raise UnsafeStoragePath("Raw 임시 파일의 상위 경로가 준비 이후 변경되었습니다.")
-            return tempfile.mkstemp(prefix=f".{filename}.", suffix=".tmp", dir=directory)
+            return tempfile.mkstemp(prefix=".tmp-", suffix=".raw", dir=directory)
 
         descriptor, temporary_name = retry_windows_file_operation(create_temporary)
         temporary_path = Path(temporary_name)
@@ -137,6 +137,7 @@ class RawOutputStore:
                 replace=os.replace,
                 expected_sha256=hashlib.sha256(data).hexdigest(),
                 expected_size=len(data),
+                use_native_windows_identity=True,
             )
         finally:
             temporary_path.unlink(missing_ok=True)

@@ -1,9 +1,9 @@
 """Native Windows metadata for identity-sensitive file handles.
 
 Python's Windows ``stat`` implementation can expose different inode values for
-path and descriptor queries on some filesystems. Lease safety checks need both
-queries to use the same native identity source, so this module reads 128-bit
-``FileIdInfo`` plus ``BY_HANDLE_FILE_INFORMATION`` for each handle.
+path and descriptor queries on some filesystems. Managed-file safety checks need
+both queries to use the same native identity source, so this module reads
+128-bit ``FileIdInfo`` plus ``BY_HANDLE_FILE_INFORMATION`` for each handle.
 """
 
 from __future__ import annotations
@@ -64,6 +64,7 @@ class WindowsFileMetadata:
     number_of_links: int
     file_attributes: int
     file_size: int
+    modified_ns: int = 0
     file_type: int = _FILE_TYPE_DISK
 
     @property
@@ -191,8 +192,16 @@ def _from_handle(handle: int) -> WindowsFileMetadata:
         number_of_links=int(information.nNumberOfLinks),
         file_attributes=int(information.dwFileAttributes),
         file_size=(int(information.nFileSizeHigh) << 32) | int(information.nFileSizeLow),
+        modified_ns=_filetime_ns(information.ftLastWriteTime),
         file_type=file_type,
     )
+
+
+def _filetime_ns(value: wintypes.FILETIME) -> int:
+    """Convert a Windows FILETIME to Unix-epoch nanoseconds."""
+
+    ticks_100ns = (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
+    return (ticks_100ns - 116_444_736_000_000_000) * 100
 
 
 def _kernel32() -> Any:
