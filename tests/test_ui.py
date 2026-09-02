@@ -877,7 +877,8 @@ def test_export_completion_opens_without_gui_thread_filesystem_stat(
 
         window._show_export_completion("CSV 내보내기", destination)
 
-    assert opened_paths == [str(destination)]
+    assert len(opened_paths) == 1
+    assert Path(opened_paths[0]) == destination
     window.close()
 
 
