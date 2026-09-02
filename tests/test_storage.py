@@ -829,19 +829,34 @@ def test_poll_batch_uses_native_windows_metadata_when_crt_stat_is_incomplete(
     observation = _observation()
     original_lstat = os.lstat
 
+    class IncompleteRegularStat:
+        def __init__(self, info: os.stat_result) -> None:
+            self._info = info
+
+        @property
+        def st_dev(self) -> int:
+            return 0
+
+        @property
+        def st_ino(self) -> int:
+            return 0
+
+        @property
+        def st_size(self) -> int:
+            return 0
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._info, name)
+
     def incomplete_regular_lstat(
         path: object,
         *args: object,
         **kwargs: object,
-    ) -> os.stat_result:
+    ) -> os.stat_result | IncompleteRegularStat:
         info = original_lstat(path, *args, **kwargs)  # type: ignore[arg-type]
         if not stat.S_ISREG(info.st_mode):
             return info
-        values = list(info)
-        values[1] = 0
-        values[2] = 0
-        values[6] = 0
-        return os.stat_result(values)
+        return IncompleteRegularStat(info)
 
     def native_info(info: os.stat_result) -> object:
         attributes = 0x10 if stat.S_ISDIR(info.st_mode) else 0
