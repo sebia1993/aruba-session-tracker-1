@@ -2957,16 +2957,15 @@ class SessionStore:
         if self._directory_identities:
             self._assert_managed_layout()
         connection = sqlite3.connect(self.db_path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 10000")
-        if configure_wal:
-            mode = str(connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]).lower()
-            if mode != "wal":
-                connection.close()
-                raise StorageError("SQLite WAL journal mode를 활성화할 수 없습니다.")
-        connection.execute("PRAGMA synchronous = FULL")
         try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 10000")
+            if configure_wal:
+                mode = str(connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]).lower()
+                if mode != "wal":
+                    raise StorageError("SQLite WAL journal mode를 활성화할 수 없습니다.")
+            connection.execute("PRAGMA synchronous = FULL")
             with connection:
                 yield connection
         finally:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -149,7 +150,7 @@ def test_list_runs_returns_latest_mappable_diagnostic_without_schema_change(
     assert rows[empty_run]["latest_diagnostic_code"] is None
     assert rows[empty_run]["latest_support_code"] is None
 
-    with sqlite3.connect(store.db_path) as connection:
+    with closing(sqlite3.connect(store.db_path)) as connection:
         run_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(runs)")}
     assert "latest_diagnostic_stage" not in run_columns
     assert "latest_diagnostic_code" not in run_columns

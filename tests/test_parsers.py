@@ -44,6 +44,37 @@ def test_datapath_parser_enforces_observation_capacity_before_append() -> None:
     assert caught.value.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
 
 
+@pytest.mark.parametrize(
+    "over_limit_row",
+    [
+        # A repeated key must not downgrade the capacity failure to a partial parse.
+        "192.0.2.10        203.0.113.20    6    54321 443   0/0  0    0   12  "
+        "local       0    10      2048  FCI   1",
+        # Field validation beyond the basic row shape also comes after the capacity gate.
+        "192.0.2.10        203.0.113.20    6    54321 443   bad  0    0   12  "
+        "local       0    10      2048  FCI   1",
+    ],
+)
+def test_datapath_capacity_precedes_duplicate_and_field_validation(
+    over_limit_row: str,
+) -> None:
+    lines = fixture("datapath_sessions.txt").splitlines()
+    first_row_index = next(
+        index for index, line in enumerate(lines) if line.startswith("192.0.2.10")
+    )
+    output = "\n".join([*lines[: first_row_index + 1], over_limit_row, "Entries: 2"])
+
+    with pytest.raises(ParseError) as caught:
+        parse_datapath_sessions(
+            output,
+            controller_name="MD-1",
+            controller_host="198.51.100.11",
+            max_observations=1,
+        )
+
+    assert caught.value.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
+
+
 def test_global_user_parser_distinguishes_zero_rows() -> None:
     result = parse_global_user_table(fixture("global_user_empty.txt"), client_ip="192.0.2.99")
     assert result.status is GlobalUserStatus.NOT_FOUND
@@ -196,6 +227,32 @@ def test_datapath_parser_maps_standard_rows_to_models() -> None:
     assert rows[1].flags == "Y"
     assert rows[2].flags == ""
     assert rows[2].cpu_id == 6
+
+
+@pytest.mark.parametrize(
+    "duplicate_row",
+    [
+        # The same flow with different flags and CPU ownership is still ambiguous.
+        "192.0.2.10 203.0.113.20 6 54321 443 0/0 0 0 12 local 0 10 2048 Y 2",
+        # Counters are observations of one key, not distinct sessions.
+        "192.0.2.10 203.0.113.20 6 54321 443 1/2 0 0 13 local 0 11 4096 FCI 1",
+        # Even byte-for-byte equivalent session data must not be silently collapsed.
+        "192.0.2.10        203.0.113.20    6    54321 443   0/0  0    0   12  "
+        "local       0    10      2048  FCI   1",
+    ],
+)
+def test_datapath_parser_rejects_duplicate_session_keys(duplicate_row: str) -> None:
+    output = fixture("datapath_sessions.txt").replace(
+        "Entries: 3",
+        f"{duplicate_row}\nEntries: 4",
+    )
+
+    with pytest.raises(ParseError, match="duplicate session key"):
+        parse_datapath_sessions(
+            output,
+            controller_name="md-document-01",
+            controller_host="198.51.100.11",
+        )
 
 
 def test_datapath_parser_accepts_tabs_and_spacing_variation() -> None:

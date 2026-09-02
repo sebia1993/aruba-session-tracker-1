@@ -43,7 +43,7 @@ branch = true
 source = ["aruba_session_tracker"]
 
 [tool.coverage.report]
-fail_under = 75
+fail_under = 83
 show_missing = true
 
 [tool.ruff]

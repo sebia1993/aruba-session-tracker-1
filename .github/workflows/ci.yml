@@ -1,9 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
   workflow_dispatch:
 
@@ -57,11 +54,3 @@ jobs:
           $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
           if ($LASTEXITCODE -ne 0) { throw "Could not read project version." }
           ./build_windows.ps1 -PythonPath python -Version $version.Trim() -SkipValidation -UseCurrentEnvironment
-
-      - name: Upload verified CI package inputs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ArubaSessionTracker-windows-x64-ci
-          path: artifacts/release/*
-          if-no-files-found: error
-          retention-days: 7
