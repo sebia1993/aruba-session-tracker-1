@@ -8,40 +8,16 @@ new visual hierarchy from those primitives without widening exported data.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
-from datetime import datetime
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 
+from aruba_session_tracker.analysis import service_label
 from aruba_session_tracker.storage import html_report as _base
 from aruba_session_tracker.storage.html_report import RunReportSnapshot
 
 ReportRow = dict[str, object]
-FlowKey = tuple[str, str, str, str, str]
-
-_EVENT_LABELS = {
-    "STARTED": "세션 확인 시작",
-    "OPENED": "세션 확인 시작",
-    "OBSERVED": "세션 다시 확인",
-    "CLOSED": "세션 종료 확인",
-    "MISSED": "세션 일시 미확인",
-    "CONTROLLER_CHANGED": "관측 MD 변경 확인",
-    "FLAGS_CHANGED": "세션 특이사항 변경 확인",
-    "COUNTERS_CHANGED": "세션 수치 기준 변경 확인",
-}
-_TIMELINE_LIMIT = 12
-_STATE_ORDER = ("확인됨", "관측됨", "잠시 미확인", "종료 확인")
-_STATE_LABELS = {
-    "확인됨": "확인됨",
-    "관측됨": "관측됨",
-    "잠시 미확인": "일시 미확인",
-    "종료 확인": "종료 확인",
-}
-_STATE_CLASSES = {
-    "확인됨": "confirmed",
-    "관측됨": "observed",
-    "잠시 미확인": "missed",
-    "종료 확인": "closed",
-}
+FrequencyRow = tuple[str, int, int] | tuple[int, int, int, int]
+_FREQUENCY_LIMIT = 5
 
 
 def render_html_report(snapshot: RunReportSnapshot) -> str:
@@ -64,6 +40,9 @@ def write_html_report_stream_atomic(
     logical_session_total: int,
 ) -> Path:
     """Atomically stream a complete approved report to the destination."""
+
+    if snapshot.ip_frequency_summary is None or snapshot.protocol_port_frequency_summary is None:
+        raise ValueError("streamed HTML reports require precomputed frequency summaries")
 
     return _base._write_html_chunks_atomic(
         destination,
@@ -126,10 +105,13 @@ def _report_chunks(
         run.get("destination_port"),
         other_address=run.get("source_ip"),
     )
-    state_counts = _state_counts(latest_groups, flow_statuses, session_statuses)
-    timeline = _timeline_markup(snapshot)
+    frequency_rows = snapshot.observation_history or snapshot.observations
+    ip_frequency_summary = _resolve_ip_frequency_summary(snapshot, frequency_rows)
+    protocol_port_frequency_summary = _resolve_protocol_port_frequency_summary(
+        snapshot, frequency_rows
+    )
     duration = _format_duration(run.get("started_at"), run.get("ended_at"))
-    display_run_id = _display_run_identifier(run)
+    query_target = _display_query_target(run)
     observed_controllers = _observed_controllers(latest_observations)
     observed_controller_text = " · ".join(observed_controllers) if observed_controllers else "—"
 
@@ -218,47 +200,31 @@ def _report_chunks(
     .collection-fact dd {{ margin:3px 0 0; color:#17324d; font-weight:800;
       overflow-wrap:anywhere; }}
 
-    .insight-grid {{ display:grid; grid-template-columns:minmax(310px,.72fr) minmax(0,1.28fr);
-      gap:13px; margin-bottom:13px; }}
-    .insight-grid section {{ margin:0; }}
-    .insight-grid h3 {{ margin:0 0 5px; color:var(--text); font-size:1.08rem; }}
-    .state-content {{ display:grid; grid-template-columns:150px minmax(0,1fr); gap:18px;
-      align-items:center; margin-top:10px; }}
-    .state-ring {{ width:146px; height:146px; display:block; margin:auto; }}
-    .state-ring-base {{ fill:none; stroke:#e3eaf0; stroke-width:14; }}
-    .state-ring-segment {{ fill:none; stroke-width:14; stroke-linecap:butt;
-      transform:rotate(-90deg); transform-origin:60px 60px; }}
-    .state-ring-segment.confirmed {{ stroke:#147d64; }}
-    .state-ring-segment.observed {{ stroke:#486581; }}
-    .state-ring-segment.missed {{ stroke:#d49a2f; }}
-    .state-ring-segment.closed {{ stroke:#b42318; }}
-    .state-total {{ fill:#17324d; font-size:20px; font-weight:800; text-anchor:middle; }}
-    .state-caption {{ fill:#64748b; font-size:8px; font-weight:700; text-anchor:middle; }}
-    .state-list {{ display:grid; gap:7px; margin:0; }}
-    .state-row {{ display:grid; grid-template-columns:10px minmax(0,1fr) auto; gap:8px;
-      align-items:center; padding:7px 8px; border:1px solid #dbe5ed; border-radius:6px;
-      background:#fbfdff; }}
-    .state-dot {{ width:9px; height:9px; border-radius:50%; background:var(--neutral); }}
-    .state-dot.confirmed {{ background:var(--success); }}
-    .state-dot.missed {{ background:#d49a2f; }}
-    .state-dot.closed {{ background:var(--danger); }}
-    .state-name {{ color:#334155; font-size:.82rem; font-weight:700; }}
-    .state-count {{ color:#17324d; font-size:.9rem; font-weight:850; }}
-
-    .event-list {{ display:grid; gap:0; margin:10px 0 0; padding:0; list-style:none; }}
-    .event-item {{ display:grid; grid-template-columns:106px 18px minmax(0,1fr); gap:8px;
-      min-height:47px; }}
-    .event-time {{ padding-top:2px; color:var(--text-muted); font-size:.75rem;
-      font-variant-numeric:tabular-nums; white-space:nowrap; }}
-    .event-track {{ position:relative; }}
-    .event-track::before {{ content:""; position:absolute; left:8px; top:13px; bottom:-13px;
-      width:1px; background:#cbd8e3; }}
-    .event-item:last-child .event-track::before {{ display:none; }}
-    .event-track::after {{ content:""; position:absolute; left:4px; top:6px; width:9px;
-      height:9px; border-radius:50%; background:var(--primary); border:2px solid #d9eaf5; }}
-    .event-title {{ color:#17324d; font-size:.84rem; font-weight:800; }}
-    .event-detail {{ margin-top:2px; color:var(--text-muted); font-size:.78rem;
+    .frequency-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:13px;
+      margin-top:12px; }}
+    .frequency-card {{ min-width:0; padding:14px; border:1px solid var(--border);
+      border-radius:8px; background:#f8fafc; }}
+    .frequency-card h3 {{ margin:0 0 10px; color:var(--text); font-size:1.02rem; }}
+    .frequency-list {{ display:grid; gap:11px; margin:0; padding:0; list-style:none;
+      counter-reset:frequency-rank; }}
+    .frequency-item {{ min-width:0; counter-increment:frequency-rank; }}
+    .frequency-heading {{ display:flex; justify-content:space-between; gap:10px; align-items:baseline; }}
+    .frequency-label {{ min-width:0; color:#17324d; font-size:.86rem; font-weight:800;
       overflow-wrap:anywhere; }}
+    .frequency-label::before {{ content:counter(frequency-rank) ". "; color:var(--text-muted);
+      font-weight:700; }}
+    .frequency-count {{ margin-top:2px; color:var(--text-muted); font-size:.76rem;
+      font-variant-numeric:tabular-nums; }}
+    .frequency-bar {{ display:flex; width:100%; height:10px; margin-top:5px; overflow:hidden;
+      border:1px solid #aebcca; border-radius:999px; background:#e8eef4; }}
+    .frequency-source {{ display:block; height:100%; background:#0b5f9a; }}
+    .frequency-destination {{ display:block; height:100%; background:#d46b2f; }}
+    .frequency-legend {{ display:flex; flex-wrap:wrap; gap:12px; margin:11px 0 0; padding:0;
+      list-style:none; color:var(--text-muted); font-size:.76rem; }}
+    .frequency-legend li {{ display:inline-flex; align-items:center; gap:5px; }}
+    .frequency-swatch {{ width:11px; height:11px; border-radius:2px; border:1px solid #789; }}
+    .frequency-swatch.source {{ background:#0b5f9a; }}
+    .frequency-swatch.destination {{ background:#d46b2f; }}
 
     .filter-panel[hidden] {{ display:none !important; }}
     .filter-panel {{ position:relative; background:#f8fafc; border-color:#b9c9d8; }}
@@ -338,7 +304,7 @@ def _report_chunks(
       overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }}
 
     @media (max-width:1000px) {{
-      .hero-grid,.insight-grid {{ grid-template-columns:1fr; }}
+      .hero-grid {{ grid-template-columns:1fr; }}
       .hero-side {{ border-left:0; border-top:1px solid var(--border); }}
     }}
     @media (max-width:850px) {{
@@ -346,8 +312,7 @@ def _report_chunks(
       section {{ padding:14px; }}
       .summary-stats {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
       .filter-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
-      .state-content {{ grid-template-columns:130px minmax(0,1fr); }}
-      .state-ring {{ width:126px; height:126px; }}
+      .frequency-grid {{ grid-template-columns:1fr; }}
       .collection-grid {{ grid-template-columns:1fr; }}
     }}
     @media (max-width:720px) {{
@@ -357,8 +322,6 @@ def _report_chunks(
       .direction {{ text-align:left; min-width:0; }}
       .direction-arrow {{ transform:rotate(90deg); transform-origin:left center;
         margin-left:8px; }}
-      .state-content {{ grid-template-columns:1fr; }}
-      .event-item {{ grid-template-columns:88px 18px minmax(0,1fr); }}
     }}
     @media (max-width:520px) {{
       .report-header-inner {{ display:block; }}
@@ -368,19 +331,18 @@ def _report_chunks(
       .filter-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
       .filter-field:first-child,.filter-reset {{ grid-column:1 / -1; }}
       .filter-reset {{ width:100%; }}
-      .event-item {{ grid-template-columns:1fr; padding:0 0 11px 16px;
-        border-left:2px solid #d5e0e8; }}
-      .event-track {{ display:none; }}
     }}
     @media (max-width:360px) {{
       .summary-stats,.filter-grid {{ grid-template-columns:1fr; }}
     }}
     @media (forced-colors:active) {{
       .report-header {{ border-bottom-color:Highlight; }}
-      .run-state,.direction-pill,.summary-stat,.flow-panel,.hero-side,.state-row,
+      .run-state,.direction-pill,.summary-stat,.flow-panel,.hero-side,.frequency-card,
+      .frequency-bar,.frequency-swatch,
       .filter-input,.filter-select,.filter-reset,.filter-count,.suggestion-list,
       .table-wrap,.badge,summary {{ border:1px solid CanvasText; forced-color-adjust:auto; }}
-      .run-state::before,.state-dot,.event-track::after {{ background:Highlight; }}
+      .run-state::before,.frequency-source,.frequency-swatch.source {{ background:Highlight; }}
+      .frequency-destination,.frequency-swatch.destination {{ background:LinkText; }}
       .filter-input:focus-visible,.filter-select:focus-visible,.filter-reset:focus-visible,
       .suggestion-list [role="option"]:focus-visible,.table-wrap:focus-visible,
       summary:focus-visible {{ outline-color:Highlight; }}
@@ -394,7 +356,7 @@ def _report_chunks(
       .report-header-inner {{ padding:0; }}
       .content {{ padding:0; }}
       section {{ border:0; border-radius:0; padding:0; margin-bottom:8px; }}
-      .hero-grid,.insight-grid {{ grid-template-columns:1fr 1fr; }}
+      .hero-grid,.frequency-grid {{ grid-template-columns:1fr 1fr; }}
       .hero-side {{ border:0; }}
       .flow-panel {{ grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);
         gap:14px; background:#fff; }}
@@ -411,7 +373,8 @@ def _report_chunks(
       th {{ position:static; }}
       th,td {{ padding:4px; overflow-wrap:anywhere; }}
       .muted {{ padding:8px 4px; }}
-      .summary-stats,.flow-panel,.state-content,.event-item,.collection-fact,tr {{ break-inside:avoid; }}
+      .summary-stats,.flow-panel,.frequency-card,.frequency-item,.collection-fact,tr {{ break-inside:avoid; }}
+      .frequency-source,.frequency-destination {{ print-color-adjust:exact; }}
       tbody tr:nth-child(even),tbody tr:hover {{ background:#fff; }}
     }}
   </style>
@@ -460,7 +423,7 @@ def _report_chunks(
         <aside class="hero-side" aria-label="보고서 기준">
           <p class="section-kicker">REPORT BASIS</p>
           <dl class="run-facts">
-            {_run_fact("실행 ID", display_run_id)}
+            {_run_fact("조회 대상", query_target)}
             {_run_fact("추적 시간", duration)}
             {_run_fact("최신 표시", f"{_base._format_integer(displayed_latest)}/{_base._format_integer(total_sessions)}개")}
             {_run_fact("전체 이력", f"{_base._format_integer(snapshot.observation_total)}건")}
@@ -469,21 +432,25 @@ def _report_chunks(
       </div>
     </section>
 
-    <div class="insight-grid">
-      <section id="session-state" aria-labelledby="session-state-title">
-        <p class="section-kicker">SESSION STATE</p>
-        <h3 id="session-state-title">최신 표시 세션 상태</h3>
-        <p class="section-note">최신 결과에 표시된 {_base._format_integer(displayed_latest)}/{_base._format_integer(total_sessions)}개 논리 세션만 집계합니다.</p>
-        {_state_summary_markup(state_counts, displayed_latest=displayed_latest, total_sessions=total_sessions)}
-      </section>
-
-      <section id="significant-events" aria-labelledby="significant-events-title">
-        <p class="section-kicker">SIGNIFICANT EVENTS</p>
-        <h3 id="significant-events-title">주요 세션 변화</h3>
-        <p class="section-note">보고서 스냅샷에 포함된 저장 사실 중 최근 최대 {_TIMELINE_LIMIT}개입니다. 원인이나 전체 이벤트 이력을 의미하지 않습니다.</p>
-        {timeline}
-      </section>
-    </div>
+    <section id="observation-frequency" aria-labelledby="observation-frequency-title">
+      <p class="section-kicker">FULL-HISTORY FREQUENCY</p>
+      <h2 id="observation-frequency-title">전체 이력 관측 빈도 TOP 5</h2>
+      <p class="section-note">저장된 전체 관측 {_base._format_integer(snapshot.observation_total)}건의 각 행에서 출발지와 목적지를 각각 1회로 집계합니다. IP는 빈 값을, 포트·프로토콜은 0번 포트를 제외합니다. 관측 횟수이며 트래픽 양·전송량·원인을 의미하지 않고, 아래 결과 필터와도 연동되지 않습니다.</p>
+      <ul class="frequency-legend" aria-label="막대 색상 안내">
+        <li><span class="frequency-swatch source" aria-hidden="true"></span>출발지</li>
+        <li><span class="frequency-swatch destination" aria-hidden="true"></span>목적지</li>
+      </ul>
+      <div class="frequency-grid">
+        <article class="frequency-card" aria-labelledby="ip-frequency-title">
+          <h3 id="ip-frequency-title">IP별 관측 횟수 TOP 5</h3>
+          {_frequency_chart_markup(ip_frequency_summary, _ip_frequency_label, "집계할 IP가 없습니다.")}
+        </article>
+        <article class="frequency-card" aria-labelledby="protocol-port-frequency-title">
+          <h3 id="protocol-port-frequency-title">포트·프로토콜별 관측 횟수 TOP 5</h3>
+          {_frequency_chart_markup(protocol_port_frequency_summary, _protocol_port_frequency_label, "집계할 프로토콜·포트가 없습니다.")}
+        </article>
+      </div>
+    </section>
 
     <section id="result-filter" class="filter-panel js-only" aria-labelledby="result-filter-title" hidden>
       <h2 id="result-filter-title" class="filter-heading">결과 찾기</h2>
@@ -591,161 +558,157 @@ def _report_chunks(
 """
 
 
-def _state_counts(
-    flow_groups: tuple[tuple[FlowKey, tuple[ReportRow, ...]], ...],
-    flow_statuses: dict[FlowKey, str],
-    session_statuses: dict[str, str],
-) -> dict[str, int]:
-    counts = {status: 0 for status in _STATE_ORDER}
-    for _flow, rows in flow_groups:
-        status = _base._status_for(rows[-1], flow_statuses, session_statuses)
-        normalized = status if status in counts else "관측됨"
-        counts[normalized] += 1
-    return counts
+def _resolve_ip_frequency_summary(
+    snapshot: RunReportSnapshot,
+    rows: Iterable[ReportRow],
+) -> tuple[tuple[str, int, int], ...]:
+    summary = snapshot.ip_frequency_summary
+    if summary is None:
+        return _top_ip_frequencies(rows)
+    return _normalize_ip_frequencies(summary)
 
 
-def _state_summary_markup(
-    counts: dict[str, int],
-    *,
-    displayed_latest: int,
-    total_sessions: int,
-) -> str:
-    total = sum(counts.values())
-    if total == 0:
-        return (
-            '<p class="muted">최신 표시 '
-            f"{_base._format_integer(displayed_latest)}/"
-            f"{_base._format_integer(total_sessions)}개 범위에 집계할 세션이 없습니다.</p>"
-        )
-    offset = 0.0
-    segments: list[str] = []
-    for status in _STATE_ORDER:
-        count = counts.get(status, 0)
-        percentage = (count / total * 100.0) if total else 0.0
-        if percentage > 0:
-            rest = max(0.0, 100.0 - percentage)
-            segments.append(
-                '<circle class="state-ring-segment '
-                f'{_STATE_CLASSES[status]}" cx="60" cy="60" r="44" pathLength="100" '
-                f'stroke-dasharray="{percentage:.4f} {rest:.4f}" '
-                f'stroke-dashoffset="{-offset:.4f}"></circle>'
-            )
-            offset += percentage
-    ring = "".join(segments)
-    rows = "".join(
-        '<div class="state-row">'
-        f'<span class="state-dot {_STATE_CLASSES[status]}" aria-hidden="true"></span>'
-        f'<span class="state-name">{_base._e(_STATE_LABELS[status])}</span>'
-        f'<strong class="state-count">{_base._format_integer(counts.get(status, 0))}</strong>'
-        "</div>"
-        for status in _STATE_ORDER
-    )
-    return (
-        '<div class="state-content">'
-        '<svg class="state-ring" viewBox="0 0 120 120" role="img" '
-        f'aria-label="최신 표시 {_base._format_integer(total)}/'
-        f'{_base._format_integer(total_sessions)}개 상태 분포">'
-        '<circle class="state-ring-base" cx="60" cy="60" r="44"></circle>'
-        f"{ring}"
-        f'<text class="state-total" x="60" y="59">{_base._format_integer(total)}</text>'
-        f'<text class="state-caption" x="60" y="74">LATEST '
-        f"{_base._format_integer(total)}/{_base._format_integer(total_sessions)}</text>"
-        "</svg>"
-        f'<div class="state-list">{rows}</div>'
-        "</div>"
+def _resolve_protocol_port_frequency_summary(
+    snapshot: RunReportSnapshot,
+    rows: Iterable[ReportRow],
+) -> tuple[tuple[int, int, int, int], ...]:
+    summary = snapshot.protocol_port_frequency_summary
+    if summary is None:
+        return _top_protocol_port_frequencies(rows)
+    return _normalize_protocol_port_frequencies(summary)
+
+
+def _top_ip_frequencies(rows: Iterable[ReportRow]) -> tuple[tuple[str, int, int], ...]:
+    counts: dict[str, list[int]] = {}
+    for row in rows:
+        source = _frequency_ip(row.get("source_ip"))
+        destination = _frequency_ip(row.get("destination_ip"))
+        if source:
+            counts.setdefault(source, [0, 0])[0] += 1
+        if destination:
+            counts.setdefault(destination, [0, 0])[1] += 1
+    return _normalize_ip_frequencies(
+        (address, direction_counts[0], direction_counts[1])
+        for address, direction_counts in counts.items()
     )
 
 
-def _timeline_markup(snapshot: RunReportSnapshot) -> str:
-    entries: list[tuple[datetime, int, str, str, str]] = []
-    controller_entries: list[tuple[datetime, int, str, str, str]] = []
-    controller_fact_counts: dict[tuple[datetime, str], int] = {}
-
-    for index, row in enumerate(snapshot.controller_events):
-        parsed = _base._parse_datetime(row.get("occurred_at"))
-        if parsed is None:
+def _top_protocol_port_frequencies(
+    rows: Iterable[ReportRow],
+) -> tuple[tuple[int, int, int, int], ...]:
+    counts: dict[tuple[int, int], list[int]] = {}
+    for row in rows:
+        protocol = _base._optional_int(row.get("protocol"))
+        if protocol is None or not 0 <= protocol <= 255:
             continue
-        previous = _base._plain(row.get("previous_controller"))
-        current = _base._plain(row.get("current_controller"))
-        detail = (
-            f"{previous} → {current}"
-            if previous != "-" or current != "-"
-            else "관측 MD 정보가 변경되었습니다."
-        )
-        fact_key = (parsed, current)
-        controller_fact_counts[fact_key] = controller_fact_counts.get(fact_key, 0) + 1
-        controller_entries.append(
-            (
-                parsed,
-                len(snapshot.lifecycle_events) + index,
-                _base._format_kst(row.get("occurred_at")),
-                "관측 MD 변경 확인",
-                detail,
-            )
-        )
-
-    for index, row in enumerate(snapshot.lifecycle_events):
-        event_type = str(row.get("event_type") or "").upper()
-        label = _EVENT_LABELS.get(event_type)
-        parsed = _base._parse_datetime(row.get("occurred_at"))
-        if label is None or parsed is None:
-            continue
-        # The normal persistence path records a confirmed controller move in
-        # both lifecycle_events and controller_events. Suppress only one
-        # lifecycle row for a controller fact with the same timestamp and
-        # current controller; a timestamp alone is not a safe correlation key.
-        if event_type == "CONTROLLER_CHANGED":
-            fact_key = (parsed, _base._plain(row.get("controller_name")))
-            remaining = controller_fact_counts.get(fact_key, 0)
-            if remaining > 0:
-                controller_fact_counts[fact_key] = remaining - 1
+        for direction_index, field in enumerate(("source_port", "destination_port")):
+            port = _base._optional_int(row.get(field))
+            if port is None or not 1 <= port <= 65535:
                 continue
-        entries.append(
-            (
-                parsed,
-                index,
-                _base._format_kst(row.get("occurred_at")),
-                label,
-                _session_key_context(row.get("session_key")),
-            )
-        )
-
-    entries.extend(controller_entries)
-
-    deduplicated: dict[tuple[str, str, str], tuple[datetime, int, str, str, str]] = {}
-    for entry in entries:
-        key = (entry[2], entry[3], entry[4])
-        deduplicated.setdefault(key, entry)
-    ordered = sorted(deduplicated.values(), key=lambda item: (item[0], item[1]))
-    ordered = ordered[-_TIMELINE_LIMIT:]
-    if not ordered:
-        return '<p class="muted">보고서 스냅샷에 표시할 저장 사실이 없습니다.</p>'
-    return (
-        '<ol class="event-list">'
-        + "".join(
-            '<li class="event-item">'
-            f'<time class="event-time">{_base._e(timestamp)}</time>'
-            '<span class="event-track" aria-hidden="true"></span>'
-            "<div>"
-            f'<div class="event-title">{_base._e(label)}</div>'
-            f'<div class="event-detail">{_base._e(detail)}</div>'
-            "</div></li>"
-            for _parsed, _index, timestamp, label, detail in ordered
-        )
-        + "</ol>"
+            counts.setdefault((protocol, port), [0, 0])[direction_index] += 1
+    return _normalize_protocol_port_frequencies(
+        (protocol, port, direction_counts[0], direction_counts[1])
+        for (protocol, port), direction_counts in counts.items()
     )
 
 
-def _session_key_context(value: object) -> str:
-    session_key = str(value or "")
-    parts = session_key.split("|")
-    if len(parts) != 6:
-        return "저장된 논리 세션"
-    protocol = _base._protocol(parts[1])
-    protocol_number = _base._optional_int(parts[1])
-    source = _base._endpoint(parts[2], parts[4], protocol=protocol_number)
-    destination = _base._endpoint(parts[3], parts[5], protocol=protocol_number)
-    return f"{protocol} · {source} → {destination}"
+def _normalize_ip_frequencies(
+    rows: Iterable[tuple[str, int, int]],
+) -> tuple[tuple[str, int, int], ...]:
+    combined: dict[str, list[int]] = {}
+    for address, source_count, destination_count in rows:
+        clean_address = _frequency_ip(address)
+        source = max(0, int(source_count))
+        destination = max(0, int(destination_count))
+        if not clean_address or source + destination == 0:
+            continue
+        target = combined.setdefault(clean_address, [0, 0])
+        target[0] += source
+        target[1] += destination
+    ordered = sorted(
+        (
+            (address, direction_counts[0], direction_counts[1])
+            for address, direction_counts in combined.items()
+        ),
+        key=lambda item: (-(item[1] + item[2]), item[0]),
+    )
+    return tuple(ordered[:_FREQUENCY_LIMIT])
+
+
+def _normalize_protocol_port_frequencies(
+    rows: Iterable[tuple[int, int, int, int]],
+) -> tuple[tuple[int, int, int, int], ...]:
+    combined: dict[tuple[int, int], list[int]] = {}
+    for protocol_value, port_value, source_count, destination_count in rows:
+        protocol = _base._optional_int(protocol_value)
+        port = _base._optional_int(port_value)
+        source = max(0, int(source_count))
+        destination = max(0, int(destination_count))
+        if (
+            protocol is None
+            or port is None
+            or not 0 <= protocol <= 255
+            or not 1 <= port <= 65535
+            or source + destination == 0
+        ):
+            continue
+        target = combined.setdefault((protocol, port), [0, 0])
+        target[0] += source
+        target[1] += destination
+    ordered = sorted(
+        (
+            (protocol, port, direction_counts[0], direction_counts[1])
+            for (protocol, port), direction_counts in combined.items()
+        ),
+        key=lambda item: (-(item[2] + item[3]), item[0], item[1]),
+    )
+    return tuple(ordered[:_FREQUENCY_LIMIT])
+
+
+def _frequency_ip(value: object) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def _frequency_chart_markup(
+    rows: tuple[FrequencyRow, ...],
+    labeler: Callable[[FrequencyRow], str],
+    empty_message: str,
+) -> str:
+    if not rows:
+        return f'<p class="muted">{_base._e(empty_message)}</p>'
+    maximum = max(row[-2] + row[-1] for row in rows)
+    items: list[str] = []
+    for row in rows:
+        source_count = row[-2]
+        destination_count = row[-1]
+        total = source_count + destination_count
+        source_width = source_count / maximum * 100.0
+        destination_width = destination_count / maximum * 100.0
+        label = labeler(row)
+        items.append(
+            '<li class="frequency-item">'
+            '<div class="frequency-heading">'
+            f'<span class="frequency-label">{_base._e(label)}</span>'
+            "</div>"
+            f'<div class="frequency-count">총 {_base._format_integer(total)}회 · '
+            f"출발지 {_base._format_integer(source_count)}회 · "
+            f"목적지 {_base._format_integer(destination_count)}회</div>"
+            '<div class="frequency-bar" aria-hidden="true">'
+            f'<span class="frequency-source" style="width:{source_width:.4f}%"></span>'
+            f'<span class="frequency-destination" style="width:{destination_width:.4f}%"></span>'
+            "</div></li>"
+        )
+    return '<ol class="frequency-list" role="list">' + "".join(items) + "</ol>"
+
+
+def _ip_frequency_label(row: FrequencyRow) -> str:
+    return str(row[0])
+
+
+def _protocol_port_frequency_label(row: FrequencyRow) -> str:
+    protocol = int(row[0])
+    port = int(row[1])
+    return f"{_base._protocol(protocol)} · {service_label(protocol, port)}"
 
 
 def _format_duration(started_at: object, ended_at: object) -> str:
@@ -764,11 +727,16 @@ def _format_duration(started_at: object, ended_at: object) -> str:
     return f"{minutes}분 {seconds}초"
 
 
-def _display_run_identifier(run: ReportRow) -> str:
-    source = _base._plain(run.get("source_ip"))
-    destination = _base._plain(run.get("destination_ip"))
-    started = _base._format_kst(run.get("started_at"))
-    return f"{source} → {destination} · {started}"
+def _display_query_target(run: ReportRow) -> str:
+    source = _frequency_ip(run.get("source_ip"))
+    destination = _frequency_ip(run.get("destination_ip"))
+    if source and destination:
+        return f"{source} → {destination}"
+    if source:
+        return f"출발지: {source}"
+    if destination:
+        return f"목적지: {destination}"
+    return "조회 대상 없음"
 
 
 def _observed_controllers(rows: tuple[ReportRow, ...]) -> tuple[str, ...]:

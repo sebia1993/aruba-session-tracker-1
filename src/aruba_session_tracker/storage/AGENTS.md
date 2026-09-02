@@ -1,12 +1,11 @@
-# HTML Report Redesign Instructions — Dark NOC Console V1
+# HTML Report Presentation Instructions — Dark NOC Console V1
 
 These instructions apply to report presentation files under
-`src/aruba_session_tracker/storage/` on branch `design/dark-noc-console-v1`.
+`src/aruba_session_tracker/storage/`.
 
 Read `design-system/aruba-session-tracker/DARK_NOC_CONSOLE_V1.md` first.
-For HTML presentation, that design target supersedes the older root presentation rule
-that prohibited all lifecycle/controller event timelines. Security, privacy, storage,
-and data-integrity rules from the root instructions remain mandatory.
+Security, privacy, storage, and data-integrity rules from the root instructions remain
+mandatory.
 
 ## Approved report direction
 
@@ -14,11 +13,16 @@ and data-integrity rules from the root instructions remain mandatory.
 - Keep one self-contained HTML5 file.
 - Preserve complete stored observations.
 - Keep current local exact-value filtering behavior if present.
-- May add a significant-event timeline using only stored sanitized lifecycle/controller
-  facts already present in the report snapshot.
-- May add a state summary using deterministic stored lifecycle status counts.
-- May use inline SVG/CSS for a compact ring/segmented visualization.
-- Do not infer cause, failover, outage, or path from controller/lifecycle events.
+- Replace the former session-state summary and recent-event timeline with exactly two
+  static, full-history TOP 5 summaries: IP and protocol/port. Each stored observation
+  contributes one source count and one destination count.
+- Use deterministic ordering (total descending, then IP text or protocol/port ascending),
+  omit blank IPs and port 0, and label only catalogue-known services such as
+  `443(HTTPS)`; unknown services remain numeric.
+- Render accessible horizontal stacked bars with visible counts. They do not respond to
+  result filters and require no new JavaScript, SVG, library, or external asset.
+- The visible report-basis field is `조회 대상`; do not expose or alter the internal
+  run ID. Do not add date text to that field.
 
 ## Still forbidden
 
@@ -34,6 +38,8 @@ and data-integrity rules from the root instructions remain mandatory.
 - browser storage;
 - clipboard APIs;
 - `eval` or executable runtime/device markup.
+- session-state or lifecycle/controller-event summaries and timelines;
+- device/controller, diagnostic, cause, or other distribution charts.
 
 ## Security and tests
 

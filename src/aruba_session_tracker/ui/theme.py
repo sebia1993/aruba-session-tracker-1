@@ -31,12 +31,262 @@ _DEFAULT_FONT_SIZE = 9
 _HEADER_HEIGHT = 66
 
 
+def apply_application_popup_theme(application: QApplication) -> None:
+    """Install the popup theme before any application-owned transient is shown.
+
+    Startup failures are displayed before :class:`MainWindow` exists, so the
+    popup palette must live on the application rather than relying on the main
+    window stylesheet.  Native operating-system file choosers are not Qt
+    widgets and remain owned by the platform; these rules apply only when Qt
+    uses its widget-based fallback dialog.
+    """
+
+    high_contrast = _uses_high_contrast_palette(application.palette())
+    application.setProperty("popupThemeContrast", "high" if high_contrast else "normal")
+    application.setFont(QFont(_DEFAULT_FONT_FAMILY, _DEFAULT_FONT_SIZE))
+    application.setStyleSheet(build_popup_stylesheet(high_contrast=high_contrast))
+
+
+def build_popup_stylesheet(*, high_contrast: bool = False) -> str:
+    """Return the shared application-level styling for owned popup surfaces."""
+
+    if high_contrast:
+        return """
+        /* Native-palette popup fallback for Windows high contrast. */
+        QMessageBox,
+        QDialog,
+        QFileDialog,
+        QMenu,
+        QWidget[popupSurface="startup"] {
+            color: palette(window-text);
+            background-color: palette(window);
+            border-color: palette(highlight);
+        }
+
+        QMessageBox QLabel,
+        QDialog QLabel,
+        QFileDialog QLabel,
+        QWidget[popupSurface="startup"] QLabel,
+        QMessageBox QCheckBox,
+        QDialog QCheckBox,
+        QFileDialog QCheckBox {
+            color: palette(window-text);
+            background-color: transparent;
+        }
+
+        QMessageBox QLineEdit,
+        QMessageBox QTextEdit,
+        QMessageBox QPlainTextEdit,
+        QMessageBox QListWidget,
+        QDialog QLineEdit,
+        QDialog QTextEdit,
+        QDialog QPlainTextEdit,
+        QDialog QListWidget,
+        QDialog QTreeView,
+        QDialog QTableView,
+        QDialog QComboBox,
+        QDialog QSpinBox,
+        QFileDialog QLineEdit,
+        QFileDialog QListView,
+        QFileDialog QTreeView,
+        QFileDialog QComboBox {
+            color: palette(text);
+            background-color: palette(base);
+            border: 1px solid palette(highlight);
+            selection-color: palette(highlighted-text);
+            selection-background-color: palette(highlight);
+        }
+
+        QMessageBox QPushButton,
+        QDialog QPushButton,
+        QFileDialog QPushButton {
+            min-height: 30px;
+            padding: 0 12px;
+            color: palette(button-text);
+            background-color: palette(button);
+            border: 2px solid palette(highlight);
+            border-radius: 4px;
+        }
+
+        QMessageBox QPushButton:focus,
+        QMessageBox QPushButton:default,
+        QDialog QPushButton:focus,
+        QDialog QPushButton:default,
+        QFileDialog QPushButton:focus,
+        QFileDialog QPushButton:default,
+        QMenu:focus {
+            border: 2px solid palette(highlight);
+        }
+
+        QMenu::item {
+            min-height: 26px;
+            padding: 4px 24px 4px 10px;
+            color: palette(window-text);
+            background-color: palette(window);
+        }
+
+        QMenu::item:selected {
+            color: palette(highlighted-text);
+            background-color: palette(highlight);
+        }
+
+        QMenu::item:disabled {
+            color: palette(mid);
+        }
+
+        QMenu::separator {
+            height: 1px;
+            background-color: palette(highlight);
+        }
+
+        QToolTip {
+            color: palette(window-text);
+            background-color: palette(window);
+            border: 1px solid palette(highlight);
+            padding: 5px 7px;
+        }
+
+        QWidget[popupSurface="startup"] QProgressBar {
+            min-height: 12px;
+            color: palette(text);
+            background-color: palette(base);
+            border: 1px solid palette(highlight);
+        }
+
+        QWidget[popupSurface="startup"] QProgressBar::chunk {
+            background-color: palette(highlight);
+        }
+        """
+
+    return """
+    /* Application-owned transient surfaces — Dark NOC Console V1. */
+    QMessageBox,
+    QDialog,
+    QFileDialog,
+    QMenu,
+    QWidget[popupSurface="startup"] {
+        color: #E8EFF6;
+        background-color: #152331;
+        border-color: #66859D;
+    }
+
+    QMessageBox QLabel,
+    QDialog QLabel,
+    QFileDialog QLabel,
+    QWidget[popupSurface="startup"] QLabel,
+    QMessageBox QCheckBox,
+    QDialog QCheckBox,
+    QFileDialog QCheckBox {
+        color: #E8EFF6;
+        background-color: transparent;
+    }
+
+    QMessageBox QLabel#qt_msgbox_label,
+    QMessageBox QLabel#qt_msgbox_informativelabel {
+        min-width: 320px;
+    }
+
+    QMessageBox QLineEdit,
+    QMessageBox QTextEdit,
+    QMessageBox QPlainTextEdit,
+    QMessageBox QListWidget,
+    QDialog QLineEdit,
+    QDialog QTextEdit,
+    QDialog QPlainTextEdit,
+    QDialog QListWidget,
+    QDialog QTreeView,
+    QDialog QTableView,
+    QDialog QComboBox,
+    QDialog QSpinBox,
+    QFileDialog QLineEdit,
+    QFileDialog QListView,
+    QFileDialog QTreeView,
+    QFileDialog QComboBox {
+        color: #E8EFF6;
+        background-color: #0C1822;
+        border: 1px solid #66859D;
+        border-radius: 3px;
+        selection-color: #FFFFFF;
+        selection-background-color: #294D6A;
+    }
+
+    QMessageBox QPushButton,
+    QDialog QPushButton,
+    QFileDialog QPushButton {
+        min-height: 30px;
+        padding: 0 12px;
+        color: #E8EFF6;
+        background-color: #1C2E3F;
+        border: 1px solid #66859D;
+        border-radius: 4px;
+    }
+
+    QMessageBox QPushButton:hover,
+    QDialog QPushButton:hover,
+    QFileDialog QPushButton:hover {
+        background-color: #243A4E;
+    }
+
+    QMessageBox QPushButton:focus,
+    QMessageBox QPushButton:default,
+    QDialog QPushButton:focus,
+    QDialog QPushButton:default,
+    QFileDialog QPushButton:focus,
+    QFileDialog QPushButton:default,
+    QMenu:focus {
+        border: 2px solid #42B7C8;
+    }
+
+    QMenu::item {
+        min-height: 26px;
+        padding: 4px 24px 4px 10px;
+        color: #E8EFF6;
+        background-color: #152331;
+    }
+
+    QMenu::item:selected {
+        color: #FFFFFF;
+        background-color: #294D6A;
+    }
+
+    QMenu::item:disabled {
+        color: #91A5B8;
+    }
+
+    QMenu::separator {
+        height: 1px;
+        background-color: #66859D;
+    }
+
+    QToolTip {
+        color: #FFFFFF;
+        background-color: #1C2937;
+        border: 1px solid #66859D;
+        padding: 5px 7px;
+    }
+
+    QWidget[popupSurface="startup"] QProgressBar {
+        min-height: 12px;
+        color: #E8EFF6;
+        background-color: #0C1822;
+        border: 1px solid #66859D;
+        border-radius: 4px;
+    }
+
+    QWidget[popupSurface="startup"] QProgressBar::chunk {
+        background-color: #2F80ED;
+    }
+    """
+
+
 def apply_main_window_theme(window: MainWindow) -> None:
     """Apply the approved dark NOC presentation without replacing controls."""
 
     window.setObjectName("mainWindow")
     application = QApplication.instance()
     palette = application.palette() if isinstance(application, QApplication) else window.palette()
+    if isinstance(application, QApplication):
+        apply_application_popup_theme(application)
     window.setProperty(
         "themeContrast",
         "high" if _uses_high_contrast_palette(palette) else "normal",
@@ -1008,6 +1258,12 @@ def build_stylesheet() -> str:
         border-color: palette(mid);
     }
 
+    QMainWindow#mainWindow[themeContrast="high"] QToolTip {
+        color: palette(window-text);
+        background-color: palette(window);
+        border: 1px solid palette(highlight);
+    }
+
     QMainWindow#mainWindow[themeContrast="high"] QTabBar::tab:selected,
     QMainWindow#mainWindow[themeContrast="high"] QTableWidget::item:selected,
     QMainWindow#mainWindow[themeContrast="high"] QListWidget::item:selected {
@@ -1177,14 +1433,31 @@ def _clear_explicit_result_foregrounds(window: MainWindow) -> None:
 
 
 def _uses_high_contrast_palette(palette: QPalette) -> bool:
-    role_pairs = (
+    text_pairs = (
         (QPalette.ColorRole.Window, QPalette.ColorRole.WindowText),
         (QPalette.ColorRole.Base, QPalette.ColorRole.Text),
         (QPalette.ColorRole.Highlight, QPalette.ColorRole.HighlightedText),
     )
-    return all(
-        _contrast_ratio(palette.color(background), palette.color(foreground)) >= 7.0
-        for background, foreground in role_pairs
+    button_ratio = _contrast_ratio(
+        palette.color(QPalette.ColorRole.Button),
+        palette.color(QPalette.ColorRole.ButtonText),
+    )
+    highlight = palette.color(QPalette.ColorRole.Highlight)
+    focus_surfaces = (
+        QPalette.ColorRole.Window,
+        QPalette.ColorRole.Base,
+        QPalette.ColorRole.Button,
+    )
+    focus_visible = all(
+        _contrast_ratio(highlight, palette.color(surface)) >= 3.0 for surface in focus_surfaces
+    )
+    return (
+        button_ratio >= 4.5
+        and focus_visible
+        and all(
+            _contrast_ratio(palette.color(background), palette.color(foreground)) >= 7.0
+            for background, foreground in text_pairs
+        )
     )
 
 
@@ -1215,4 +1488,9 @@ def _configure_guidance(window: MainWindow) -> None:
     window.mm_standby_host.setPlaceholderText("Standby MM IPv4")
 
 
-__all__ = ["apply_main_window_theme", "build_stylesheet"]
+__all__ = [
+    "apply_application_popup_theme",
+    "apply_main_window_theme",
+    "build_popup_stylesheet",
+    "build_stylesheet",
+]

@@ -12,7 +12,12 @@ from aruba_session_tracker.collectors import (
     SSHConnectionFactory,
     StrictNetmikoFactory,
 )
-from aruba_session_tracker.models import AppConfig, Credentials, QueryRequest
+from aruba_session_tracker.models import (
+    AppConfig,
+    Credentials,
+    QueryRequest,
+    StorageFailureBoundary,
+)
 from aruba_session_tracker.paths import AppPaths
 from aruba_session_tracker.services import (
     FullScanApproval,
@@ -28,6 +33,7 @@ from aruba_session_tracker.storage import (
     PollPersistenceResult,
     PollPersistenceStatus,
     SessionStore,
+    StorageError,
 )
 
 
@@ -164,7 +170,11 @@ class RuntimeExecutor:
         full_scan_approval: FullScanApproval,
     ) -> QueryOutcome:
         service = self._service(config, host_key_approval, full_scan_approval)
-        run_id = self._store.start_run(request)
+        try:
+            run_id = self._store.start_run(request)
+        except StorageError as exc:
+            exc.at_boundary(StorageFailureBoundary.QUERY_START)
+            raise
         poll_id = uuid4().hex
         try:
             outcome = service.query_once(
@@ -192,6 +202,12 @@ class RuntimeExecutor:
                 )
             self._require_indeterminate_poll_id(exc, poll_id)
             raise
+        except StorageError as exc:
+            exc.at_boundary(StorageFailureBoundary.QUERY_RESULT)
+            finish_error = self._finish_or_queue(run_id, "FAILED")
+            if finish_error is not None:
+                exc.add_note("실행 실패 상태도 저장하지 못했습니다.")
+            raise
         except Exception as exc:
             finish_error = self._finish_or_queue(run_id, "FAILED")
             if finish_error is not None:
@@ -200,6 +216,8 @@ class RuntimeExecutor:
         status = _one_shot_status(outcome)
         finish_error = self._finish_or_queue(run_id, status)
         if finish_error is not None:
+            if isinstance(finish_error, StorageError):
+                raise finish_error
             raise RuntimeError("실행 종료 상태를 저장하지 못했습니다.") from finish_error
         return outcome
 
@@ -412,6 +430,8 @@ class RuntimeExecutor:
             if restart_run_id is not None:
                 finish_error = self._finish_or_queue(restart_run_id, "RESTARTED")
                 if finish_error is not None:
+                    if isinstance(finish_error, StorageError):
+                        raise finish_error
                     raise RuntimeError("이전 모니터링 종료 상태를 저장하지 못했습니다.") from (
                         finish_error
                     )
@@ -436,7 +456,11 @@ class RuntimeExecutor:
                     credentials,
                     full_scan_approval=full_scan_approval,
                 )
-                run_id = self._store.start_run(request)
+                try:
+                    run_id = self._store.start_run(request)
+                except StorageError as exc:
+                    exc.at_boundary(StorageFailureBoundary.QUERY_START)
+                    raise
                 with self._lock:
                     if self._active_monitor_poll is not lease:
                         raise RuntimeError("모니터링 실행 소유권이 변경되었습니다.")
@@ -490,6 +514,8 @@ class RuntimeExecutor:
             self._require_indeterminate_poll_id(exc, lease.poll_id)
             raise
         except Exception as exc:
+            if isinstance(exc, StorageError):
+                exc.at_boundary(StorageFailureBoundary.QUERY_RESULT)
             if pending is not None and prepared is pending.prepared:
                 # Once a previous attempt became indeterminate, only a
                 # confirmed committed result may release this prepared poll.
@@ -555,6 +581,8 @@ class RuntimeExecutor:
                     if self._active_monitor_poll is lease:
                         self._active_monitor_poll = None
                 if finish_error is not None:
+                    if isinstance(finish_error, StorageError):
+                        raise finish_error
                     raise RuntimeError("모니터링 종료 상태를 저장하지 못했습니다.") from (
                         finish_error
                     )
@@ -605,6 +633,8 @@ class RuntimeExecutor:
         try:
             self._store.finish_run(run_id, status=status)
         except Exception as exc:
+            if isinstance(exc, StorageError):
+                exc.at_boundary(StorageFailureBoundary.QUERY_FINALIZE)
             with self._lock:
                 self._pending_finishes[run_id] = status
                 self.last_shutdown_error = type(exc).__name__
@@ -643,6 +673,11 @@ class RuntimeExecutor:
             except PollPersistenceIndeterminate as exc:
                 self._require_indeterminate_poll_id(exc, pending.poll_id)
                 raise
+            except StorageError as exc:
+                exc.at_boundary(StorageFailureBoundary.QUERY_RESULT)
+                # Preserve the exact pending poll for the same reason as the
+                # general failure path below.
+                raise
             except Exception:
                 # The first attempt's commit state is still unknown. Preserve
                 # the exact request, result, run and poll ID until a durable
@@ -656,6 +691,8 @@ class RuntimeExecutor:
             status = _one_shot_status(pending.outcome)
             finish_error = self._finish_or_queue(pending.run_id, status)
             if finish_error is not None:
+                if isinstance(finish_error, StorageError):
+                    raise finish_error
                 raise RuntimeError("실행 종료 상태를 저장하지 못했습니다.") from finish_error
             if not monitoring and signature == pending.signature and request == pending.request:
                 return pending.outcome
@@ -704,6 +741,8 @@ class RuntimeExecutor:
                 if error is not None and first_error is None:
                     first_error = error
             if required and first_error is not None:
+                if isinstance(first_error, StorageError):
+                    raise first_error
                 raise RuntimeError("이전 실행 종료 상태를 저장하지 못했습니다.") from first_error
 
 

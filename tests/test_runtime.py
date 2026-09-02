@@ -25,6 +25,8 @@ from aruba_session_tracker.models import (
     ErrorCode,
     QueryRequest,
     SessionObservation,
+    StorageFailureBoundary,
+    StorageFailureKind,
 )
 from aruba_session_tracker.paths import AppPaths
 from aruba_session_tracker.runtime import RuntimeExecutor, _one_shot_status
@@ -493,6 +495,77 @@ def test_runtime_retries_one_shot_finalization_before_the_next_query(
     assert finish_attempts == 3
     assert executor.last_shutdown_error is None
     assert [run["status"] for run in store.list_runs()] == ["COMPLETED", "COMPLETED"]
+
+
+def test_runtime_preserves_typed_storage_result_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    store = SessionStore(paths.database, paths.raw, paths.exports)
+    store.initialize()
+    executor = RuntimeExecutor(paths, store, ssh_factory=_Factory())
+    request = QueryRequest("192.0.2.10", "203.0.113.20", 54321, 443)
+    credentials = Credentials("operator", "session-only")
+
+    def fail_result(*_args: object, **_kwargs: object) -> PollPersistenceResult:
+        raise StorageError(
+            "fixture output limit",
+            failure_kind=StorageFailureKind.OUTPUT_LIMIT,
+        )
+
+    monkeypatch.setattr(store, "record_poll_batch", fail_result)
+    with pytest.raises(StorageError) as caught:
+        executor.execute(
+            _config(),
+            request,
+            credentials,
+            monitoring=False,
+            cancel_token=CancellationToken(),
+            host_key_approval=lambda _target, _info: True,
+            full_scan_approval=lambda _request, _devices: False,
+        )
+
+    assert caught.value.code is ErrorCode.OUTPUT_LIMIT_EXCEEDED
+    assert caught.value.failure_kind is StorageFailureKind.OUTPUT_LIMIT
+    assert caught.value.boundary is StorageFailureBoundary.QUERY_RESULT
+
+
+def test_runtime_preserves_typed_storage_finalize_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    store = SessionStore(paths.database, paths.raw, paths.exports)
+    store.initialize()
+    executor = RuntimeExecutor(paths, store, ssh_factory=_Factory())
+    request = QueryRequest("192.0.2.10", "203.0.113.20", 54321, 443)
+    credentials = Credentials("operator", "session-only")
+    original_finish = store.finish_run
+
+    def fail_finalize(*_args: object, **_kwargs: object) -> None:
+        raise StorageError(
+            "fixture storage path",
+            failure_kind=StorageFailureKind.STORAGE_PATH,
+        )
+
+    monkeypatch.setattr(store, "finish_run", fail_finalize)
+    with pytest.raises(StorageError) as caught:
+        executor.execute(
+            _config(),
+            request,
+            credentials,
+            monitoring=False,
+            cancel_token=CancellationToken(),
+            host_key_approval=lambda _target, _info: True,
+            full_scan_approval=lambda _request, _devices: False,
+        )
+
+    assert caught.value.code is ErrorCode.STORAGE_PATH_FAILED
+    assert caught.value.failure_kind is StorageFailureKind.STORAGE_PATH
+    assert caught.value.boundary is StorageFailureBoundary.QUERY_FINALIZE
+    run_id = str(store.list_runs()[0]["id"])
+    original_finish(run_id, status="FAILED")
 
 
 def test_runtime_serializes_concurrent_pending_finish_retries(

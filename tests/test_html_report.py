@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import re
+from collections.abc import Iterator
 from html.parser import HTMLParser
 from inspect import signature
 from pathlib import Path
@@ -76,6 +77,8 @@ def _snapshot(
     controller_events: tuple[dict[str, object], ...] | None = None,
     diagnostics: tuple[dict[str, object], ...] | None = None,
     observation_total: int | None = None,
+    ip_frequency_summary: tuple[tuple[str, int, int], ...] | None = None,
+    protocol_port_frequency_summary: tuple[tuple[int, int, int, int], ...] | None = None,
 ) -> RunReportSnapshot:
     run_row = (
         run
@@ -167,6 +170,8 @@ def _snapshot(
         raw_file_total=len(raw_rows),
         raw_byte_total=1024,
         observation_history=history_rows,
+        ip_frequency_summary=ip_frequency_summary,
+        protocol_port_frequency_summary=protocol_port_frequency_summary,
     )
 
 
@@ -252,10 +257,17 @@ def test_report_is_concise_standalone_result_only_html5() -> None:
     assert not re.search(r"\b(?:src|href)=[\"'](?:https?:)?//", lowered)
     assert "<nav" not in lowered
 
-    headings = ("조회 요약", "결과 찾기", "최신 세션 결과", "수집 정보", "전체 추적 이력")
+    headings = (
+        "조회 요약",
+        "전체 이력 관측 빈도 TOP 5",
+        "결과 찾기",
+        "최신 세션 결과",
+        "수집 정보",
+        "전체 추적 이력",
+    )
     positions = [document.index(heading) for heading in headings]
     assert positions == sorted(positions)
-    assert document.count("<h2") == 5
+    assert document.count("<h2") == 6
     assert re.findall(r'<th scope="col">([^<]+)</th>', _section(document, "latest-sessions")) == [
         "프로토콜",
         "출발지 IP·포트",
@@ -604,6 +616,31 @@ def test_report_shows_the_wildcard_side_of_a_single_ip_query() -> None:
     assert '<span class="endpoint-value">203.0.113.80:443</span>' in document
 
 
+@pytest.mark.parametrize(
+    ("source_ip", "destination_ip", "expected"),
+    (
+        ("192.0.2.10", "203.0.113.20", "192.0.2.10 → 203.0.113.20"),
+        ("192.0.2.10", "", "출발지: 192.0.2.10"),
+        ("", "203.0.113.20", "목적지: 203.0.113.20"),
+        ("", "", "조회 대상 없음"),
+    ),
+)
+def test_report_basis_uses_clean_query_target_without_date_or_internal_id(
+    source_ip: str,
+    destination_ip: str,
+    expected: str,
+) -> None:
+    run = dict(_snapshot().run)
+    run.update(id="INTERNAL-RUN-ID", source_ip=source_ip, destination_ip=destination_ip)
+
+    document = render_html_report(_snapshot(run=run))
+
+    assert f'<div class="run-fact"><dt>조회 대상</dt><dd>{expected}</dd></div>' in document
+    assert "<dt>실행 ID</dt>" not in document
+    assert "INTERNAL-RUN-ID" not in document
+    assert f"{expected} · 2026-08-28" not in document
+
+
 def test_summary_prioritizes_query_flow_and_keeps_only_four_core_stats() -> None:
     document = render_html_report(_snapshot())
 
@@ -627,8 +664,7 @@ def test_investigation_sections_keep_the_approved_evidence_order() -> None:
     document = render_html_report(_snapshot())
     markers = (
         "조회 요약",
-        'id="session-state"',
-        'id="significant-events"',
+        'id="observation-frequency"',
         'id="latest-sessions"',
         'id="collection-information"',
         'id="observation-history"',
@@ -637,8 +673,12 @@ def test_investigation_sections_keep_the_approved_evidence_order() -> None:
     positions = [document.index(marker) for marker in markers]
     assert positions == sorted(positions)
     assert "Network Session Investigation Report" in document
-    assert "보고서 스냅샷에 포함된 저장 사실" in document
-    assert "전체 이벤트 이력을 의미하지 않습니다." in document
+    assert "저장된 전체 관측 1건" in document
+    assert "아래 결과 필터와도 연동되지 않습니다." in document
+    assert 'id="session-state"' not in document
+    assert 'id="significant-events"' not in document
+    assert "최신 표시 세션 상태" not in document
+    assert "주요 세션 변화" not in document
 
 
 @pytest.mark.parametrize(
@@ -717,138 +757,138 @@ def test_collection_information_uses_dash_when_no_session_has_a_controller() -> 
     assert "<dt>최근 세션 관측 장비</dt><dd>—</dd>" in collection
 
 
-def test_timeline_prefers_controller_fact_and_omits_private_event_fields() -> None:
-    observation = _observation(controller_name="MD-B", controller_host="198.51.100.77")
-    lifecycle = (
-        {
-            "occurred_at": "2026-08-28T08:03:00Z",
-            "session_key": observation["session_key"],
-            "event_type": "CONTROLLER_CHANGED",
-            "controller_name": "MD-B &",
-            "details_json": '{"password":"LIFECYCLE-SECRET"}',
-        },
-        {
-            "occurred_at": "2026-08-28T08:04:00Z",
-            "session_key": observation["session_key"],
-            "event_type": "OBSERVED",
-            "details_json": '{"reason":"PRIVATE-RECOVERY"}',
-        },
-        {
-            "occurred_at": "2026-08-28T08:05:00Z",
-            "session_key": observation["session_key"],
-            "event_type": "COUNTERS_CHANGED",
-            "details_json": '{"packet_delta":987654321}',
-        },
-    )
-    controller_events = (
-        {
-            "occurred_at": "2026-08-28T08:03:00Z",
-            "previous_controller": "<MD-A>",
-            "current_controller": "MD-B &",
-            "reason": "password=CONTROLLER-SECRET",
-        },
-    )
-
-    document = render_html_report(
-        _snapshot(
-            observations=(observation,),
-            observation_history=(observation,),
-            lifecycle_events=lifecycle,
-            controller_events=controller_events,
-        )
-    )
-    timeline = _section(document, "significant-events")
-
-    assert timeline.count("관측 MD 변경 확인") == 1
-    assert "&lt;MD-A&gt; → MD-B &amp;" in timeline
-    assert "세션 다시 확인" in timeline
-    assert "세션 수치 기준 변경 확인" in timeline
-    for private_value in (
-        "LIFECYCLE-SECRET",
-        "PRIVATE-RECOVERY",
-        "987654321",
-        "CONTROLLER-SECRET",
-        "details_json",
-        "reason",
-        "198.51.100.77",
-    ):
-        assert private_value not in timeline
-
-
-def test_timeline_keeps_distinct_controller_changes_with_the_same_timestamp() -> None:
+def test_frequency_charts_use_every_history_observation_and_direction() -> None:
     first = _observation(
-        controller_name="MD-B",
         source_ip="192.0.2.10",
         destination_ip="203.0.113.20",
+        source_port=0,
+        destination_port=443,
     )
     second = _observation(
-        controller_name="MD-C",
-        source_ip="192.0.2.11",
+        observed_at="2026-08-28T08:02:00Z",
+        source_ip="192.0.2.10",
         destination_ip="203.0.113.21",
+        source_port=0,
+        destination_port=443,
     )
-    occurred_at = "2026-08-28T08:03:00Z"
-    lifecycle = (
-        {
-            "occurred_at": occurred_at,
-            "session_key": first["session_key"],
-            "event_type": "CONTROLLER_CHANGED",
-            "controller_name": "MD-B",
-        },
-        {
-            "occurred_at": occurred_at,
-            "session_key": second["session_key"],
-            "event_type": "CONTROLLER_CHANGED",
-            "controller_name": "MD-C",
-        },
-    )
-    controller_events = (
-        {
-            "occurred_at": occurred_at,
-            "previous_controller": "MD-A",
-            "current_controller": "MD-B",
-        },
+    latest = _observation(
+        observed_at="2026-08-28T08:03:00Z",
+        source_ip="203.0.113.20",
+        destination_ip="192.0.2.10",
+        source_port=9999,
+        destination_port=53,
     )
 
     document = render_html_report(
         _snapshot(
-            observations=(first, second),
-            observation_history=(first, second),
-            lifecycle_events=lifecycle,
-            controller_events=controller_events,
+            observations=(latest,),
+            observation_history=(first, second, latest),
+            lifecycle_events=(),
+            observation_total=3,
         )
     )
-    timeline = _section(document, "significant-events")
+    frequency = _section(document, "observation-frequency")
 
-    assert timeline.count("관측 MD 변경 확인") == 2
-    assert "MD-A → MD-B" in timeline
-    assert "192.0.2.11:53000 → 203.0.113.21:443" in timeline
+    assert "IP별 관측 횟수 TOP 5" in frequency
+    assert "포트·프로토콜별 관측 횟수 TOP 5" in frequency
+    assert "192.0.2.10" in frequency
+    assert "총 3회 · 출발지 2회 · 목적지 1회" in frequency
+    assert "TCP (6) · 443(HTTPS)" in frequency
+    assert "총 2회 · 출발지 0회 · 목적지 2회" in frequency
+    assert "TCP (6) · 9999" in frequency
+    assert "9999(" not in frequency
+    assert 'class="frequency-bar" aria-hidden="true"' in frequency
 
 
-def test_timeline_is_bounded_to_twelve_recent_snapshot_facts() -> None:
-    observation = _observation()
-    lifecycle = tuple(
-        {
-            "occurred_at": f"2026-08-28T09:10:{index:02d}Z",
-            "session_key": observation["session_key"],
-            "event_type": "MISSED",
-        }
-        for index in range(13)
+def test_frequency_charts_are_top_five_with_deterministic_ties() -> None:
+    document = render_html_report(
+        _snapshot(
+            ip_frequency_summary=(
+                ("192.0.2.60", 1, 0),
+                ("192.0.2.20", 1, 0),
+                ("192.0.2.50", 1, 0),
+                ("192.0.2.10", 1, 0),
+                ("192.0.2.40", 1, 0),
+                ("192.0.2.30", 1, 0),
+            ),
+            protocol_port_frequency_summary=(
+                (17, 53, 1, 0),
+                (6, 443, 1, 0),
+                (6, 22, 1, 0),
+                (17, 123, 1, 0),
+                (6, 80, 1, 0),
+                (6, 53, 1, 0),
+            ),
+        )
     )
-    document = render_html_report(_snapshot(lifecycle_events=lifecycle, controller_events=()))
-    timeline = _section(document, "significant-events")
+    frequency = _section(document, "observation-frequency")
+    labels = re.findall(r'<span class="frequency-label">([^<]+)</span>', frequency)
 
-    assert timeline.count('class="event-item"') == 12
-    assert "2026-08-28 18:10:00 KST" not in timeline
-    assert "2026-08-28 18:10:01 KST" in timeline
-    assert "2026-08-28 18:10:12 KST" in timeline
+    assert labels[:5] == [
+        "192.0.2.10",
+        "192.0.2.20",
+        "192.0.2.30",
+        "192.0.2.40",
+        "192.0.2.50",
+    ]
+    assert labels[5:] == [
+        "TCP (6) · 22(SSH)",
+        "TCP (6) · 53(DNS)",
+        "TCP (6) · 80(HTTP)",
+        "TCP (6) · 443(HTTPS)",
+        "UDP (17) · 53(DNS)",
+    ]
+    assert "192.0.2.60" not in frequency
+    assert "UDP (17) · 123(NTP)" not in frequency
 
 
-def test_empty_timeline_describes_only_the_report_snapshot() -> None:
-    document = render_html_report(_snapshot(lifecycle_events=(), controller_events=()))
+def test_frequency_charts_exclude_blank_ips_and_zero_ports() -> None:
+    blank = _observation(source_ip="", destination_ip=" ", source_port=0, destination_port=0)
+    document = render_html_report(
+        _snapshot(
+            observations=(blank,),
+            observation_history=(blank,),
+            lifecycle_events=(),
+            ip_frequency_summary=(),
+            protocol_port_frequency_summary=(),
+        )
+    )
+    frequency = _section(document, "observation-frequency")
 
-    timeline = _section(document, "significant-events")
-    assert "보고서 스냅샷에 표시할 저장 사실이 없습니다." in timeline
-    assert "변화가 발생하지 않았습니다" not in timeline
+    assert "집계할 IP가 없습니다." in frequency
+    assert "집계할 프로토콜·포트가 없습니다." in frequency
+    assert 'class="frequency-item"' not in frequency
+
+
+def test_removed_state_and_timeline_never_expose_private_event_fields() -> None:
+    observation = _observation()
+    document = render_html_report(
+        _snapshot(
+            lifecycle_events=(
+                {
+                    "occurred_at": "2026-08-28T08:03:00Z",
+                    "session_key": observation["session_key"],
+                    "event_type": "CONTROLLER_CHANGED",
+                    "details_json": '{"password":"LIFECYCLE-SECRET"}',
+                },
+            ),
+            controller_events=(
+                {
+                    "occurred_at": "2026-08-28T08:03:00Z",
+                    "previous_controller": "PRIVATE-MD-A",
+                    "current_controller": "PRIVATE-MD-B",
+                    "reason": "CONTROLLER-SECRET",
+                },
+            ),
+        )
+    )
+
+    assert "최신 표시 세션 상태" not in document
+    assert "주요 세션 변화" not in document
+    assert "LIFECYCLE-SECRET" not in document
+    assert "CONTROLLER-SECRET" not in document
+    assert "PRIVATE-MD-A" not in document
+    assert "PRIVATE-MD-B" not in document
 
 
 @pytest.mark.parametrize(
@@ -953,7 +993,7 @@ def test_single_direction_flow_uses_right_arrow_and_accessible_korean_label() ->
     assert '<span class="direction-pill">단방향</span>' in document
 
 
-def test_summary_omits_distributions_and_latest_table_still_uses_fifty_flows() -> None:
+def test_only_approved_full_history_distributions_are_shown() -> None:
     rows = tuple(
         _observation(
             observed_at=f"2026-08-28T08:{index:02d}:00.000Z",
@@ -979,8 +1019,10 @@ def test_summary_omits_distributions_and_latest_table_still_uses_fifty_flows() -
     assert len(_report_rows(_table_body(latest))) == 50
     assert "프로토콜별 최신 세션" not in document
     assert "장비별 최신 세션" not in document
-    assert "아래 분포는 필터 적용 전" not in document
-    assert 'class="distribution"' not in document
+    assert "IP별 관측 횟수 TOP 5" in document
+    assert "포트·프로토콜별 관측 횟수 TOP 5" in document
+    assert document.count('class="frequency-item"') <= 10
+    assert "관측 MD별" not in document
 
 
 def test_lifecycle_statuses_are_korean_and_diagnostics_do_not_change_status() -> None:
@@ -1374,9 +1416,9 @@ def test_only_latest_table_is_limited_to_fifty_logical_flows() -> None:
     assert "고유 세션 55개 중 마지막 확인 시각을 기준으로 최근 50개" in latest
     assert "192.0.2.100:53000" not in _table_body(latest)
     assert "192.0.2.100:53000" in _table_body(history)
-    assert 'aria-label="최신 표시 50/55개 상태 분포"' in document
-    assert ">LATEST 50/55</text>" in document
-    assert "최신 결과에 표시된 50/55개 논리 세션만 집계합니다." in document
+    frequency = _section(document, "observation-frequency")
+    assert "저장된 전체 관측 55건" in frequency
+    assert "총 55회 · 출발지 55회 · 목적지 0회" in frequency
 
 
 def test_full_history_preserves_all_2005_rows_beyond_ui_limit() -> None:
@@ -1478,7 +1520,8 @@ def test_empty_result_has_clear_rows_and_no_false_session_state() -> None:
     assert len(_report_rows(document)) == 0
     assert document.count('class="filter-empty-row" hidden') == 2
     assert document.count("선택한 필터와 일치하는 세션이 없습니다.") == 2
-    assert "최신 표시 0/0개 범위에 집계할 세션이 없습니다." in document
+    assert "집계할 IP가 없습니다." in document
+    assert "집계할 프로토콜·포트가 없습니다." in document
     assert '<svg class="state-ring"' not in document
 
 
@@ -1539,6 +1582,33 @@ def test_render_and_atomic_writes_are_deterministic(tmp_path: Path) -> None:
     assert write_html_report_atomic(second_path, snapshot) == second_path
     assert first_path.read_bytes() == second_path.read_bytes()
     assert first_path.read_text(encoding="utf-8") == first_render
+    assert not tuple(tmp_path.glob(".*.tmp"))
+
+
+def test_streaming_report_fails_before_consuming_history_without_frequency_summaries(
+    tmp_path: Path,
+) -> None:
+    consumed: list[bool] = []
+
+    def history_rows() -> Iterator[dict[str, object]]:
+        consumed.append(True)
+        yield _observation(source_ip="192.0.2.99")
+
+    destination = tmp_path / "streamed-report.html"
+
+    with pytest.raises(ValueError, match="precomputed frequency summaries"):
+        html_report_presentation.write_html_report_stream_atomic(
+            destination,
+            _snapshot(
+                ip_frequency_summary=None,
+                protocol_port_frequency_summary=None,
+            ),
+            history_rows(),
+            logical_session_total=1,
+        )
+
+    assert consumed == []
+    assert not destination.exists()
     assert not tuple(tmp_path.glob(".*.tmp"))
 
 

@@ -180,14 +180,13 @@ Required structure:
 2. run timing/query summary;
 3. compact high-level counts;
 4. query/traffic-flow summary;
-5. session-state summary only when reliably derivable;
-6. significant session events timeline only from stored sanitized lifecycle/controller facts;
+5. static full-history IP TOP 5 and protocol/port TOP 5 observation-frequency bars;
+6. explicit source/destination counts and a note that charts are independent of filters;
 7. latest sessions;
 8. complete observation history, collapsed on screen and complete in print;
 9. concise footer.
 
-The old presentation rule that categorically prohibited lifecycle/controller timelines is
-intentionally superseded on this redesign branch. However the report must still exclude:
+The report must exclude:
 
 - diagnostic messages/codes;
 - Raw CLI bodies;
@@ -195,9 +194,13 @@ intentionally superseded on this redesign branch. However the report must still 
 - credentials;
 - logs;
 - developer/internal control-flow information.
+- session-state summaries and lifecycle/controller event timelines;
+- device/controller, diagnostic, cause, or other distribution charts.
 
-A donut/ring summary is allowed only as inline SVG/CSS generated from deterministic
-stored status counts. No chart library or external script is needed.
+The two TOP 5 charts count every stored observation's source and destination once,
+exclude blank IPs and port 0, and use deterministic ties. Service names appear only for
+known catalogue pairs. Use semantic HTML and CSS horizontal stacked bars; no chart
+library, SVG, or additional script is needed.
 
 ## HTML security
 

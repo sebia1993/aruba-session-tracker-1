@@ -13,8 +13,8 @@ IP and port, and tracked state with the least possible scanning effort.
 
 1. Compact product masthead and stored run state.
 2. Query direction, start/end time, duration, and confirmed counts.
-3. Latest-displayed session-state summary and recent stored-fact timeline,
-   with their snapshot scope stated explicitly.
+3. Static full-history `IP별 관측 횟수 TOP 5` and
+   `포트·프로토콜별 관측 횟수 TOP 5` source/destination bars.
 4. Local IP, protocol, and port autocomplete filters.
 5. Latest 50 logical sessions.
 6. Collection information derived only from report observations.
@@ -33,12 +33,14 @@ so the address/port boundary is unambiguous.
 
 ## Deliberate exclusions
 
-Do not add packet or byte counters, counter changes, protocol/controller
+Do not add packet or byte counters, counter changes, device/controller or diagnostic
 distribution charts, CLI, Raw, diagnostics, logs, file paths, hashes,
-troubleshooting guidance, or developer information. A compact state summary
-and recent-event timeline are allowed only from sanitized facts already present
-in the bounded report snapshot. They must not claim complete event coverage or
-infer health, reachability, failover, outage, cause, or packet path.
+troubleshooting guidance, or developer information. Do not present a session-state
+summary or lifecycle/controller event timeline. The only charts are the two approved
+full-history TOP 5 summaries. Count each observation's source and destination once,
+exclude blank IPs and port 0, resolve ties deterministically, and show a service name
+only for a catalogue-known protocol/port pair. The charts are not linked to filters and
+must not infer health, reachability, failover, outage, cause, path, traffic, or volume.
 
 ## Offline and accessibility contract
 
@@ -50,3 +52,5 @@ infer health, reachability, failover, outage, cause, or packet path.
 - Use Korean text for every status so color is only reinforcement.
 - Keep forced-colors borders and focus outlines, horizontal table scrolling on
   narrow screens, and the applied-filter summary in print output.
+- Keep chart meaning in visible text, mark decorative bars as hidden from assistive
+  technology, and preserve the two-column/one-column chart layout in print/mobile.

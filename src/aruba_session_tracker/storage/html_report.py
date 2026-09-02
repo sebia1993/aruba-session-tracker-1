@@ -530,6 +530,8 @@ class RunReportSnapshot:
     raw_file_total: int
     raw_byte_total: int
     observation_history: tuple[ReportRow, ...] = ()
+    ip_frequency_summary: tuple[tuple[str, int, int], ...] | None = None
+    protocol_port_frequency_summary: tuple[tuple[int, int, int, int], ...] | None = None
 
 
 def render_html_report(snapshot: RunReportSnapshot) -> str:

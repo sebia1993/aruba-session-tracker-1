@@ -3,16 +3,24 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+import pytest
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QBoxLayout,
+    QDialog,
+    QFileDialog,
     QFrame,
     QLabel,
+    QLineEdit,
+    QMenu,
+    QMessageBox,
+    QPushButton,
     QScrollArea,
     QSizePolicy,
     QTabWidget,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -23,7 +31,14 @@ from aruba_session_tracker.storage import SessionStore
 from aruba_session_tracker.ui import MainWindow
 from aruba_session_tracker.ui.developer_inspector import DeveloperInspectorController
 from aruba_session_tracker.ui.main_window import _ResultFilterDialog
-from aruba_session_tracker.ui.theme import apply_main_window_theme, build_stylesheet
+from aruba_session_tracker.ui.startup import StartupWindow
+from aruba_session_tracker.ui.theme import (
+    _uses_high_contrast_palette,
+    apply_application_popup_theme,
+    apply_main_window_theme,
+    build_popup_stylesheet,
+    build_stylesheet,
+)
 
 
 class _Executor:
@@ -217,6 +232,326 @@ def test_theme_stylesheet_uses_approved_dark_tokens_and_semantic_states() -> Non
     assert "http://" not in stylesheet
     assert "https://" not in stylesheet
     assert "gradient" not in stylesheet.casefold()
+
+
+def test_application_popup_theme_covers_owned_transient_surfaces(
+    qtbot: object,
+) -> None:
+    application = QApplication.instance()
+    assert isinstance(application, QApplication)
+    original_stylesheet = application.styleSheet()
+    original_font = application.font()
+    surfaces: list[QWidget] = []
+    try:
+        apply_application_popup_theme(application)
+        assert application.property("popupThemeContrast") == "normal"
+
+        message = QMessageBox()
+        message.setText(
+            "조회 결과를 안전하게 저장하지 못했습니다. 저장소 권한과 보안 상태를 확인하십시오."
+        )
+        message.setInformativeText(f"{'긴-한글-파일명-' * 12}보고서.html")
+        message.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        message.setDefaultButton(QMessageBox.StandardButton.No)
+        surfaces.append(message)
+
+        generic_dialog = QDialog()
+        generic_layout = QVBoxLayout(generic_dialog)
+        generic_layout.addWidget(QLabel("별도 상세 창 문구", generic_dialog))
+        generic_layout.addWidget(QLineEdit("필드 문구", generic_dialog))
+        generic_layout.addWidget(QPushButton("확인", generic_dialog))
+        surfaces.append(generic_dialog)
+
+        menu = QMenu()
+        menu.addAction("출발지 IP 필터")
+        surfaces.append(menu)
+
+        fallback_file_dialog = QFileDialog()
+        fallback_file_dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        surfaces.append(fallback_file_dialog)
+
+        startup = StartupWindow()
+        startup.setProperty("popupSurface", "startup")
+        surfaces.append(startup)
+
+        for surface in surfaces:
+            qtbot.addWidget(surface)  # type: ignore[attr-defined]
+            surface.show()
+        QApplication.processEvents()
+
+        for surface in surfaces:
+            palette = surface.palette()
+            background = palette.color(QPalette.ColorRole.Window).name()
+            foreground = palette.color(QPalette.ColorRole.WindowText).name()
+            assert background == "#152331"
+            assert foreground == "#e8eff6"
+            assert _contrast_ratio(foreground, background) >= 7.0
+
+        body_label = message.findChild(QLabel, "qt_msgbox_label")
+        information_label = message.findChild(QLabel, "qt_msgbox_informativelabel")
+        assert body_label is not None and body_label.isVisible()
+        assert information_label is not None and information_label.isVisible()
+        assert body_label.minimumWidth() >= 320
+        assert information_label.minimumWidth() >= 320
+        assert information_label.text().endswith("보고서.html")
+
+        no_button = message.button(QMessageBox.StandardButton.No)
+        assert no_button is not None and no_button.isDefault()
+        button_palette = no_button.palette()
+        assert (
+            _contrast_ratio(
+                button_palette.color(QPalette.ColorRole.ButtonText).name(),
+                button_palette.color(QPalette.ColorRole.Button).name(),
+            )
+            >= 4.5
+        )
+
+        file_name_edit = fallback_file_dialog.findChild(QLineEdit, "fileNameEdit")
+        assert file_name_edit is not None
+        field_palette = file_name_edit.palette()
+        assert (
+            _contrast_ratio(
+                field_palette.color(QPalette.ColorRole.Text).name(),
+                field_palette.color(QPalette.ColorRole.Base).name(),
+            )
+            >= 7.0
+        )
+
+        popup_stylesheet = build_popup_stylesheet()
+        assert "QMessageBox" in popup_stylesheet
+        assert "QDialog" in popup_stylesheet
+        assert "QFileDialog" in popup_stylesheet
+        assert "QMenu" in popup_stylesheet
+        assert "QToolTip" in popup_stylesheet
+        assert "DontUseNativeDialog" not in popup_stylesheet
+        assert _contrast_ratio("#42B7C8", "#152331") >= 3.0
+        assert _contrast_ratio("#66859D", "#1C2E3F") >= 3.0
+    finally:
+        for surface in surfaces:
+            surface.close()
+        QApplication.processEvents()
+        application.setStyleSheet(original_stylesheet)
+        application.setFont(original_font)
+
+
+@pytest.mark.parametrize(
+    (
+        "window",
+        "window_text",
+        "base",
+        "text",
+        "button",
+        "button_text",
+        "highlight",
+        "highlighted_text",
+    ),
+    (
+        ("#000000", "#ffffff", "#000000", "#ffffff", "#000000", "#ffffff", "#ffff00", "#000000"),
+        ("#ffffff", "#000000", "#ffffff", "#000000", "#ffffff", "#000000", "#000000", "#ffffff"),
+    ),
+)
+def test_application_popup_theme_uses_native_roles_for_high_contrast(
+    qtbot: object,
+    window: str,
+    window_text: str,
+    base: str,
+    text: str,
+    button: str,
+    button_text: str,
+    highlight: str,
+    highlighted_text: str,
+) -> None:
+    application = QApplication.instance()
+    assert isinstance(application, QApplication)
+    original_palette = application.palette()
+    original_stylesheet = application.styleSheet()
+    original_font = application.font()
+    palette = QPalette(original_palette)
+    palette.setColor(QPalette.ColorRole.Window, QColor(window))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor(window_text))
+    palette.setColor(QPalette.ColorRole.Base, QColor(base))
+    palette.setColor(QPalette.ColorRole.Text, QColor(text))
+    palette.setColor(QPalette.ColorRole.Button, QColor(button))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor(button_text))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(highlight))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor(highlighted_text))
+    application.setPalette(palette)
+    surfaces: list[QWidget] = []
+    try:
+        apply_application_popup_theme(application)
+        assert application.property("popupThemeContrast") == "high"
+        assert "palette(window-text)" in application.styleSheet()
+
+        popup = QMessageBox()
+        surfaces.append(popup)
+        qtbot.addWidget(popup)  # type: ignore[attr-defined]
+        popup.setText("고대비 팝업 문구")
+        popup.setStandardButtons(QMessageBox.StandardButton.Ok)
+        popup.show()
+
+        fallback_file_dialog = QFileDialog()
+        surfaces.append(fallback_file_dialog)
+        qtbot.addWidget(fallback_file_dialog)  # type: ignore[attr-defined]
+        fallback_file_dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        fallback_file_dialog.show()
+
+        generic_dialog = QDialog()
+        QVBoxLayout(generic_dialog).addWidget(QPushButton("확인", generic_dialog))
+        surfaces.append(generic_dialog)
+        qtbot.addWidget(generic_dialog)  # type: ignore[attr-defined]
+        generic_dialog.show()
+
+        menu = QMenu()
+        menu.addAction("필터")
+        surfaces.append(menu)
+        qtbot.addWidget(menu)  # type: ignore[attr-defined]
+        menu.show()
+
+        startup = StartupWindow()
+        startup.setProperty("popupSurface", "startup")
+        surfaces.append(startup)
+        qtbot.addWidget(startup)  # type: ignore[attr-defined]
+        startup.show()
+        QApplication.processEvents()
+
+        for surface in surfaces:
+            surface_palette = surface.palette()
+            actual_background = surface_palette.color(QPalette.ColorRole.Window).name()
+            actual_foreground = surface_palette.color(QPalette.ColorRole.WindowText).name()
+            assert actual_background == window
+            assert actual_foreground == window_text
+            assert _contrast_ratio(actual_foreground, actual_background) >= 7.0
+
+        file_name_edit = fallback_file_dialog.findChild(QLineEdit, "fileNameEdit")
+        assert file_name_edit is not None
+        field_palette = file_name_edit.palette()
+        assert field_palette.color(QPalette.ColorRole.Base).name() == base
+        assert field_palette.color(QPalette.ColorRole.Text).name() == text
+
+        ok_button = popup.button(QMessageBox.StandardButton.Ok)
+        assert ok_button is not None
+        button_palette = ok_button.palette()
+        assert button_palette.color(QPalette.ColorRole.Button).name() == button
+        assert button_palette.color(QPalette.ColorRole.ButtonText).name() == button_text
+    finally:
+        for surface in surfaces:
+            surface.close()
+        QApplication.processEvents()
+        application.setStyleSheet(original_stylesheet)
+        application.setFont(original_font)
+        application.setPalette(original_palette)
+
+
+def test_high_contrast_detection_accepts_button_text_at_aa_threshold() -> None:
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#767676"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#ffff00"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#000000"))
+
+    button_ratio = _contrast_ratio("#ffffff", "#767676")
+    assert 4.5 <= button_ratio < 7.0
+    assert _uses_high_contrast_palette(palette)
+
+
+def test_high_contrast_detection_rejects_invisible_focus_color() -> None:
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#000000"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+
+    assert not _uses_high_contrast_palette(palette)
+
+
+def test_popup_theme_preserves_default_button_and_escape_semantics(
+    qtbot: object,
+) -> None:
+    application = QApplication.instance()
+    assert isinstance(application, QApplication)
+    original_stylesheet = application.styleSheet()
+    original_font = application.font()
+    approval = QMessageBox(
+        QMessageBox.Icon.Question,
+        "조회 승인",
+        "승인하지 않으면 안전하게 취소됩니다.",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+    )
+    filter_owner = QWidget()
+    filter_dialog = _ResultFilterDialog(
+        filter_owner,
+        title="출발지 IP",
+        values=(("192.0.2.10", "192.0.2.10"),),
+        selected=set(),
+        filter_active=False,
+    )
+    try:
+        apply_application_popup_theme(application)
+        qtbot.addWidget(approval)  # type: ignore[attr-defined]
+        qtbot.addWidget(filter_owner)  # type: ignore[attr-defined]
+        approval.setDefaultButton(QMessageBox.StandardButton.No)
+        approval.show()
+        QApplication.processEvents()
+
+        assert approval.defaultButton() is approval.button(QMessageBox.StandardButton.No)
+        qtbot.keyClick(approval, Qt.Key.Key_Escape)  # type: ignore[attr-defined]
+        qtbot.waitUntil(lambda: not approval.isVisible(), timeout=3000)  # type: ignore[attr-defined]
+        assert approval.result() == QMessageBox.StandardButton.No.value
+
+        filter_dialog.show()
+        QApplication.processEvents()
+        qtbot.keyClick(filter_dialog, Qt.Key.Key_Escape)  # type: ignore[attr-defined]
+        qtbot.waitUntil(lambda: not filter_dialog.isVisible(), timeout=3000)  # type: ignore[attr-defined]
+        assert filter_dialog.result() == QDialog.DialogCode.Rejected.value
+    finally:
+        approval.close()
+        filter_dialog.close()
+        QApplication.processEvents()
+        application.setStyleSheet(original_stylesheet)
+        application.setFont(original_font)
+
+
+def test_export_completion_popup_remains_readable_inside_themed_main_window(
+    qtbot: object,
+    tmp_path: Path,
+) -> None:
+    window = _build_window(qtbot, tmp_path)
+    apply_main_window_theme(window)
+    window.show()
+    inspected: list[bool] = []
+
+    def inspect_and_close() -> None:
+        dialog = window.findChild(QMessageBox, "exportCompletionDialog")
+        assert dialog is not None and dialog.isVisible()
+        background = dialog.palette().color(QPalette.ColorRole.Window).name()
+        body = dialog.findChild(QLabel, "qt_msgbox_label")
+        information = dialog.findChild(QLabel, "qt_msgbox_informativelabel")
+        assert body is not None and body.text() == "HTML 보고서를 저장했습니다."
+        assert information is not None and information.text().endswith("보고서.html")
+        foreground = body.palette().color(body.foregroundRole()).name()
+        assert _contrast_ratio(foreground, background) >= 7.0
+        confirm = next(
+            button for button in dialog.findChildren(QPushButton) if button.text() == "확인"
+        )
+        inspected.append(True)
+        confirm.click()
+
+    QTimer.singleShot(0, inspect_and_close)
+    window._show_export_completion(
+        "HTML 보고서",
+        tmp_path / f"{'긴-한글-파일명-' * 12}보고서.html",
+    )
+
+    assert inspected == [True]
+    window.close()
 
 
 def test_theme_can_be_applied_twice_without_duplicate_shell_components(
