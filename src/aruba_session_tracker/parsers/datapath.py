@@ -45,6 +45,7 @@ def parse_datapath_sessions(
         raise ParseError("Datapath session table uses an unsupported next-hop column schema.")
 
     observations: list[SessionObservation] = []
+    seen_session_keys: set[str] = set()
     for raw_line in output.splitlines():
         stripped = raw_line.strip()
         if not stripped:
@@ -68,14 +69,16 @@ def parse_datapath_sessions(
                 "Datapath session observation limit exceeded.",
                 code=ErrorCode.OUTPUT_LIMIT_EXCEEDED,
             )
-        observations.append(
-            _parse_row(
-                fields,
-                raw_line=raw_line.rstrip(),
-                controller_name=controller_name.strip(),
-                controller_host=normalized_controller_host,
-            )
+        observation = _parse_row(
+            fields,
+            raw_line=raw_line.rstrip(),
+            controller_name=controller_name.strip(),
+            controller_host=normalized_controller_host,
         )
+        if observation.session_key in seen_session_keys:
+            raise ParseError("Datapath session table contains a duplicate session key.")
+        seen_session_keys.add(observation.session_key)
+        observations.append(observation)
     count_match = _ENTRY_COUNT_RE.search(output)
     if count_match is not None and len(observations) != int(count_match.group(1)):
         raise ParseError(

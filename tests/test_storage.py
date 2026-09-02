@@ -212,6 +212,42 @@ def test_wal_mode_is_configured_only_during_initialize(
     assert "PRAGMASYNCHRONOUS=FULL" in normalized
 
 
+def test_connection_closes_when_setup_pragma_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    original_connect = session_store_module.sqlite3.connect
+    connections: list[SimpleNamespace] = []
+
+    def failing_connect(*args: object, **kwargs: object) -> SimpleNamespace:
+        wrapped = original_connect(*args, **kwargs)  # type: ignore[arg-type]
+        connection = SimpleNamespace(closed=False)
+        connection.row_factory = wrapped.row_factory
+
+        def execute(statement: str, *parameters: object) -> sqlite3.Cursor:
+            if statement == "PRAGMA busy_timeout = 10000":
+                raise sqlite3.OperationalError("sanitized setup pragma fixture")
+            return wrapped.execute(statement, *parameters)
+
+        def close() -> None:
+            connection.closed = True
+            wrapped.close()
+
+        connection.execute = execute
+        connection.close = close
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(session_store_module.sqlite3, "connect", failing_connect)
+
+    with pytest.raises(StorageError, match="sanitized setup pragma fixture"):
+        store.list_runs()
+
+    assert len(connections) == 1
+    assert connections[0].closed is True
+
+
 def test_initialize_migrates_v1_lifecycle_instance_id(tmp_path: Path) -> None:
     db_path = tmp_path / "tracker.db"
     with closing(sqlite3.connect(db_path)) as connection, connection:

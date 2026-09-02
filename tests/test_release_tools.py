@@ -15,6 +15,7 @@ import pytest
 
 from tools.check_coverage_policy import (
     CRITICAL_BRANCH_FLOORS,
+    GLOBAL_LINE_FLOOR,
     CoveragePolicyError,
     check_coverage_policy,
 )
@@ -690,6 +691,12 @@ def test_coverage_policy_rejects_global_line_regression(tmp_path: Path) -> None:
         check_coverage_policy(report)
 
 
+def test_pyproject_coverage_floor_matches_release_policy() -> None:
+    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+    assert project["tool"]["coverage"]["report"]["fail_under"] == GLOBAL_LINE_FLOOR * 100
+
+
 def _release_document(asset: Path) -> dict[str, object]:
     expected = ExpectedAsset(asset.name, asset)
     return {
@@ -1303,6 +1310,10 @@ def test_continuous_workflow_delegates_to_durable_reconciler() -> None:
     workflow = Path(".github/workflows/continuous.yml").read_text(encoding="utf-8")
 
     assert "timeout-minutes: 30" in workflow
+    assert "./build_windows.ps1" in workflow
+    assert "actions/upload-artifact" in workflow
+    assert "actions/download-artifact" in workflow
+    assert workflow.count("ArubaSessionTracker-continuous-${{ github.sha }}") == 2
     assert "./tools/publish_continuous.ps1" in workflow
     assert "-ExpectedCommit $env:EXPECTED_COMMIT" in workflow
     assert "GH_TOKEN: ${{ github.token }}" in workflow
@@ -1334,6 +1345,21 @@ def test_regular_validation_excludes_manual_soak_tests() -> None:
     assert "python -m pytest -m soak" not in Path(".github/workflows/continuous.yml").read_text(
         encoding="utf-8"
     )
+
+
+def test_ci_workflow_keeps_pr_package_validation_without_duplicate_artifact() -> None:
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    trigger = workflow[: workflow.index("permissions:")]
+
+    assert "push:" not in trigger
+    assert "pull_request:" in trigger
+    assert "workflow_dispatch:" in trigger
+    assert "windows-validate-package:" in workflow
+    assert "name: GitHub-hosted Windows x64 validation and package" in workflow
+    assert "Build and verify portable package" in workflow
+    assert "./build_windows.ps1" in workflow
+    assert "actions/upload-artifact" not in workflow
+    assert "ArubaSessionTracker-windows-x64-ci" not in workflow
 
 
 def test_continuous_reconciler_persists_stages_and_uses_release_ids() -> None:

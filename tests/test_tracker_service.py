@@ -505,6 +505,41 @@ def test_same_source_and_destination_md_is_queried_once() -> None:
     assert factory.calls == ["MM-Primary", "MD-1"]
 
 
+def test_duplicate_session_key_is_non_authoritative_and_preserves_raw() -> None:
+    datapath_output = _datapath_output()
+    duplicate_row = datapath_output.splitlines()[-2]
+    duplicate_output = datapath_output.replace(
+        "Entries: 1",
+        f"{duplicate_row}\nEntries: 2",
+    )
+    command = build_datapath_session_command(REQUEST.source_ip)
+    outputs = {
+        "MM-Primary": _mm_outputs("192.0.2.101", "192.0.2.101"),
+        "MD-1": {
+            NO_PAGING_COMMAND: "",
+            command: duplicate_output,
+        },
+    }
+
+    outcome = TrackerService(_config(), FakeFactory(outputs)).query_once(
+        REQUEST,
+        CREDENTIALS,
+    )
+
+    assert outcome.observations == ()
+    assert outcome.authoritative is False
+    md_snapshot = next(
+        snapshot
+        for snapshot in outcome.raw_snapshots
+        if snapshot.device_name == "MD-1" and snapshot.command == command
+    )
+    assert md_snapshot.output == duplicate_output
+    assert md_snapshot.observation_keys == ()
+    parse_event = next(event for event in outcome.diagnostics if event.stage == "MD_PARSE")
+    assert parse_event.code is ErrorCode.PARSE_PARTIAL
+    assert "duplicate session key" in parse_event.message
+
+
 def test_md_authentication_failure_stops_before_other_candidates() -> None:
     config = _config()
     outputs = {
