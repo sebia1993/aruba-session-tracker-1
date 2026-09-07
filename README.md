@@ -8,6 +8,16 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 필터형 조회 명령으로 제한되며, 필터 구문이 장비에서 거부되어도 전체
 세션 테이블 조회로 자동 전환하지 않습니다.
 
+## 네트워크 엔지니어 포트폴리오 검토
+
+| 운영 문제와 역량 | 확인할 근거 |
+|---|---|
+| 단말 위치 확인 뒤 관련 MD의 흐름을 추적 | [사례·설계·코드 읽기 안내](docs/PORTFOLIO_KO.md) |
+| 수집 실패를 세션 종료로 오인하지 않는 상태 관리 | [모니터링 회귀 테스트](tests/test_tracker_service.py), [읽기 전용 명령 생성](src/aruba_session_tracker/commands.py) |
+| 로컬 저장·복구·배포의 추적 가능성 | [보안 경계](SECURITY.md), [Windows CI](https://github.com/sebia1993/aruba-session-tracker-1/actions/workflows/ci.yml), [실행 ZIP](https://github.com/sebia1993/aruba-session-tracker-1/releases/tag/continuous) |
+
+[장비 없는 fixture 재현](docs/PORTFOLIO_KO.md#장비-없이-재현하기)부터 검토할 수 있습니다. 자동 검증 범위와 실제 Aruba 장비·회사 PC 검증을 구분하며, 업무 시간 절감 수치는 주장하지 않습니다.
+
 ## 지원 범위
 
 - Windows 11 x64, 일반 사용자 권한
