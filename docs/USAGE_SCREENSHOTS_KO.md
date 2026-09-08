@@ -28,7 +28,7 @@
 - **읽을 값:** 실행 조건·시작/종료·상태·관측 수를 먼저 확인합니다. 예시는 임시 SQLite에 저장한 1분 실행, 4개 관측입니다. `완료`는 수집 실행 상태이며 장애 해결을 뜻하지 않습니다.
 - **다음 행동:** 조사 목적에 맞춰 결과 파일을 저장한 뒤 공유 전 IP 등 민감정보를 점검합니다. 오른쪽 삭제 동작은 내보내기와 다른 작업입니다.
 
-이력 위쪽 저장소 용량·여유 공간은 임시 합성 저장소와 CI 러너의 로컬 디스크 값이며 사용자 PC의 값이 아닙니다. 조회 화면의 작은 최근 확인 카드와 시작시각 행 일부는 이 캡처에서 잘려 보이므로, 정확한 시간은 이력 표와 보고서에서 확인합니다.
+이력 위쪽 저장소 용량·여유 공간은 임시 합성 저장소와 CI 러너의 로컬 디스크 값이며 사용자 PC의 값이 아닙니다.
 
 ## 4. 독립 HTML 조사 보고서 읽기
 
@@ -42,10 +42,11 @@
 
 ## 캡처 출처와 재현
 
-캡처 소스: `543f8ec4e24d623601dbe8d9bc050570bb078a58`. [Windows 생성 실행 34175800866](https://github.com/sebia1993/aruba-session-tracker-1/actions/runs/34175800866)에서 4개 PNG를 내려받아 직접 검토했습니다.
+캡처 소스: `59c728f69bdf938fbe8bf270c897aa10edf00f4e`. [Windows 생성 실행 34176973002](https://github.com/sebia1993/aruba-session-tracker-1/actions/runs/34176973002)에서 4개 PNG를 내려받아 직접 검토했습니다.
 
 - 앱 버전: **0.6.0**. 캡처 소스 SHA·실행 ID·PNG 크기·SHA-256은 [capture-metadata.json](images/capture-metadata.json)에 기록합니다.
 - 도구: [render_docs_screenshots.py](../tools/render_docs_screenshots.py), [Windows 캡처 workflow](../.github/workflows/docs-screenshots.yml).
+- Qt 창은 1680×1080이며, 비동기 결과 표시 후 레이아웃이 안정될 때까지 기다려 최근 확인 시각 전체를 캡처합니다. 조회 시작·경과 시간은 같은 합성 저장 실행의 09:00 KST·1분에 맞춰 표시 필드에 넣었습니다. 조회 버튼이나 네트워크 수집을 실행한 것은 아닙니다.
 - 환경: GitHub Actions `windows-latest`가 선택한 **Windows Server 2025**, CPython 3.13.15 x64, PySide6 6.11.0, Qt offscreen 100%, Windows 내장 Malgun Gothic. 물리 Windows 11 데스크톱 캡처와 구분합니다.
 - 데이터 경로: 임시 ConfigRepository/SessionStore → 합성 QueryOutcome → 실제 MainWindow / 실제 HTML export → PNG. 실제 RuntimeExecutor를 만들지 않고 Python socket 연결도 차단합니다. 임시 DB·Raw·HTML은 종료 시 제거합니다.
 
