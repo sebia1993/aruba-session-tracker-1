@@ -23,10 +23,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+if sys.platform == "win32":
+    os.environ.setdefault("QT_QPA_FONTDIR", str(Path(os.environ["WINDIR"]) / "Fonts"))
 os.environ.setdefault("QT_SCALE_FACTOR", "1")
 
 from PySide6 import __version__ as qt_version
-from PySide6.QtGui import QFont, QImage
+from PySide6.QtGui import QFont, QFontDatabase, QFontMetrics, QImage
 from PySide6.QtWidgets import QApplication
 
 from aruba_session_tracker import __version__
@@ -107,7 +109,17 @@ def main() -> int:
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     app = QApplication([])
-    app.setFont(QFont("Malgun Gothic" if sys.platform == "win32" else "Apple SD Gothic Neo", 10))
+    if sys.platform == "win32":
+        font_path = Path(os.environ["WINDIR"]) / "Fonts" / "malgun.ttf"
+        font_id = QFontDatabase.addApplicationFont(str(font_path))
+        if font_id < 0:
+            raise RuntimeError("Windows Malgun Gothic could not be loaded")
+        family = QFontDatabase.applicationFontFamilies(font_id)[0]
+    else:
+        family = "Apple SD Gothic Neo"
+    app.setFont(QFont(family, 10))
+    if not all(QFontMetrics(app.font()).inFontUcs4(ord(char)) for char in "가A1"):
+        raise RuntimeError("Documentation font lacks required Korean/Latin glyphs")
     apply_application_popup_theme(app)
     names = ["session-settings.png", "session-query.png", "session-history.png"]
     with tempfile.TemporaryDirectory(prefix="session-docs-") as temporary:
