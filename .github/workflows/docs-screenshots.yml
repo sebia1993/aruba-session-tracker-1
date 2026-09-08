@@ -1,0 +1,65 @@
+name: Documentation screenshots
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "tools/render_docs_screenshots.py"
+      - ".github/workflows/docs-screenshots.yml"
+  push:
+    branches: ["codex/usage-evidence-20260908"]
+    paths:
+      - "tools/render_docs_screenshots.py"
+      - ".github/workflows/docs-screenshots.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-screenshots-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  capture:
+    name: Capture synthetic Windows UI
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: "1"
+      PYTHONPATH: src
+      QT_QPA_PLATFORM: offscreen
+      QT_SCALE_FACTOR: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements-runtime.lock
+      - name: Install locked dependencies in repository environment
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install -r requirements-runtime.lock
+          if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed" }
+          .\.venv\Scripts\python.exe -m pip check
+          if ($LASTEXITCODE -ne 0) { throw "Dependency check failed" }
+      - name: Render real widgets with synthetic data only
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe tools/render_docs_screenshots.py --output artifacts/docs-screenshots --include-report
+          if ($LASTEXITCODE -ne 0) { throw "Screenshot generation failed" }
+      - name: Upload verified screenshots
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: usage-screenshots-windows
+          path: |
+            artifacts/docs-screenshots/*.png
+            artifacts/docs-screenshots/capture-metadata.json
+          if-no-files-found: error
+          retention-days: 14
