@@ -29,7 +29,7 @@ os.environ.setdefault("QT_SCALE_FACTOR", "1")
 
 from PySide6 import __version__ as qt_version
 from PySide6.QtGui import QFont, QFontDatabase, QFontMetrics, QImage
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLabel
 
 from aruba_session_tracker import __version__
 from aruba_session_tracker.config import ConfigRepository
@@ -63,7 +63,11 @@ def drain(app: QApplication, predicate: object = None) -> None:
         if time.monotonic() > deadline:
             raise RuntimeError("Qt fixture work did not settle within 8 seconds")
         time.sleep(0.01)
-    app.processEvents()
+    # Text/model callbacks schedule subsequent layout requests. Drain those too,
+    # so captures cannot retain a chip width measured for its previous empty text.
+    for _ in range(6):
+        app.processEvents()
+        time.sleep(0.01)
 
 
 def observations() -> tuple[SessionObservation, ...]:
@@ -154,7 +158,7 @@ def main() -> int:
         ):
             window = MainWindow(config, store, OfflineExecutor())
             apply_main_window_theme(window)
-            window.resize(1440, 1000)
+            window.resize(1680, 1080)
             window.show()
             drain(app, lambda: not window._history_task_running)
             window.tabs.setCurrentWidget(window.settings_page)
@@ -170,9 +174,22 @@ def main() -> int:
                     authoritative=True,
                 )
             )
+            # The display fixture bypasses _start_query, so seed the same run
+            # timing fields from the synthetic stored run before capturing.
+            window._run_started_at = STAMP
+            window._run_started_monotonic = time.monotonic() - 60
+            window._refresh_elapsed_labels()
             window.result_table.selectRow(0)
             window.raw_diagnostics_toggle.setChecked(True)
             window.details.setCurrentIndex(0)
+            drain(app)
+            for label in window.nav_identity.findChildren(QLabel, "headerChipValue"):
+                if label.width() < label.fontMetrics().horizontalAdvance(label.text()):
+                    raise RuntimeError("Header text is clipped after fixture layout settled")
+            if "2026-09-08 09:00:00 KST" not in window.elapsed_label.text():
+                raise RuntimeError("Synthetic query start time was not rendered")
+            if window.elapsed_label.height() < window.elapsed_label.fontMetrics().height():
+                raise RuntimeError("Query timing text is vertically clipped")
             capture(window, output / names[1], app)
             window.tabs.setCurrentWidget(window.history_page)
             drain(app, lambda: not window._history_task_running)
