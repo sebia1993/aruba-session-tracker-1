@@ -18,6 +18,13 @@ Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 
 [장비 없는 fixture 재현](docs/PORTFOLIO_KO.md#장비-없이-재현하기)부터 검토할 수 있습니다. 자동 검증 범위와 실제 Aruba 장비·회사 PC 검증을 구분하며, 업무 시간 절감 수치는 주장하지 않습니다.
 
+## 실제 화면과 사용 흐름
+
+![Aruba Session Tracker 현재 조회와 조사 상세 — 합성 데이터](docs/images/session-query.png)
+
+v0.6.0 실제 Qt 화면에 문서용 합성 세션을 넣은 예시입니다. 장비를 조회한 결과가 아닙니다.
+[장비 설정 → 조회 근거 → 기록·내보내기 → HTML 보고서](docs/USAGE_SCREENSHOTS_KO.md)에서 사용 행동, 읽을 값, 다음 확인과 캡처 출처를 확인할 수 있습니다.
+
 ## 지원 범위
 
 - Windows 11 x64, 일반 사용자 권한

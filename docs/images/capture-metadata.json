@@ -1,0 +1,38 @@
+{
+  "source_sha": "543f8ec4e24d623601dbe8d9bc050570bb078a58",
+  "app_version": "0.6.0",
+  "python": "3.13.15",
+  "qt": "6.11.0",
+  "os": "Windows-2025Server-10.0.26100-SP0",
+  "scale_factor": "1",
+  "workflow_run_id": "34175800866",
+  "synthetic": true,
+  "method": "MainWindow + injected QueryOutcome + temporary SessionStore; actual HTML export",
+  "limitations": "No SSH, live collection, physical desktop or full query verification",
+  "files": [
+    {
+      "name": "session-settings.png",
+      "width": 1440,
+      "height": 1000,
+      "sha256": "28f373a816ce4627a226be0ae247b2cb75fe26641c45218a5f0b2e1a745c7320"
+    },
+    {
+      "name": "session-query.png",
+      "width": 1440,
+      "height": 1000,
+      "sha256": "3cf03bd42b08c21f913b0e2dfbec4a373f835b6cc7195ebc9b58199a7a17b82a"
+    },
+    {
+      "name": "session-history.png",
+      "width": 1440,
+      "height": 1000,
+      "sha256": "52af45e473ef210a8c5082879d16fe7225f5c56ac2a6a8a7e62f3660cfcde176"
+    },
+    {
+      "name": "session-report.png",
+      "width": 1440,
+      "height": 1800,
+      "sha256": "f74705f9e74f6c57aef0c924a53c23e5ef36d1a0680ce4fc8c1ebc069894b33b"
+    }
+  ]
+}
