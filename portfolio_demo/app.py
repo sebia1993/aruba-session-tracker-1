@@ -40,7 +40,7 @@ if st.button("분석 실행", type="primary", width="stretch"):
         history = st.session_state.get("history", [])
         history.append(
             {
-                "Run": len(history) + 1,
+                "Run": history[-1]["Run"] + 1 if history else 1,
                 "Client": client,
                 "Scenario": SCENARIOS[scenario],
                 "Status": result["status"],
@@ -68,7 +68,10 @@ if "result" in st.session_state:
     rows = [
         r for r in result["rows"] if search.casefold() in " ".join(map(str, r.values())).casefold()
     ]
-    st.caption(f"표시 {len(rows)} / 관측 {len(result['rows'])}")
+    if result["authoritative"]:
+        st.caption(f"표시 {len(rows)} / 관측 {len(result['rows'])}")
+    else:
+        st.caption("수집 불완전 · 세션 개수 확인 불가")
     if rows:
         st.dataframe(rows, hide_index=True, width="stretch")
     if result["rows"]:
