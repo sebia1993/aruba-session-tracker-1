@@ -1,5 +1,7 @@
 # Public Streamlit Demo
 
+**[Live Demo](https://sebia1993-session-tracker-demo.streamlit.app/)** · [GitHub Source](https://github.com/sebia1993/aruba-session-tracker-1)
+
 별도 장비와 계정 없이 원 프로젝트의 Python 분석 로직을 실행합니다.
 비식별 문서 주소와 합성 CLI만 사용하며, 외부 연결·내부 파일 업로드는 지원하지 않습니다.
 
