@@ -1,5 +1,9 @@
 # Aruba Session Tracker
 
+**[공개 Streamlit 체험판 실행 안내](portfolio_demo/README.md)** · [GitHub Source](https://github.com/sebia1993/aruba-session-tracker-1)
+
+장비 없이 합성 시나리오를 선택하고 기존 Python 분석 결과와 Raw 근거를 확인할 수 있습니다.
+
 Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 읽기 전용으로 조회해 특정 IPv4 흐름의 datapath 세션을 찾고 변화 이력을
 로컬에 기록하는 한국어 데스크톱 프로그램입니다.
