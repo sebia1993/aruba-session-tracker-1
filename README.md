@@ -1,6 +1,6 @@
 # Aruba Session Tracker
 
-**[공개 Streamlit 체험판 실행 안내](portfolio_demo/README.md)** · [GitHub Source](https://github.com/sebia1993/aruba-session-tracker-1)
+**[Live Demo · 브라우저에서 실행](https://sebia1993-session-tracker-demo.streamlit.app/)** · [실행·검증 안내](portfolio_demo/README.md) · [GitHub Source](https://github.com/sebia1993/aruba-session-tracker-1)
 
 장비 없이 합성 시나리오를 선택하고 기존 Python 분석 결과와 Raw 근거를 확인할 수 있습니다.
 
