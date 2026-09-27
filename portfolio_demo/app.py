@@ -1,12 +1,14 @@
+import sys
 from dataclasses import asdict
 from pathlib import Path
-import sys
+
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from portfolio_demo.runtime import DemoRuntime, QueryRequest
-from portfolio_demo.fixture_transport import CONFIG, inventory
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aruba_session_tracker.parsers.flags import interpret_flags
+from portfolio_demo.fixture_transport import CONFIG, inventory
+from portfolio_demo.runtime import DemoRuntime, QueryRequest
 
 st.set_page_config(page_title="Session NOC Console · Public Demo v2", page_icon="📡", layout="wide")
 if "runtime" not in st.session_state:
@@ -17,7 +19,8 @@ st.caption("조회 조건 → MM 위치 확인 → 관련 MD → 현재 조회 /
 with st.sidebar:
     st.success("실제 SSH 비활성 · 합성 Transport")
     st.caption(
-        "계정 입력 없이 문서용 가상 네트워크를 조회합니다. 임의의 유효 IPv4 조건도 검증하며 가상망에 없으면 진단 결과를 표시합니다."
+        "계정 입력 없이 문서용 가상 네트워크를 조회합니다. "
+        "임의의 유효 IPv4 조건도 검증하며 가상망에 없으면 진단 결과를 표시합니다."
     )
     if st.button("Demo Reset"):
         st.session_state.runtime = DemoRuntime()
@@ -32,11 +35,14 @@ with settings:
         hide_index=True,
     )
     st.write(
-        f"세션 주기 {CONFIG.session_interval_seconds}초 · 위치 확인 {CONFIG.location_interval_seconds}초 · Close after {CONFIG.close_after_misses} misses"
+        f"세션 주기 {CONFIG.session_interval_seconds}초 · 위치 확인 "
+        f"{CONFIG.location_interval_seconds}초 · Close after "
+        f"{CONFIG.close_after_misses} misses"
     )
     st.dataframe(inventory(), hide_index=True)
     st.caption(
-        "지속 모니터링은 다음 Poll로 가상 시간을 진행합니다. 서버 백그라운드 스레드를 만들지 않습니다."
+        "지속 모니터링은 다음 Poll로 가상 시간을 진행합니다. "
+        "서버 백그라운드 스레드를 만들지 않습니다."
     )
 with query:
     c = st.columns(2)
@@ -99,18 +105,22 @@ with query:
         c[3].metric("Last Poll", r.poll_count)
         c[4].metric("현재 관측", len(o.observations) if o.authoritative else "확인 불가")
         st.write(
-            f"Used MM: {o.used_mm or '확인 불가'} · Controllers: {', '.join(o.controllers) or '없음'}"
+            f"Used MM: {o.used_mm or '확인 불가'} "
+            f"· Controllers: {', '.join(o.controllers) or '없음'}"
         )
         st.caption(f"실행 조건: {asdict(r.request)} · Stage: {r.stage}")
         if not o.authoritative:
             st.warning(
-                "수집 불완전 / Unknown · 세션 없음이나 종료로 판단하지 않습니다. 기존 추적 상태를 유지합니다."
+                "수집 불완전 / Unknown · 세션 없음이나 종료로 판단하지 않습니다. "
+                "기존 추적 상태를 유지합니다."
             )
         elif not o.observations:
             st.info("현재 관측 0개 · 기존 세션은 MISS 횟수와 CLOSED 이벤트를 별도로 확인하세요.")
         if r.result:
             st.caption(
-                f"MM refresh: {r.result.refreshed_location} · Retry: {r.result.retry_after_seconds}초 · 연속 MISS: {r.result.consecutive_misses}"
+                f"MM refresh: {r.result.refreshed_location} · Retry: "
+                f"{r.result.retry_after_seconds}초 · 연속 MISS: "
+                f"{r.result.consecutive_misses}"
             )
         st.json(
             {
@@ -149,7 +159,9 @@ with query:
                 "선택 세션 상세",
                 range(len(rows)),
                 format_func=lambda i: (
-                    f"{rows[i]['source_ip']}:{rows[i]['source_port']} → {rows[i]['destination_ip']}:{rows[i]['destination_port']} · {rows[i]['controller_name']}"
+                    f"{rows[i]['source_ip']}:{rows[i]['source_port']} → "
+                    f"{rows[i]['destination_ip']}:{rows[i]['destination_port']} · "
+                    f"{rows[i]['controller_name']}"
                 ),
             )
             st.json(rows[selected])
@@ -171,17 +183,20 @@ with evidence:
 with history:
     st.dataframe(r.history, hide_index=True, width="stretch")
     st.caption(
-        "최근 20회 Run 요약. 아래 Export는 마지막 Run의 전체 관측이며 표 필터와 독립적입니다. Reset 시 모두 지웁니다."
+        "최근 20회 Run 요약. "
+        "아래 Export는 마지막 Run의 전체 관측이며 표 필터와 독립적입니다. Reset 시 모두 지웁니다."
     )
     if r.outcome:
         st.download_button("CSV Export", r.csv(), "session-v2.csv", "text/csv")
         st.download_button("HTML Report", r.html(), "session-v2.html", "text/html")
 with st.expander("Architecture"):
     st.write(
-        "QueryRequest → TrackerService → SSHCollector allowlist → FixtureFactory → production Parser → QueryOutcome → MonitorEngine"
+        "QueryRequest → TrackerService → SSHCollector allowlist → "
+        "FixtureFactory → production Parser → QueryOutcome → MonitorEngine"
     )
     st.caption(
-        "SQLite와 known_hosts를 사용하지 않습니다. 합성 transport는 등록된 Demo 장비의 필터형 명령만 처리합니다."
+        "SQLite와 known_hosts를 사용하지 않습니다. "
+        "합성 transport는 등록된 Demo 장비의 필터형 명령만 처리합니다."
     )
 st.link_button(
     "GitHub Source",

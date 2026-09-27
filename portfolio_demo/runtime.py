@@ -1,21 +1,25 @@
 """Session-local TrackerService / MonitorEngine orchestration, no database."""
 
-from dataclasses import asdict
-from datetime import datetime, timezone
-from pathlib import Path
 import csv
 import io
 import sys
 import time
+from dataclasses import asdict
+from datetime import UTC, datetime
+from pathlib import Path
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from aruba_session_tracker.models import Credentials, QueryRequest
-from aruba_session_tracker.services.tracker import TrackerService, TrackerCallbacks
-from aruba_session_tracker.services.monitoring import MonitorEngine
-from aruba_session_tracker.storage.html_report import RunReportSnapshot, render_html_report
-from portfolio_demo.fixture_transport import CONFIG, FixtureFactory, STAGES
+from aruba_session_tracker.models import Credentials  # noqa: E402
+from aruba_session_tracker.models import QueryRequest as QueryRequest  # noqa: E402
+from aruba_session_tracker.services.monitoring import MonitorEngine  # noqa: E402
+from aruba_session_tracker.services.tracker import TrackerCallbacks, TrackerService  # noqa: E402
+from aruba_session_tracker.storage.html_report import (  # noqa: E402
+    RunReportSnapshot,
+    render_html_report,
+)
+from portfolio_demo.fixture_transport import CONFIG, STAGES, FixtureFactory  # noqa: E402
 
 
 class DemoRuntime:
@@ -48,7 +52,7 @@ class DemoRuntime:
             self.stop()
         self.request = request
         self.run_id = str(uuid4())
-        self.started = datetime.now(timezone.utc).isoformat()
+        self.started = datetime.now(UTC).isoformat()
         self.poll_count = 0
         self.observations, self.events, self.latest_lifecycle = [], [], {}
         self.factory.tick = 0
@@ -169,7 +173,7 @@ class DemoRuntime:
             **asdict(self.request),
             "run_id": self.run_id,
             "started_at": self.started,
-            "ended_at": datetime.now(timezone.utc).isoformat(),
+            "ended_at": datetime.now(UTC).isoformat(),
             "status": self.history[-1]["Status"],
         }
         snapshot = RunReportSnapshot(

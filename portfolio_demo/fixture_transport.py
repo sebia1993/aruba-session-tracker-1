@@ -28,8 +28,10 @@ STAGES = (
 GLOBAL_HEADER = "IP              MAC                Name              Current switch    Role"
 DATAPATH_HEADER = (
     "Datapath Session Table Entries\n------------------------------\n"
-    "Source IP or MAC Destination IP Prot SPort DPort Cntr Prio ToS Age Destination TAge Packets Bytes Flags CPU ID\n"
-    "---------------- ---------------- ---- ----- ----- ---- ---- --- --- ----------- ---- ------- ----- ----- ------\n"
+    "Source IP or MAC Destination IP Prot SPort DPort Cntr Prio ToS Age "
+    "Destination TAge Packets Bytes Flags CPU ID\n"
+    "---------------- ---------------- ---- ----- ----- ---- ---- --- --- "
+    "----------- ---- ------- ----- ----- ------\n"
 )
 
 
@@ -126,7 +128,8 @@ class FixtureConnection(AbstractContextManager):
                 ):
                     flags = "SY" if f.tick == 0 else "F"
                     lines.append(
-                        f"{source} {dest} {proto} {sport} {dport} 0/0 0 0 10 0 0 {5 + f.tick} {100 + f.tick * 20} {flags} 0"
+                        f"{source} {dest} {proto} {sport} {dport} 0/0 0 0 10 "
+                        f"0 0 {5 + f.tick} {100 + f.tick * 20} {flags} 0"
                     )
         return DATAPATH_HEADER + "\n".join(lines) + f"\nEntries: {len(lines)}\n"
 

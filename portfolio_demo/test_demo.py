@@ -1,13 +1,15 @@
-from pathlib import Path
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from portfolio_demo.runtime import DemoRuntime, QueryRequest
-from aruba_session_tracker.collectors.ssh import _known_hosts_file_lock, CancellationToken
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from streamlit.testing.v1 import AppTest
+
+from aruba_session_tracker.collectors.ssh import CancellationToken, _known_hosts_file_lock
+from portfolio_demo.runtime import DemoRuntime, QueryRequest
 
 
 class DemoTests(unittest.TestCase):
@@ -89,9 +91,11 @@ class DemoTests(unittest.TestCase):
     def test_native_lock_fails_closed_outside_windows(self):
         with tempfile.TemporaryDirectory() as root, patch("sys.platform", "linux"):
             path = Path(root) / "known_hosts"
-            with self.assertRaisesRegex(RuntimeError, "requires Windows"):
-                with _known_hosts_file_lock(path, CancellationToken()):
-                    pass
+            with (
+                self.assertRaisesRegex(RuntimeError, "requires Windows"),
+                _known_hosts_file_lock(path, CancellationToken()),
+            ):
+                pass
             self.assertEqual(list(Path(root).iterdir()), [])
 
     def test_ui_monitor_query_lock_stop_reset_and_session_isolation(self):
