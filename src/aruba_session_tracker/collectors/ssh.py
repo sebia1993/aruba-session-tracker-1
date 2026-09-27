@@ -12,11 +12,11 @@ import base64
 import binascii
 import hashlib
 import inspect
-import msvcrt
 import os
 import re
 import socket
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -27,6 +27,9 @@ from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Protocol, Self
+
+if sys.platform == "win32":
+    import msvcrt
 
 import paramiko
 from netmiko.aruba.aruba_os import ArubaOsSSH
@@ -1936,6 +1939,8 @@ def _known_hosts_file_lock(
     deadline: PollDeadline | None = None,
     parent_identity: DirectoryIdentity | None = None,
 ) -> Iterator[None]:
+    if sys.platform != "win32":
+        raise RuntimeError("Native known_hosts locking requires Windows.")
     cancel_token.raise_if_cancelled()
     if deadline is not None:
         deadline.raise_if_expired()

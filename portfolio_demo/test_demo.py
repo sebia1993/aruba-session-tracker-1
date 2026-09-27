@@ -1,57 +1,132 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from streamlit.testing.v1 import AppTest
 
-from portfolio_demo.logic import SCENARIOS, run_demo
+from aruba_session_tracker.collectors.ssh import CancellationToken, _known_hosts_file_lock
+from portfolio_demo.runtime import DemoRuntime, QueryRequest
 
 
 class DemoTests(unittest.TestCase):
-    def test_all_scenarios_through_ui_without_network(self):
-        for scenario in SCENARIOS:
+    def test_queries_route_filter_and_accept_other_clients(self):
+        with patch("socket.create_connection", side_effect=AssertionError("No network")):
+            r = DemoRuntime()
+            first = r.start(QueryRequest("198.51.100.10", ""))
+            self.assertTrue(first.authoritative)
+            self.assertEqual(len(first.observations), 3)
+            self.assertEqual(first.controllers, ("DEMO-MD-03",))
+            self.assertEqual(
+                len(
+                    r.start(
+                        QueryRequest("198.51.100.10", "", destination_port=443, bidirectional=False)
+                    ).observations
+                ),
+                1,
+            )
+            self.assertEqual(
+                len(
+                    r.start(
+                        QueryRequest("198.51.100.10", "", destination_port=443, bidirectional=True)
+                    ).observations
+                ),
+                2,
+            )
+            other = r.start(QueryRequest("198.51.100.21", ""))
+            self.assertEqual(len(other.observations), 3)
+            self.assertNotEqual(first.controllers, other.controllers)
+            dest = r.start(QueryRequest("", "198.51.100.21"))
+            self.assertTrue(dest.authoritative)
+            self.assertTrue(dest.observations)
+            both = r.start(QueryRequest("198.51.100.10", "203.0.113.21"))
+            self.assertEqual(set(both.controllers), {"DEMO-MD-03", "DEMO-MD-02"})
+            absent = r.start(QueryRequest("198.51.100.250", ""))
+            self.assertTrue(absent.diagnostics)
+            self.assertFalse(absent.authoritative)
+            self.assertFalse(absent.observations)
+            with self.assertRaises(ValueError):
+                QueryRequest("bad; command", "")
+            with self.assertRaises(ValueError):
+                QueryRequest("", "")
+
+    def test_monitor_overlap_move_failures_miss_close_and_exports(self):
+        with patch("socket.create_connection", side_effect=AssertionError("No network")):
+            r = DemoRuntime()
+            r.start(QueryRequest("198.51.100.10", ""), monitor=True)
+            r.poll()
+            self.assertTrue(any(e.event_type.value == "FLAGS_CHANGED" for e in r.result.events))
+            r.poll()
+            self.assertEqual(len(r.outcome.observations), 6)
+            self.assertFalse(
+                any(e.event_type.value == "CONTROLLER_CHANGED" for e in r.result.events)
+            )
+            r.poll()
+            self.assertTrue(
+                any(e.event_type.value == "CONTROLLER_CHANGED" for e in r.result.events)
+            )
+            for tick, expected_misses in [(4, 0), (5, 1), (6, 1), (7, 2)]:
+                r.poll()
+                self.assertTrue(
+                    all(s.miss_count == expected_misses for s in r.result.active_sessions)
+                )
+                if tick in (4, 6):
+                    self.assertFalse(r.outcome.authoritative)
+                    self.assertFalse(r.result.events)
+            r.poll()
+            self.assertFalse(r.result.active_sessions)
+            self.assertTrue(all(e.event_type.value == "CLOSED" for e in r.result.events))
+            r.poll()
+            self.assertTrue(r.result.active_sessions)
+            self.assertIn("source_ip", r.csv())
+            self.assertIn("198.51.100.10", r.html())
+            self.assertNotIn("show datapath", r.html())
+            self.assertNotIn("synthetic-not-a-secret", r.html())
+            for entry in r.factory.trace:
+                self.assertNotEqual(entry["Command"], "show datapath session table")
+
+    def test_native_lock_fails_closed_outside_windows(self):
+        with tempfile.TemporaryDirectory() as root, patch("sys.platform", "linux"):
+            path = Path(root) / "known_hosts"
             with (
-                self.subTest(scenario=scenario),
-                patch("socket.create_connection", side_effect=AssertionError("No network")),
+                self.assertRaisesRegex(RuntimeError, "requires Windows"),
+                _known_hosts_file_lock(path, CancellationToken()),
             ):
-                app = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run(timeout=20)
-                self.assertFalse(app.exception)
-                app.selectbox[0].select(scenario).run()
-                next(b for b in app.button if b.label == "분석 실행").click().run(timeout=20)
-                self.assertFalse(app.exception)
-                self.assertTrue(app.metric)
-                self.assertTrue(app.dataframe)
-                # Re-render must retain the result without re-running analysis.
-                app.run()
-                self.assertFalse(app.exception)
-                self.assertIn("result", app.session_state)
+                pass
+            self.assertEqual(list(Path(root).iterdir()), [])
 
-    def test_empty_and_failure_are_distinct(self):
-        for client in ("192.0.2.10", "192.0.2.20", "192.0.2.30"):
-            active = run_demo("sessions", client)
-            self.assertEqual(len(active["rows"]), 3)
-            self.assertTrue(active["authoritative"])
-            self.assertEqual(active["context"][0]["client_ip"], client)
-        empty = run_demo("empty", "192.0.2.10")
-        self.assertTrue(empty["authoritative"])
-        self.assertEqual(empty["status"], "No Active Session")
-        for scenario in ("collection_failed", "parse_failed"):
-            failed = run_demo(scenario, "192.0.2.10")
-            self.assertFalse(failed["authoritative"])
-            self.assertIn("Unknown", failed["status"])
-        with self.assertRaises(ValueError):
-            run_demo("sessions", "8.8.8.8")
+    def test_ui_monitor_query_lock_stop_reset_and_session_isolation(self):
+        with patch("socket.create_connection", side_effect=AssertionError("No network")):
+            app = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run(timeout=30)
 
-    def test_filter_history_and_browser_isolation(self):
-        app = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run()
-        next(b for b in app.button if b.label == "분석 실행").click().run()
-        app.text_input[1].input("UDP").run()
-        self.assertEqual(len(app.dataframe[1].value), 1)
-        self.assertEqual(len(app.session_state["history"]), 1)
-        other = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run()
-        self.assertNotIn("result", other.session_state)
+            def click(label):
+                next(b for b in app.button if b.label == label).click().run(timeout=30)
+                self.assertFalse(app.exception)
+
+            click("지속 모니터링 시작")
+            self.assertTrue(app.text_input[0].disabled)
+            for _ in range(3):
+                click("다음 Poll")
+            self.assertTrue(
+                any(
+                    e["event_type"] == "CONTROLLER_CHANGED"
+                    for e in app.session_state.runtime.events
+                )
+            )
+            click("중지")
+            self.assertFalse(app.text_input[0].disabled)
+            other = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run(timeout=30)
+            self.assertIsNone(other.session_state.runtime.outcome)
+            click("Demo Reset")
+            self.assertFalse(app.session_state.runtime.history)
+            self.assertIsNone(app.session_state.runtime.monitor)
+            app.text_input[0].set_value("198.51.100.21").run()
+            click("현재 조회")
+            self.assertEqual(len(app.session_state.runtime.outcome.observations), 3)
+            self.assertIsNone(app.session_state.runtime.monitor)
 
 
 if __name__ == "__main__":
