@@ -1,24 +1,35 @@
-# Public Streamlit Demo
+# Public Demo v2 — Session NOC Console
 
-**[Live Demo](https://sebia1993-session-tracker-demo.streamlit.app/)** · [GitHub Source](https://github.com/sebia1993/aruba-session-tracker-1)
+[Current main Live Demo](https://sebia1993-session-tracker-demo.streamlit.app/) · [v2 review branch](https://github.com/sebia1993/aruba-session-tracker-1/tree/codex/public-demo-v2)
 
-별도 장비와 계정 없이 원 프로젝트의 Python 분석 로직을 실행합니다.
-비식별 문서 주소와 합성 CLI만 사용하며, 외부 연결·내부 파일 업로드는 지원하지 않습니다.
+This branch is for review. It does not change main or the current Cloud deployment.
 
 ```sh
-python -m venv .venv-demo
-# 가상환경 활성화 후
 python -m pip install -r portfolio_demo/requirements.txt
 python -m streamlit run portfolio_demo/app.py
 python -m unittest discover -s portfolio_demo -p test_demo.py -v
 ```
 
-Streamlit Community Cloud: repository `sebia1993/aruba-session-tracker-1`, branch `main`,
-entrypoint `portfolio_demo/app.py`, Python 3.13.
-의존성은 entrypoint 옆 `portfolio_demo/requirements.txt`를 사용합니다.
-기존 Windows 앱의 런타임 잠금 파일과 패키징 경로는 유지합니다.
+Use Python 3.13 and `portfolio_demo/app.py` with its adjacent requirements in Cloud.
+Inspect Device Settings, enter source/destination IP and optional ports/direction,
+then use Current Query or Start Monitoring / Next Poll / Stop. Inputs remain locked
+to the active monitor; stop before changing conditions. The virtual network lists
+12 clients and multiple TCP/UDP flows. Any valid IPv4 query is accepted and an
+unknown client produces the production diagnostic, never an arbitrary allowlist error.
 
-시나리오 선택 → 분석 실행 → Summary → 상세 결과 → Raw/Evidence 흐름입니다.
-입력을 변경하면 기존 결과의 시나리오를 표시하며 다시 실행해야 갱신합니다.
-각 실행은 독립된 분석 상태로 시작하고 결과는 브라우저 세션별로 분리합니다.
-Fixture·AppTest·Windows CI는 실제 장비/운영망 검증이 아닙니다.
+The production path is QueryRequest → TrackerService → SSHCollector command
+allowlist → synthetic FixtureFactory → production Parser → QueryOutcome.
+MonitorEngine retains its production location cache, required controller scope,
+overlap/move detection and authoritative MISS/CLOSED rules. The timeline includes
+counter/flags changes, overlap, confirmed move, timeout, miss, parse failure, close,
+and re-observation. Fault injection never opens a real connection.
+
+The UI shows Raw, diagnostics, exact command trace, lifecycle details and the latest
+20 run summaries. CSV and production HTML export contain the latest run's complete
+observations independent of presentation filters. Each run is capped at 50 polls.
+Reset discards the entire runtime; there is no shared SQLite, known_hosts, daemon
+or credential input. Non-Windows imports of the real service are enabled with a
+platform guard; native known_hosts locking still fails closed outside Windows.
+Windows locking behavior and the desktop's security boundaries are unchanged.
+
+Fixture and CI results are not live-device or field-PC validation.
