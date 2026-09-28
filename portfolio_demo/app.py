@@ -378,8 +378,6 @@ def render_query_page() -> None:
     )
     state_row[2].caption(f"시작 시각: {r.started or '-'} · Poll {r.poll_count}")
 
-    render_result_console()
-
 
 def result_rows() -> list[dict[str, object]]:
     return r.rows() if r.outcome else []
@@ -688,18 +686,21 @@ def render_history_page() -> None:
 
 
 render_header()
-trace_slot = st.empty()
-r.execution.on_change = lambda: render_trace(r.execution, trace_slot)
-render_trace(r.execution, trace_slot)
-render_sidebar()
 
 query_page, settings_page, history_page = st.tabs(["세션 조회", "장비 설정", "기록 및 내보내기"])
 with query_page:
-    render_query_page()
+    query_area = st.container()
+    trace_slot = st.empty()
+    r.execution.on_change = lambda: render_trace(r.execution, trace_slot)
+    render_trace(r.execution, trace_slot)
+    with query_area:
+        render_query_page()
+    render_result_console()
 with settings_page:
     render_settings_page()
 with history_page:
     render_history_page()
+render_sidebar()
 
 st.caption(
     "Public Web Edition · QueryRequest / TrackerService / production Parser / "
