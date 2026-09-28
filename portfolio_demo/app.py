@@ -469,6 +469,7 @@ def render_header() -> None:
               <span class="noc-badge">READ ONLY</span>
               <span class="noc-badge">PUBLIC DEMO</span>
               <span class="noc-badge">SYNTHETIC TRANSPORT</span>
+              <span class="noc-badge">UI BUILD · MOBILE FIX</span>
             </div>
           </div>
           <div class="noc-hero-summary">
