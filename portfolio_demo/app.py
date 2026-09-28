@@ -183,30 +183,29 @@ def render_header() -> None:
     )
 
 
-
 def render_reviewer_summary() -> None:
     st.markdown("### 이 프로젝트는 무엇을 해결하나요?")
     left, right = st.columns(2)
     with left, st.container(border=True):
-            st.markdown("**프로젝트 목적**")
-            st.write(
-                "특정 단말의 IP 주소 하나를 출발점으로, 그 단말이 어느 무선 장비에 연결되어 있고 "
-                "현재 어떤 서버나 서비스와 통신하고 있는지를 자동으로 따라가는 도구입니다."
-            )
-            st.caption(
-                "쉽게 말해: '이 기기가 지금 어디를 통해 어디와 통신하고 있는지'를 "
-                "자동으로 추적합니다."
-            )
+        st.markdown("**프로젝트 목적**")
+        st.write(
+            "특정 단말의 IP 주소 하나를 출발점으로, 그 단말이 어느 무선 장비에 연결되어 있고 "
+            "현재 어떤 서버나 서비스와 통신하고 있는지를 자동으로 따라가는 도구입니다."
+        )
+        st.caption(
+            "쉽게 말해: '이 기기가 지금 어디를 통해 어디와 통신하고 있는지'를 "
+            "자동으로 추적합니다."
+        )
     with right, st.container(border=True):
-            st.markdown("**이 데모에서 보여주는 것**")
-            st.write(
-                "단말 IP 확인 → 단말 위치 찾기 → 담당 Controller 선택 → 실제 통신 세션 조회 → "
-                "통신 흐름과 변화 확인까지를 한 번의 실행으로 보여줍니다."
-            )
-            st.caption(
-                "해커톤 관점: 여러 단계로 나뉜 장애 조사 절차를 하나의 자동 추적 흐름으로 "
-                "연결합니다."
-            )
+        st.markdown("**이 데모에서 보여주는 것**")
+        st.write(
+            "단말 IP 확인 → 단말 위치 찾기 → 담당 Controller 선택 → 실제 통신 세션 조회 → "
+            "통신 흐름과 변화 확인까지를 한 번의 실행으로 보여줍니다."
+        )
+        st.caption(
+            "해커톤 관점: 여러 단계로 나뉜 장애 조사 절차를 하나의 자동 추적 흐름으로 "
+            "연결합니다."
+        )
 
 
 def demo_reset() -> None:
