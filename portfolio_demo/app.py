@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from aruba_session_tracker.parsers.flags import interpret_flags
-from portfolio_demo.fixture_transport import CONFIG, inventory
+from portfolio_demo.fixture_transport import CONFIG
 from portfolio_demo.runtime import DemoRuntime, QueryRequest
 
 st.set_page_config(
@@ -137,7 +137,8 @@ def render_header() -> None:
         st.markdown(
             '<div class="product-shell">'
             '<div class="product-name">ARUBA SESSION TRACKER</div>'
-            '<div class="product-meta">네트워크 세션 분석 콘솔 · Public Web Edition · 로컬/읽기 전용 설계</div>'
+            '<div class="product-meta">네트워크 세션 분석 콘솔 · Public Web Edition · '
+            '로컬/읽기 전용 설계</div>'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -153,7 +154,10 @@ def render_header() -> None:
     chips = st.columns(6)
     values = (
         ("MM", "설정 2/2"),
-        ("MD", f"설정 {len(CONFIG.managed_devices)}/{len(CONFIG.managed_devices)}"),
+        (
+            "MD",
+            f"설정 {len(CONFIG.managed_devices)}/{len(CONFIG.managed_devices)}",
+        ),
         ("조회 주기", f"{CONFIG.session_interval_seconds}s"),
         ("최근 확인", latest_seen()),
         ("실행 모드", "Web Demo · 읽기 전용"),
@@ -207,7 +211,8 @@ def render_sidebar() -> None:
                 }[value],
             )
             st.caption(
-                "실제 Desktop App의 운영 기능이 아니라 공개 데모에서 상태 전이를 재현하기 위한 입력입니다."
+                "실제 Desktop App의 운영 기능이 아니라 공개 데모에서 "
+                "상태 전이를 재현하기 위한 입력입니다."
             )
 
 
@@ -273,7 +278,8 @@ def render_query_page() -> None:
             placeholder="예: 198.51.100.10",
         )
         endpoints[1].markdown(
-            '<div style="text-align:center;padding-top:2rem;font-size:1.2rem">⇄</div>',
+            '<div style="text-align:center;padding-top:2rem;'
+            'font-size:1.2rem">⇄</div>',
             unsafe_allow_html=True,
         )
         destination = endpoints[2].text_input(
@@ -410,7 +416,8 @@ def render_result_console() -> None:
 
     if r.outcome and not r.outcome.authoritative:
         st.warning(
-            "현재 수집은 완전하지 않습니다. 세션 없음/종료로 단정하지 않고 확인 필요 상태로 유지합니다."
+            "현재 수집은 완전하지 않습니다. 세션 없음/종료로 단정하지 않고 "
+            "확인 필요 상태로 유지합니다."
         )
 
     if not rows:
@@ -487,8 +494,10 @@ def render_result_console() -> None:
         "선택한 세션",
         range(len(filtered)),
         format_func=lambda index: (
-            f"{filtered[index].get('source_ip')}:{filtered[index].get('source_port')} → "
-            f"{filtered[index].get('destination_ip')}:{filtered[index].get('destination_port')} · "
+            f"{filtered[index].get('source_ip')}:"
+            f"{filtered[index].get('source_port')} → "
+            f"{filtered[index].get('destination_ip')}:"
+            f"{filtered[index].get('destination_port')} · "
             f"{filtered[index].get('controller_name')}"
         ),
     )
@@ -504,14 +513,16 @@ def render_result_console() -> None:
         flow[0].markdown(
             '<div class="flow-card">'
             '<div class="flow-label">출발지</div>'
-            f'<div class="flow-value">{row.get("source_ip")}:{row.get("source_port")}</div>'
+            f'<div class="flow-value">{row.get("source_ip")}:'
+            f'{row.get("source_port")}</div>'
             '</div>',
             unsafe_allow_html=True,
         )
         flow[1].markdown(
             '<div class="flow-card">'
             '<div class="flow-label">Protocol / MD</div>'
-            f'<div class="flow-value">{row.get("protocol")}<br>{row.get("controller_name")}</div>'
+            f'<div class="flow-value">{row.get("protocol")}<br>'
+            f'{row.get("controller_name")}</div>'
             '</div>',
             unsafe_allow_html=True,
         )
