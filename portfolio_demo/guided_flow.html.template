@@ -1,35 +1,177 @@
-<section id="guided-flow" data-run="__RUN_ID__" data-phase="__PHASE__" data-elapsed="__ELAPSED__" aria-label="안내형 실행 화면" style="scroll-margin-top:70px">
+<section id="guided-flow" class="investigation-console" data-run="__RUN_ID__" data-phase="__PHASE__" data-elapsed="__ELAPSED__" aria-label="안내형 실행 화면" style="scroll-margin-top:70px">
 <style>
-#guided-flow {border:1px solid #8886;border-radius:12px;padding:1rem;margin:.5rem 0;overflow-wrap:anywhere}
-#guided-flow h3 {margin:0 0 .6rem}
-#guided-flow .run-state {display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin:.45rem 0 .7rem}
-#guided-flow .state-badge {display:inline-flex;align-items:center;border:1px solid #4f9eff88;border-radius:999px;padding:.28rem .65rem;font-weight:800}
-#guided-flow .runtime {font-size:.82rem;opacity:.8}
-#guided-flow .progress-shell {height:8px;border-radius:999px;background:#8883;overflow:hidden;margin:.55rem 0 .7rem}
-#guided-flow .progress-bar {height:100%;width:0;background:#4f9eff;transition:width .25s ease}
-#guided-flow .guide-nav {display:flex;flex-wrap:wrap;gap:.5rem;margin:.5rem 0}
-#guided-flow button,#guided-flow select {font:inherit;color:inherit;background:transparent;border:1px solid #8888;border-radius:8px;padding:.5rem;max-width:100%;cursor:pointer}
+#guided-flow {
+  border:1px solid rgba(89,139,185,.36);
+  border-radius:15px;
+  padding:1rem 1.05rem;
+  margin:.65rem 0 1rem;
+  overflow-wrap:anywhere;
+  background:linear-gradient(180deg,rgba(13,23,36,.96),rgba(12,20,31,.88));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.025);
+}
+#guided-flow .execution-kicker {
+  color:#7999b8;
+  font-size:.62rem;
+  letter-spacing:.13em;
+  font-weight:900;
+  margin-bottom:.18rem;
+}
+#guided-flow h3 {margin:0 0 .65rem;font-size:1.04rem}
+#guided-flow .run-state {
+  display:flex;
+  flex-wrap:wrap;
+  gap:.55rem;
+  align-items:center;
+  margin:.45rem 0 .7rem;
+}
+#guided-flow .state-badge {
+  display:inline-flex;
+  align-items:center;
+  border:1px solid rgba(79,158,222,.46);
+  border-radius:999px;
+  padding:.29rem .68rem;
+  font-weight:900;
+  color:#b9daf5;
+  background:rgba(37,85,124,.26);
+}
+#guided-flow .runtime {
+  font-size:.78rem;
+  color:#879aaf;
+}
+#guided-flow .progress-shell {
+  height:7px;
+  border-radius:999px;
+  background:rgba(117,143,169,.18);
+  overflow:hidden;
+  margin:.55rem 0 .75rem;
+}
+#guided-flow .progress-bar {
+  height:100%;
+  width:0;
+  background:linear-gradient(90deg,#4c92ce,#65b9df);
+  transition:width .25s ease;
+}
+#guided-flow .step-rail {
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(58px,1fr));
+  gap:.38rem;
+  margin:.65rem 0 .8rem;
+}
+#guided-flow .rail-step {
+  position:relative;
+  border:1px solid rgba(108,137,166,.25);
+  border-radius:9px;
+  background:rgba(20,31,45,.72);
+  min-height:43px;
+  padding:.38rem .42rem;
+  display:flex;
+  align-items:center;
+  gap:.4rem;
+  color:#7d91a5;
+}
+#guided-flow .rail-step .rail-index {
+  width:1.35rem;
+  height:1.35rem;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  border-radius:50%;
+  border:1px solid rgba(111,143,175,.34);
+  font-size:.62rem;
+  font-weight:900;
+  flex:0 0 auto;
+}
+#guided-flow .rail-step .rail-label {
+  font-size:.61rem;
+  line-height:1.2;
+  font-weight:800;
+  overflow:hidden;
+  display:-webkit-box;
+  -webkit-line-clamp:2;
+  -webkit-box-orient:vertical;
+}
+#guided-flow .rail-step.done {
+  color:#9ad8bc;
+  border-color:rgba(81,184,135,.34);
+  background:rgba(25,77,55,.18);
+}
+#guided-flow .rail-step.active {
+  color:#c8e4fa;
+  border-color:rgba(80,163,228,.62);
+  background:rgba(36,83,119,.3);
+  box-shadow:0 0 0 1px rgba(80,163,228,.12);
+}
+#guided-flow .rail-step.failure {
+  color:#f0b0b0;
+  border-color:rgba(211,101,101,.48);
+  background:rgba(93,37,37,.22);
+}
+#guided-flow [data-readout] {
+  color:#a9b9c9;
+  font-size:.8rem;
+  margin:.15rem 0 .55rem;
+}
+#guided-flow .guide-nav {
+  display:flex;
+  flex-wrap:wrap;
+  gap:.45rem;
+  margin:.45rem 0;
+}
+#guided-flow button,#guided-flow select {
+  font:inherit;
+  color:inherit;
+  background:rgba(21,33,48,.72);
+  border:1px solid rgba(111,143,175,.34);
+  border-radius:8px;
+  padding:.46rem .58rem;
+  max-width:100%;
+  cursor:pointer;
+}
+#guided-flow button:hover {border-color:rgba(89,157,216,.64)}
 #guided-flow select {flex:1;min-width:160px}
 #guided-flow select option {color:#111;background:#fff}
 #guided-flow [hidden] {display:none!important}
 #guided-flow .scenario-grid {display:block}
-#guided-flow article {margin:.5rem 0!important}
-#guided-flow article[data-status="running"] {border-color:#4f9eff!important;box-shadow:0 0 0 1px #4f9eff33}
+#guided-flow article {
+  margin:.55rem 0!important;
+  border-radius:11px!important;
+  background:rgba(19,31,45,.76);
+}
+#guided-flow article[data-status="running"] {
+  border-color:#4f9eff!important;
+  box-shadow:0 0 0 1px #4f9eff33;
+}
 #guided-flow article[data-status="warning"] {border-color:#d6a84b!important}
 #guided-flow article[data-status="failure"] {border-color:#d66a6a!important}
-#guided-flow .guide-evidence {font-size:.82rem;opacity:.82}
+#guided-flow .guide-evidence {font-size:.78rem;opacity:.82}
 #guided-flow section > h3,#guided-flow section > p {display:none}
 #guided-flow :focus-visible {outline:3px solid #4f9eff;outline-offset:3px}
-@media(max-width:600px) {#guided-flow {padding:.7rem} #guided-flow select {width:100%;flex-basis:100%}}
-@media(prefers-reduced-motion:reduce) {#guided-flow .progress-bar {transition:none}}
+@media(max-width:700px) {
+  #guided-flow {padding:.8rem}
+  #guided-flow select {width:100%;flex-basis:100%}
+  #guided-flow .step-rail {grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media(prefers-reduced-motion:reduce) {
+  #guided-flow .progress-bar {transition:none}
+}
 </style>
+<div class="execution-kicker">INVESTIGATION EXECUTION</div>
 <h3 tabindex="-1">__TITLE__</h3>
 <div class="run-state">
   <span class="state-badge" data-state-badge>대기</span>
-  <span class="runtime">실제 Runtime 처리: <b>__ELAPSED__</b></span>
+  <span class="runtime">실제 Runtime 처리 · <b>__ELAPSED__</b></span>
 </div>
 <div class="progress-shell" aria-hidden="true"><div class="progress-bar" data-progress></div></div>
+<div class="step-rail" data-rail aria-label="조사 단계 진행 상태"></div>
 <p data-readout role="status" aria-live="polite">실제 실행 상태를 확인합니다.</p>
-<div class="guide-nav"><button data-follow type="button">결과 보기</button><button data-replay type="button">실제 처리 과정 다시 보기</button></div>
-<div class="guide-nav" data-steps><select aria-label="실행 단계 선택"><option value="-1">최종 결과</option></select><button data-back type="button" aria-label="이전 단계">← 이전</button><button data-next type="button" aria-label="다음 단계">다음 →</button></div>
-<div>__BODY__</div></section>
+<div class="guide-nav">
+  <button data-follow type="button">결과 보기</button>
+  <button data-replay type="button">실제 처리 과정 다시 보기</button>
+</div>
+<div class="guide-nav" data-steps>
+  <select aria-label="실행 단계 선택"><option value="-1">최종 결과</option></select>
+  <button data-back type="button" aria-label="이전 단계">← 이전</button>
+  <button data-next type="button" aria-label="다음 단계">다음 →</button>
+</div>
+<div>__BODY__</div>
+</section>
