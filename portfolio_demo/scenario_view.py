@@ -192,7 +192,8 @@ def render_communication(runtime, st):
         "</div>"
         '<div class="topology-foot">'
         "표시 값은 실제 DemoRuntime의 관측 결과입니다. Public Demo는 비식별 합성 Transport를 "
-        "사용하지만 QueryRequest · TrackerService · production Parser · MonitorEngine 경로를 재사용합니다."
+        "사용하지만 QueryRequest · TrackerService · production Parser · "
+        "MonitorEngine 경로를 재사용합니다."
         "</div>"
         "</section>",
         unsafe_allow_html=True,
