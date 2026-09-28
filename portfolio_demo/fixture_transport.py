@@ -86,6 +86,27 @@ class FixtureConnection(AbstractContextManager):
         pass
 
     def send_command(self, command, *, read_timeout):
+        trace = getattr(self.factory, "execution", None)
+        if trace is None or command == "no paging":
+            return self._send_command(command, read_timeout=read_timeout)
+        label = "MM 위치 수집" if command.startswith("show global-user") else "필터형 datapath 조회"
+        with trace.step("collect", label, f"{self.target.name} · {command}") as step:
+            try:
+                output = self._send_command(command, read_timeout=read_timeout)
+            except CollectorError as exc:
+                step.status = "failure"
+                step.detail = f"{self.target.name} · {exc.code.value} · 관측 확인 불가"
+                # Keep collector failure semantics; the production service handles it.
+                raise
+            step.detail = f"{self.target.name} · {command} · {len(output.splitlines())}줄 응답"
+            step.evidence = {
+                "device": self.target.name,
+                "command": command,
+                "lines": len(output.splitlines()),
+            }
+            return output
+
+    def _send_command(self, command, *, read_timeout):
         del read_timeout
         f = self.factory
         f.trace.append({"Device": self.target.name, "Command": command})

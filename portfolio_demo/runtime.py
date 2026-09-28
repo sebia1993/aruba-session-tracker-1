@@ -19,16 +19,46 @@ from aruba_session_tracker.storage.html_report import (  # noqa: E402
     RunReportSnapshot,
     render_html_report,
 )
+from portfolio_demo.execution_trace import ExecutionTrace, traced  # noqa: E402
 from portfolio_demo.fixture_transport import CONFIG, STAGES, FixtureFactory  # noqa: E402
+
+
+class EvidenceTrackerService(TrackerService):
+    """Observe the production location result without changing routing or parsing."""
+
+    def _resolve_locations(self, *args, **kwargs):
+        with self.execution.step("location", "MM 위치 조회 / Production Parser") as step:
+            result = super()._resolve_locations(*args, **kwargs)
+            locations = (
+                [item for item in (result.source, result.destination) if item] if result else []
+            )
+            step.status = (
+                "success"
+                if locations and set(args[0].client_ips) <= {item.client_ip for item in locations}
+                else "warning"
+            )
+            step.detail = (result.used_mm or "확인 불가") if result else "MM 위치 확인 불가"
+            step.detail += " · " + (
+                " / ".join(f"{item.client_ip} → {item.current_switch}" for item in locations)
+                or "단말 위치 확인 불가"
+            )
+            step.evidence = {
+                "used_mm": result.used_mm if result else None,
+                "locations": [asdict(item) for item in locations],
+            }
+            return result
 
 
 class DemoRuntime:
     def __init__(self):
+        self.execution = ExecutionTrace()
         self.factory = FixtureFactory()
+        self.factory.execution = self.execution
         self.trace = []
-        self.service = TrackerService(
+        self.service = EvidenceTrackerService(
             CONFIG, self.factory, TrackerCallbacks(progress=self._progress)
         )
+        self.service.execution = self.execution
         self.monitor = None
         self.request = None
         self.outcome = None
@@ -46,10 +76,23 @@ class DemoRuntime:
 
     def _progress(self, stage, device):
         self.trace.append({"Stage": stage, "Device": device})
+        if stage == "MD_QUERY":
+            self.execution.record(
+                "route", "조회 대상 MD 결정", "success", device, {"controller": device}
+            )
 
+    @traced("세션 조회")
     def start(self, request, monitor=False, mode="timeline"):
         if self.running:
             self.stop()
+        with self.execution.step("input", "입력 검증") as step:
+            # Reconstruct the validated production request, not a separate demo validator.
+            request = QueryRequest(**asdict(request))
+            step.evidence = asdict(request)
+            step.detail = (
+                f"Source {request.source_ip or '미지정'} → "
+                f"Destination {request.destination_ip or '미지정'}"
+            )
         self.request = request
         self.run_id = str(uuid4())
         self.started = datetime.now(UTC).isoformat()
@@ -69,6 +112,7 @@ class DemoRuntime:
         )
         return self.poll(mode=mode)
 
+    @traced("세션 Poll")
     def poll(self, mode="timeline"):
         if self.request is None:
             raise ValueError("먼저 조회 조건을 입력하세요.")
@@ -101,6 +145,62 @@ class DemoRuntime:
                 Credentials("demo-not-an-account", "synthetic-not-a-secret"),
                 allow_full_scan=False,
             )
+        outcome = self.outcome
+        mm_commands = [
+            entry for entry in self.factory.trace if entry["Command"].startswith("show global-user")
+        ]
+        if not mm_commands:
+            self.execution.record(
+                "location",
+                "MM 위치 조회 결과",
+                "success" if outcome.used_mm else "warning",
+                f"{outcome.used_mm or '확인 불가'} → "
+                f"{', '.join(outcome.controllers) or '응답 MD 확인 불가'}"
+                + (" · 이전 위치 관측 재사용" if not mm_commands else ""),
+                {
+                    "used_mm": outcome.used_mm,
+                    "controllers": list(outcome.controllers),
+                    "cached": not bool(mm_commands),
+                },
+            )
+        self.execution.record(
+            "parser",
+            "Production Session Parser",
+            "success" if outcome.authoritative else "warning",
+            f"{len(outcome.observations)}개 Session 관측"
+            if outcome.authoritative
+            else f"완전한 관측 확인 불가 · 확보한 행 {len(outcome.observations)} · "
+            + ", ".join(d.code.value for d in outcome.diagnostics),
+            {
+                "observations": len(outcome.observations) if outcome.authoritative else None,
+                "partial_observations": len(outcome.observations),
+                "authoritative": outcome.authoritative,
+            },
+        )
+        observed = (
+            sum(not item.miss_count for item in self.result.active_sessions)
+            if self.result
+            else len(outcome.observations)
+        )
+        closed = (
+            sum(event.event_type.value == "CLOSED" for event in self.result.events)
+            if self.result
+            else 0
+        )
+        retained = len(self.result.active_sessions) if self.result else len(outcome.observations)
+        self.execution.record(
+            "lifecycle",
+            "MonitorEngine / Lifecycle" if self.monitor else "현재 조회 결과",
+            "success" if outcome.authoritative else "warning",
+            f"OBSERVED {observed} · CLOSED {closed} · 추적 {retained}"
+            if outcome.authoritative
+            else f"기존 추적 {retained}개 유지 · 수집 실패를 세션 종료로 판단하지 않음",
+            {
+                "observed": observed if outcome.authoritative else None,
+                "closed": closed,
+                "retained": retained,
+            },
+        )
         self.poll_count += 1
         for observation in self.outcome.observations:
             self.observations.append(
