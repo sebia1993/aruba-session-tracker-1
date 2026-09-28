@@ -1,0 +1,20 @@
+<section id="guided-flow" data-run="__RUN_ID__" data-phase="__PHASE__" aria-label="안내형 실행 화면" style="scroll-margin-top:70px">
+<style>
+#guided-flow {border:1px solid #8886;border-radius:12px;padding:1rem;margin:.5rem 0;overflow-wrap:anywhere}
+#guided-flow h3 {margin:0 0 .6rem}
+#guided-flow .guide-nav {display:flex;flex-wrap:wrap;gap:.5rem;margin:.5rem 0}
+#guided-flow button,#guided-flow select {font:inherit;color:inherit;background:transparent;border:1px solid #8888;border-radius:8px;padding:.5rem;max-width:100%;cursor:pointer}
+#guided-flow select {flex:1;min-width:160px}
+#guided-flow select option {color:#111;background:#fff}
+#guided-flow [hidden] {display:none!important}
+#guided-flow .scenario-grid {display:block}
+#guided-flow article {margin:.5rem 0!important}
+#guided-flow section > h3,#guided-flow section > p {display:none}
+#guided-flow :focus-visible {outline:3px solid #4f9eff;outline-offset:3px}
+@media(max-width:600px) {#guided-flow {padding:.7rem} #guided-flow select {width:100%;flex-basis:100%}}
+</style>
+<h3 tabindex="-1">__TITLE__</h3>
+<p data-readout role="status" aria-live="polite">실제 실행 기록을 확인합니다.</p>
+<div class="guide-nav"><button data-follow type="button">현재 단계 따라가기</button><button data-replay type="button">과정 다시 보기</button></div>
+<div class="guide-nav" data-steps><select aria-label="실행 단계 선택"><option value="-1">최종 결과</option></select><button data-back type="button" aria-label="이전 단계">← 이전</button><button data-next type="button" aria-label="다음 단계">다음 →</button></div>
+<div>__BODY__</div></section>
