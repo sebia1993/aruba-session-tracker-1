@@ -14,16 +14,16 @@ def _evidence_text(evidence):
     return " · ".join(parts)
 
 
-def _step_card(poll, step):
+def _step_card(poll, step, order):
     icon = {"running": "●", "success": "✓", "warning": "⚠", "failure": "✕"}.get(step.status, "•")
     timing = "" if step.elapsed_ms is None else f" · {step.elapsed_ms:.1f} ms"
     evidence = _evidence_text(step.evidence)
     evidence_html = f'<p class="guide-evidence">{escape(evidence)}</p>' if evidence else ""
     detail = escape(step.detail or "실제 Runtime 단계 처리")
+    delay = (order - 1) * 0.62
     return (
         f'<article data-guide-step data-status="{escape(step.status)}" '
-        'style="border:1px solid #8885;border-radius:10px;padding:.8rem;'
-        'margin:.5rem 0;overflow-wrap:anywhere">'
+        f'style="--step-delay:{delay:.2f}s">'
         f"<h4>Poll #{poll} · {icon} {escape(step.label)}</h4>"
         f"<p>{detail}{timing}</p>"
         f"{evidence_html}</article>"
@@ -37,13 +37,18 @@ def render_timeline(runner, slot):
 
     run = runner.run
     cards = []
+    order = 1
     for snap in run.snapshots:
-        cards.extend(_step_card(snap.poll, step) for step in snap.trace.steps)
+        for step in snap.trace.steps:
+            cards.append(_step_card(snap.poll, step, order))
+            order += 1
 
     # During a live poll, expose the current real ExecutionTrace before the
     # immutable snapshot is appended. Completed runs replay the retained copies.
     if not run.completed and not run.error and len(run.snapshots) < run.current_poll:
-        cards.extend(_step_card(run.current_poll, step) for step in runner.runtime.execution.steps)
+        for step in runner.runtime.execution.steps:
+            cards.append(_step_card(run.current_poll, step, order))
+            order += 1
 
     state = "시나리오 완료" if run.completed else "실행 중단" if run.error else "시나리오 실행 중"
     if run.snapshots:
