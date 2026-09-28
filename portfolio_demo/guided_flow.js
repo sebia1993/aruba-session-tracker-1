@@ -22,7 +22,8 @@
  const readout = root.querySelector('[data-readout]');
  const result = phase !== 'running';
  const current = cards.findIndex(c => c.textContent.includes('실행 중') || c.textContent.includes('실제 관측 처리 중'));
- const live = current >= 0 ? current : cards.length - 1;
+ const hasPending = cards.some(c => c.textContent.includes('대기 ·'));
+ const live = hasPending && current >= 0 ? current : cards.length - 1;
  cards.forEach((card,i) => {
    const opt = document.createElement('option');
    opt.value = i;
