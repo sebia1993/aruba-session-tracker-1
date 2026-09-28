@@ -35,14 +35,33 @@ class GuidedSlot:
         )
         run_id = st.session_state.get("guided_run_id", "initial")
         title = {
-            "running": "현재 실행 과정",
-            "result": "실행 완료 · 결과 확인",
+            "running": "실제 분석 진행 중",
+            "result": "실제 분석 완료 · 처리 기록 재생",
             "error": "실행 중단 · 확인 필요",
         }[phase]
+
+        elapsed_values = [
+            snap.trace.elapsed_ms
+            for snap in getattr(run, "snapshots", [])
+            if snap.trace.elapsed_ms is not None
+        ]
+        elapsed = (
+            "측정 중"
+            if phase == "running"
+            else f"{sum(elapsed_values):.1f} ms"
+            if elapsed_values
+            else "기록 없음"
+        )
+
         with self.slot.container():
             assets = Path(__file__).parent
             template = (assets / "guided_flow.html.template").read_text(encoding="utf-8")
-            for key, value in {"RUN_ID": run_id, "PHASE": phase, "TITLE": title}.items():
+            for key, value in {
+                "RUN_ID": run_id,
+                "PHASE": phase,
+                "TITLE": title,
+                "ELAPSED": elapsed,
+            }.items():
                 template = template.replace(f"__{key}__", value)
             # Insert the already escaped timeline last; never interpolate it as code.
             template = template.replace("__BODY__", body)
