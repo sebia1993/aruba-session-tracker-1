@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aruba_session_tracker.parsers.flags import interpret_flags
 from portfolio_demo.execution_trace import render_trace
 from portfolio_demo.fixture_transport import CONFIG
+from portfolio_demo.guided_flow import GuidedSlot, begin
 from portfolio_demo.runtime import DemoRuntime, QueryRequest
 from portfolio_demo.scenario_runner import SCENARIOS, ScenarioRunner
 from portfolio_demo.scenario_view import render_communication, render_timeline
@@ -705,6 +706,7 @@ def render_history_page() -> None:
 
 def start_scenario(key):
     global r
+    begin()
     runner = ScenarioRunner()
     st.session_state.scenario_runner = runner
     for widget_key in ("result_search", "result_protocol", "result_controller", "result_lifecycle"):
@@ -725,10 +727,13 @@ def start_scenario(key):
 
 render_header()
 scenario_controls = st.container()
+timeline_slot = GuidedSlot(
+    st.empty(), lambda: getattr(st.session_state.get("scenario_runner"), "run", None)
+)
 communication_area = st.container()
-timeline_slot = st.empty()
-trace_selector = st.container()
-trace_slot = st.empty()
+with st.expander("실제 처리 기록 / Execution Trace", expanded=False):
+    trace_selector = st.container()
+    trace_slot = st.empty()
 with scenario_controls:
     chosen = None
     if st.button("대표 통신 추적 실행", type="primary", use_container_width=True):
