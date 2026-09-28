@@ -316,7 +316,7 @@ class ScenarioTests(unittest.TestCase):
                 for m in app.markdown
             )
         )
-        self.assertTrue(any("Scenario Timeline" in m.proto.body for m in app.get("html")))
+        self.assertTrue(any("Scenario Timeline" in m.value for m in app.markdown))
         self.assertTrue(any("Execution Trace" in m.value for m in app.markdown))
         next(s for s in app.selectbox if s.label == "Protocol").select("TCP").run()
         metrics = {m.label: m.value for m in app.metric}
