@@ -6,15 +6,22 @@
  if (!state || state.id !== id) {
    if (state?.cleanup) state.cleanup();
    state = window.__demoGuide = {id, follow:true, selected:null, moved:new Set()};
-   const pause = () => {state.follow = false;};
+   const pause = () => {
+     state.follow = false;
+     const selected = document.querySelector('#guided-flow select');
+     if (selected) state.selected = Number(selected.value);
+   };
+   const detail = e => {if (e.target.closest('summary, [role="tab"]')) pause();};
    const key = e => {if (['PageUp','PageDown','ArrowUp','ArrowDown','Home','End'].includes(e.key)) pause();};
    document.addEventListener('wheel',pause,{passive:true});
    document.addEventListener('touchmove',pause,{passive:true});
    document.addEventListener('keydown',key);
+   document.addEventListener('click',detail);
    state.cleanup = () => {
      document.removeEventListener('wheel',pause);
      document.removeEventListener('touchmove',pause);
      document.removeEventListener('keydown',key);
+     document.removeEventListener('click',detail);
    };
  }
  const cards = [...root.querySelectorAll('article')];
