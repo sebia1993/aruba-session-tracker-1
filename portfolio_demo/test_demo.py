@@ -390,7 +390,7 @@ class GuidedFlowTests(unittest.TestCase):
         runner = app.session_state.scenario_runner
         snap = runner.run.snapshots[-1]
         html = next(h.proto.body for h in app.get("html") if 'id="guided-flow"' in h.proto.body)
-        self.assertEqual(html.count("data-guide-step"), len(snap.trace.steps))
+        self.assertEqual(html.count("<article data-guide-step"), len(snap.trace.steps))
         for step in snap.trace.steps:
             self.assertIn(step.label, html)
         self.assertIn(f"{snap.trace.elapsed_ms:.1f} ms", html)
