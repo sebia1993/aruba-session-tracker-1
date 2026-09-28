@@ -115,6 +115,34 @@ class GuidedSlot:
 }}
 #guided-flow, #guided-flow * {{
   box-sizing:border-box;
+  color-scheme:dark;
+}}
+#guided-flow {{
+  -webkit-text-fill-color:#eaf2f8;
+}}
+#guided-flow .native-kicker {{
+  -webkit-text-fill-color:#7fb3df;
+}}
+#guided-flow .native-runtime {{
+  -webkit-text-fill-color:#aebdcc;
+}}
+#guided-flow .native-replay-status {{
+  -webkit-text-fill-color:#bed8ee;
+}}
+#guided-flow .native-complete-status {{
+  -webkit-text-fill-color:#a8e3c5;
+}}
+#guided-flow .native-rail-step {{
+  -webkit-text-fill-color:#91a6ba;
+}}
+#guided-flow article[data-guide-step] h4 {{
+  -webkit-text-fill-color:#f4f8fb;
+}}
+#guided-flow article[data-guide-step] p {{
+  -webkit-text-fill-color:#bdcbd8;
+}}
+#guided-flow article[data-guide-step] .guide-evidence {{
+  -webkit-text-fill-color:#8fb5d4;
 }}
 #guided-flow h3,
 #guided-flow h4,
