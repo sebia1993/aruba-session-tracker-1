@@ -99,7 +99,7 @@ def render_explainer() -> None:
             "장애 분석 근거로 남깁니다.",
         ),
     )
-    for col, (label, title, copy) in zip(cols, cards):
+    for col, (label, title, copy) in zip(cols, cards, strict=True):
         col.markdown(
             '<div class="explain-card">'
             f'<div class="explain-label">{label}</div>'
@@ -110,7 +110,8 @@ def render_explainer() -> None:
         )
     st.info(
         "예시 VOC: Wi-Fi는 연결됐는데 특정 서버 접속이 안 됩니다. "
-        "단말 IP만 입력하면 위치 확인 → 담당 Controller 식별 → 해당 IP의 통신 세션 조회까지 이어집니다."
+        "단말 IP만 입력하면 위치 확인 → 담당 Controller 식별 → "
+        "해당 IP의 통신 세션 조회까지 이어집니다."
     )
     c = st.columns([1.45, 3.55])
     if c[0].button(
@@ -129,13 +130,16 @@ def render_explainer() -> None:
 
     with st.expander("MM / MD가 무엇인가요?", expanded=False):
         st.write(
-            "**MM (Mobility Conductor / Master)**: 단말이 어느 Controller에 있는지 확인하는 상위 관리 계층"
+            "**MM (Mobility Conductor / Master)**: 단말이 어느 Controller에 있는지 "
+            "확인하는 상위 관리 계층"
         )
         st.write(
-            "**MD (Managed Device / Controller)**: 무선 단말 트래픽을 실제로 처리하며 datapath session을 조회하는 장비"
+            "**MD (Managed Device / Controller)**: 무선 단말 트래픽을 실제로 처리하며 "
+            "datapath session을 조회하는 장비"
         )
         st.write(
-            "**datapath session**: 단말 IP·포트·프로토콜 기준으로 Controller에서 관측되는 실제 통신 흐름"
+            "**datapath session**: 단말 IP·포트·프로토콜 기준으로 Controller에서 "
+            "관측되는 실제 통신 흐름"
         )
 
 
