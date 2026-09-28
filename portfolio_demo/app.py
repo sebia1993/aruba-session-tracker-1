@@ -94,6 +94,10 @@ st.markdown(
         font-size: .66rem;
         font-weight: 800;
     }
+    [data-testid="stMetricValue"] {
+        white-space: normal; overflow-wrap: anywhere; font-size: clamp(1rem, 2.2vw, 2rem);
+    }
+    .header-chip-value {overflow-wrap: anywhere;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -244,31 +248,6 @@ def render_query_page() -> None:
     st.subheader("세션 조회")
 
     with st.container(border=True):
-        st.markdown("**로그인 정보 · 이번 실행에만 사용**")
-        c = st.columns(3)
-        c[0].text_input(
-            "SSH 사용자 이름",
-            value="Public Demo에서는 입력하지 않습니다",
-            disabled=True,
-        )
-        c[1].text_input(
-            "SSH 암호",
-            value="synthetic-only",
-            type="password",
-            disabled=True,
-        )
-        c[2].text_input(
-            "Enable 암호 (선택)",
-            value="",
-            type="password",
-            disabled=True,
-        )
-        st.caption(
-            "실제 Desktop App에서는 실행 세션 메모리에서만 사용합니다. "
-            "Public Web Edition은 외부 SSH를 완전히 비활성화합니다."
-        )
-
-    with st.container(border=True):
         st.markdown("**조회할 세션 흐름 · IP 하나 이상 입력**")
         endpoints = st.columns([1, 0.25, 1])
         source = endpoints[0].text_input(
@@ -360,6 +339,31 @@ def render_query_page() -> None:
                 "Public Demo는 외부 연결 없이 다음 Poll을 수동 재생합니다."
             )
 
+    with st.container(border=True):
+        st.markdown("**로그인 정보 · 이번 실행에만 사용**")
+        c = st.columns(3)
+        c[0].text_input(
+            "SSH 사용자 이름",
+            value="Public Demo에서는 입력하지 않습니다",
+            disabled=True,
+        )
+        c[1].text_input(
+            "SSH 암호",
+            value="synthetic-only",
+            type="password",
+            disabled=True,
+        )
+        c[2].text_input(
+            "Enable 암호 (선택)",
+            value="",
+            type="password",
+            disabled=True,
+        )
+        st.caption(
+            "실제 Desktop App에서는 실행 세션 메모리에서만 사용합니다. "
+            "Public Web Edition은 외부 SSH를 완전히 비활성화합니다."
+        )
+
     state_row = st.columns([1, 2, 2])
     state_row[0].metric("실행 상태", operating_state())
     state_row[1].caption(
@@ -379,6 +383,20 @@ def result_rows() -> list[dict[str, object]]:
     return r.rows() if r.outcome else []
 
 
+def render_run_evidence() -> None:
+    if r.events:
+        with st.expander("Lifecycle Events", expanded=False):
+            st.dataframe(r.events[-30:], hide_index=True, width="stretch")
+    if r.outcome:
+        with st.expander("수집 진단 · 전체 Raw", expanded=not r.outcome.authoritative):
+            st.json([asdict(item) for item in r.outcome.diagnostics])
+            st.caption(f"현재 단계: {r.stage}")
+            st.dataframe(r.trace, hide_index=True, width="stretch")
+            for snapshot in r.outcome.raw_snapshots:
+                st.caption(f"{snapshot.device_name} · {snapshot.command}")
+                st.code(snapshot.output, language="text")
+
+
 def render_result_console() -> None:
     st.markdown("### 세션 조회 결과")
     st.caption(
@@ -386,28 +404,19 @@ def render_result_console() -> None:
     )
 
     rows = result_rows()
-    active = len(r.result.active_sessions) if r.result else len(rows)
-    changed = 0
-    controllers = set()
-    for row in rows:
-        controllers.add(str(row.get("controller_name", "")))
-        state = str(row.get("State", ""))
-        if state not in {"", "OBSERVED"}:
-            changed += 1
-    if r.events:
-        changed += sum(
-            event.get("event_type") in {"FIRST_SEEN", "CONTROLLER_CHANGED", "FLAGS_CHANGED"}
-            for event in r.events[-20:]
-        )
-
+    authoritative = r.outcome is not None and r.outcome.authoritative
+    observations = r.outcome.observations if authoritative else []
+    changed = len(r.result.events) if r.result and authoritative else 0
     metrics = st.columns(4)
-    metrics[0].metric("현재 관측 흐름", active)
-    metrics[1].metric("결과표 표시 행", len(rows))
-    metrics[2].metric("신규·변경 흐름", changed)
+    metrics[0].metric("현재 관측 흐름", len(observations) if authoritative else "확인 불가")
+    displayed_count = metrics[1].empty()
+    metrics[2].metric("이번 Poll 이벤트", changed if authoritative else "확인 불가")
     metrics[3].metric(
         "관측 MD",
-        len({value for value in controllers if value}),
+        len({item.controller_name for item in observations}) if authoritative else "확인 불가",
     )
+    st.caption(f"추적 중인 세션: {len(rows)} · 수집 실패 시 이전 관측을 유지합니다.")
+    render_run_evidence()
 
     if r.outcome and not r.outcome.authoritative:
         st.warning(
@@ -416,6 +425,7 @@ def render_result_console() -> None:
         )
 
     if not rows:
+        displayed_count.metric("결과표 표시 행", 0)
         st.info(
             "조회 결과가 없습니다. 위 조건으로 조회하거나 Sidebar의 샘플 현재 조회를 사용하세요."
         )
@@ -451,6 +461,8 @@ def render_result_console() -> None:
         ).casefold()
     ]
 
+    displayed_count.metric("결과표 표시 행", len(filtered))
+
     display_columns = (
         "controller_name",
         "protocol",
@@ -459,7 +471,7 @@ def render_result_console() -> None:
         "destination_ip",
         "destination_port",
         "packets",
-        "bytes",
+        "bytes_count",
         "age",
         "cpu_id",
         "Last Seen",
@@ -520,16 +532,12 @@ def render_result_console() -> None:
         facts[0].metric("상태", row.get("State", "—"))
         facts[1].metric("Flags", row.get("flags", "—"))
         facts[2].metric("Packets", row.get("packets", "—"))
-        facts[3].metric("Bytes", row.get("bytes", "—"))
+        facts[3].metric("Bytes", row.get("bytes_count", "—"))
         facts[4].metric("Age", row.get("age", "—"))
         facts[5].metric("CPU", row.get("cpu_id", "—"))
 
         with st.expander("Flags 해석", expanded=False):
             st.json([asdict(flag) for flag in interpret_flags(str(row.get("flags", "")))])
-
-        if r.events:
-            st.markdown("#### Lifecycle Events")
-            st.dataframe(r.events[-30:], hide_index=True, width="stretch")
 
     with raw:
         raw_line = row.get("raw_line")
@@ -616,6 +624,9 @@ def render_settings_page() -> None:
 def render_history_page() -> None:
     st.subheader("기록 및 내보내기")
 
+    st.caption(
+        "CSV와 HTML은 현재 실행 전체를 내보냅니다. 아래 기록 선택은 실행 요약 삭제에만 사용합니다."
+    )
     actions = st.columns(5)
     actions[0].button("새로고침", disabled=True, use_container_width=True)
 

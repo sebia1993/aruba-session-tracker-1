@@ -88,6 +88,43 @@ class DemoTests(unittest.TestCase):
             for entry in r.factory.trace:
                 self.assertNotEqual(entry["Command"], "show datapath session table")
 
+    def test_ui_counters_filters_and_empty_diagnostics(self):
+        app = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run()
+        runtime = app.session_state.runtime
+        runtime.start(QueryRequest("198.51.100.10", ""), monitor=True)
+        app.run()
+        self.assertFalse(app.exception)
+        metrics = {item.label: item.value for item in app.metric}
+        self.assertEqual(metrics["Bytes"], str(runtime.rows()[0]["bytes_count"]))
+        next(item for item in app.text_input if item.label == "결과 검색").set_value(
+            "no-match"
+        ).run()
+        self.assertEqual(
+            next(item.value for item in app.metric if item.label == "결과표 표시 행"), "0"
+        )
+        runtime.poll("timeout")
+        app = AppTest.from_file(str(Path(__file__).with_name("app.py")))
+        app.session_state.runtime = runtime
+        app.run()
+        self.assertEqual(
+            next(item.value for item in app.metric if item.label == "현재 관측 흐름"), "확인 불가"
+        )
+        runtime.start(QueryRequest("198.51.100.250", ""))
+        app = AppTest.from_file(str(Path(__file__).with_name("app.py")))
+        app.session_state.runtime = runtime
+        app.run()
+        self.assertFalse(runtime.rows())
+        self.assertTrue(any(item.label == "수집 진단 · 전체 Raw" for item in app.expander))
+        runtime.start(QueryRequest("198.51.100.10", ""), monitor=True)
+        for _ in range(8):
+            runtime.poll()
+        app = AppTest.from_file(str(Path(__file__).with_name("app.py")))
+        app.session_state.runtime = runtime
+        app.run()
+        self.assertFalse(runtime.rows())
+        self.assertTrue(any(item.label == "Lifecycle Events" for item in app.expander))
+        self.assertFalse(app.exception)
+
     def test_native_lock_fails_closed_outside_windows(self):
         with tempfile.TemporaryDirectory() as root, patch("sys.platform", "linux"):
             path = Path(root) / "known_hosts"
