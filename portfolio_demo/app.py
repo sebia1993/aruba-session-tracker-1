@@ -415,7 +415,7 @@ def render_result_console() -> None:
 
     if not rows:
         st.info(
-            "조회 결과가 없습니다. 위 조건으로 조회하거나 Sidebar의 ‘샘플 현재 조회’를 사용하세요."
+            "조회 결과가 없습니다. 위 조건으로 조회하거나 Sidebar의 샘플 현재 조회를 사용하세요."
         )
         return
 
@@ -518,7 +518,8 @@ def render_result_console() -> None:
         flow[2].markdown(
             '<div class="flow-card">'
             '<div class="flow-label">목적지</div>'
-            f'<div class="flow-value">{row.get("destination_ip")}:{row.get("destination_port")}</div>'
+            f'<div class="flow-value">{row.get("destination_ip")}:'
+            f'{row.get("destination_port")}</div>'
             '</div>',
             unsafe_allow_html=True,
         )
