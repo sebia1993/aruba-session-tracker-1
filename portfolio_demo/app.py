@@ -13,6 +13,8 @@ from aruba_session_tracker.parsers.flags import interpret_flags
 from portfolio_demo.execution_trace import render_trace
 from portfolio_demo.fixture_transport import CONFIG
 from portfolio_demo.runtime import DemoRuntime, QueryRequest
+from portfolio_demo.scenario_runner import SCENARIOS, ScenarioRunner
+from portfolio_demo.scenario_view import render_communication, render_timeline
 
 st.set_page_config(
     page_title="Aruba Session Tracker · Public Web Edition",
@@ -156,6 +158,17 @@ def render_header() -> None:
             unsafe_allow_html=True,
         )
 
+    st.info(
+        "무선 단말 IP 하나를 시작점으로 어느 Controller에 연결되어 "
+        "있고, 현재 어떤 대상과 통신하는지 자동으로 추적하는 도구입니다."
+    )
+    st.caption(
+        "MM은 단말 위치를 찾는 관리 장비, MD는 통신 세션을 조회하는 "
+        "Controller입니다. 공개판은 비식별 합성 입력과 실제 분석 코어를 사용합니다."
+    )
+
+
+def render_status_chips() -> None:
     chips = st.columns(6)
     values = (
         ("MM", "설정 2/2"),
@@ -177,49 +190,45 @@ def render_header() -> None:
             unsafe_allow_html=True,
         )
 
-    st.info(
-        "단말 IP를 기준으로 MM에서 위치를 찾고 관련 MD에서 필터형 datapath session을 조회합니다. "
-        "Public Demo에서는 실제 장비 접속 대신 비식별 합성 Transport만 사용합니다."
-    )
-
 
 def demo_reset() -> None:
+    st.session_state.pop("scenario_runner", None)
     st.session_state.runtime = DemoRuntime()
     st.rerun()
 
 
 def render_sidebar() -> None:
-    with st.sidebar:
-        st.subheader("Public Demo")
-        st.caption("Desktop App의 UI/작업 흐름을 Web으로 옮긴 버전입니다.")
-        if st.button("샘플 현재 조회", type="primary", use_container_width=True):
-            demo = DemoRuntime()
-            demo.execution.on_change = lambda: render_trace(demo.execution, trace_slot)
-            demo.start(
-                QueryRequest("198.51.100.10", ""),
-                monitor=False,
-                mode="normal",
-            )
-            st.session_state.runtime = demo
-            st.rerun()
-        if st.button("Demo Reset", use_container_width=True):
-            demo_reset()
-        st.divider()
-        with st.expander("Demo Fault / Timeline", expanded=False):
-            st.session_state.session_demo_mode = st.selectbox(
-                "다음 수집 조건",
-                ["timeline", "normal", "timeout", "parse"],
-                format_func=lambda value: {
-                    "timeline": "운영 타임라인",
-                    "normal": "정상 수집",
-                    "timeout": "CLI 수집 실패",
-                    "parse": "Parsing 실패",
-                }[value],
-            )
-            st.caption(
-                "실제 Desktop App의 운영 기능이 아니라 공개 데모에서 "
-                "상태 전이를 재현하기 위한 입력입니다."
-            )
+    st.subheader("Public Demo")
+    st.caption("Desktop App의 UI/작업 흐름을 Web으로 옮긴 버전입니다.")
+    if st.button("샘플 현재 조회", type="primary", use_container_width=True):
+        st.session_state.pop("scenario_runner", None)
+        demo = DemoRuntime()
+        demo.execution.on_change = lambda: render_trace(demo.execution, trace_slot)
+        demo.start(
+            QueryRequest("198.51.100.10", ""),
+            monitor=False,
+            mode="normal",
+        )
+        st.session_state.runtime = demo
+        st.rerun()
+    if st.button("Demo Reset", use_container_width=True):
+        demo_reset()
+    st.divider()
+    with st.expander("Demo Fault / Timeline", expanded=False):
+        st.session_state.session_demo_mode = st.selectbox(
+            "다음 수집 조건",
+            ["timeline", "normal", "timeout", "parse"],
+            format_func=lambda value: {
+                "timeline": "운영 타임라인",
+                "normal": "정상 수집",
+                "timeout": "CLI 수집 실패",
+                "parse": "Parsing 실패",
+            }[value],
+        )
+        st.caption(
+            "실제 Desktop App의 운영 기능이 아니라 공개 데모에서 "
+            "상태 전이를 재현하기 위한 입력입니다."
+        )
 
 
 def build_query_request(
@@ -239,6 +248,7 @@ def build_query_request(
 
 
 def run_query(request: QueryRequest, *, monitor: bool) -> None:
+    st.session_state.pop("scenario_runner", None)
     r.start(
         request,
         monitor=monitor,
@@ -332,6 +342,7 @@ def render_query_page() -> None:
             playback = st.columns([1, 4])
             if playback[0].button("다음 Poll", use_container_width=True):
                 try:
+                    st.session_state.pop("scenario_runner", None)
                     r.poll(st.session_state.session_demo_mode)
                     st.rerun()
                 except ValueError as exc:
@@ -388,7 +399,7 @@ def render_run_evidence() -> None:
         with st.expander("Lifecycle Events", expanded=False):
             st.dataframe(r.events[-30:], hide_index=True, width="stretch")
     if r.outcome:
-        with st.expander("수집 진단 · 전체 Raw", expanded=not r.outcome.authoritative):
+        with st.expander("수집 진단 · 전체 Raw", expanded=False):
             st.json([asdict(item) for item in r.outcome.diagnostics])
             st.caption(f"현재 단계: {r.stage}")
             st.dataframe(r.trace, hide_index=True, width="stretch")
@@ -416,31 +427,36 @@ def render_result_console() -> None:
         len({item.controller_name for item in observations}) if authoritative else "확인 불가",
     )
     st.caption(f"추적 중인 세션: {len(rows)} · 수집 실패 시 이전 관측을 유지합니다.")
-    render_run_evidence()
+    with st.expander("Diagnostics / 전체 Raw", expanded=False):
+        render_run_evidence()
 
     if r.outcome and not r.outcome.authoritative:
         st.warning(
-            "현재 수집은 완전하지 않습니다. 세션 없음/종료로 단정하지 않고 "
+            "현재 수집은 완전하지 않습니다. 세션 없음/종료로 "
+            "단정하지 않고 "
             "확인 필요 상태로 유지합니다."
         )
 
     if not rows:
         displayed_count.metric("결과표 표시 행", 0)
         st.info(
-            "조회 결과가 없습니다. 위 조건으로 조회하거나 Sidebar의 샘플 현재 조회를 사용하세요."
+            "현재 표시할 추적 행이 없습니다. 대표 시나리오 또는 고급 "
+            "직접 조회를 실행할 수 있습니다."
         )
         return
 
     filters = st.columns(4)
-    search = filters[0].text_input("결과 검색", placeholder="IP / Port")
-    protocol = filters[1].selectbox("Protocol", ["All", "TCP", "UDP"])
+    search = filters[0].text_input("결과 검색", placeholder="IP / Port", key="result_search")
+    protocol = filters[1].selectbox("Protocol", ["All", "TCP", "UDP"], key="result_protocol")
     controller = filters[2].selectbox(
         "Controller",
         ["All", *(device.name for device in CONFIG.managed_devices)],
+        key="result_controller",
     )
     lifecycle = filters[3].selectbox(
         "Lifecycle",
         ["All", "OBSERVED", "MISSED"],
+        key="result_lifecycle",
     )
 
     filtered = [
@@ -498,68 +514,69 @@ def render_result_console() -> None:
     )
     row = filtered[selected]
 
-    summary, raw, diagnostics = st.tabs(["세션 요약", "선택 행 Raw", "진단 이벤트"])
+    with st.expander("고급 결과 상세 / Raw / Diagnostics", expanded=False):
+        summary, raw, diagnostics = st.tabs(["세션 요약", "선택 행 Raw", "진단 이벤트"])
 
-    with summary:
-        st.markdown("#### 선택한 세션")
-        flow = st.columns([2, 1, 2])
-        flow[0].markdown(
-            '<div class="flow-card">'
-            '<div class="flow-label">출발지</div>'
-            f'<div class="flow-value">{row.get("source_ip")}:'
-            f"{row.get('source_port')}</div>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        flow[1].markdown(
-            '<div class="flow-card">'
-            '<div class="flow-label">Protocol / MD</div>'
-            f'<div class="flow-value">{row.get("protocol")}<br>'
-            f"{row.get('controller_name')}</div>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        flow[2].markdown(
-            '<div class="flow-card">'
-            '<div class="flow-label">목적지</div>'
-            f'<div class="flow-value">{row.get("destination_ip")}:'
-            f"{row.get('destination_port')}</div>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
+        with summary:
+            st.markdown("#### 선택한 세션")
+            flow = st.columns([2, 1, 2])
+            flow[0].markdown(
+                '<div class="flow-card">'
+                '<div class="flow-label">출발지</div>'
+                f'<div class="flow-value">{row.get("source_ip")}:'
+                f"{row.get('source_port')}</div>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            flow[1].markdown(
+                '<div class="flow-card">'
+                '<div class="flow-label">Protocol / MD</div>'
+                f'<div class="flow-value">{row.get("protocol")}<br>'
+                f"{row.get('controller_name')}</div>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            flow[2].markdown(
+                '<div class="flow-card">'
+                '<div class="flow-label">목적지</div>'
+                f'<div class="flow-value">{row.get("destination_ip")}:'
+                f"{row.get('destination_port')}</div>"
+                "</div>",
+                unsafe_allow_html=True,
+            )
 
-        facts = st.columns(6)
-        facts[0].metric("상태", row.get("State", "—"))
-        facts[1].metric("Flags", row.get("flags", "—"))
-        facts[2].metric("Packets", row.get("packets", "—"))
-        facts[3].metric("Bytes", row.get("bytes_count", "—"))
-        facts[4].metric("Age", row.get("age", "—"))
-        facts[5].metric("CPU", row.get("cpu_id", "—"))
+            facts = st.columns(6)
+            facts[0].metric("상태", row.get("State", "—"))
+            facts[1].metric("Flags", row.get("flags", "—"))
+            facts[2].metric("Packets", row.get("packets", "—"))
+            facts[3].metric("Bytes", row.get("bytes_count", "—"))
+            facts[4].metric("Age", row.get("age", "—"))
+            facts[5].metric("CPU", row.get("cpu_id", "—"))
 
-        with st.expander("Flags 해석", expanded=False):
-            st.json([asdict(flag) for flag in interpret_flags(str(row.get("flags", "")))])
+            with st.expander("Flags 해석", expanded=False):
+                st.json([asdict(flag) for flag in interpret_flags(str(row.get("flags", "")))])
 
-    with raw:
-        raw_line = row.get("raw_line")
-        if raw_line:
-            st.code(str(raw_line), language="text")
-        elif r.outcome:
-            for snapshot in r.outcome.raw_snapshots:
-                with st.expander(
-                    f"{snapshot.device_name} · {snapshot.command}",
-                    expanded=False,
-                ):
-                    st.code(snapshot.output, language="text")
-        else:
-            st.caption("원본 출력이 없습니다.")
+        with raw:
+            raw_line = row.get("raw_line")
+            if raw_line:
+                st.code(str(raw_line), language="text")
+            elif r.outcome:
+                for snapshot in r.outcome.raw_snapshots:
+                    with st.expander(
+                        f"{snapshot.device_name} · {snapshot.command}",
+                        expanded=False,
+                    ):
+                        st.code(snapshot.output, language="text")
+            else:
+                st.caption("원본 출력이 없습니다.")
 
-    with diagnostics:
-        if r.outcome:
-            st.json([asdict(item) for item in r.outcome.diagnostics])
-            st.caption(f"현재 단계: {r.stage}")
-            st.dataframe(r.trace, hide_index=True, width="stretch")
-        else:
-            st.caption("진단 이벤트가 없습니다.")
+        with diagnostics:
+            if r.outcome:
+                st.json([asdict(item) for item in r.outcome.diagnostics])
+                st.caption(f"현재 단계: {r.stage}")
+                st.dataframe(r.trace, hide_index=True, width="stretch")
+            else:
+                st.caption("진단 이벤트가 없습니다.")
 
 
 def render_settings_page() -> None:
@@ -616,7 +633,8 @@ def render_settings_page() -> None:
 
     st.button("장비 설정 저장", disabled=True)
     st.caption(
-        "Public Web Edition에서는 Demo 장비 설정을 변경하거나 자격 증명을 저장하지 않습니다. "
+        "Public Web Edition에서는 Demo 장비 설정을 "
+        "변경하거나 자격 증명을 저장하지 않습니다. "
         "실제 Desktop App에서는 설정과 로컬 저장 경계를 사용합니다."
     )
 
@@ -685,31 +703,82 @@ def render_history_page() -> None:
         st.info("저장된 Demo 실행 기록이 없습니다.")
 
 
-render_header()
+def start_scenario(key):
+    global r
+    runner = ScenarioRunner()
+    st.session_state.scenario_runner = runner
+    for widget_key in ("result_search", "result_protocol", "result_controller", "result_lifecycle"):
+        st.session_state.pop(widget_key, None)
 
+    def update(current):
+        render_timeline(current, timeline_slot)
+        render_trace(current.runtime.execution, trace_slot)
+
+    try:
+        runner.play(key, update)
+    except Exception as exc:
+        st.error(f"시나리오 실행을 완료하지 못했습니다: {exc}")
+    r = runner.runtime
+    st.session_state.runtime = r
+    st.session_state.trace_poll = max(0, len(runner.run.snapshots) - 1) if runner.run else 0
+
+
+render_header()
+scenario_controls = st.container()
+communication_area = st.container()
+timeline_slot = st.empty()
+trace_selector = st.container()
+trace_slot = st.empty()
+with scenario_controls:
+    chosen = None
+    if st.button("대표 통신 추적 실행", type="primary", use_container_width=True):
+        chosen = "normal"
+    cols = st.columns(3)
+    for column, (key, label) in zip(cols, SCENARIOS.items(), strict=True):
+        if column.button(label, use_container_width=True):
+            chosen = key
+    if chosen:
+        start_scenario(chosen)
+
+runner = st.session_state.get("scenario_runner")
+with communication_area:
+    render_communication(r, st)
+render_timeline(runner, timeline_slot)
+r.execution.on_change = lambda: render_trace(r.execution, trace_slot)
+if runner and runner.run and runner.run.snapshots:
+    with trace_selector:
+        trace_index = st.selectbox(
+            "Poll별 Execution Trace",
+            range(len(runner.run.snapshots)),
+            format_func=lambda i: (
+                f"Poll #{runner.run.snapshots[i].poll} · {runner.run.snapshots[i].title}"
+            ),
+            key="trace_poll",
+        )
+        st.caption(
+            "Trace는 선택한 Poll의 기록입니다. 통신 흐름과 아래 결과표는 마지막 Poll을 표시합니다."
+        )
+    render_trace(runner.run.snapshots[trace_index].trace, trace_slot)
+    if runner.run.error:
+        st.error(runner.run.error)
+else:
+    render_trace(r.execution, trace_slot)
+
+render_status_chips()
 query_page, settings_page, history_page = st.tabs(["세션 조회", "장비 설정", "기록 및 내보내기"])
 with query_page:
-    query_area = st.container()
-    trace_slot = st.empty()
-    r.execution.on_change = lambda: render_trace(r.execution, trace_slot)
-    render_trace(r.execution, trace_slot)
-    with query_area:
-        render_query_page()
     render_result_console()
+    with st.expander("고급 직접 조회", expanded=False):
+        render_query_page()
+        render_sidebar()
 with settings_page:
     render_settings_page()
 with history_page:
     render_history_page()
-render_sidebar()
 
 st.caption(
     "Public Web Edition · QueryRequest / TrackerService / production Parser / "
     "MonitorEngine 재사용 · 실제 SSH/known_hosts/자격 증명 입력 없음"
 )
-st.link_button(
-    "GitHub Source",
-    "https://github.com/sebia1993/aruba-session-tracker-1",
-)
-
-# Bind UI notifications only for the active Streamlit script run.
+st.link_button("GitHub Source", "https://github.com/sebia1993/aruba-session-tracker-1")
 r.execution.on_change = None

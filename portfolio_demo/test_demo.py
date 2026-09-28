@@ -1,6 +1,7 @@
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,7 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from streamlit.testing.v1 import AppTest
 
 from aruba_session_tracker.collectors.ssh import CancellationToken, _known_hosts_file_lock
-from portfolio_demo.runtime import DemoRuntime, QueryRequest
+from portfolio_demo.runtime import CONFIG, DemoRuntime, QueryRequest
+from portfolio_demo.scenario_runner import ScenarioRunner, communication_rows
 
 
 class DemoTests(unittest.TestCase):
@@ -206,6 +208,152 @@ class DemoTests(unittest.TestCase):
             any("실행 과정" in m.value and "Session Parser" in m.value for m in app.markdown)
         )
         self.assertEqual(next(m.value for m in app.metric if m.label == "결과표 표시 행"), "3")
+
+
+class ScenarioTests(unittest.TestCase):
+    def test_normal_routes_parses_and_builds_each_actual_direction(self):
+        runner = ScenarioRunner()
+        with patch("socket.create_connection", side_effect=AssertionError("No network")):
+            run = runner.play("normal")
+        snap = run.snapshots[0]
+        self.assertTrue(run.completed)
+        self.assertEqual(snap.observed, len(runner.runtime.outcome.observations))
+        self.assertEqual(snap.outcome.used_mm, "DEMO-MM-PRIMARY")
+        self.assertEqual(snap.selected_controllers, ["DEMO-MD-03"])
+        self.assertIsNotNone(runner.runtime.monitor)
+        self.assertFalse(runner.runtime.running)
+        flows = communication_rows(snap.outcome.observations)
+        self.assertEqual(len(flows), snap.observed)
+        for flow, observation in zip(flows, snap.outcome.observations, strict=True):
+            self.assertEqual(
+                flow["destination"], f"{observation.destination_ip}:{observation.destination_port}"
+            )
+            self.assertEqual(flow["source"], f"{observation.source_ip}:{observation.source_port}")
+        self.assertTrue(any(f["source"].startswith("203.0.113.") for f in flows))
+        self.assertTrue(
+            all(
+                entry["Command"] != "show datapath session table"
+                for entry in runner.runtime.factory.trace
+            )
+        )
+
+    def test_close_uses_real_configured_miss_threshold(self):
+        for threshold in (2, 3, 5):
+            runner = ScenarioRunner(replace(CONFIG, close_after_misses=threshold))
+            run = runner.play("closure")
+            self.assertEqual(len(run.snapshots), 1 + threshold)
+            initial = run.snapshots[0].retained
+            self.assertGreater(initial, 0)
+            for n, snap in enumerate(run.snapshots[1:-1], 1):
+                self.assertTrue(snap.outcome.authoritative)
+                self.assertEqual(snap.observed, 0)
+                self.assertEqual(snap.missed, n)
+                self.assertEqual(snap.closed, 0)
+                self.assertEqual(snap.retained, initial)
+            last = run.snapshots[-1]
+            self.assertEqual(last.closed, initial)
+            self.assertEqual(last.retained, 0)
+            self.assertTrue(
+                all(
+                    e.miss_count == threshold
+                    for e in last.result.events
+                    if e.event_type.value == "CLOSED"
+                )
+            )
+            self.assertEqual(last.rows, runner.runtime.rows())
+            self.assertEqual(run.snapshots[0].retained, initial)
+
+    def test_timeout_preserves_instances_and_misses_and_rechecks_location(self):
+        runner = ScenarioRunner()
+        run = runner.play("failure")
+        before, after = run.snapshots
+        self.assertIsNone(after.observed)
+        self.assertFalse(after.outcome.authoritative)
+        self.assertEqual(after.closed, 0)
+        self.assertEqual(after.retained, before.retained)
+        self.assertEqual(after.result.active_sessions, before.result.active_sessions)
+        self.assertEqual(after.outcome.used_mm, before.outcome.used_mm)
+        self.assertEqual(after.selected_controllers, before.selected_controllers)
+        self.assertTrue(
+            any(
+                s.id == "location" and s.status == "success" and s.evidence.get("locations")
+                for s in after.trace.steps
+            )
+        )
+        self.assertTrue(any(s.id == "collect" and s.status == "failure" for s in after.trace.steps))
+        self.assertFalse(after.result.events)
+        self.assertIn("MD_UNREACHABLE", {d.code.value for d in after.outcome.diagnostics})
+
+    def test_trace_counters_match_every_outcome_and_remain_independent(self):
+        runner = ScenarioRunner()
+        for key in ("normal", "closure", "failure"):
+            run = runner.play(key)
+            for snap in run.snapshots:
+                steps = {s.id: s for s in snap.trace.steps}
+                self.assertTrue(
+                    {"location", "route", "collect", "parser", "lifecycle"} <= steps.keys()
+                )
+                self.assertEqual(steps["parser"].evidence["observations"], snap.observed)
+                self.assertEqual(steps["lifecycle"].evidence["retained"], snap.retained)
+                self.assertEqual(steps["lifecycle"].evidence["closed"], snap.closed)
+                self.assertIsNotNone(snap.trace.elapsed_ms)
+                self.assertTrue(all(s.status != "running" for s in snap.trace.steps))
+            self.assertIsNot(run.snapshots[0].trace, runner.runtime.execution)
+
+    def test_one_click_ui_flow_counts_filters_and_manual_controls(self):
+        app = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run()
+        next(b for b in app.button if b.label == "대표 통신 추적 실행").click().run()
+        self.assertFalse(app.exception)
+        runtime = app.session_state.runtime
+        count = len(runtime.outcome.observations)
+        self.assertTrue(app.session_state.scenario_runner.run.completed)
+        metrics = {m.label: m.value for m in app.metric}
+        self.assertEqual(metrics["현재 관측 흐름"], str(count))
+        self.assertEqual(metrics["결과표 표시 행"], str(len(runtime.rows())))
+        self.assertTrue(
+            any(
+                "Communication Flow" in m.value
+                and "DEMO-MD-03" in m.value
+                and "203.0.113." in m.value
+                for m in app.markdown
+            )
+        )
+        self.assertTrue(any("Scenario Timeline" in m.value for m in app.markdown))
+        self.assertTrue(any("Execution Trace" in m.value for m in app.markdown))
+        next(s for s in app.selectbox if s.label == "Protocol").select("TCP").run()
+        metrics = {m.label: m.value for m in app.metric}
+        self.assertEqual(metrics["현재 관측 흐름"], str(count))
+        expected = sum(row["protocol"] == 6 for row in runtime.rows())
+        self.assertEqual(metrics["결과표 표시 행"], str(expected))
+        advanced = next(e for e in app.expander if e.label == "고급 직접 조회")
+        self.assertTrue(any(t.label == "출발지 IP" for t in advanced.get("text_input")))
+        for label in ("세션 종료 추적", "Session 수집 실패", "정상 통신 추적"):
+            next(b for b in app.button if b.label == label).click().run()
+            self.assertFalse(app.exception)
+            self.assertTrue(app.session_state.scenario_runner.run.completed)
+            if label == "Session 수집 실패":
+                metrics = {m.label: m.value for m in app.metric}
+                self.assertEqual(metrics["현재 관측 흐름"], "확인 불가")
+                self.assertEqual(metrics["결과표 표시 행"], str(count))
+                self.assertTrue(any("이전 관측" in m.value for m in app.markdown))
+            if label == "세션 종료 추적":
+                self.assertFalse(app.session_state.runtime.rows())
+                self.assertTrue(any("CLOSED" in m.value for m in app.markdown))
+        next(b for b in app.button if b.label == "현재 조회").click().run()
+        self.assertFalse(app.exception)
+        self.assertNotIn("scenario_runner", app.session_state)
+
+    def test_rerun_preserves_scenario_and_selected_trace_without_polling(self):
+        app = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run()
+        next(b for b in app.button if b.label == "세션 종료 추적").click().run()
+        count = app.session_state.runtime.poll_count
+        next(s for s in app.selectbox if s.label == "Poll별 Execution Trace").select(0).run()
+        self.assertEqual(app.session_state.runtime.poll_count, count)
+        self.assertTrue(
+            any("OBSERVED" in m.value and "Execution Trace" in m.value for m in app.markdown)
+        )
+        self.assertFalse(app.session_state.runtime.rows())
+        self.assertTrue(app.session_state.scenario_runner.run.completed)
 
 
 if __name__ == "__main__":

@@ -50,13 +50,14 @@ class EvidenceTrackerService(TrackerService):
 
 
 class DemoRuntime:
-    def __init__(self):
+    def __init__(self, config=CONFIG):
+        self.config = config
         self.execution = ExecutionTrace()
-        self.factory = FixtureFactory()
+        self.factory = FixtureFactory(config)
         self.factory.execution = self.execution
         self.trace = []
         self.service = EvidenceTrackerService(
-            CONFIG, self.factory, TrackerCallbacks(progress=self._progress)
+            config, self.factory, TrackerCallbacks(progress=self._progress)
         )
         self.service.execution = self.execution
         self.monitor = None
@@ -125,7 +126,7 @@ class DemoRuntime:
         self.factory.tick = min(self.poll_count, len(STAGES) - 1)
         self.stage = STAGES[self.factory.tick] if mode == "timeline" else mode
         # Advance an injected monotonic clock; never wait or start a daemon.
-        self.virtual_time += CONFIG.session_interval_seconds
+        self.virtual_time += self.config.session_interval_seconds
         if self.monitor:
             self.result = self.monitor.poll_once()
             self.outcome = self.result.outcome

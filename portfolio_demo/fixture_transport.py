@@ -120,7 +120,7 @@ class FixtureConnection(AbstractContextManager):
                 x["Destination"] for x in inventory()
             }
             owner = home(ip)
-            if f.tick >= 2:
+            if f.mode == "timeline" and f.tick >= 2:
                 owner = f.moved(owner)
             return global_output(ip, owner if exists else None)
         ip = str(IPv4Address(command.rsplit(" ", 1)[1]))
@@ -133,11 +133,11 @@ class FixtureConnection(AbstractContextManager):
         if f.mode == "parse" or (f.mode == "timeline" and f.tick == 6):
             return "truncated synthetic CLI"
         lines = []
-        if not (f.mode == "timeline" and f.tick in (5, 7, 8)):
+        if f.mode != "empty" and not (f.mode == "timeline" and f.tick in (5, 7, 8)):
             for client in inventory():
                 src, dst = client["Client"], client["Destination"]
-                owners = {home(src)} if f.tick < 2 else {f.moved(home(src))}
-                if f.tick == 2:
+                owners = {home(src)} if f.mode != "timeline" or f.tick < 2 else {f.moved(home(src))}
+                if f.mode == "timeline" and f.tick == 2:
                     owners.add(home(src))
                 if self.target.host not in owners or ip not in (src, dst):
                     continue
@@ -156,7 +156,8 @@ class FixtureConnection(AbstractContextManager):
 
 
 class FixtureFactory:
-    def __init__(self):
+    def __init__(self, config=CONFIG):
+        self.config = config
         self.tick = 0
         self.mode = "timeline"
         self.trace = []
@@ -169,6 +170,10 @@ class FixtureFactory:
         del credentials, host_key_approval
         cancel_token.raise_if_cancelled()
         deadline.raise_if_expired()
-        if target not in (CONFIG.mm_primary, CONFIG.mm_standby, *CONFIG.managed_devices):
+        if target not in (
+            self.config.mm_primary,
+            self.config.mm_standby,
+            *self.config.managed_devices,
+        ):
             raise ValueError("Unknown demo target")
         return FixtureConnection(self, target)
