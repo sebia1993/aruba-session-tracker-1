@@ -138,8 +138,8 @@ def render_header() -> None:
             '<div class="product-shell">'
             '<div class="product-name">ARUBA SESSION TRACKER</div>'
             '<div class="product-meta">네트워크 세션 분석 콘솔 · Public Web Edition · '
-            '로컬/읽기 전용 설계</div>'
-            '</div>',
+            "로컬/읽기 전용 설계</div>"
+            "</div>",
             unsafe_allow_html=True,
         )
     with right:
@@ -147,7 +147,7 @@ def render_header() -> None:
             '<div style="padding-top:.6rem;text-align:right">'
             '<span class="demo-pill">PUBLIC DEMO</span>'
             '<span class="demo-pill">SYNTHETIC TRANSPORT</span>'
-            '</div>',
+            "</div>",
             unsafe_allow_html=True,
         )
 
@@ -168,7 +168,7 @@ def render_header() -> None:
             '<div class="header-chip">'
             f'<div class="header-chip-label">{label}</div>'
             f'<div class="header-chip-value">{value}</div>'
-            '</div>',
+            "</div>",
             unsafe_allow_html=True,
         )
 
@@ -270,7 +270,7 @@ def render_query_page() -> None:
 
     with st.container(border=True):
         st.markdown("**조회할 세션 흐름 · IP 하나 이상 입력**")
-        endpoints = st.columns([1, .25, 1])
+        endpoints = st.columns([1, 0.25, 1])
         source = endpoints[0].text_input(
             "출발지 IP",
             value="198.51.100.10",
@@ -278,8 +278,7 @@ def render_query_page() -> None:
             placeholder="예: 198.51.100.10",
         )
         endpoints[1].markdown(
-            '<div style="text-align:center;padding-top:2rem;'
-            'font-size:1.2rem">⇄</div>',
+            '<div style="text-align:center;padding-top:2rem;font-size:1.2rem">⇄</div>',
             unsafe_allow_html=True,
         )
         destination = endpoints[2].text_input(
@@ -366,15 +365,12 @@ def render_query_page() -> None:
     state_row[1].caption(
         "MM/MD: "
         + (
-            f"{r.outcome.used_mm or '확인 불가'} → "
-            f"{', '.join(r.outcome.controllers) or '없음'}"
+            f"{r.outcome.used_mm or '확인 불가'} → {', '.join(r.outcome.controllers) or '없음'}"
             if r.outcome
             else "아직 조회하지 않음"
         )
     )
-    state_row[2].caption(
-        f"시작 시각: {r.started or '-'} · Poll {r.poll_count}"
-    )
+    state_row[2].caption(f"시작 시각: {r.started or '-'} · Poll {r.poll_count}")
 
     render_result_console()
 
@@ -400,8 +396,7 @@ def render_result_console() -> None:
             changed += 1
     if r.events:
         changed += sum(
-            event.get("event_type")
-            in {"FIRST_SEEN", "CONTROLLER_CHANGED", "FLAGS_CHANGED"}
+            event.get("event_type") in {"FIRST_SEEN", "CONTROLLER_CHANGED", "FLAGS_CHANGED"}
             for event in r.events[-20:]
         )
 
@@ -441,18 +436,9 @@ def render_result_console() -> None:
     filtered = [
         row
         for row in rows
-        if (
-            protocol == "All"
-            or row.get("protocol") == {"TCP": 6, "UDP": 17}.get(protocol)
-        )
-        and (
-            controller == "All"
-            or row.get("controller_name") == controller
-        )
-        and (
-            lifecycle == "All"
-            or row.get("State") == lifecycle
-        )
+        if (protocol == "All" or row.get("protocol") == {"TCP": 6, "UDP": 17}.get(protocol))
+        and (controller == "All" or row.get("controller_name") == controller)
+        and (lifecycle == "All" or row.get("State") == lifecycle)
         and search.casefold()
         in " ".join(
             str(row.get(key, ""))
@@ -480,10 +466,7 @@ def render_result_console() -> None:
         "flags",
         "State",
     )
-    table_rows = [
-        {key: row.get(key, "") for key in display_columns}
-        for row in filtered
-    ]
+    table_rows = [{key: row.get(key, "") for key in display_columns} for row in filtered]
     st.dataframe(table_rows, hide_index=True, width="stretch")
 
     if not filtered:
@@ -503,9 +486,7 @@ def render_result_console() -> None:
     )
     row = filtered[selected]
 
-    summary, raw, diagnostics = st.tabs(
-        ["세션 요약", "선택 행 Raw", "진단 이벤트"]
-    )
+    summary, raw, diagnostics = st.tabs(["세션 요약", "선택 행 Raw", "진단 이벤트"])
 
     with summary:
         st.markdown("#### 선택한 세션")
@@ -514,24 +495,24 @@ def render_result_console() -> None:
             '<div class="flow-card">'
             '<div class="flow-label">출발지</div>'
             f'<div class="flow-value">{row.get("source_ip")}:'
-            f'{row.get("source_port")}</div>'
-            '</div>',
+            f"{row.get('source_port')}</div>"
+            "</div>",
             unsafe_allow_html=True,
         )
         flow[1].markdown(
             '<div class="flow-card">'
             '<div class="flow-label">Protocol / MD</div>'
             f'<div class="flow-value">{row.get("protocol")}<br>'
-            f'{row.get("controller_name")}</div>'
-            '</div>',
+            f"{row.get('controller_name')}</div>"
+            "</div>",
             unsafe_allow_html=True,
         )
         flow[2].markdown(
             '<div class="flow-card">'
             '<div class="flow-label">목적지</div>'
             f'<div class="flow-value">{row.get("destination_ip")}:'
-            f'{row.get("destination_port")}</div>'
-            '</div>',
+            f"{row.get('destination_port')}</div>"
+            "</div>",
             unsafe_allow_html=True,
         )
 
@@ -544,12 +525,7 @@ def render_result_console() -> None:
         facts[5].metric("CPU", row.get("cpu_id", "—"))
 
         with st.expander("Flags 해석", expanded=False):
-            st.json(
-                [
-                    asdict(flag)
-                    for flag in interpret_flags(str(row.get("flags", "")))
-                ]
-            )
+            st.json([asdict(flag) for flag in interpret_flags(str(row.get("flags", "")))])
 
         if r.events:
             st.markdown("#### Lifecycle Events")
@@ -668,8 +644,7 @@ def render_history_page() -> None:
             "기록 선택",
             range(len(r.history)),
             format_func=lambda index: (
-                f"{r.history[index].get('Started', '')} · "
-                f"{r.history[index].get('Status', '')}"
+                f"{r.history[index].get('Started', '')} · {r.history[index].get('Status', '')}"
             ),
         )
 
@@ -692,9 +667,7 @@ def render_history_page() -> None:
         r.history.clear()
         st.rerun()
 
-    st.caption(
-        "내보내기 · 현재 Public Demo 세션 안의 비식별 관측만 포함합니다."
-    )
+    st.caption("내보내기 · 현재 Public Demo 세션 안의 비식별 관측만 포함합니다.")
     if r.history:
         st.dataframe(r.history, hide_index=True, width="stretch")
     else:
@@ -704,9 +677,7 @@ def render_history_page() -> None:
 render_header()
 render_sidebar()
 
-query_page, settings_page, history_page = st.tabs(
-    ["세션 조회", "장비 설정", "기록 및 내보내기"]
-)
+query_page, settings_page, history_page = st.tabs(["세션 조회", "장비 설정", "기록 및 내보내기"])
 with query_page:
     render_query_page()
 with settings_page:
