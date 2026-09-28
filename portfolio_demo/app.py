@@ -75,7 +75,6 @@ def render_header() -> None:
     )
 
 
-
 def render_explainer() -> None:
     st.markdown("### 이 도구는 무엇을 해결하나요?")
     cols = st.columns(3)
@@ -105,7 +104,7 @@ def render_explainer() -> None:
             f'<div class="explain-label">{label}</div>'
             f'<div class="explain-title">{title}</div>'
             f'<div class="explain-copy">{copy}</div>'
-            '</div>',
+            "</div>",
             unsafe_allow_html=True,
         )
     st.info(
