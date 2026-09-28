@@ -5,34 +5,76 @@ from html import escape
 from portfolio_demo.scenario_runner import communication_rows
 
 
+def _evidence_text(evidence):
+    if not evidence:
+        return ""
+    parts = []
+    for key, value in evidence.items():
+        if value in (None, "", [], (), {}):
+            continue
+        parts.append(f"{key}: {value}")
+    return " · ".join(parts)
+
+
+def _step_card(poll, step):
+    icon = {"running": "●", "success": "✓", "warning": "⚠", "failure": "✕"}.get(step.status, "•")
+    timing = "" if step.elapsed_ms is None else f" · {step.elapsed_ms:.1f} ms"
+    evidence = _evidence_text(step.evidence)
+    evidence_html = f'<p class="guide-evidence">{escape(evidence)}</p>' if evidence else ""
+    detail = escape(step.detail or "실제 Runtime 단계 처리")
+    return (
+        f'<article data-guide-step data-status="{escape(step.status)}" '
+        'style="border:1px solid #8885;border-radius:10px;padding:.8rem;'
+        'margin:.5rem 0;overflow-wrap:anywhere">'
+        f"<h4>Poll #{poll} · {icon} {escape(step.label)}</h4>"
+        f"<p>{detail}{timing}</p>"
+        f"{evidence_html}</article>"
+    )
+
+
 def render_timeline(runner, slot):
     if not runner or not runner.run:
         slot.empty()
         return
+
     run = runner.run
     cards = []
     for snap in run.snapshots:
-        observed = "확인 불가" if snap.observed is None else str(snap.observed)
-        state = "현재 단계" if snap.poll == run.current_poll else "완료"
-        cards.append(
-            '<article style="border:1px solid #8885;border-radius:10px;padding:.8rem;'
-            'margin:.5rem 0;overflow-wrap:anywhere">'
-            f"<h4>Poll #{snap.poll} · {escape(snap.title)}</h4>"
-            f"<p>{state} · 관측 행 {observed} · 추적 {snap.retained} · "
-            f"MISS {snap.missed} · CLOSED {snap.closed}</p>"
-            f"<p>위치 조회 MM: {escape(snap.outcome.used_mm or '확인 불가')} · "
-            f"조회 대상 MD: {escape(', '.join(snap.selected_controllers) or '확인 불가')}</p>"
-            f"<p>{escape(snap.explanation)}</p></article>"
-        )
+        cards.extend(_step_card(snap.poll, step) for step in snap.trace.steps)
+
+    # During a live poll, expose the current real ExecutionTrace before the
+    # immutable snapshot is appended. Completed runs replay the retained copies.
     if not run.completed and not run.error and len(run.snapshots) < run.current_poll:
-        cards.append(f"<p>Poll #{run.current_poll} · 실제 조회 처리 중</p>")
+        cards.extend(_step_card(run.current_poll, step) for step in runner.runtime.execution.steps)
+
     state = "시나리오 완료" if run.completed else "실행 중단" if run.error else "시나리오 실행 중"
+    if run.snapshots:
+        last = run.snapshots[-1]
+        observed = "확인 불가" if last.observed is None else str(last.observed)
+        final_summary = (
+            '<div data-final-summary style="border:1px solid #8885;border-radius:10px;'
+            'padding:.8rem;margin:.5rem 0">'
+            f"<b>{escape(last.title)}</b>"
+            f"<p>{escape(last.explanation)}</p>"
+            f"<p>관측 행 {observed} · 추적 {last.retained} · "
+            f"MISS {last.missed} · CLOSED {last.closed}</p>"
+            f"<p>위치 조회 MM: {escape(last.outcome.used_mm or '확인 불가')} · "
+            f"조회 대상 MD: {escape(', '.join(last.selected_controllers) or '확인 불가')}</p>"
+            "</div>"
+        )
+    else:
+        final_summary = (
+            "<div data-final-summary><p>첫 실제 관측 결과를 준비하고 있습니다.</p></div>"
+        )
+
     slot.markdown(
         '<section aria-label="Scenario Timeline"><h3>Scenario Timeline · '
         + escape(run.name)
         + f"</h3><p>{state} · {len(run.snapshots)}/{run.planned_polls} Poll</p>"
+        + final_summary
+        + '<div class="scenario-grid">'
         + "".join(cards)
-        + "</section>",
+        + "</div></section>",
         unsafe_allow_html=True,
     )
 

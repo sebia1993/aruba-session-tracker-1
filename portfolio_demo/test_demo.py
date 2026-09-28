@@ -370,7 +370,12 @@ class GuidedFlowTests(unittest.TestCase):
         runtime = app.session_state.runtime
         html = next(h.proto.body for h in app.get("html") if 'id="guided-flow"' in h.proto.body)
         self.assertIn('data-phase="result"', html)
+        self.assertIn('data-elapsed="', html)
         self.assertIn('aria-label="실행 단계 선택"', html)
+        self.assertIn("data-state-badge", html)
+        self.assertIn("data-progress", html)
+        self.assertIn("data-guide-step", html)
+        self.assertGreaterEqual(html.count("data-guide-step"), 5)
         app.run()
         self.assertFalse(app.exception)
         self.assertEqual(token, app.session_state.guided_run_id)
@@ -378,3 +383,15 @@ class GuidedFlowTests(unittest.TestCase):
         self.assertIs(runtime, app.session_state.runtime)
         next(b for b in app.button if b.label == "대표 통신 추적 실행").click().run()
         self.assertNotEqual(token, app.session_state.guided_run_id)
+
+    def test_guided_replay_uses_retained_real_execution_steps(self):
+        app = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run()
+        next(b for b in app.button if b.label == "대표 통신 추적 실행").click().run()
+        runner = app.session_state.scenario_runner
+        snap = runner.run.snapshots[-1]
+        html = next(h.proto.body for h in app.get("html") if 'id="guided-flow"' in h.proto.body)
+        self.assertEqual(html.count("<article data-guide-step"), len(snap.trace.steps))
+        for step in snap.trace.steps:
+            self.assertIn(step.label, html)
+        self.assertIn(f"{snap.trace.elapsed_ms:.1f} ms", html)
+        self.assertFalse(app.exception)

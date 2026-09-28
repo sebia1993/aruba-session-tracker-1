@@ -1,7 +1,12 @@
-<section id="guided-flow" data-run="__RUN_ID__" data-phase="__PHASE__" aria-label="안내형 실행 화면" style="scroll-margin-top:70px">
+<section id="guided-flow" data-run="__RUN_ID__" data-phase="__PHASE__" data-elapsed="__ELAPSED__" aria-label="안내형 실행 화면" style="scroll-margin-top:70px">
 <style>
 #guided-flow {border:1px solid #8886;border-radius:12px;padding:1rem;margin:.5rem 0;overflow-wrap:anywhere}
 #guided-flow h3 {margin:0 0 .6rem}
+#guided-flow .run-state {display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin:.45rem 0 .7rem}
+#guided-flow .state-badge {display:inline-flex;align-items:center;border:1px solid #4f9eff88;border-radius:999px;padding:.28rem .65rem;font-weight:800}
+#guided-flow .runtime {font-size:.82rem;opacity:.8}
+#guided-flow .progress-shell {height:8px;border-radius:999px;background:#8883;overflow:hidden;margin:.55rem 0 .7rem}
+#guided-flow .progress-bar {height:100%;width:0;background:#4f9eff;transition:width .25s ease}
 #guided-flow .guide-nav {display:flex;flex-wrap:wrap;gap:.5rem;margin:.5rem 0}
 #guided-flow button,#guided-flow select {font:inherit;color:inherit;background:transparent;border:1px solid #8888;border-radius:8px;padding:.5rem;max-width:100%;cursor:pointer}
 #guided-flow select {flex:1;min-width:160px}
@@ -9,12 +14,22 @@
 #guided-flow [hidden] {display:none!important}
 #guided-flow .scenario-grid {display:block}
 #guided-flow article {margin:.5rem 0!important}
+#guided-flow article[data-status="running"] {border-color:#4f9eff!important;box-shadow:0 0 0 1px #4f9eff33}
+#guided-flow article[data-status="warning"] {border-color:#d6a84b!important}
+#guided-flow article[data-status="failure"] {border-color:#d66a6a!important}
+#guided-flow .guide-evidence {font-size:.82rem;opacity:.82}
 #guided-flow section > h3,#guided-flow section > p {display:none}
 #guided-flow :focus-visible {outline:3px solid #4f9eff;outline-offset:3px}
 @media(max-width:600px) {#guided-flow {padding:.7rem} #guided-flow select {width:100%;flex-basis:100%}}
+@media(prefers-reduced-motion:reduce) {#guided-flow .progress-bar {transition:none}}
 </style>
 <h3 tabindex="-1">__TITLE__</h3>
-<p data-readout role="status" aria-live="polite">실제 실행 기록을 확인합니다.</p>
-<div class="guide-nav"><button data-follow type="button">현재 단계 따라가기</button><button data-replay type="button">과정 다시 보기</button></div>
+<div class="run-state">
+  <span class="state-badge" data-state-badge>대기</span>
+  <span class="runtime">실제 Runtime 처리: <b>__ELAPSED__</b></span>
+</div>
+<div class="progress-shell" aria-hidden="true"><div class="progress-bar" data-progress></div></div>
+<p data-readout role="status" aria-live="polite">실제 실행 상태를 확인합니다.</p>
+<div class="guide-nav"><button data-follow type="button">결과 보기</button><button data-replay type="button">실제 처리 과정 다시 보기</button></div>
 <div class="guide-nav" data-steps><select aria-label="실행 단계 선택"><option value="-1">최종 결과</option></select><button data-back type="button" aria-label="이전 단계">← 이전</button><button data-next type="button" aria-label="다음 단계">다음 →</button></div>
 <div>__BODY__</div></section>
