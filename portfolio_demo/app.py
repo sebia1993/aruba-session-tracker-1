@@ -57,7 +57,7 @@ def render_header() -> None:
     )
     st.markdown(
         '<div class="product-sub">단말 위치를 MM에서 확인하고 관련 MD의 datapath session을 '
-        '추적·기록합니다.</div>',
+        "추적·기록합니다.</div>",
         unsafe_allow_html=True,
     )
     st.markdown(
@@ -196,16 +196,10 @@ def render_query_path() -> None:
     src = asdict(o.source_location) if o.source_location else {}
     dst = asdict(o.destination_location) if o.destination_location else {}
     src_value = (
-        src.get("controller_name")
-        or src.get("controller")
-        or src.get("switch")
-        or "확인 불가"
+        src.get("controller_name") or src.get("controller") or src.get("switch") or "확인 불가"
     )
     dst_value = (
-        dst.get("controller_name")
-        or dst.get("controller")
-        or dst.get("switch")
-        or "선택 없음"
+        dst.get("controller_name") or dst.get("controller") or dst.get("switch") or "선택 없음"
     )
     md_value = ", ".join(o.controllers) or "없음"
 
@@ -244,8 +238,7 @@ def filtered_rows():
         and (state == "All" or row["State"] == state)
         and text
         in " ".join(
-            str(row[k])
-            for k in ("source_ip", "destination_ip", "source_port", "destination_port")
+            str(row[k]) for k in ("source_ip", "destination_ip", "source_port", "destination_port")
         )
     ]
 
@@ -301,7 +294,7 @@ def render_sessions() -> None:
         c.markdown(
             f'<div class="path-card"><div class="path-title">DESTINATION</div>'
             f'<div class="path-value">{row["destination_ip"]}:'
-            f'{row["destination_port"]}</div></div>',
+            f"{row['destination_port']}</div></div>",
             unsafe_allow_html=True,
         )
         with st.expander("세션 상세 / Flags", expanded=False):
@@ -346,9 +339,7 @@ render_sidebar()
 render_query_bar()
 render_metrics()
 
-sessions, diagnostics, history = st.tabs(
-    ["세션 Console", "Advanced Diagnostics", "이력 / Export"]
-)
+sessions, diagnostics, history = st.tabs(["세션 Console", "Advanced Diagnostics", "이력 / Export"])
 with sessions:
     render_sessions()
 with diagnostics:
