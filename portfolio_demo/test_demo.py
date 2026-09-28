@@ -173,6 +173,40 @@ class DemoTests(unittest.TestCase):
             self.assertTrue(app.session_state.runtime.outcome.authoritative)
             self.assertEqual(len(app.session_state.runtime.outcome.observations), 3)
 
+    def test_execution_trace_tracks_real_outcomes_and_timeout(self):
+        r = DemoRuntime()
+        updates = []
+        r.execution.on_change = lambda: updates.append([s.status for s in r.execution.steps])
+        outcome = r.start(QueryRequest("198.51.100.10", ""), monitor=True)
+        steps = {s.id: s for s in r.execution.steps}
+        self.assertTrue(
+            {"input", "collect", "route", "location", "parser", "lifecycle"} <= steps.keys()
+        )
+        self.assertEqual(steps["parser"].evidence["observations"], len(outcome.observations))
+        self.assertEqual(steps["location"].evidence["used_mm"], outcome.used_mm)
+        self.assertTrue(any("running" in update for update in updates))
+        before = {s.instance_id for s in r.result.active_sessions}
+        r.poll("timeout")
+        steps = {s.id: s for s in r.execution.steps}
+        self.assertIsNone(steps["parser"].evidence["observations"])
+        self.assertEqual(steps["lifecycle"].evidence["closed"], 0)
+        self.assertEqual(before, {s.instance_id for s in r.result.active_sessions})
+        self.assertIn("종료로 판단하지 않음", steps["lifecycle"].detail)
+        self.assertTrue(any(s.status == "failure" for s in r.execution.steps))
+        r.start(QueryRequest("198.51.100.10", ""), monitor=True)
+        for _ in range(8):
+            r.poll()
+        lifecycle = next(s for s in r.execution.steps if s.id == "lifecycle")
+        self.assertEqual(lifecycle.evidence["closed"], len(r.result.events))
+        self.assertEqual(lifecycle.evidence["observed"], 0)
+        app = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run()
+        next(b for b in app.button if b.label == "현재 조회").click().run()
+        self.assertFalse(app.exception)
+        self.assertTrue(
+            any("실행 과정" in m.value and "Session Parser" in m.value for m in app.markdown)
+        )
+        self.assertEqual(next(m.value for m in app.metric if m.label == "결과표 표시 행"), "3")
+
 
 if __name__ == "__main__":
     unittest.main()

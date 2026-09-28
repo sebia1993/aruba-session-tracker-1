@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from aruba_session_tracker.parsers.flags import interpret_flags
+from portfolio_demo.execution_trace import render_trace
 from portfolio_demo.fixture_transport import CONFIG
 from portfolio_demo.runtime import DemoRuntime, QueryRequest
 
@@ -193,6 +194,7 @@ def render_sidebar() -> None:
         st.caption("Desktop App의 UI/작업 흐름을 Web으로 옮긴 버전입니다.")
         if st.button("샘플 현재 조회", type="primary", use_container_width=True):
             demo = DemoRuntime()
+            demo.execution.on_change = lambda: render_trace(demo.execution, trace_slot)
             demo.start(
                 QueryRequest("198.51.100.10", ""),
                 monitor=False,
@@ -375,8 +377,6 @@ def render_query_page() -> None:
         )
     )
     state_row[2].caption(f"시작 시각: {r.started or '-'} · Poll {r.poll_count}")
-
-    render_result_console()
 
 
 def result_rows() -> list[dict[str, object]]:
@@ -686,15 +686,21 @@ def render_history_page() -> None:
 
 
 render_header()
-render_sidebar()
 
 query_page, settings_page, history_page = st.tabs(["세션 조회", "장비 설정", "기록 및 내보내기"])
 with query_page:
-    render_query_page()
+    query_area = st.container()
+    trace_slot = st.empty()
+    r.execution.on_change = lambda: render_trace(r.execution, trace_slot)
+    render_trace(r.execution, trace_slot)
+    with query_area:
+        render_query_page()
+    render_result_console()
 with settings_page:
     render_settings_page()
 with history_page:
     render_history_page()
+render_sidebar()
 
 st.caption(
     "Public Web Edition · QueryRequest / TrackerService / production Parser / "
@@ -704,3 +710,6 @@ st.link_button(
     "GitHub Source",
     "https://github.com/sebia1993/aruba-session-tracker-1",
 )
+
+# Bind UI notifications only for the active Streamlit script run.
+r.execution.on_change = None
