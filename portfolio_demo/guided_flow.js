@@ -12,6 +12,7 @@
  const badge = root.querySelector('[data-state-badge]');
  const progress = root.querySelector('[data-progress]');
  const finalSummary = root.querySelector('[data-final-summary]');
+ const rail = root.querySelector('[data-rail]');
 
  let state = window.__demoGuide;
  const isNewRun = !state || state.id !== id;
@@ -71,6 +72,23 @@
    opt.value = i;
    opt.textContent = card.querySelector('h4')?.textContent || `단계 ${i + 1}`;
    select.appendChild(opt);
+
+   if (rail) {
+     const item = document.createElement('span');
+     item.className = 'rail-step';
+     item.dataset.railIndex = String(i);
+     item.title = opt.textContent;
+     const index = document.createElement('span');
+     index.className = 'rail-index';
+     index.textContent = String(i + 1);
+     const label = document.createElement('span');
+     label.className = 'rail-label';
+     label.textContent = opt.textContent
+       .replace(/^Poll #\d+ ·\s*/, '')
+       .replace(/^[✓●⚠✕•]\s*/, '');
+     item.append(index, label);
+     rail.appendChild(item);
+   }
  });
 
  function setProgress(index, final=false) {
@@ -79,8 +97,28 @@
    progress.style.width = `${Math.max(0, Math.min(1, ratio)) * 100}%`;
  }
 
+ function paintRail(chosen) {
+   if (!rail) return;
+   const items = [...rail.querySelectorAll('.rail-step')];
+   items.forEach((item, i) => {
+     const card = cards[i];
+     item.classList.remove('done', 'active', 'failure');
+     if (card?.dataset.status === 'failure' || card?.dataset.status === 'warning') {
+       item.classList.add('failure');
+     }
+     if (chosen < 0) {
+       if (phase === 'result') item.classList.add('done');
+       return;
+     }
+     if (i < chosen) item.classList.add('done');
+     if (i === chosen) item.classList.add('active');
+   });
+ }
+
  function paint() {
    let chosen;
+   paintRail(chosen);
+
    if (state.replaying) {
      chosen = state.replayIndex;
    } else if (phase === 'running' && state.follow) {

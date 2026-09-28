@@ -312,9 +312,7 @@ class ScenarioTests(unittest.TestCase):
         self.assertEqual(metrics["결과표 표시 행"], str(len(runtime.rows())))
         self.assertTrue(
             any(
-                "Communication Flow" in m.value
-                and "DEMO-MD-03" in m.value
-                and "203.0.113." in m.value
+                "data-topology" in m.value and "DEMO-MD-03" in m.value and "203.0.113." in m.value
                 for m in app.markdown
             )
         )
@@ -361,6 +359,27 @@ if __name__ == "__main__":
 
 
 class GuidedFlowTests(unittest.TestCase):
+    def test_enterprise_noc_shell_and_topology_are_visible(self):
+        app = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run()
+        self.assertTrue(
+            any(
+                "ENTERPRISE WLAN · SESSION INVESTIGATION" in item.value
+                and "READ ONLY" in item.value
+                for item in app.markdown
+            )
+        )
+        self.assertTrue(any("noc-status-strip" in item.value for item in app.markdown))
+        next(b for b in app.button if b.label == "대표 통신 추적 실행").click().run()
+        self.assertTrue(
+            any(
+                "LIVE INVESTIGATION TOPOLOGY" in item.value
+                and "TARGET · WIRELESS CLIENT" in item.value
+                and "MOBILITY CONDUCTOR" in item.value
+                for item in app.markdown
+            )
+        )
+        self.assertFalse(app.exception)
+
     def test_navigation_keeps_execution_identity_and_results_on_rerun(self):
         app = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run()
         next(b for b in app.button if b.label == "대표 통신 추적 실행").click().run()
@@ -374,6 +393,7 @@ class GuidedFlowTests(unittest.TestCase):
         self.assertIn('aria-label="실행 단계 선택"', html)
         self.assertIn("data-state-badge", html)
         self.assertIn("data-progress", html)
+        self.assertIn("data-rail", html)
         self.assertIn("data-guide-step", html)
         self.assertGreaterEqual(html.count("data-guide-step"), 5)
         app.run()

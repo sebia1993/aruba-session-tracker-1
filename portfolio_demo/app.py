@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import asdict
+from html import escape
 from pathlib import Path
 
 import streamlit as st
@@ -102,6 +103,319 @@ st.markdown(
         white-space: normal; overflow-wrap: anywhere; font-size: clamp(1rem, 2.2vw, 2rem);
     }
     .header-chip-value {overflow-wrap: anywhere;}
+    .noc-hero {
+        position: relative;
+        overflow: hidden;
+        border: 1px solid rgba(91, 143, 193, .38);
+        border-radius: 16px;
+        background:
+            linear-gradient(135deg, rgba(10, 18, 29, .98), rgba(16, 31, 48, .94)),
+            radial-gradient(circle at 88% 8%, rgba(61, 137, 205, .18), transparent 34%);
+        padding: 18px 20px 16px;
+        margin-bottom: .7rem;
+        box-shadow: 0 14px 36px rgba(0, 0, 0, .18);
+    }
+    .noc-hero::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background-image:
+            linear-gradient(rgba(120, 160, 205, .035) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(120, 160, 205, .035) 1px, transparent 1px);
+        background-size: 28px 28px;
+    }
+    .noc-hero-top {
+        position: relative;
+        z-index: 1;
+        display: flex;
+        justify-content: space-between;
+        gap: 1rem;
+        align-items: flex-start;
+    }
+    .noc-eyebrow {
+        font-size: .69rem;
+        letter-spacing: .16em;
+        font-weight: 850;
+        color: #7db8ee;
+        margin-bottom: .35rem;
+    }
+    .noc-title {
+        font-size: clamp(1.55rem, 3vw, 2.2rem);
+        line-height: 1.05;
+        font-weight: 900;
+        letter-spacing: .025em;
+    }
+    .noc-subtitle {
+        margin-top: .45rem;
+        color: #9aadc2;
+        font-size: .82rem;
+        font-weight: 650;
+    }
+    .noc-badges {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: .4rem;
+    }
+    .noc-badge {
+        border: 1px solid rgba(126, 178, 224, .38);
+        border-radius: 999px;
+        padding: .24rem .58rem;
+        font-size: .66rem;
+        font-weight: 850;
+        letter-spacing: .045em;
+        color: #c7def5;
+        background: rgba(30, 57, 82, .46);
+        white-space: nowrap;
+    }
+    .noc-hero-summary {
+        position: relative;
+        z-index: 1;
+        margin-top: 1rem;
+        padding-top: .85rem;
+        border-top: 1px solid rgba(130, 160, 190, .18);
+        color: #d9e3ed;
+        font-size: .92rem;
+    }
+    .noc-status-strip {
+        display: grid;
+        grid-template-columns: 1.15fr repeat(5, 1fr);
+        gap: 1px;
+        border: 1px solid rgba(107, 139, 171, .3);
+        border-radius: 12px;
+        overflow: hidden;
+        margin: .55rem 0 1rem;
+        background: rgba(91, 118, 145, .18);
+    }
+    .noc-status-item {
+        min-width: 0;
+        background: rgba(13, 22, 34, .86);
+        padding: .62rem .72rem;
+    }
+    .noc-status-label {
+        display: block;
+        color: #7f91a4;
+        font-size: .62rem;
+        letter-spacing: .08em;
+        font-weight: 800;
+        text-transform: uppercase;
+    }
+    .noc-status-value {
+        display: block;
+        margin-top: .18rem;
+        font-size: .79rem;
+        font-weight: 850;
+        overflow-wrap: anywhere;
+    }
+    .noc-status-main {
+        display: flex;
+        align-items: center;
+        gap: .48rem;
+    }
+    .noc-dot {
+        width: .52rem;
+        height: .52rem;
+        border-radius: 50%;
+        flex: 0 0 auto;
+        box-shadow: 0 0 0 4px rgba(117, 153, 188, .08);
+    }
+    .noc-dot-ok { background: #55c993; box-shadow: 0 0 0 4px rgba(85, 201, 147, .12); }
+    .noc-dot-warn { background: #e0b35c; box-shadow: 0 0 0 4px rgba(224, 179, 92, .12); }
+    .noc-dot-idle { background: #7e91a5; }
+    .review-brief {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: .75rem;
+        margin: .35rem 0 1rem;
+    }
+    .review-card {
+        border: 1px solid rgba(111, 146, 181, .28);
+        border-radius: 13px;
+        background: linear-gradient(180deg, rgba(22, 34, 49, .72), rgba(15, 24, 36, .62));
+        padding: .95rem 1rem;
+        min-height: 132px;
+    }
+    .review-card-kicker {
+        font-size: .66rem;
+        color: #76afe3;
+        letter-spacing: .12em;
+        font-weight: 850;
+        margin-bottom: .38rem;
+    }
+    .review-card-title {
+        font-weight: 900;
+        font-size: 1rem;
+        margin-bottom: .4rem;
+    }
+    .review-card p {
+        margin: 0;
+        line-height: 1.55;
+        color: #c9d5e1;
+        font-size: .86rem;
+    }
+    .runbook-heading {
+        border-left: 3px solid #589bd6;
+        padding-left: .75rem;
+        margin: .9rem 0 .55rem;
+    }
+    .runbook-heading .kicker {
+        font-size: .64rem;
+        letter-spacing: .12em;
+        color: #7f9bb6;
+        font-weight: 850;
+    }
+    .runbook-heading .title {
+        margin-top: .12rem;
+        font-size: 1.03rem;
+        font-weight: 900;
+    }
+    .topology-shell {
+        border: 1px solid rgba(91, 139, 184, .34);
+        border-radius: 15px;
+        background: linear-gradient(180deg, rgba(14, 24, 37, .92), rgba(12, 19, 30, .86));
+        padding: 1rem;
+        margin: .7rem 0 1rem;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.025);
+    }
+    .topology-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: .8rem;
+        margin-bottom: .9rem;
+    }
+    .topology-kicker {
+        color: #7f9bb6;
+        font-size: .64rem;
+        letter-spacing: .12em;
+        font-weight: 850;
+    }
+    .topology-title {
+        font-weight: 900;
+        font-size: 1.05rem;
+        margin-top: .1rem;
+    }
+    .topology-state {
+        border-radius: 999px;
+        padding: .27rem .58rem;
+        font-size: .67rem;
+        font-weight: 900;
+        letter-spacing: .04em;
+        border: 1px solid rgba(91, 182, 140, .45);
+        color: #9ee0bd;
+        background: rgba(35, 96, 65, .24);
+    }
+    .topology-state.warn {
+        border-color: rgba(211, 166, 73, .45);
+        color: #e7c882;
+        background: rgba(107, 75, 24, .24);
+    }
+    .topology-path {
+        display: grid;
+        grid-template-columns: minmax(150px, 1fr) 52px minmax(150px, 1fr) 52px minmax(150px, 1fr);
+        gap: .55rem;
+        align-items: stretch;
+    }
+    .topology-node {
+        border: 1px solid rgba(118, 151, 185, .28);
+        border-radius: 12px;
+        background: rgba(21, 34, 50, .82);
+        padding: .8rem .85rem;
+        min-height: 92px;
+    }
+    .topology-node.client { border-top: 2px solid #60a6df; }
+    .topology-node.mm { border-top: 2px solid #8399d8; }
+    .topology-node.md { border-top: 2px solid #5fc09a; }
+    .topology-node-kind {
+        color: #7f91a6;
+        font-size: .61rem;
+        letter-spacing: .095em;
+        font-weight: 850;
+    }
+    .topology-node-value {
+        font-weight: 900;
+        font-size: .96rem;
+        margin-top: .34rem;
+        overflow-wrap: anywhere;
+    }
+    .topology-node-meta {
+        color: #91a3b6;
+        font-size: .72rem;
+        margin-top: .26rem;
+    }
+    .topology-link {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        color: #77a9d3;
+        font-weight: 900;
+        font-size: 1.2rem;
+    }
+    .topology-link small {
+        margin-top: .2rem;
+        color: #6f8194;
+        font-size: .55rem;
+        line-height: 1.15;
+        text-align: center;
+        font-weight: 750;
+    }
+    .peer-section {
+        border-top: 1px solid rgba(110, 142, 174, .2);
+        margin-top: .9rem;
+        padding-top: .85rem;
+    }
+    .peer-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: .55rem;
+        margin-top: .55rem;
+    }
+    .peer-card {
+        border: 1px solid rgba(109, 141, 174, .26);
+        border-radius: 10px;
+        background: rgba(18, 29, 43, .76);
+        padding: .7rem .76rem;
+    }
+    .peer-card .proto {
+        display: inline-block;
+        font-size: .62rem;
+        font-weight: 900;
+        border: 1px solid rgba(104, 154, 201, .38);
+        border-radius: 999px;
+        padding: .12rem .38rem;
+        color: #a8cbea;
+        margin-bottom: .38rem;
+    }
+    .peer-card .peer {
+        font-size: .85rem;
+        font-weight: 850;
+        overflow-wrap: anywhere;
+    }
+    .peer-card .meta {
+        margin-top: .28rem;
+        color: #8295a8;
+        font-size: .68rem;
+    }
+    .topology-foot {
+        margin-top: .7rem;
+        color: #76899d;
+        font-size: .7rem;
+    }
+    @media(max-width:900px) {
+        .noc-status-strip {grid-template-columns: repeat(3, 1fr);}
+        .topology-path {grid-template-columns: 1fr; gap:.35rem;}
+        .topology-link {min-height:32px; transform:rotate(90deg);}
+        .topology-link small {display:none;}
+        .peer-grid {grid-template-columns:1fr;}
+    }
+    @media(max-width:700px) {
+        .noc-hero-top {flex-direction:column;}
+        .noc-badges {justify-content:flex-start;}
+        .review-brief {grid-template-columns:1fr;}
+        .noc-status-strip {grid-template-columns:repeat(2, 1fr);}
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -140,82 +454,95 @@ def latest_seen() -> str:
 
 
 def render_header() -> None:
-    left, right = st.columns([4.4, 1.6])
-    with left:
-        st.markdown(
-            '<div class="product-shell">'
-            '<div class="product-name">ARUBA SESSION TRACKER</div>'
-            '<div class="product-meta">네트워크 세션 분석 콘솔 · Public Web Edition · '
-            "로컬/읽기 전용 설계</div>"
-            "</div>",
-            unsafe_allow_html=True,
-        )
-    with right:
-        st.markdown(
-            '<div style="padding-top:.6rem;text-align:right">'
-            '<span class="demo-pill">PUBLIC DEMO</span>'
-            '<span class="demo-pill">SYNTHETIC TRANSPORT</span>'
-            "</div>",
-            unsafe_allow_html=True,
-        )
-
-    st.info(
-        "무선 단말 IP 하나를 시작점으로 어느 Controller에 연결되어 "
-        "있고, 현재 어떤 대상과 통신하는지 자동으로 추적하는 도구입니다."
-    )
-    st.caption(
-        "MM은 단말 위치를 찾는 관리 장비, MD는 통신 세션을 조회하는 "
-        "Controller입니다. 공개판은 비식별 합성 입력과 실제 분석 코어를 사용합니다."
+    st.markdown(
+        """
+        <section class="noc-hero">
+          <div class="noc-hero-top">
+            <div>
+              <div class="noc-eyebrow">ENTERPRISE WLAN · SESSION INVESTIGATION</div>
+              <div class="noc-title">ARUBA SESSION TRACKER</div>
+              <div class="noc-subtitle">
+                Wireless Client → Mobility Conductor → Managed Device → Datapath Session
+              </div>
+            </div>
+            <div class="noc-badges">
+              <span class="noc-badge">READ ONLY</span>
+              <span class="noc-badge">PUBLIC DEMO</span>
+              <span class="noc-badge">SYNTHETIC TRANSPORT</span>
+            </div>
+          </div>
+          <div class="noc-hero-summary">
+            단말 IP 하나에서 출발해 위치를 찾고, 담당 Controller를 식별한 뒤
+            실제 통신 세션과 상태 변화를 추적하는 Enterprise WLAN 장애 조사 콘솔입니다.
+          </div>
+        </section>
+        """,
+        unsafe_allow_html=True,
     )
 
 
 def render_reviewer_summary() -> None:
-    st.markdown("### 이 프로젝트는 무엇을 해결하나요?")
-    left, right = st.columns(2)
-
-    with left, st.container(border=True):
-        st.markdown("**프로젝트 목적**")
-        st.write(
-            "특정 기기의 IP 주소 하나를 시작점으로, 그 기기가 어느 무선 장비에 연결되어 "
-            "있고 현재 어떤 대상과 통신하고 있는지를 자동으로 따라가는 장애 분석 도구입니다."
-        )
-        st.caption(
-            "쉽게 말해: 이 기기가 지금 어디를 통해 어디와 통신하고 있는지 자동으로 추적합니다."
-        )
-
-    with right, st.container(border=True):
-        st.markdown("**이 데모에서 보여주는 것**")
-        st.write(
-            "단말 IP 확인 → 단말 위치 찾기 → 담당 Controller 선택 → 통신 세션 조회 → "
-            "통신 상대와 상태 변화 확인까지를 한 번의 실행으로 보여줍니다."
-        )
-        st.caption(
-            "AI 해커톤 관점: 사람이 여러 장비에서 순서대로 확인하던 조사 절차를 "
-            "하나의 자동 추적 흐름으로 연결합니다."
-        )
+    st.markdown(
+        """
+        <section class="review-brief" aria-label="비전공 검토자를 위한 프로젝트 설명">
+          <article class="review-card">
+            <div class="review-card-kicker">WHY THIS EXISTS</div>
+            <div class="review-card-title">프로젝트 목적</div>
+            <p>
+              특정 기기의 IP 주소 하나를 시작점으로 어느 무선 장비에 연결되어 있고,
+              현재 어떤 대상과 통신하는지를 자동으로 따라갑니다.
+              사람이 여러 장비에 접속해 순서대로 확인하던 장애 조사 절차를 하나로 묶습니다.
+            </p>
+          </article>
+          <article class="review-card">
+            <div class="review-card-kicker">WHAT TO WATCH</div>
+            <div class="review-card-title">이 데모에서 보여주는 것</div>
+            <p>
+              단말 IP → 위치 확인 → 담당 Controller 선택 → 통신 세션 조회 →
+              통신 상대와 상태 변화까지 한 번의 실행으로 보여줍니다.
+              수집 실패를 통신 종료로 오판하지 않는 과정도 함께 확인할 수 있습니다.
+            </p>
+          </article>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def render_status_chips() -> None:
-    chips = st.columns(6)
-    values = (
-        ("MM", "설정 2/2"),
-        (
-            "MD",
-            f"설정 {len(CONFIG.managed_devices)}/{len(CONFIG.managed_devices)}",
-        ),
-        ("조회 주기", f"{CONFIG.session_interval_seconds}s"),
-        ("최근 확인", latest_seen()),
-        ("실행 모드", "Web Demo · 읽기 전용"),
-        ("실행 상태", operating_state()),
+    state = operating_state()
+    dot_class = (
+        "noc-dot-ok" if state == "정상" else "noc-dot-warn" if state != "대기" else "noc-dot-idle"
     )
-    for col, (label, value) in zip(chips, values, strict=True):
-        col.markdown(
-            '<div class="header-chip">'
-            f'<div class="header-chip-label">{label}</div>'
-            f'<div class="header-chip-value">{value}</div>'
-            "</div>",
-            unsafe_allow_html=True,
+    values = (
+        ("SYSTEM", state),
+        ("MM", "2 / 2"),
+        ("MD", f"{len(CONFIG.managed_devices)} / {len(CONFIG.managed_devices)}"),
+        ("POLL", f"{CONFIG.session_interval_seconds}s"),
+        ("LAST CHECK", latest_seen()),
+        ("MODE", "READ ONLY"),
+    )
+    items = []
+    for index, (label, value) in enumerate(values):
+        if index == 0:
+            value_html = (
+                '<span class="noc-status-main">'
+                f'<span class="noc-dot {dot_class}"></span>'
+                f"<span>{escape(str(value))}</span>"
+                "</span>"
+            )
+        else:
+            value_html = escape(str(value))
+        items.append(
+            '<div class="noc-status-item">'
+            f'<span class="noc-status-label">{escape(label)}</span>'
+            f'<span class="noc-status-value">{value_html}</span>'
+            "</div>"
         )
+    st.markdown(
+        '<section class="noc-status-strip" aria-label="NOC 상태">' + "".join(items) + "</section>",
+        unsafe_allow_html=True,
+    )
 
 
 def demo_reset() -> None:
@@ -752,6 +1079,7 @@ def start_scenario(key):
 
 
 render_header()
+render_status_chips()
 render_reviewer_summary()
 scenario_controls = st.container()
 timeline_slot = GuidedSlot(
@@ -762,6 +1090,13 @@ with st.expander("실제 처리 기록 / Execution Trace", expanded=False):
     trace_selector = st.container()
     trace_slot = st.empty()
 with scenario_controls:
+    st.markdown(
+        '<div class="runbook-heading">'
+        '<div class="kicker">INVESTIGATION RUNBOOK</div>'
+        '<div class="title">대표 조사 시나리오를 실행해 실제 분석 흐름을 확인하세요.</div>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
     chosen = None
     if st.button("대표 통신 추적 실행", type="primary", use_container_width=True):
         chosen = "normal"
@@ -796,7 +1131,6 @@ if runner and runner.run and runner.run.snapshots:
 else:
     render_trace(r.execution, trace_slot)
 
-render_status_chips()
 query_page, settings_page, history_page = st.tabs(["세션 조회", "장비 설정", "기록 및 내보내기"])
 with query_page:
     render_result_console()
