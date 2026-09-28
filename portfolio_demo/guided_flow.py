@@ -5,7 +5,7 @@ recorded ExecutionTrace in the Streamlit DOM so reviewers can see the sequence.
 No JavaScript is required.
 """
 
-from html import escape
+import html
 from uuid import uuid4
 
 import streamlit as st
@@ -32,8 +32,8 @@ def _rail_html(run):
         return ""
     items = []
     for index, step in enumerate(steps, 1):
-        status = escape(str(getattr(step, "status", "")))
-        label = escape(str(getattr(step, "label", f"단계 {index}")))
+        status = html.escape(str(getattr(step, "status", "")))
+        label = html.escape(str(getattr(step, "label", f"단계 {index}")))
         delay = (index - 1) * STEP_DELAY_SECONDS
         items.append(
             '<span class="native-rail-step" '
@@ -64,7 +64,7 @@ class GuidedSlot:
             if getattr(run, "completed", False)
             else "running"
         )
-        run_id = escape(st.session_state.get("guided_run_id", "initial"))
+        run_id = html.escape(st.session_state.get("guided_run_id", "initial"))
         steps = _trace_steps(run)
         total_steps = max(len(steps), body.count("<article data-guide-step"), 1)
         replay_seconds = max(total_steps * STEP_DELAY_SECONDS, STEP_DELAY_SECONDS)
@@ -87,6 +87,11 @@ class GuidedSlot:
             "running": "실제 분석 진행 중",
             "result": "실제 분석 완료 · 처리 기록 순차 재생",
             "error": "실행 중단 · 확인 필요",
+        }[phase]
+        state_label = {
+            "running": "● 실제 분석 진행 중",
+            "result": "● 실제 처리 완료 · 기록 재생 중",
+            "error": "✕ 실행 중단",
         }[phase]
 
         rail = _rail_html(run)
@@ -327,13 +332,11 @@ class GuidedSlot:
 }}
 </style>
 <div class="native-kicker">INVESTIGATION EXECUTION</div>
-<div class="native-title">{escape(title)}</div>
+<div class="native-title">{html.escape(title)}</div>
 <div class="native-state-row">
-  <span class="native-state native-replay-status">
-    {"● 실제 분석 진행 중" if phase == "running" else "● 실제 처리 완료 · 기록 재생 중" if phase == "result" else "✕ 실행 중단"}
-  </span>
+  <span class="native-state native-replay-status">{html.escape(state_label)}</span>
   <span class="native-state native-complete-status">✓ 분석 완료</span>
-  <span class="native-runtime">실제 Runtime 처리 · <b>{escape(elapsed)}</b></span>
+  <span class="native-runtime">실제 Runtime 처리 · <b>{html.escape(elapsed)}</b></span>
 </div>
 <div class="native-progress"><span></span></div>
 <div class="native-rail">{rail}</div>
