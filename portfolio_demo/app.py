@@ -511,7 +511,13 @@ def render_reviewer_summary() -> None:
 
 def render_status_chips() -> None:
     state = operating_state()
-    dot_class = "noc-dot-ok" if state == "정상" else "noc-dot-warn" if state != "대기" else "noc-dot-idle"
+    dot_class = (
+        "noc-dot-ok"
+        if state == "정상"
+        else "noc-dot-warn"
+        if state != "대기"
+        else "noc-dot-idle"
+    )
     values = (
         ("SYSTEM", state),
         ("MM", "2 / 2"),
