@@ -127,6 +127,10 @@ class DemoTests(unittest.TestCase):
             click("현재 조회")
             self.assertEqual(len(app.session_state.runtime.outcome.observations), 3)
             self.assertIsNone(app.session_state.runtime.monitor)
+            click("Demo Reset")
+            click("▶ 샘플 세션 조회 1-click")
+            self.assertTrue(app.session_state.runtime.outcome.authoritative)
+            self.assertEqual(len(app.session_state.runtime.outcome.observations), 3)
 
 
 if __name__ == "__main__":
