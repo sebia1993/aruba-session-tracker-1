@@ -12,8 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from aruba_session_tracker.parsers.flags import interpret_flags
 from portfolio_demo.execution_trace import render_trace
 from portfolio_demo.fixture_transport import CONFIG
-from portfolio_demo.runtime import DemoRuntime, QueryRequest
 from portfolio_demo.guided_flow import GuidedSlot, begin
+from portfolio_demo.runtime import DemoRuntime, QueryRequest
 from portfolio_demo.scenario_runner import SCENARIOS, ScenarioRunner
 from portfolio_demo.scenario_view import render_communication, render_timeline
 
