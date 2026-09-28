@@ -2,8 +2,6 @@
 
 from html import escape
 
-from portfolio_demo.scenario_runner import communication_rows
-
 
 def _evidence_text(evidence):
     if not evidence:
