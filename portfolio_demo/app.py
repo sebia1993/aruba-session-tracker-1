@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -12,7 +14,7 @@ from portfolio_demo.fixture_transport import CONFIG, inventory
 from portfolio_demo.runtime import DemoRuntime, QueryRequest
 
 st.set_page_config(
-    page_title="Session NOC Console · Public Demo",
+    page_title="Aruba Session Tracker · Public Web Edition",
     page_icon="📡",
     layout="wide",
 )
@@ -20,29 +22,78 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .block-container {padding-top: 1.5rem; padding-bottom: 3rem; max-width: 1500px;}
-    .product-kicker {
-        font-size:.78rem; letter-spacing:.08em; font-weight:800;
-        color:#7da7ff; margin-bottom:.25rem;
+    .block-container {
+        max-width: 1540px;
+        padding-top: 1.15rem;
+        padding-bottom: 3rem;
     }
-    .product-title {font-size:2.15rem; line-height:1.1; font-weight:800; margin:0;}
-    .product-sub {color:#8a98aa; margin-top:.45rem; margin-bottom:1rem;}
-    .demo-badge {
-        display:inline-block; border:1px solid #31445f; border-radius:999px;
-        padding:.22rem .62rem; font-size:.72rem; font-weight:750;
-        color:#afc8ee; background:#101927; margin-right:.35rem;
+    .product-shell {
+        border: 1px solid rgba(120, 145, 175, .24);
+        border-radius: 14px;
+        background: rgba(15, 23, 35, .58);
+        padding: 12px 16px;
+        margin-bottom: .55rem;
     }
-    .path-card {border:1px solid rgba(120,145,175,.25); border-radius:12px; padding:.75rem .9rem;
-                background:rgba(18,27,41,.55); min-height:78px;}
-    .path-title {font-size:.74rem; color:#8da2bb; font-weight:700; margin-bottom:.2rem;}
-    .path-value {font-size:.98rem; font-weight:760;}
-    .explain-card {
-        border:1px solid rgba(120,145,175,.24); border-radius:12px;
-        padding:.85rem 1rem; background:rgba(18,27,41,.5); min-height:118px;
+    .product-name {
+        font-size: 1.4rem;
+        font-weight: 850;
+        letter-spacing: .02em;
     }
-    .explain-label {font-size:.72rem; color:#7da7ff; font-weight:800; letter-spacing:.04em;}
-    .explain-title {font-size:1rem; font-weight:780; margin:.2rem 0 .35rem;}
-    .explain-copy {font-size:.86rem; color:#91a0b3; line-height:1.45;}
+    .product-meta {
+        color: #8797aa;
+        font-size: .8rem;
+        margin-top: .15rem;
+    }
+    .header-chip {
+        border: 1px solid rgba(120, 145, 175, .24);
+        border-radius: 9px;
+        padding: 7px 9px;
+        min-height: 54px;
+        background: rgba(17, 26, 39, .55);
+    }
+    .header-chip-label {
+        font-size: .68rem;
+        color: #8191a5;
+        font-weight: 750;
+    }
+    .header-chip-value {
+        font-size: .86rem;
+        font-weight: 800;
+        margin-top: .15rem;
+    }
+    .query-box {
+        border: 1px solid rgba(120, 145, 175, .23);
+        border-radius: 11px;
+        padding: 12px 14px;
+        background: rgba(18, 27, 41, .46);
+    }
+    .flow-card {
+        border: 1px solid rgba(120, 145, 175, .23);
+        border-radius: 11px;
+        padding: 10px 12px;
+        background: rgba(18, 27, 41, .52);
+        min-height: 82px;
+    }
+    .flow-label {
+        color: #8495a9;
+        font-size: .7rem;
+        font-weight: 800;
+    }
+    .flow-value {
+        font-size: .95rem;
+        font-weight: 800;
+        margin-top: .22rem;
+    }
+    .demo-pill {
+        display: inline-block;
+        border: 1px solid #38506d;
+        border-radius: 999px;
+        padding: .16rem .5rem;
+        margin-right: .3rem;
+        color: #afc8ee;
+        font-size: .66rem;
+        font-weight: 800;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -50,415 +101,609 @@ st.markdown(
 
 if "runtime" not in st.session_state:
     st.session_state.runtime = DemoRuntime()
+if "session_demo_mode" not in st.session_state:
+    st.session_state.session_demo_mode = "timeline"
+
 r = st.session_state.runtime
 
 
-def render_header() -> None:
-    st.markdown(
-        '<div class="product-kicker">ARUBA DATAPATH SESSION TRACKER</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        '<div class="product-title">무선 단말 통신 세션 추적기</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        '<div class="product-sub">단말 IP 하나로 어느 무선 Controller에 연결됐는지 찾고, '
-        "그 장비에서 실제 datapath 통신 세션을 조회·추적합니다.</div>",
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        '<span class="demo-badge">PUBLIC DEMO</span>'
-        '<span class="demo-badge">SYNTHETIC TRANSPORT</span>'
-        '<span class="demo-badge">READ ONLY</span>',
-        unsafe_allow_html=True,
-    )
-
-
-def render_explainer() -> None:
-    st.markdown("### 이 도구는 무엇을 해결하나요?")
-    cols = st.columns(3)
-    cards = (
-        (
-            "현업 문제",
-            "Wi-Fi 연결 이후가 안 보임",
-            "단말은 무선에 연결됐지만 특정 서버 통신이 안 될 때, 먼저 어느 Controller에 "
-            "붙어 있는지 찾고 다시 세션을 조회해야 합니다.",
-        ),
-        (
-            "자동화 방식",
-            "단말 IP → MM → MD → Session",
-            "입력한 IP의 위치를 상위 관리 계층에서 찾고, 실제 트래픽을 처리하는 Controller에 "
-            "필터형 datapath 조회를 자동으로 보냅니다.",
-        ),
-        (
-            "운영 결과",
-            "통신 흐름과 변화 이력",
-            "현재 세션뿐 아니라 Controller 이동, MISS, 재관측과 종료 이벤트를 구분해 "
-            "장애 분석 근거로 남깁니다.",
-        ),
-    )
-    for col, (label, title, copy) in zip(cols, cards, strict=True):
-        col.markdown(
-            '<div class="explain-card">'
-            f'<div class="explain-label">{label}</div>'
-            f'<div class="explain-title">{title}</div>'
-            f'<div class="explain-copy">{copy}</div>'
-            "</div>",
-            unsafe_allow_html=True,
-        )
-    st.info(
-        "예시 VOC: Wi-Fi는 연결됐는데 특정 서버 접속이 안 됩니다. "
-        "단말 IP만 입력하면 위치 확인 → 담당 Controller 식별 → "
-        "해당 IP의 통신 세션 조회까지 이어집니다."
-    )
-    c = st.columns([1.45, 3.55])
-    if c[0].button(
-        "▶ 샘플 세션 조회 1-click",
-        type="primary",
-        use_container_width=True,
-    ):
-        demo = DemoRuntime()
-        demo.start(QueryRequest("198.51.100.10", ""), monitor=False, mode="normal")
-        st.session_state.runtime = demo
-        st.rerun()
-    c[1].caption(
-        "한 번 클릭하면 문서용 샘플 단말의 위치와 통신 세션을 바로 조회합니다. "
-        "실제 SSH나 계정은 사용하지 않습니다."
-    )
-
-    with st.expander("MM / MD가 무엇인가요?", expanded=False):
-        st.write(
-            "**MM (Mobility Conductor / Master)**: 단말이 어느 Controller에 있는지 "
-            "확인하는 상위 관리 계층"
-        )
-        st.write(
-            "**MD (Managed Device / Controller)**: 무선 단말 트래픽을 실제로 처리하며 "
-            "datapath session을 조회하는 장비"
-        )
-        st.write(
-            "**datapath session**: 단말 IP·포트·프로토콜 기준으로 Controller에서 "
-            "관측되는 실제 통신 흐름"
-        )
-
-
-def render_plain_summary() -> None:
-    if not r.outcome:
-        return
-    o = r.outcome
-    if not o.authoritative:
-        st.warning(
-            "결론: 이번 수집은 완전하지 않습니다. 세션이 없거나 종료됐다고 단정하지 않고 "
-            "확인 필요 상태로 유지합니다."
-        )
-        return
-
-    count = len(r.result.active_sessions) if r.result else len(o.observations)
-    controllers = ", ".join(o.controllers) or "확인된 Controller 없음"
-    if count:
-        st.success(
-            f"결론: 입력한 단말의 통신 흐름이 {controllers}에서 확인됐고 "
-            f"현재 {count}개의 세션을 관측했습니다."
-        )
-    else:
-        st.info(
-            f"결론: 단말 위치 조회는 완료됐지만 {controllers}에서 현재 조건에 맞는 세션은 "
-            "관측되지 않았습니다."
-        )
-
-
-def render_sidebar() -> None:
-    with st.sidebar:
-        st.subheader("Demo Network")
-        st.caption("계정 입력과 실제 SSH 연결은 비활성화되어 있습니다.")
-        st.write(f"**MM**  {CONFIG.mm_primary.name} / {CONFIG.mm_standby.name}")
-        st.write(f"**MD**  {len(CONFIG.managed_devices)} Controllers")
-        st.write(f"**Session Poll**  {CONFIG.session_interval_seconds}s")
-        st.write(f"**Location Refresh**  {CONFIG.location_interval_seconds}s")
-        st.divider()
-        if st.button("Demo Reset", use_container_width=True):
-            st.session_state.runtime = DemoRuntime()
-            st.rerun()
-
-
-def render_query_bar() -> tuple[bool, bool, str]:
-    st.subheader("세션 조회")
-    c = st.columns(2)
-    source = c[0].text_input(
-        "출발지 IP",
-        "198.51.100.10",
-        disabled=r.running,
-        placeholder="예: 198.51.100.10",
-    )
-    destination = c[1].text_input(
-        "목적지 IP",
-        "",
-        disabled=r.running,
-        placeholder="선택 입력",
-    )
-
-    c = st.columns([1, 1, 1, 1.4])
-    sport = c[0].text_input("Source Port (선택)", disabled=r.running)
-    dport = c[1].text_input("Destination Port (선택)", disabled=r.running)
-    bidirectional = c[2].checkbox("양방향 조회", True, disabled=r.running)
-    c[3].caption("IP 하나만 입력해도 현재 위치와 관련 MD를 찾아 제한된 필터형 CLI만 조회합니다.")
-
-    mode = "timeline"
-    with st.expander("Demo controls · 장애/수집 실패 재현", expanded=False):
-        st.caption(
-            "운영 화면의 기본 흐름과 분리된 검증용 제어입니다. "
-            "기본 사용자는 정상 조회/모니터링만 사용하면 됩니다."
-        )
-        mode = st.selectbox(
-            "다음 수집 조건",
-            ["timeline", "normal", "timeout", "parse"],
-            format_func=lambda v: {
-                "timeline": "운영 타임라인",
-                "normal": "정상 수집",
-                "timeout": "CLI 수집 실패",
-                "parse": "Parsing 실패",
-            }[v],
-        )
-
-    c = st.columns([1.1, 1.25, 1, 1, 3])
-    once = c[0].button("현재 조회", disabled=r.running, type="primary", use_container_width=True)
-    start = c[1].button("지속 모니터링 시작", disabled=r.running, use_container_width=True)
-    next_poll = c[2].button("다음 Poll", disabled=not r.running, use_container_width=True)
-    stop = c[3].button("중지", disabled=not r.running, use_container_width=True)
-    c[4].caption(
-        "지속 모니터링은 백그라운드 연결을 만들지 않습니다. "
-        "`다음 Poll`로 가상 시간을 진행해 lifecycle 변화를 재현합니다."
-    )
-    if stop:
-        r.stop()
-        st.rerun()
-
-    if once or start or next_poll:
-        try:
-            with st.status(
-                "QueryRequest 검증 → MM 위치 확인 → MD 필터형 명령 → Parser",
-                expanded=False,
-            ):
-                if next_poll:
-                    r.poll(mode)
-                else:
-                    request = QueryRequest(
-                        source,
-                        destination,
-                        int(sport) if sport.strip() else None,
-                        int(dport) if dport.strip() else None,
-                        bidirectional,
-                    )
-                    r.start(request, monitor=start, mode=mode)
-            st.rerun()
-        except (ValueError, TypeError) as exc:
-            st.error(str(exc))
-
-    return once, start, mode
-
-
-def operator_status() -> str:
-    if not r.outcome:
+def operating_state() -> str:
+    if r.outcome is None:
         return "대기"
     if r.outcome.authoritative:
         return "정상"
-    if r.result and r.result.retry_after_seconds:
+    if r.result is not None and r.result.retry_after_seconds:
         return "재시도 중"
     return "확인 필요"
 
 
-def render_metrics() -> None:
-    c = st.columns(5)
-    c[0].metric("운영 상태", operator_status())
-    if not r.outcome:
-        c[1].metric("Active Sessions", "-")
-        c[2].metric("관측 MD", "-")
-        c[3].metric("Last Poll", "0")
-        c[4].metric("Lifecycle Events", "0")
-        return
-
-    c[1].metric(
-        "Active Sessions",
-        len(r.result.active_sessions)
-        if r.result
-        else (len(r.outcome.observations) if r.outcome.authoritative else "확인 불가"),
-    )
-    c[2].metric("관측 MD", len(r.outcome.controllers))
-    c[3].metric("Last Poll", r.poll_count)
-    c[4].metric("Lifecycle Events", len(r.events))
+def latest_seen() -> str:
+    rows = r.rows() if r.outcome else []
+    values = [
+        str(row.get("Last Seen", "")).strip()
+        for row in rows
+        if str(row.get("Last Seen", "")).strip()
+    ]
+    if values:
+        return max(values)
+    if r.poll_count:
+        return f"Poll {r.poll_count}"
+    return "—"
 
 
-def render_query_path() -> None:
-    if not r.outcome:
-        return
-    o = r.outcome
-    src = asdict(o.source_location) if o.source_location else {}
-    dst = asdict(o.destination_location) if o.destination_location else {}
-    src_value = (
-        src.get("controller_name") or src.get("controller") or src.get("switch") or "확인 불가"
-    )
-    dst_value = (
-        dst.get("controller_name") or dst.get("controller") or dst.get("switch") or "선택 없음"
-    )
-    md_value = ", ".join(o.controllers) or "없음"
-
-    a, b, c = st.columns(3)
-    a.markdown(
-        f'<div class="path-card"><div class="path-title">SOURCE LOCATION</div>'
-        f'<div class="path-value">{src_value}</div></div>',
-        unsafe_allow_html=True,
-    )
-    b.markdown(
-        f'<div class="path-card"><div class="path-title">DESTINATION LOCATION</div>'
-        f'<div class="path-value">{dst_value}</div></div>',
-        unsafe_allow_html=True,
-    )
-    c.markdown(
-        f'<div class="path-card"><div class="path-title">QUERIED MD</div>'
-        f'<div class="path-value">{md_value}</div></div>',
-        unsafe_allow_html=True,
-    )
-
-
-def filtered_rows():
-    c = st.columns(4)
-    text = c[0].text_input("IP / Port 검색")
-    protocol = c[1].selectbox("Protocol", ["All", "TCP", "UDP"])
-    controller = c[2].selectbox(
-        "Controller",
-        ["All", *(d.name for d in CONFIG.managed_devices)],
-    )
-    state = c[3].selectbox("Lifecycle", ["All", "OBSERVED", "MISSED"])
-    return [
-        row
-        for row in r.rows()
-        if (protocol == "All" or row["protocol"] == {"TCP": 6, "UDP": 17}.get(protocol))
-        and (controller == "All" or row["controller_name"] == controller)
-        and (state == "All" or row["State"] == state)
-        and text
-        in " ".join(
-            str(row[k]) for k in ("source_ip", "destination_ip", "source_port", "destination_port")
+def render_header() -> None:
+    left, right = st.columns([4.4, 1.6])
+    with left:
+        st.markdown(
+            '<div class="product-shell">'
+            '<div class="product-name">ARUBA SESSION TRACKER</div>'
+            '<div class="product-meta">네트워크 세션 분석 콘솔 · Public Web Edition · 로컬/읽기 전용 설계</div>'
+            '</div>',
+            unsafe_allow_html=True,
         )
+    with right:
+        st.markdown(
+            '<div style="padding-top:.6rem;text-align:right">'
+            '<span class="demo-pill">PUBLIC DEMO</span>'
+            '<span class="demo-pill">SYNTHETIC TRANSPORT</span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+    chips = st.columns(6)
+    values = (
+        ("MM", "설정 2/2"),
+        ("MD", f"설정 {len(CONFIG.managed_devices)}/{len(CONFIG.managed_devices)}"),
+        ("조회 주기", f"{CONFIG.session_interval_seconds}s"),
+        ("최근 확인", latest_seen()),
+        ("실행 모드", "Web Demo · 읽기 전용"),
+        ("실행 상태", operating_state()),
+    )
+    for col, (label, value) in zip(chips, values, strict=True):
+        col.markdown(
+            '<div class="header-chip">'
+            f'<div class="header-chip-label">{label}</div>'
+            f'<div class="header-chip-value">{value}</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+    st.info(
+        "단말 IP를 기준으로 MM에서 위치를 찾고 관련 MD에서 필터형 datapath session을 조회합니다. "
+        "Public Demo에서는 실제 장비 접속 대신 비식별 합성 Transport만 사용합니다."
+    )
+
+
+def demo_reset() -> None:
+    st.session_state.runtime = DemoRuntime()
+    st.rerun()
+
+
+def render_sidebar() -> None:
+    with st.sidebar:
+        st.subheader("Public Demo")
+        st.caption("Desktop App의 UI/작업 흐름을 Web으로 옮긴 버전입니다.")
+        if st.button("샘플 현재 조회", type="primary", use_container_width=True):
+            demo = DemoRuntime()
+            demo.start(
+                QueryRequest("198.51.100.10", ""),
+                monitor=False,
+                mode="normal",
+            )
+            st.session_state.runtime = demo
+            st.rerun()
+        if st.button("Demo Reset", use_container_width=True):
+            demo_reset()
+        st.divider()
+        with st.expander("Demo Fault / Timeline", expanded=False):
+            st.session_state.session_demo_mode = st.selectbox(
+                "다음 수집 조건",
+                ["timeline", "normal", "timeout", "parse"],
+                format_func=lambda value: {
+                    "timeline": "운영 타임라인",
+                    "normal": "정상 수집",
+                    "timeout": "CLI 수집 실패",
+                    "parse": "Parsing 실패",
+                }[value],
+            )
+            st.caption(
+                "실제 Desktop App의 운영 기능이 아니라 공개 데모에서 상태 전이를 재현하기 위한 입력입니다."
+            )
+
+
+def build_query_request(
+    source: str,
+    destination: str,
+    source_port: str,
+    destination_port: str,
+    bidirectional: bool,
+) -> QueryRequest:
+    return QueryRequest(
+        source,
+        destination,
+        int(source_port) if source_port.strip() else None,
+        int(destination_port) if destination_port.strip() else None,
+        bidirectional,
+    )
+
+
+def run_query(request: QueryRequest, *, monitor: bool) -> None:
+    r.start(
+        request,
+        monitor=monitor,
+        mode=st.session_state.session_demo_mode,
+    )
+
+
+def render_query_page() -> None:
+    st.subheader("세션 조회")
+
+    with st.container(border=True):
+        st.markdown("**로그인 정보 · 이번 실행에만 사용**")
+        c = st.columns(3)
+        c[0].text_input(
+            "SSH 사용자 이름",
+            value="Public Demo에서는 입력하지 않습니다",
+            disabled=True,
+        )
+        c[1].text_input(
+            "SSH 암호",
+            value="synthetic-only",
+            type="password",
+            disabled=True,
+        )
+        c[2].text_input(
+            "Enable 암호 (선택)",
+            value="",
+            type="password",
+            disabled=True,
+        )
+        st.caption(
+            "실제 Desktop App에서는 실행 세션 메모리에서만 사용합니다. "
+            "Public Web Edition은 외부 SSH를 완전히 비활성화합니다."
+        )
+
+    with st.container(border=True):
+        st.markdown("**조회할 세션 흐름 · IP 하나 이상 입력**")
+        endpoints = st.columns([1, .25, 1])
+        source = endpoints[0].text_input(
+            "출발지 IP",
+            value="198.51.100.10",
+            disabled=r.running,
+            placeholder="예: 198.51.100.10",
+        )
+        endpoints[1].markdown(
+            '<div style="text-align:center;padding-top:2rem;font-size:1.2rem">⇄</div>',
+            unsafe_allow_html=True,
+        )
+        destination = endpoints[2].text_input(
+            "목적지 IP",
+            value="",
+            disabled=r.running,
+            placeholder="선택 입력",
+        )
+        bidirectional = st.checkbox(
+            "양방향 조회",
+            value=True,
+            disabled=r.running,
+        )
+
+        with st.expander("고급 조건 보기", expanded=False):
+            advanced = st.columns(2)
+            source_port = advanced[0].text_input(
+                "출발지 포트 (선택)",
+                disabled=r.running,
+            )
+            destination_port = advanced[1].text_input(
+                "목적지 포트 (선택)",
+                disabled=r.running,
+            )
+
+        controls = st.columns([1.35, 1, 1, 3])
+        start = controls[0].button(
+            "지속 모니터링 시작",
+            disabled=r.running,
+            use_container_width=True,
+        )
+        once = controls[1].button(
+            "현재 조회",
+            disabled=r.running,
+            type="primary",
+            use_container_width=True,
+        )
+        stop = controls[2].button(
+            "중지",
+            disabled=not r.running,
+            use_container_width=True,
+        )
+        controls[3].caption(
+            "필터 조건이 장비에서 거부되어도 전체 datapath table 조회로 자동 전환하지 않습니다."
+        )
+
+        if stop:
+            r.stop()
+            st.rerun()
+
+        if once or start:
+            try:
+                request = build_query_request(
+                    source,
+                    destination,
+                    source_port,
+                    destination_port,
+                    bidirectional,
+                )
+                with st.status(
+                    "입력 검증 → MM 위치 확인 → 관련 MD 선택 → datapath Parser",
+                    expanded=False,
+                ):
+                    run_query(request, monitor=start)
+                st.rerun()
+            except (TypeError, ValueError) as exc:
+                st.error(str(exc))
+
+        if r.running:
+            playback = st.columns([1, 4])
+            if playback[0].button("다음 Poll", use_container_width=True):
+                try:
+                    r.poll(st.session_state.session_demo_mode)
+                    st.rerun()
+                except ValueError as exc:
+                    st.warning(str(exc))
+            playback[1].caption(
+                "Desktop App에서는 설정한 주기로 자동 수집합니다. "
+                "Public Demo는 외부 연결 없이 다음 Poll을 수동 재생합니다."
+            )
+
+    state_row = st.columns([1, 2, 2])
+    state_row[0].metric("실행 상태", operating_state())
+    state_row[1].caption(
+        "MM/MD: "
+        + (
+            f"{r.outcome.used_mm or '확인 불가'} → "
+            f"{', '.join(r.outcome.controllers) or '없음'}"
+            if r.outcome
+            else "아직 조회하지 않음"
+        )
+    )
+    state_row[2].caption(
+        f"시작 시각: {r.started or '-'} · Poll {r.poll_count}"
+    )
+
+    render_result_console()
+
+
+def result_rows() -> list[dict[str, object]]:
+    return r.rows() if r.outcome else []
+
+
+def render_result_console() -> None:
+    st.markdown("### 세션 조회 결과")
+    st.caption(
+        "수집 실패는 세션 종료로 해석하지 않습니다. 현재 조회가 불완전하면 기존 상태를 유지합니다."
+    )
+
+    rows = result_rows()
+    active = len(r.result.active_sessions) if r.result else len(rows)
+    changed = 0
+    controllers = set()
+    for row in rows:
+        controllers.add(str(row.get("controller_name", "")))
+        state = str(row.get("State", ""))
+        if state not in {"", "OBSERVED"}:
+            changed += 1
+    if r.events:
+        changed += sum(
+            event.get("event_type")
+            in {"FIRST_SEEN", "CONTROLLER_CHANGED", "FLAGS_CHANGED"}
+            for event in r.events[-20:]
+        )
+
+    metrics = st.columns(4)
+    metrics[0].metric("현재 관측 흐름", active)
+    metrics[1].metric("결과표 표시 행", len(rows))
+    metrics[2].metric("신규·변경 흐름", changed)
+    metrics[3].metric(
+        "관측 MD",
+        len({value for value in controllers if value}),
+    )
+
+    if r.outcome and not r.outcome.authoritative:
+        st.warning(
+            "현재 수집은 완전하지 않습니다. 세션 없음/종료로 단정하지 않고 확인 필요 상태로 유지합니다."
+        )
+
+    if not rows:
+        st.info(
+            "조회 결과가 없습니다. 위 조건으로 조회하거나 Sidebar의 ‘샘플 현재 조회’를 사용하세요."
+        )
+        return
+
+    filters = st.columns(4)
+    search = filters[0].text_input("결과 검색", placeholder="IP / Port")
+    protocol = filters[1].selectbox("Protocol", ["All", "TCP", "UDP"])
+    controller = filters[2].selectbox(
+        "Controller",
+        ["All", *(device.name for device in CONFIG.managed_devices)],
+    )
+    lifecycle = filters[3].selectbox(
+        "Lifecycle",
+        ["All", "OBSERVED", "MISSED"],
+    )
+
+    filtered = [
+        row
+        for row in rows
+        if (
+            protocol == "All"
+            or row.get("protocol") == {"TCP": 6, "UDP": 17}.get(protocol)
+        )
+        and (
+            controller == "All"
+            or row.get("controller_name") == controller
+        )
+        and (
+            lifecycle == "All"
+            or row.get("State") == lifecycle
+        )
+        and search.casefold()
+        in " ".join(
+            str(row.get(key, ""))
+            for key in (
+                "source_ip",
+                "source_port",
+                "destination_ip",
+                "destination_port",
+            )
+        ).casefold()
     ]
 
+    display_columns = (
+        "controller_name",
+        "protocol",
+        "source_ip",
+        "source_port",
+        "destination_ip",
+        "destination_port",
+        "packets",
+        "bytes",
+        "age",
+        "cpu_id",
+        "Last Seen",
+        "flags",
+        "State",
+    )
+    table_rows = [
+        {key: row.get(key, "") for key in display_columns}
+        for row in filtered
+    ]
+    st.dataframe(table_rows, hide_index=True, width="stretch")
 
-def render_sessions() -> None:
-    st.subheader("현재 세션")
-    if not r.outcome:
-        st.info("출발지 또는 목적지 IP를 입력하고 `현재 조회`를 실행하세요.")
-        st.caption("빠르게 확인하려면 위의 샘플 세션 조회 1-click을 사용하세요.")
-        with st.expander("사용 가능한 샘플 IP 보기", expanded=False):
-            st.dataframe(inventory(), hide_index=True, width="stretch")
+    if not filtered:
+        st.caption("필터 조건에 맞는 행이 없습니다.")
         return
 
-    o = r.outcome
-    if not o.authoritative:
-        st.warning(
-            "수집 불완전 / Unknown · 세션 없음이나 종료로 판단하지 않습니다. "
-            "기존 추적 상태를 유지합니다."
-        )
-    elif not o.observations:
-        st.info("현재 관측 0개 · 기존 세션은 MISS 횟수와 CLOSED 이벤트를 별도로 확인하세요.")
+    selected = st.selectbox(
+        "선택한 세션",
+        range(len(filtered)),
+        format_func=lambda index: (
+            f"{filtered[index].get('source_ip')}:{filtered[index].get('source_port')} → "
+            f"{filtered[index].get('destination_ip')}:{filtered[index].get('destination_port')} · "
+            f"{filtered[index].get('controller_name')}"
+        ),
+    )
+    row = filtered[selected]
 
-    render_query_path()
-    rows = filtered_rows()
-    st.dataframe(
-        [{k: v for k, v in row.items() if k != "raw_line"} for row in rows],
-        hide_index=True,
-        width="stretch",
+    summary, raw, diagnostics = st.tabs(
+        ["세션 요약", "선택 행 Raw", "진단 이벤트"]
     )
 
-    if rows:
-        selected = st.selectbox(
-            "선택 세션 상세",
-            range(len(rows)),
-            format_func=lambda i: (
-                f"{rows[i]['source_ip']}:{rows[i]['source_port']} → "
-                f"{rows[i]['destination_ip']}:{rows[i]['destination_port']} · "
-                f"{rows[i]['controller_name']}"
+    with summary:
+        st.markdown("#### 선택한 세션")
+        flow = st.columns([2, 1, 2])
+        flow[0].markdown(
+            '<div class="flow-card">'
+            '<div class="flow-label">출발지</div>'
+            f'<div class="flow-value">{row.get("source_ip")}:{row.get("source_port")}</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        flow[1].markdown(
+            '<div class="flow-card">'
+            '<div class="flow-label">Protocol / MD</div>'
+            f'<div class="flow-value">{row.get("protocol")}<br>{row.get("controller_name")}</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        flow[2].markdown(
+            '<div class="flow-card">'
+            '<div class="flow-label">목적지</div>'
+            f'<div class="flow-value">{row.get("destination_ip")}:{row.get("destination_port")}</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        facts = st.columns(6)
+        facts[0].metric("상태", row.get("State", "—"))
+        facts[1].metric("Flags", row.get("flags", "—"))
+        facts[2].metric("Packets", row.get("packets", "—"))
+        facts[3].metric("Bytes", row.get("bytes", "—"))
+        facts[4].metric("Age", row.get("age", "—"))
+        facts[5].metric("CPU", row.get("cpu_id", "—"))
+
+        with st.expander("Flags 해석", expanded=False):
+            st.json(
+                [
+                    asdict(flag)
+                    for flag in interpret_flags(str(row.get("flags", "")))
+                ]
+            )
+
+        if r.events:
+            st.markdown("#### Lifecycle Events")
+            st.dataframe(r.events[-30:], hide_index=True, width="stretch")
+
+    with raw:
+        raw_line = row.get("raw_line")
+        if raw_line:
+            st.code(str(raw_line), language="text")
+        elif r.outcome:
+            for snapshot in r.outcome.raw_snapshots:
+                with st.expander(
+                    f"{snapshot.device_name} · {snapshot.command}",
+                    expanded=False,
+                ):
+                    st.code(snapshot.output, language="text")
+        else:
+            st.caption("원본 출력이 없습니다.")
+
+    with diagnostics:
+        if r.outcome:
+            st.json([asdict(item) for item in r.outcome.diagnostics])
+            st.caption(f"현재 단계: {r.stage}")
+            st.dataframe(r.trace, hide_index=True, width="stretch")
+        else:
+            st.caption("진단 이벤트가 없습니다.")
+
+
+def render_settings_page() -> None:
+    st.subheader("장비 설정")
+
+    with st.container(border=True):
+        st.markdown("**Mobility Conductor (MM)**")
+        rows = [
+            {
+                "구분": "Primary",
+                "표시 이름": CONFIG.mm_primary.name,
+                "IPv4": CONFIG.mm_primary.host,
+                "SSH 포트": CONFIG.mm_primary.port,
+                "사용": True,
+            },
+            {
+                "구분": "Standby",
+                "표시 이름": CONFIG.mm_standby.name,
+                "IPv4": CONFIG.mm_standby.host,
+                "SSH 포트": CONFIG.mm_standby.port,
+                "사용": True,
+            },
+        ]
+        st.dataframe(rows, hide_index=True, width="stretch")
+
+    with st.container(border=True):
+        st.markdown("**Managed Device (MD, 7240XM)**")
+        st.dataframe(
+            [
+                {
+                    "사용": True,
+                    "표시 이름": device.name,
+                    "IPv4": device.host,
+                    "SSH 포트": device.port,
+                }
+                for device in CONFIG.managed_devices
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+
+    with st.container(border=True):
+        st.markdown("**모니터링 판정 기준**")
+        cols = st.columns(3)
+        cols[0].metric("세션 조회 주기", f"{CONFIG.session_interval_seconds}s")
+        cols[1].metric(
+            "위치 갱신 주기",
+            f"{CONFIG.location_interval_seconds}s",
+        )
+        cols[2].metric(
+            "종료 확정 MISS",
+            CONFIG.close_after_misses,
+        )
+
+    st.button("장비 설정 저장", disabled=True)
+    st.caption(
+        "Public Web Edition에서는 Demo 장비 설정을 변경하거나 자격 증명을 저장하지 않습니다. "
+        "실제 Desktop App에서는 설정과 로컬 저장 경계를 사용합니다."
+    )
+
+
+def render_history_page() -> None:
+    st.subheader("기록 및 내보내기")
+
+    actions = st.columns(5)
+    actions[0].button("새로고침", disabled=True, use_container_width=True)
+
+    if r.outcome:
+        actions[1].download_button(
+            "CSV 내보내기",
+            r.csv(),
+            "session-history.csv",
+            "text/csv",
+            use_container_width=True,
+        )
+        actions[2].download_button(
+            "HTML 보고서",
+            r.html(),
+            "session-report.html",
+            "text/html",
+            use_container_width=True,
+        )
+    else:
+        actions[1].button("CSV 내보내기", disabled=True, use_container_width=True)
+        actions[2].button("HTML 보고서", disabled=True, use_container_width=True)
+
+    selected_index = None
+    if r.history:
+        selected_index = st.selectbox(
+            "기록 선택",
+            range(len(r.history)),
+            format_func=lambda index: (
+                f"{r.history[index].get('Started', '')} · "
+                f"{r.history[index].get('Status', '')}"
             ),
         )
-        row = rows[selected]
-        st.subheader("선택한 세션")
-        a, b, c = st.columns(3)
-        a.markdown(
-            f'<div class="path-card"><div class="path-title">SOURCE</div>'
-            f'<div class="path-value">{row["source_ip"]}:{row["source_port"]}</div></div>',
-            unsafe_allow_html=True,
-        )
-        b.markdown(
-            f'<div class="path-card"><div class="path-title">CONTROLLER / PROTOCOL</div>'
-            f'<div class="path-value">{row["controller_name"]} · {row["protocol"]}</div></div>',
-            unsafe_allow_html=True,
-        )
-        c.markdown(
-            f'<div class="path-card"><div class="path-title">DESTINATION</div>'
-            f'<div class="path-value">{row["destination_ip"]}:'
-            f"{row['destination_port']}</div></div>",
-            unsafe_allow_html=True,
-        )
-        with st.expander("세션 상세 / Flags", expanded=False):
-            st.json(row)
-            st.json([asdict(flag) for flag in interpret_flags(row["flags"])])
 
-    if r.events:
-        st.subheader("Lifecycle Events")
-        st.dataframe(r.events, hide_index=True, width="stretch")
+    if actions[3].button(
+        "선택 삭제",
+        disabled=selected_index is None,
+        use_container_width=True,
+    ):
+        if selected_index is not None:
+            del r.history[selected_index]
+            st.rerun()
 
+    if actions[4].button(
+        "전체 기록 삭제",
+        disabled=not r.history,
+        use_container_width=True,
+    ):
+        r.history.clear()
+        st.rerun()
 
-def render_diagnostics() -> None:
-    st.subheader("Diagnostics / Evidence")
-    if not r.outcome:
-        st.info("조회 후 실제 production parser로 처리한 경로와 Raw CLI가 표시됩니다.")
-        return
-    st.caption(f"Stage: {r.stage}")
-    st.dataframe(r.trace, hide_index=True, width="stretch")
-    st.dataframe(r.factory.trace, hide_index=True, width="stretch")
-    with st.expander("진단 이벤트", expanded=False):
-        st.json([asdict(d) for d in r.outcome.diagnostics])
-    with st.expander("Raw CLI", expanded=False):
-        for n, raw in enumerate(r.outcome.raw_snapshots):
-            st.markdown(f"**{n + 1}. {raw.device_name} · {raw.command}**")
-            st.code(raw.output, language="text")
-
-
-def render_history() -> None:
-    st.subheader("이력 / Export")
-    if not r.history:
-        st.info("조회 이력이 아직 없습니다.")
-        return
-    st.dataframe(r.history, hide_index=True, width="stretch")
-    st.caption("최근 20회 Run 요약. Export는 마지막 Run의 전체 관측이며 표 필터와 독립적입니다.")
-    if r.outcome:
-        st.download_button("CSV Export", r.csv(), "session-v2.csv", "text/csv")
-        st.download_button("HTML Report", r.html(), "session-v2.html", "text/html")
+    st.caption(
+        "내보내기 · 현재 Public Demo 세션 안의 비식별 관측만 포함합니다."
+    )
+    if r.history:
+        st.dataframe(r.history, hide_index=True, width="stretch")
+    else:
+        st.info("저장된 Demo 실행 기록이 없습니다.")
 
 
 render_header()
-render_explainer()
 render_sidebar()
-with st.expander("직접 조회 / 모니터링", expanded=False):
-    render_query_bar()
-render_metrics()
-render_plain_summary()
 
-sessions, diagnostics, history = st.tabs(["세션 Console", "Advanced Diagnostics", "이력 / Export"])
-with sessions:
-    render_sessions()
-with diagnostics:
-    render_diagnostics()
-with history:
-    render_history()
+query_page, settings_page, history_page = st.tabs(
+    ["세션 조회", "장비 설정", "기록 및 내보내기"]
+)
+with query_page:
+    render_query_page()
+with settings_page:
+    render_settings_page()
+with history_page:
+    render_history_page()
 
-with st.expander("Architecture", expanded=False):
-    st.write(
-        "QueryRequest → TrackerService → SSHCollector allowlist → "
-        "FixtureFactory → production Parser → QueryOutcome → MonitorEngine"
-    )
-    st.caption(
-        "Public Demo는 등록된 문서용 Demo 장비의 필터형 명령만 처리하며 "
-        "SQLite, known_hosts, 자격 증명 입력이나 실제 네트워크 연결을 사용하지 않습니다."
-    )
+st.caption(
+    "Public Web Edition · QueryRequest / TrackerService / production Parser / "
+    "MonitorEngine 재사용 · 실제 SSH/known_hosts/자격 증명 입력 없음"
+)
 st.link_button(
     "GitHub Source",
     "https://github.com/sebia1993/aruba-session-tracker-1",
