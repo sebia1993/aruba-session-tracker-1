@@ -2,7 +2,9 @@
 
 **[Live Demo · 브라우저에서 실행](https://sebia1993-session-tracker-demo.streamlit.app/)** · [실행·검증 안내](portfolio_demo/README.md) · [GitHub Source](https://github.com/sebia1993/aruba-session-tracker-1)
 
-장비 없이 합성 시나리오를 선택하고 기존 Python 분석 결과와 Raw 근거를 확인할 수 있습니다.
+> **30초 요약:** “Wi-Fi는 연결됐는데 특정 서버 통신이 안 된다”는 상황에서 단말 IP를 입력하면 **단말 위치 확인 → 담당 Controller 식별 → datapath 통신 세션 조회**를 자동으로 이어주는 장애 분석 도구입니다.
+
+Live Demo에서는 **샘플 세션 조회 1-click**으로 이 흐름을 즉시 볼 수 있습니다. 공개 환경에서는 실제 SSH 대신 비식별 합성 Transport를 사용하지만 TrackerService, Parser와 세션 상태 로직은 production 코드를 재사용합니다.
 
 Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 읽기 전용으로 조회해 특정 IPv4 흐름의 datapath 세션을 찾고 변화 이력을
