@@ -673,14 +673,16 @@ def render_history_page() -> None:
             ),
         )
 
-    if actions[3].button(
-        "선택 삭제",
-        disabled=selected_index is None,
-        use_container_width=True,
+    if (
+        actions[3].button(
+            "선택 삭제",
+            disabled=selected_index is None,
+            use_container_width=True,
+        )
+        and selected_index is not None
     ):
-        if selected_index is not None:
-            del r.history[selected_index]
-            st.rerun()
+        del r.history[selected_index]
+        st.rerun()
 
     if actions[4].button(
         "전체 기록 삭제",
