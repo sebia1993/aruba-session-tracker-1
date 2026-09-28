@@ -21,11 +21,17 @@ st.markdown(
     """
     <style>
     .block-container {padding-top: 1.5rem; padding-bottom: 3rem; max-width: 1500px;}
-    .product-kicker {font-size:.78rem; letter-spacing:.08em; font-weight:800; color:#7da7ff; margin-bottom:.25rem;}
+    .product-kicker {
+        font-size:.78rem; letter-spacing:.08em; font-weight:800;
+        color:#7da7ff; margin-bottom:.25rem;
+    }
     .product-title {font-size:2.15rem; line-height:1.1; font-weight:800; margin:0;}
     .product-sub {color:#8a98aa; margin-top:.45rem; margin-bottom:1rem;}
-    .demo-badge {display:inline-block; border:1px solid #31445f; border-radius:999px; padding:.22rem .62rem;
-                 font-size:.72rem; font-weight:750; color:#afc8ee; background:#101927; margin-right:.35rem;}
+    .demo-badge {
+        display:inline-block; border:1px solid #31445f; border-radius:999px;
+        padding:.22rem .62rem; font-size:.72rem; font-weight:750;
+        color:#afc8ee; background:#101927; margin-right:.35rem;
+    }
     .path-card {border:1px solid rgba(120,145,175,.25); border-radius:12px; padding:.75rem .9rem;
                 background:rgba(18,27,41,.55); min-height:78px;}
     .path-title {font-size:.74rem; color:#8da2bb; font-weight:700; margin-bottom:.2rem;}
@@ -41,10 +47,17 @@ r = st.session_state.runtime
 
 
 def render_header() -> None:
-    st.markdown('<div class="product-kicker">ARUBA SESSION OPERATIONS</div>', unsafe_allow_html=True)
-    st.markdown('<div class="product-title">Session Tracker</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="product-sub">단말 위치를 MM에서 확인하고 관련 MD의 datapath session을 추적·기록합니다.</div>',
+        '<div class="product-kicker">ARUBA SESSION OPERATIONS</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="product-title">Session Tracker</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="product-sub">단말 위치를 MM에서 확인하고 관련 MD의 datapath session을 '
+        '추적·기록합니다.</div>',
         unsafe_allow_html=True,
     )
     st.markdown(
@@ -115,7 +128,7 @@ def render_query_bar() -> tuple[bool, bool, str]:
     stop = c[3].button("중지", disabled=not r.running, use_container_width=True)
     c[4].caption(
         "지속 모니터링은 백그라운드 연결을 만들지 않습니다. "
-        "‘다음 Poll’로 가상 시간을 진행해 lifecycle 변화를 재현합니다."
+        "`다음 Poll`로 가상 시간을 진행해 lifecycle 변화를 재현합니다."
     )
     if stop:
         r.stop()
@@ -182,8 +195,18 @@ def render_query_path() -> None:
     o = r.outcome
     src = asdict(o.source_location) if o.source_location else {}
     dst = asdict(o.destination_location) if o.destination_location else {}
-    src_value = src.get("controller_name") or src.get("controller") or src.get("switch") or "확인 불가"
-    dst_value = dst.get("controller_name") or dst.get("controller") or dst.get("switch") or "선택 없음"
+    src_value = (
+        src.get("controller_name")
+        or src.get("controller")
+        or src.get("switch")
+        or "확인 불가"
+    )
+    dst_value = (
+        dst.get("controller_name")
+        or dst.get("controller")
+        or dst.get("switch")
+        or "선택 없음"
+    )
     md_value = ", ".join(o.controllers) or "없음"
 
     a, b, c = st.columns(3)
@@ -230,7 +253,7 @@ def filtered_rows():
 def render_sessions() -> None:
     st.subheader("현재 세션")
     if not r.outcome:
-        st.info("출발지 또는 목적지 IP를 입력하고 ‘현재 조회’를 실행하세요.")
+        st.info("출발지 또는 목적지 IP를 입력하고 `현재 조회`를 실행하세요.")
         st.caption("Demo 예시: 198.51.100.10")
         st.dataframe(inventory(), hide_index=True, width="stretch")
         return
@@ -277,7 +300,8 @@ def render_sessions() -> None:
         )
         c.markdown(
             f'<div class="path-card"><div class="path-title">DESTINATION</div>'
-            f'<div class="path-value">{row["destination_ip"]}:{row["destination_port"]}</div></div>',
+            f'<div class="path-value">{row["destination_ip"]}:'
+            f'{row["destination_port"]}</div></div>',
             unsafe_allow_html=True,
         )
         with st.expander("세션 상세 / Flags", expanded=False):
