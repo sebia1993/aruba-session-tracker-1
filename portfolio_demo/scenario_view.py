@@ -17,14 +17,10 @@ def _evidence_text(evidence):
 
 
 def _step_card(poll, step):
-    icon = {"running": "●", "success": "✓", "warning": "⚠", "failure": "✕"}.get(
-        step.status, "•"
-    )
+    icon = {"running": "●", "success": "✓", "warning": "⚠", "failure": "✕"}.get(step.status, "•")
     timing = "" if step.elapsed_ms is None else f" · {step.elapsed_ms:.1f} ms"
     evidence = _evidence_text(step.evidence)
-    evidence_html = (
-        f'<p class="guide-evidence">{escape(evidence)}</p>' if evidence else ""
-    )
+    evidence_html = f'<p class="guide-evidence">{escape(evidence)}</p>' if evidence else ""
     detail = escape(step.detail or "실제 Runtime 단계 처리")
     return (
         f'<article data-guide-step data-status="{escape(step.status)}" '
@@ -49,17 +45,9 @@ def render_timeline(runner, slot):
     # During a live poll, expose the current real ExecutionTrace before the
     # immutable snapshot is appended. Completed runs replay the retained copies.
     if not run.completed and not run.error and len(run.snapshots) < run.current_poll:
-        cards.extend(
-            _step_card(run.current_poll, step) for step in runner.runtime.execution.steps
-        )
+        cards.extend(_step_card(run.current_poll, step) for step in runner.runtime.execution.steps)
 
-    state = (
-        "시나리오 완료"
-        if run.completed
-        else "실행 중단"
-        if run.error
-        else "시나리오 실행 중"
-    )
+    state = "시나리오 완료" if run.completed else "실행 중단" if run.error else "시나리오 실행 중"
     if run.snapshots:
         last = run.snapshots[-1]
         observed = "확인 불가" if last.observed is None else str(last.observed)
@@ -76,7 +64,7 @@ def render_timeline(runner, slot):
         )
     else:
         final_summary = (
-            '<div data-final-summary><p>첫 실제 관측 결과를 준비하고 있습니다.</p></div>'
+            "<div data-final-summary><p>첫 실제 관측 결과를 준비하고 있습니다.</p></div>"
         )
 
     slot.markdown(
