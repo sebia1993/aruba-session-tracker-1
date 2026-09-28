@@ -36,6 +36,13 @@ st.markdown(
                 background:rgba(18,27,41,.55); min-height:78px;}
     .path-title {font-size:.74rem; color:#8da2bb; font-weight:700; margin-bottom:.2rem;}
     .path-value {font-size:.98rem; font-weight:760;}
+    .explain-card {
+        border:1px solid rgba(120,145,175,.24); border-radius:12px;
+        padding:.85rem 1rem; background:rgba(18,27,41,.5); min-height:118px;
+    }
+    .explain-label {font-size:.72rem; color:#7da7ff; font-weight:800; letter-spacing:.04em;}
+    .explain-title {font-size:1rem; font-weight:780; margin:.2rem 0 .35rem;}
+    .explain-copy {font-size:.86rem; color:#91a0b3; line-height:1.45;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -48,16 +55,16 @@ r = st.session_state.runtime
 
 def render_header() -> None:
     st.markdown(
-        '<div class="product-kicker">ARUBA SESSION OPERATIONS</div>',
+        '<div class="product-kicker">ARUBA DATAPATH SESSION TRACKER</div>',
         unsafe_allow_html=True,
     )
     st.markdown(
-        '<div class="product-title">Session Tracker</div>',
+        '<div class="product-title">무선 단말 통신 세션 추적기</div>',
         unsafe_allow_html=True,
     )
     st.markdown(
-        '<div class="product-sub">단말 위치를 MM에서 확인하고 관련 MD의 datapath session을 '
-        "추적·기록합니다.</div>",
+        '<div class="product-sub">단말 IP 하나로 어느 무선 Controller에 연결됐는지 찾고, '
+        "그 장비에서 실제 datapath 통신 세션을 조회·추적합니다.</div>",
         unsafe_allow_html=True,
     )
     st.markdown(
@@ -66,6 +73,98 @@ def render_header() -> None:
         '<span class="demo-badge">READ ONLY</span>',
         unsafe_allow_html=True,
     )
+
+
+def render_explainer() -> None:
+    st.markdown("### 이 도구는 무엇을 해결하나요?")
+    cols = st.columns(3)
+    cards = (
+        (
+            "현업 문제",
+            "Wi-Fi 연결 이후가 안 보임",
+            "단말은 무선에 연결됐지만 특정 서버 통신이 안 될 때, 먼저 어느 Controller에 "
+            "붙어 있는지 찾고 다시 세션을 조회해야 합니다.",
+        ),
+        (
+            "자동화 방식",
+            "단말 IP → MM → MD → Session",
+            "입력한 IP의 위치를 상위 관리 계층에서 찾고, 실제 트래픽을 처리하는 Controller에 "
+            "필터형 datapath 조회를 자동으로 보냅니다.",
+        ),
+        (
+            "운영 결과",
+            "통신 흐름과 변화 이력",
+            "현재 세션뿐 아니라 Controller 이동, MISS, 재관측과 종료 이벤트를 구분해 "
+            "장애 분석 근거로 남깁니다.",
+        ),
+    )
+    for col, (label, title, copy) in zip(cols, cards, strict=True):
+        col.markdown(
+            '<div class="explain-card">'
+            f'<div class="explain-label">{label}</div>'
+            f'<div class="explain-title">{title}</div>'
+            f'<div class="explain-copy">{copy}</div>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    st.info(
+        "예시 VOC: Wi-Fi는 연결됐는데 특정 서버 접속이 안 됩니다. "
+        "단말 IP만 입력하면 위치 확인 → 담당 Controller 식별 → "
+        "해당 IP의 통신 세션 조회까지 이어집니다."
+    )
+    c = st.columns([1.45, 3.55])
+    if c[0].button(
+        "▶ 샘플 세션 조회 1-click",
+        type="primary",
+        use_container_width=True,
+    ):
+        demo = DemoRuntime()
+        demo.start(QueryRequest("198.51.100.10", ""), monitor=False, mode="normal")
+        st.session_state.runtime = demo
+        st.rerun()
+    c[1].caption(
+        "한 번 클릭하면 문서용 샘플 단말의 위치와 통신 세션을 바로 조회합니다. "
+        "실제 SSH나 계정은 사용하지 않습니다."
+    )
+
+    with st.expander("MM / MD가 무엇인가요?", expanded=False):
+        st.write(
+            "**MM (Mobility Conductor / Master)**: 단말이 어느 Controller에 있는지 "
+            "확인하는 상위 관리 계층"
+        )
+        st.write(
+            "**MD (Managed Device / Controller)**: 무선 단말 트래픽을 실제로 처리하며 "
+            "datapath session을 조회하는 장비"
+        )
+        st.write(
+            "**datapath session**: 단말 IP·포트·프로토콜 기준으로 Controller에서 "
+            "관측되는 실제 통신 흐름"
+        )
+
+
+def render_plain_summary() -> None:
+    if not r.outcome:
+        return
+    o = r.outcome
+    if not o.authoritative:
+        st.warning(
+            "결론: 이번 수집은 완전하지 않습니다. 세션이 없거나 종료됐다고 단정하지 않고 "
+            "확인 필요 상태로 유지합니다."
+        )
+        return
+
+    count = len(r.result.active_sessions) if r.result else len(o.observations)
+    controllers = ", ".join(o.controllers) or "확인된 Controller 없음"
+    if count:
+        st.success(
+            f"결론: 입력한 단말의 통신 흐름이 {controllers}에서 확인됐고 "
+            f"현재 {count}개의 세션을 관측했습니다."
+        )
+    else:
+        st.info(
+            f"결론: 단말 위치 조회는 완료됐지만 {controllers}에서 현재 조건에 맞는 세션은 "
+            "관측되지 않았습니다."
+        )
 
 
 def render_sidebar() -> None:
@@ -247,8 +346,9 @@ def render_sessions() -> None:
     st.subheader("현재 세션")
     if not r.outcome:
         st.info("출발지 또는 목적지 IP를 입력하고 `현재 조회`를 실행하세요.")
-        st.caption("Demo 예시: 198.51.100.10")
-        st.dataframe(inventory(), hide_index=True, width="stretch")
+        st.caption("빠르게 확인하려면 위의 샘플 세션 조회 1-click을 사용하세요.")
+        with st.expander("사용 가능한 샘플 IP 보기", expanded=False):
+            st.dataframe(inventory(), hide_index=True, width="stretch")
         return
 
     o = r.outcome
@@ -335,9 +435,12 @@ def render_history() -> None:
 
 
 render_header()
+render_explainer()
 render_sidebar()
-render_query_bar()
+with st.expander("직접 조회 / 모니터링", expanded=False):
+    render_query_bar()
 render_metrics()
+render_plain_summary()
 
 sessions, diagnostics, history = st.tabs(["세션 Console", "Advanced Diagnostics", "이력 / Export"])
 with sessions:
