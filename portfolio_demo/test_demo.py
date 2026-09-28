@@ -312,9 +312,7 @@ class ScenarioTests(unittest.TestCase):
         self.assertEqual(metrics["결과표 표시 행"], str(len(runtime.rows())))
         self.assertTrue(
             any(
-                "data-topology" in m.value
-                and "DEMO-MD-03" in m.value
-                and "203.0.113." in m.value
+                "data-topology" in m.value and "DEMO-MD-03" in m.value and "203.0.113." in m.value
                 for m in app.markdown
             )
         )
