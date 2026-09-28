@@ -5,8 +5,8 @@ recorded ExecutionTrace in the Streamlit DOM so reviewers can see the sequence.
 No JavaScript is required.
 """
 
-import html
 from uuid import uuid4
+import html
 
 import streamlit as st
 
