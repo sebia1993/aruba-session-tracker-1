@@ -41,7 +41,7 @@ class GuidedSlot:
         }[phase]
         with self.slot.container():
             assets = Path(__file__).parent
-            template = (assets / "guided_flow.html").read_text(encoding="utf-8")
+            template = (assets / "guided_flow.html.template").read_text(encoding="utf-8")
             for key, value in {"RUN_ID": run_id, "PHASE": phase, "TITLE": title}.items():
                 template = template.replace(f"__{key}__", value)
             # Insert the already escaped timeline last; never interpolate it as code.
