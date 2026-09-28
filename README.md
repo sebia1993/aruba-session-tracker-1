@@ -6,6 +6,9 @@
 
 Live Demo에서는 **샘플 세션 조회 1-click**으로 이 흐름을 즉시 볼 수 있습니다. 공개 환경에서는 실제 SSH 대신 비식별 합성 Transport를 사용하지만 TrackerService, Parser와 세션 상태 로직은 production 코드를 재사용합니다.
 
+> **Public Web Edition:** 실제 Qt `Aruba Session Tracker`의 `세션 조회 / 장비 설정 / 기록 및 내보내기` 탭, MM/MD 상태 Chip, 조회 조건, 결과표, 선택 세션 상세, Raw/진단, History/Export 흐름을 브라우저로 옮겼습니다. 공개 URL에서는 실제 SSH 대신 비식별 합성 Transport만 사용하며 TrackerService·Parser·MonitorEngine은 production 코드를 재사용합니다.
+
+
 Windows 11에서 Aruba AOS 8 Mobility Conductor와 7240XM Managed Device(MD)를
 읽기 전용으로 조회해 특정 IPv4 흐름의 datapath 세션을 찾고 변화 이력을
 로컬에 기록하는 한국어 데스크톱 프로그램입니다.
