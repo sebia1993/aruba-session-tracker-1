@@ -82,51 +82,120 @@ def render_timeline(runner, slot):
 def render_communication(runtime, st):
     if not runtime.outcome:
         return
+
     outcome = runtime.outcome
     controllers = list(
         dict.fromkeys(entry["Device"] for entry in runtime.trace if entry["Stage"] == "MD_QUERY")
     ) or list(outcome.controllers)
+
     if not outcome.authoritative:
-        st.warning(
-            "Session 조회가 완료되지 않았습니다. 기존 관측은 "
-            "유지하며 세션 종료로 판단하지 않습니다."
-        )
         observations = (
-            [s.observation for s in runtime.result.active_sessions] if runtime.result else []
+            [session.observation for session in runtime.result.active_sessions]
+            if runtime.result
+            else []
         )
-        label = "이전 관측 · 현재 통신 여부 확인 불가"
+        status_text = "UNKNOWN · 수집 확인 필요"
+        status_class = "topology-state warn"
+        headline = (
+            "Session 조회가 완료되지 않았습니다. 이전 관측은 유지하고 "
+            "통신 종료로 판단하지 않습니다."
+        )
     else:
         observations = outcome.observations
-        label = "이번 Poll에서 실제 관측한 통신"
-        if observations:
-            st.success(
-                f"입력한 단말은 {', '.join(outcome.controllers)}에서 확인되었고, "
-                f"현재 {len(observations)}개의 통신 세션 관측 행이 확인되었습니다."
-            )
-        else:
-            st.info("단말 위치는 확인됐지만 현재 조건에 맞는 세션은 관측되지 않았습니다.")
-    rows = communication_rows(observations)
-    items = (
-        "".join(
-            '<li style="margin:.55rem 0;overflow-wrap:anywhere">'
-            f"<b>{escape(row['protocol'])}</b> · {escape(row['source'])} → "
-            f"{escape(row['destination'])} <span>({escape(row['controller'])})</span></li>"
-            for row in rows
+        status_text = "OBSERVED · 현재 관측"
+        status_class = "topology-state"
+        headline = (
+            f"{len(observations)}개의 실제 통신 세션 관측 행을 확인했습니다."
+            if observations
+            else "단말 위치는 확인됐지만 현재 조건에 맞는 세션은 관측되지 않았습니다."
         )
-        or "<li>표시할 현재 통신 관측 없음</li>"
+
+    client_ips = tuple(runtime.request.client_ips)
+    client_ip = " / ".join(client_ips) or "확인 불가"
+    used_mm = outcome.used_mm or "확인 불가"
+    md_text = ", ".join(controllers) or "확인 불가"
+
+    peer_cards = []
+    for index, item in enumerate(observations, 1):
+        protocol = {6: "TCP", 17: "UDP"}.get(item.protocol, str(item.protocol))
+        if item.source_ip in client_ips:
+            direction = "OUTBOUND"
+            peer_ip = item.destination_ip
+            peer_port = item.destination_port
+        elif item.destination_ip in client_ips:
+            direction = "INBOUND"
+            peer_ip = item.source_ip
+            peer_port = item.source_port
+        else:
+            direction = "OBSERVED"
+            peer_ip = item.destination_ip
+            peer_port = item.destination_port
+
+        packets = getattr(item, "packets", None)
+        bytes_count = getattr(item, "bytes_count", None)
+        age = getattr(item, "age", None)
+        meta = [
+            direction,
+            item.controller_name,
+            f"Packets {packets}" if packets is not None else "",
+            f"Bytes {bytes_count}" if bytes_count is not None else "",
+            f"Age {age}" if age not in (None, "") else "",
+        ]
+        meta_text = " · ".join(part for part in meta if part)
+
+        peer_cards.append(
+            '<article class="peer-card">'
+            f'<span class="proto">{escape(protocol)} · {escape(str(peer_port))}</span>'
+            f'<div class="peer">{escape(str(peer_ip))}:{escape(str(peer_port))}</div>'
+            f'<div class="meta">FLOW {index:02d} · {escape(meta_text)}</div>'
+            "</article>"
+        )
+
+    peer_html = "".join(peer_cards) or (
+        '<article class="peer-card">'
+        '<span class="proto">NO ACTIVE FLOW</span>'
+        '<div class="peer">현재 표시할 통신 관측 없음</div>'
+        '<div class="meta">위치 확인 결과와 수집 상태를 먼저 확인하세요.</div>'
+        "</article>"
     )
-    ips = " / ".join(runtime.request.client_ips)
+
     st.markdown(
-        '<section aria-label="Communication Flow" style="border:1px solid #8885;'
-        'border-radius:12px;padding:1rem;overflow-wrap:anywhere">'
-        "<h3>단말 위치와 통신 흐름</h3>"
-        f"<p><b>{escape(ips)}</b> → 위치 조회: <b>{escape(outcome.used_mm or '확인 불가')}</b>"
-        f" → 담당 Controller 조회: <b>{escape(', '.join(controllers) or '확인 불가')}</b></p>"
-        "<p>MM에서 단말의 위치를 찾고, 해당 MD의 통신 세션을 "
-        "읽습니다. 위 화살표는 조회 순서입니다.</p>"
-        f"<h4>{label}</h4><ul>{items}</ul>"
-        '<p style="font-size:.8rem">각 행은 실제 관측 방향과 포트입니다. '
-        "반대 방향 응답도 별도 관측 행이며, 포트 번호만으로 애플리케이션을 "
-        "확정하지 않습니다.</p></section>",
+        '<section class="topology-shell" data-topology aria-label="WLAN 조사 토폴로지">'
+        '<div class="topology-head">'
+        "<div>"
+        '<div class="topology-kicker">LIVE INVESTIGATION TOPOLOGY</div>'
+        '<div class="topology-title">Client → MM → Controller → Communication Peer</div>'
+        "</div>"
+        f'<span class="{status_class}">{escape(status_text)}</span>'
+        "</div>"
+        '<div class="topology-path">'
+        '<article class="topology-node client">'
+        '<div class="topology-node-kind">TARGET · WIRELESS CLIENT</div>'
+        f'<div class="topology-node-value">{escape(client_ip)}</div>'
+        '<div class="topology-node-meta">조사의 시작점 · 입력 IP</div>'
+        "</article>"
+        '<div class="topology-link">→<small>LOCATION<br>LOOKUP</small></div>'
+        '<article class="topology-node mm">'
+        '<div class="topology-node-kind">MOBILITY CONDUCTOR</div>'
+        f'<div class="topology-node-value">{escape(used_mm)}</div>'
+        '<div class="topology-node-meta">단말이 연결된 Controller 위치 확인</div>'
+        "</article>"
+        '<div class="topology-link">→<small>FILTERED<br>QUERY</small></div>'
+        '<article class="topology-node md">'
+        '<div class="topology-node-kind">MANAGED DEVICE · CONTROLLER</div>'
+        f'<div class="topology-node-value">{escape(md_text)}</div>'
+        '<div class="topology-node-meta">해당 단말의 datapath session 조회</div>'
+        "</article>"
+        "</div>"
+        '<div class="peer-section">'
+        '<div class="topology-kicker">OBSERVED COMMUNICATION PEERS</div>'
+        f'<div class="topology-node-meta">{escape(headline)}</div>'
+        f'<div class="peer-grid">{peer_html}</div>'
+        "</div>"
+        '<div class="topology-foot">'
+        "표시 값은 실제 DemoRuntime의 관측 결과입니다. Public Demo는 비식별 합성 Transport를 "
+        "사용하지만 QueryRequest · TrackerService · production Parser · MonitorEngine 경로를 재사용합니다."
+        "</div>"
+        "</section>",
         unsafe_allow_html=True,
     )
