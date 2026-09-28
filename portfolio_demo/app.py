@@ -109,7 +109,7 @@ def render_explainer() -> None:
             unsafe_allow_html=True,
         )
     st.info(
-        "예시 VOC: “Wi-Fi는 연결됐는데 특정 서버 접속이 안 됩니다.” "
+        "예시 VOC: Wi-Fi는 연결됐는데 특정 서버 접속이 안 됩니다. "
         "단말 IP만 입력하면 위치 확인 → 담당 Controller 식별 → 해당 IP의 통신 세션 조회까지 이어집니다."
     )
     c = st.columns([1.45, 3.55])
@@ -343,7 +343,7 @@ def render_sessions() -> None:
     st.subheader("현재 세션")
     if not r.outcome:
         st.info("출발지 또는 목적지 IP를 입력하고 `현재 조회`를 실행하세요.")
-        st.caption("빠르게 확인하려면 위의 ‘샘플 세션 조회 1-click’을 사용하세요.")
+        st.caption("빠르게 확인하려면 위의 샘플 세션 조회 1-click을 사용하세요.")
         with st.expander("사용 가능한 샘플 IP 보기", expanded=False):
             st.dataframe(inventory(), hide_index=True, width="stretch")
         return
