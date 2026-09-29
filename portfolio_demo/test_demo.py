@@ -365,6 +365,7 @@ class GuidedFlowTests(unittest.TestCase):
             any(
                 "ENTERPRISE WLAN · SESSION INVESTIGATION" in item.value
                 and "READ ONLY" in item.value
+                and "UI BUILD · MOBILE FIX" in item.value
                 for item in app.markdown
             )
         )
@@ -395,6 +396,7 @@ class GuidedFlowTests(unittest.TestCase):
         self.assertIn("data-guide-step", html)
         self.assertIn("nativeStepReveal", html)
         self.assertIn("color:#eaf2f8", html)
+        self.assertIn("-webkit-text-fill-color:#eaf2f8", html)
         self.assertNotIn("__ELAPSED__", html)
         self.assertGreaterEqual(html.count("data-guide-step"), 5)
         app.run()
