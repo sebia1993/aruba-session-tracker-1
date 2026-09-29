@@ -1,0 +1,1 @@
+/* Compatibility shim only. The current Guided Flow is Streamlit-native and requires no JavaScript. */
