@@ -1,0 +1,77 @@
+<section id="guided-flow" data-run="__RUN_ID__" data-phase="__PHASE__" aria-label="실행 과정">
+<style>
+#guided-flow{
+  color:#eef6ff!important;
+  -webkit-text-fill-color:#eef6ff!important;
+  background:#142335!important;
+  border:1px solid #41617d!important;
+  border-radius:16px!important;
+  padding:16px!important;
+  margin:10px 0 16px!important;
+}
+#guided-flow,#guided-flow *{box-sizing:border-box;color-scheme:dark}
+#guided-flow h3,#guided-flow h4,#guided-flow p,#guided-flow b,#guided-flow span{
+  color:inherit!important;
+  -webkit-text-fill-color:inherit!important;
+}
+#guided-flow .compat-kicker{
+  color:#83b9e6!important;
+  -webkit-text-fill-color:#83b9e6!important;
+  font-size:11px;font-weight:900;letter-spacing:.14em;margin-bottom:6px;
+}
+#guided-flow .compat-title{
+  color:#fff!important;
+  -webkit-text-fill-color:#fff!important;
+  font-size:18px;font-weight:900;margin-bottom:10px;
+}
+#guided-flow .compat-state{
+  display:inline-block;
+  border:1px solid #5ca8df;
+  border-radius:999px;
+  padding:6px 11px;
+  color:#d9efff!important;
+  -webkit-text-fill-color:#d9efff!important;
+  background:#244b6a;
+  font-weight:900;
+  margin-bottom:8px;
+}
+#guided-flow .compat-runtime{
+  color:#c3d1de!important;
+  -webkit-text-fill-color:#c3d1de!important;
+  font-size:13px;
+  margin:2px 0 12px;
+}
+#guided-flow article[data-guide-step]{
+  border:1px solid #3d5870!important;
+  border-radius:11px!important;
+  background:#192c3f!important;
+  padding:13px!important;
+  margin:8px 0!important;
+}
+#guided-flow article[data-guide-step] h4{
+  color:#fff!important;
+  -webkit-text-fill-color:#fff!important;
+}
+#guided-flow article[data-guide-step] p{
+  color:#c7d5e2!important;
+  -webkit-text-fill-color:#c7d5e2!important;
+}
+#guided-flow .guide-evidence{
+  color:#93bddf!important;
+  -webkit-text-fill-color:#93bddf!important;
+}
+#guided-flow [data-final-summary]{
+  border:1px solid #45627b!important;
+  border-radius:11px!important;
+  background:#172a3b!important;
+  color:#e7f1f9!important;
+  -webkit-text-fill-color:#e7f1f9!important;
+  padding:13px!important;
+}
+</style>
+<div class="compat-kicker">INVESTIGATION EXECUTION · COMPATIBILITY MODE</div>
+<div class="compat-title">__TITLE__</div>
+<div class="compat-state">✓ 실제 분석 결과</div>
+<div class="compat-runtime">실제 Runtime 처리 · <b>__ELAPSED__</b></div>
+__BODY__
+</section>
