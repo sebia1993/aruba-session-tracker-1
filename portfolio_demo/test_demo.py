@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from html import escape
 from pathlib import Path
 from unittest.mock import patch
@@ -17,6 +18,44 @@ from portfolio_demo.scenario_runner import ScenarioRunner, communication_rows
 
 
 class DemoTests(unittest.TestCase):
+    def test_report_timestamps_survive_history_deletion_and_repeated_export(self):
+        first = datetime(2026, 10, 4, 14, 0, tzinfo=UTC)
+        for deletion in ("clear", "sole"):
+            with self.subTest(deletion=deletion), patch("portfolio_demo.runtime.datetime") as clock:
+                clock.now.return_value = first
+                runtime = DemoRuntime()
+                runtime.start(QueryRequest("198.51.100.10", ""), monitor=True, mode="normal")
+                runtime.stop()
+                report = runtime.html()
+                self.assertEqual(runtime.ended, first.isoformat())
+
+                clock.now.return_value = first + timedelta(minutes=5)
+                if deletion == "clear":
+                    runtime.history.clear()
+                else:
+                    del runtime.history[0]
+                self.assertEqual(runtime.html(), report)
+                self.assertEqual(runtime.html(), report)
+                self.assertEqual(runtime.ended, first.isoformat())
+
+                runtime.start(QueryRequest("198.51.100.21", ""), mode="normal")
+                self.assertEqual(runtime.started, clock.now.return_value.isoformat())
+                self.assertEqual(runtime.ended, clock.now.return_value.isoformat())
+
+    def test_report_end_time_advances_only_when_a_poll_finishes(self):
+        first = datetime(2026, 10, 4, 14, 0, tzinfo=UTC)
+        with patch("portfolio_demo.runtime.datetime") as clock:
+            clock.now.return_value = first
+            runtime = DemoRuntime()
+            runtime.start(QueryRequest("198.51.100.10", ""), monitor=True, mode="normal")
+            clock.now.return_value = first + timedelta(seconds=5)
+            runtime.poll("timeout")
+            self.assertEqual(runtime.ended, clock.now.return_value.isoformat())
+            report = runtime.html()
+            clock.now.return_value = first + timedelta(minutes=5)
+            runtime.stop()
+            self.assertEqual(runtime.html(), report)
+
     def test_export_status_is_independent_of_removable_history(self):
         runtime = DemoRuntime()
         self.assertEqual(runtime.run_status, "")
@@ -62,14 +101,14 @@ class DemoTests(unittest.TestCase):
                 app = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run()
                 next(button for button in app.button if button.label == "현재 조회").click().run()
                 runtime = app.session_state.runtime
-                run_id, csv = runtime.run_id, runtime.csv()
+                run_id, csv, report = runtime.run_id, runtime.csv(), runtime.html()
                 self.assertEqual(len(runtime.history), 1)
                 next(button for button in app.button if button.label == label).click().run()
                 self.assertFalse(app.exception)
                 self.assertFalse(runtime.history)
                 self.assertEqual(runtime.run_id, run_id)
                 self.assertEqual(runtime.csv(), csv)
-                self.assertIn("198.51.100.10", runtime.html())
+                self.assertEqual(runtime.html(), report)
                 self.assertTrue(
                     all(
                         button.disabled
