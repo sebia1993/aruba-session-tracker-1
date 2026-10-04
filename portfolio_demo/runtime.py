@@ -73,6 +73,7 @@ class DemoRuntime:
         self.latest_lifecycle = {}
         self.virtual_time = time.monotonic()
         self.started = ""
+        self.ended = ""
         self.stage = "대기"
 
     def _progress(self, stage, device):
@@ -97,6 +98,7 @@ class DemoRuntime:
         self.request = request
         self.run_id = str(uuid4())
         self.started = datetime.now(UTC).isoformat()
+        self.ended = ""
         self.poll_count = 0
         self.observations, self.events, self.latest_lifecycle = [], [], {}
         self.factory.tick = 0
@@ -211,6 +213,9 @@ class DemoRuntime:
                     "session_key": observation.session_key,
                 }
             )
+        # Exporting or deleting a summary must not extend this completed poll.
+        # A later poll records a new end time; merely rendering HTML does not.
+        self.ended = datetime.now(UTC).isoformat()
         row = {
             "Run ID": self.run_id,
             "Query": str(asdict(self.request)),
@@ -278,7 +283,7 @@ class DemoRuntime:
             **asdict(self.request),
             "run_id": self.run_id,
             "started_at": self.started,
-            "ended_at": datetime.now(UTC).isoformat(),
+            "ended_at": self.ended,
             "status": self.run_status,
         }
         snapshot = RunReportSnapshot(
