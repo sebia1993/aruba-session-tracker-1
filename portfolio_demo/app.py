@@ -27,6 +27,15 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+    /* These custom panels stay dark in either Streamlit theme. Pair opaque
+       surfaces with explicit foregrounds so the host theme cannot reduce contrast. */
+    .product-shell, .header-chip, .query-box, .flow-card, .noc-hero,
+    .noc-status-item, .review-card, .topology-shell, .topology-node, .peer-card,
+    .product-name, .header-chip-value, .flow-value, .noc-title,
+    .noc-status-value, .review-card-title, .topology-title,
+    .topology-node-value, .peer-card .peer {
+        color: #eef4fc;
+    }
     .block-container {
         max-width: 1540px;
         padding-top: 1.15rem;
@@ -35,7 +44,7 @@ st.markdown(
     .product-shell {
         border: 1px solid rgba(120, 145, 175, .24);
         border-radius: 14px;
-        background: rgba(15, 23, 35, .58);
+        background: #0f1723;
         padding: 12px 16px;
         margin-bottom: .55rem;
     }
@@ -54,7 +63,7 @@ st.markdown(
         border-radius: 9px;
         padding: 7px 9px;
         min-height: 54px;
-        background: rgba(17, 26, 39, .55);
+        background: #111a27;
     }
     .header-chip-label {
         font-size: .68rem;
@@ -70,13 +79,13 @@ st.markdown(
         border: 1px solid rgba(120, 145, 175, .23);
         border-radius: 11px;
         padding: 12px 14px;
-        background: rgba(18, 27, 41, .46);
+        background: #121b29;
     }
     .flow-card {
         border: 1px solid rgba(120, 145, 175, .23);
         border-radius: 11px;
         padding: 10px 12px;
-        background: rgba(18, 27, 41, .52);
+        background: #121b29;
         min-height: 82px;
     }
     .flow-label {
@@ -108,9 +117,7 @@ st.markdown(
         overflow: hidden;
         border: 1px solid rgba(91, 143, 193, .38);
         border-radius: 16px;
-        background:
-            linear-gradient(135deg, rgba(10, 18, 29, .98), rgba(16, 31, 48, .94)),
-            radial-gradient(circle at 88% 8%, rgba(61, 137, 205, .18), transparent 34%);
+        background: linear-gradient(135deg, #0a121d, #101f30);
         padding: 18px 20px 16px;
         margin-bottom: .7rem;
         box-shadow: 0 14px 36px rgba(0, 0, 0, .18);
@@ -190,7 +197,7 @@ st.markdown(
     }
     .noc-status-item {
         min-width: 0;
-        background: rgba(13, 22, 34, .86);
+        background: #0d1622;
         padding: .62rem .72rem;
     }
     .noc-status-label {
@@ -232,7 +239,7 @@ st.markdown(
     .review-card {
         border: 1px solid rgba(111, 146, 181, .28);
         border-radius: 13px;
-        background: linear-gradient(180deg, rgba(22, 34, 49, .72), rgba(15, 24, 36, .62));
+        background: linear-gradient(180deg, #162231, #0f1824);
         padding: .95rem 1rem;
         min-height: 132px;
     }
@@ -262,7 +269,8 @@ st.markdown(
     .runbook-heading .kicker {
         font-size: .64rem;
         letter-spacing: .12em;
-        color: #7f9bb6;
+        /* This heading sits on the native, theme-aware Streamlit canvas. */
+        color: inherit;
         font-weight: 850;
     }
     .runbook-heading .title {
@@ -273,7 +281,7 @@ st.markdown(
     .topology-shell {
         border: 1px solid rgba(91, 139, 184, .34);
         border-radius: 15px;
-        background: linear-gradient(180deg, rgba(14, 24, 37, .92), rgba(12, 19, 30, .86));
+        background: linear-gradient(180deg, #0e1825, #0c131e);
         padding: 1rem;
         margin: .7rem 0 1rem;
         box-shadow: inset 0 1px 0 rgba(255,255,255,.025);
@@ -320,7 +328,7 @@ st.markdown(
     .topology-node {
         border: 1px solid rgba(118, 151, 185, .28);
         border-radius: 12px;
-        background: rgba(21, 34, 50, .82);
+        background: #152232;
         padding: .8rem .85rem;
         min-height: 92px;
     }
@@ -355,7 +363,7 @@ st.markdown(
     }
     .topology-link small {
         margin-top: .2rem;
-        color: #6f8194;
+        color: #94a8be;
         font-size: .55rem;
         line-height: 1.15;
         text-align: center;
@@ -375,7 +383,7 @@ st.markdown(
     .peer-card {
         border: 1px solid rgba(109, 141, 174, .26);
         border-radius: 10px;
-        background: rgba(18, 29, 43, .76);
+        background: #121d2b;
         padding: .7rem .76rem;
     }
     .peer-card .proto {
@@ -400,7 +408,7 @@ st.markdown(
     }
     .topology-foot {
         margin-top: .7rem;
-        color: #76899d;
+        color: #94a8be;
         font-size: .7rem;
     }
     @media(max-width:900px) {
@@ -510,7 +518,7 @@ def render_reviewer_summary() -> None:
     )
 
 
-def render_status_chips() -> None:
+def render_status_chips(target=st) -> None:
     state = operating_state()
     dot_class = (
         "noc-dot-ok" if state == "정상" else "noc-dot-warn" if state != "대기" else "noc-dot-idle"
@@ -540,7 +548,7 @@ def render_status_chips() -> None:
             f'<span class="noc-status-value">{value_html}</span>'
             "</div>"
         )
-    st.markdown(
+    target.markdown(
         '<section class="noc-status-strip" aria-label="NOC 상태">' + "".join(items) + "</section>",
         unsafe_allow_html=True,
     )
@@ -1080,7 +1088,8 @@ def start_scenario(key):
 
 
 render_header()
-render_status_chips()
+status_slot = st.empty()
+render_status_chips(status_slot)
 render_reviewer_summary()
 scenario_controls = st.container()
 timeline_slot = GuidedSlot(
@@ -1142,6 +1151,10 @@ with settings_page:
     render_settings_page()
 with history_page:
     render_history_page()
+
+# Scenario controls replace the runtime during this pass; refresh the same slot
+# after all actions so the header and results describe the same execution.
+render_status_chips(status_slot)
 
 st.caption(
     "Public Web Edition · QueryRequest / TrackerService / production Parser / "

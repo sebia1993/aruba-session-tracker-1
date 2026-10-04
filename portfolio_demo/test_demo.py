@@ -1,7 +1,9 @@
+import re
 import sys
 import tempfile
 import unittest
 from dataclasses import replace
+from html import escape
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +17,73 @@ from portfolio_demo.scenario_runner import ScenarioRunner, communication_rows
 
 
 class DemoTests(unittest.TestCase):
+    def test_export_status_is_independent_of_removable_history(self):
+        runtime = DemoRuntime()
+        self.assertEqual(runtime.run_status, "")
+        self.assertEqual(runtime.html(), "")
+        for deletion in ("clear", "sole", "current"):
+            for mode in ("normal", "timeout"):
+                with self.subTest(deletion=deletion, mode=mode):
+                    runtime = DemoRuntime()
+                    if deletion == "current":
+                        runtime.start(QueryRequest("198.51.100.10", ""), mode="normal")
+                    runtime.start(QueryRequest("198.51.100.21", ""), mode=mode)
+                    expected = runtime.run_status
+                    self.assertEqual(expected, "COMPLETED" if mode == "normal" else "FAILED")
+                    observations = list(runtime.observations)
+                    csv = runtime.csv()
+                    if deletion == "clear":
+                        runtime.history.clear()
+                    else:
+                        del runtime.history[-1]
+                    with patch(
+                        "portfolio_demo.runtime.render_html_report", return_value="report"
+                    ) as render:
+                        self.assertEqual(runtime.html(), "report")
+                    snapshot = render.call_args.args[0]
+                    self.assertEqual(snapshot.run["status"], expected)
+                    self.assertEqual(snapshot.run["run_id"], runtime.run_id)
+                    self.assertEqual(snapshot.observations, tuple(observations))
+                    self.assertEqual(runtime.csv(), csv)
+                    self.assertIn("<!doctype html>", runtime.html())
+
+        runtime = DemoRuntime()
+        runtime.start(QueryRequest("198.51.100.10", ""), mode="normal")
+        runtime.outcome = replace(runtime.outcome, authoritative=False)
+        runtime.history.clear()
+        self.assertEqual(runtime.run_status, "PARTIAL")
+        with patch("portfolio_demo.runtime.render_html_report", return_value="report") as render:
+            runtime.html()
+        self.assertEqual(render.call_args.args[0].run["status"], "PARTIAL")
+
+    def test_ui_history_deletion_keeps_current_exports_and_allows_another_query(self):
+        for label in ("선택 삭제", "전체 기록 삭제"):
+            with self.subTest(label=label):
+                app = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run()
+                next(button for button in app.button if button.label == "현재 조회").click().run()
+                runtime = app.session_state.runtime
+                run_id, csv = runtime.run_id, runtime.csv()
+                self.assertEqual(len(runtime.history), 1)
+                next(button for button in app.button if button.label == label).click().run()
+                self.assertFalse(app.exception)
+                self.assertFalse(runtime.history)
+                self.assertEqual(runtime.run_id, run_id)
+                self.assertEqual(runtime.csv(), csv)
+                self.assertIn("198.51.100.10", runtime.html())
+                self.assertTrue(
+                    all(
+                        button.disabled
+                        for button in app.button
+                        if button.label in ("선택 삭제", "전체 기록 삭제")
+                    )
+                )
+                app.run()
+                self.assertFalse(app.exception)
+                next(button for button in app.button if button.label == "현재 조회").click().run()
+                self.assertFalse(app.exception)
+                self.assertNotEqual(runtime.run_id, run_id)
+                self.assertEqual(len(runtime.history), 1)
+
     def test_queries_route_filter_and_accept_other_clients(self):
         with patch("socket.create_connection", side_effect=AssertionError("No network")):
             r = DemoRuntime()
@@ -211,6 +280,32 @@ class DemoTests(unittest.TestCase):
 
 
 class ScenarioTests(unittest.TestCase):
+    def test_status_header_updates_in_the_same_scenario_click(self):
+        app = AppTest.from_file(str(Path(__file__).with_name("app.py"))).run()
+        for label in ("대표 통신 추적 실행", "Session 수집 실패", "정상 통신 추적"):
+            with self.subTest(label=label):
+                next(button for button in app.button if button.label == label).click().run()
+                self.assertFalse(app.exception)
+                runtime = app.session_state.runtime
+                headers = [
+                    item.value for item in app.markdown if 'aria-label="NOC 상태"' in item.value
+                ]
+                self.assertEqual(len(headers), 1)
+                expected_state = (
+                    "정상"
+                    if runtime.outcome.authoritative
+                    else "재시도 중"
+                    if runtime.result.retry_after_seconds
+                    else "확인 필요"
+                )
+                self.assertIn(f"<span>{expected_state}</span>", headers[0])
+                seen = max(str(row["Last Seen"]) for row in runtime.rows())
+                self.assertIn(escape(seen), headers[0])
+                self.assertEqual(
+                    next(item.value for item in app.metric if item.label == "실행 상태"),
+                    expected_state,
+                )
+
     def test_normal_routes_parses_and_builds_each_actual_direction(self):
         runner = ScenarioRunner()
         with patch("socket.create_connection", side_effect=AssertionError("No network")):
@@ -352,6 +447,123 @@ class ScenarioTests(unittest.TestCase):
         )
         self.assertFalse(app.session_state.runtime.rows())
         self.assertTrue(app.session_state.scenario_runner.run.completed)
+
+
+def _styles():
+    source = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
+    css = source.split("<style>", 1)[1].split("</style>", 1)[0]
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL).split("@media", 1)[0]
+    styles = {}
+    for selectors, declarations in re.findall(r"([^{}]+)\{([^{}]*)\}", css):
+        properties = dict(re.findall(r"([\w-]+)\s*:\s*([^;]+);", declarations))
+        for selector in selectors.split(","):
+            styles.setdefault(selector.strip(), {}).update(properties)
+    return styles
+
+
+def _rgb(color):
+    return tuple(int(color[index : index + 2], 16) / 255 for index in (1, 3, 5))
+
+
+def _contrast(foreground, background):
+    def luminance(rgb):
+        channels = (c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in rgb)
+        return sum(c * weight for c, weight in zip(channels, (0.2126, 0.7152, 0.0722), strict=True))
+
+    lighter, darker = sorted((luminance(foreground), luminance(background)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+class DemoContrastTests(unittest.TestCase):
+    def setUp(self):
+        self.styles = _styles()
+        self.panels = (
+            ".product-shell",
+            ".header-chip",
+            ".query-box",
+            ".flow-card",
+            ".noc-hero",
+            ".noc-status-item",
+            ".review-card",
+            ".topology-shell",
+            ".topology-node",
+            ".peer-card",
+        )
+
+    def background_colors(self, panel):
+        value = self.styles[panel]["background"].strip()
+        # Opaque six-digit colors only, including every gradient endpoint.
+        self.assertNotRegex(value, r"rgba?\(|transparent|var\(")
+        colors = re.findall(r"#[0-9a-fA-F]{6}\b", value)
+        self.assertTrue(colors, panel)
+        return [_rgb(color) for color in colors]
+
+    def assert_readable(self, selector, panel):
+        foreground = _rgb(self.styles[selector]["color"].strip())
+        for background in self.background_colors(panel):
+            with self.subTest(selector=selector, panel=panel, background=background):
+                self.assertGreaterEqual(_contrast(foreground, background), 4.5)
+
+    def test_custom_panels_have_opaque_surfaces_and_readable_foregrounds(self):
+        for panel in self.panels:
+            self.assert_readable(panel, panel)
+
+    def test_primary_text_has_explicit_foregrounds(self):
+        for selector, panel in (
+            (".product-name", ".product-shell"),
+            (".header-chip-value", ".header-chip"),
+            (".flow-value", ".flow-card"),
+            (".noc-title", ".noc-hero"),
+            (".noc-status-value", ".noc-status-item"),
+            (".review-card-title", ".review-card"),
+            (".topology-title", ".topology-shell"),
+            (".topology-node-value", ".topology-node"),
+            (".peer-card .peer", ".peer-card"),
+        ):
+            self.assert_readable(selector, panel)
+
+    def test_secondary_text_meets_normal_text_contrast(self):
+        for selector, panel in (
+            (".product-meta", ".product-shell"),
+            (".header-chip-label", ".header-chip"),
+            (".flow-label", ".flow-card"),
+            (".noc-eyebrow", ".noc-hero"),
+            (".noc-subtitle", ".noc-hero"),
+            (".noc-hero-summary", ".noc-hero"),
+            (".noc-status-label", ".noc-status-item"),
+            (".review-card-kicker", ".review-card"),
+            (".review-card p", ".review-card"),
+            (".topology-kicker", ".topology-shell"),
+            (".topology-node-kind", ".topology-node"),
+            (".topology-node-meta", ".topology-node"),
+            (".topology-link", ".topology-shell"),
+            (".topology-link small", ".topology-shell"),
+            (".peer-card .proto", ".peer-card"),
+            (".peer-card .meta", ".peer-card"),
+            (".topology-foot", ".topology-shell"),
+        ):
+            self.assert_readable(selector, panel)
+
+    def test_badge_text_meets_contrast_over_composited_background(self):
+        for selector, panel in (
+            (".noc-badge", ".noc-hero"),
+            (".topology-state", ".topology-shell"),
+            (".topology-state.warn", ".topology-shell"),
+        ):
+            rule = self.styles[selector]
+            foreground = _rgb(rule["color"])
+            red, green, blue, alpha = map(float, re.findall(r"[\d.]+", rule["background"]))
+            for base in self.background_colors(panel):
+                composed = tuple(
+                    (channel / 255) * alpha + under * (1 - alpha)
+                    for channel, under in zip((red, green, blue), base, strict=True)
+                )
+                with self.subTest(selector=selector, background=composed):
+                    self.assertGreaterEqual(_contrast(foreground, composed), 4.5)
+
+    def test_native_canvas_heading_retains_streamlit_theme_foreground(self):
+        self.assertEqual(self.styles[".runbook-heading .kicker"]["color"], "inherit")
+        self.assertNotIn("background", self.styles[".runbook-heading"])
 
 
 if __name__ == "__main__":

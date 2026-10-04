@@ -211,17 +211,12 @@ class DemoRuntime:
                     "session_key": observation.session_key,
                 }
             )
-        status = (
-            "COMPLETED"
-            if self.outcome.authoritative
-            else ("PARTIAL" if self.outcome.observations else "FAILED")
-        )
         row = {
             "Run ID": self.run_id,
             "Query": str(asdict(self.request)),
             "Started": self.started,
             "Polls": self.poll_count,
-            "Status": status,
+            "Status": self.run_status,
             "Session Count": len(self.outcome.observations)
             if self.outcome.authoritative
             else "확인 불가",
@@ -236,6 +231,15 @@ class DemoRuntime:
 
     def stop(self):
         self.running = False
+
+    @property
+    def run_status(self):
+        """Describe the current outcome independently of removable history summaries."""
+        if self.outcome is None:
+            return ""
+        if self.outcome.authoritative:
+            return "COMPLETED"
+        return "PARTIAL" if self.outcome.observations else "FAILED"
 
     def rows(self):
         if self.result:
@@ -275,7 +279,7 @@ class DemoRuntime:
             "run_id": self.run_id,
             "started_at": self.started,
             "ended_at": datetime.now(UTC).isoformat(),
-            "status": self.history[-1]["Status"],
+            "status": self.run_status,
         }
         snapshot = RunReportSnapshot(
             run=run,
